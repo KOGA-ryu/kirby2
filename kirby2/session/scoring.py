@@ -147,9 +147,10 @@ class SessionReport:
     state_sha256: str
     timeline_sha256: str
     invariant_status: str
+    strategy_transitions: tuple[dict[str, object], ...] = ()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "invariant_status": self.invariant_status,
             "metrics": self.metrics.as_dict(),
             "objective": self.objective.as_dict(),
@@ -164,6 +165,9 @@ class SessionReport:
                 "combined_score": None,
             },
         }
+        if self.strategy_transitions:
+            payload["strategy_transitions"] = list(self.strategy_transitions)
+        return payload
 
     def render(self) -> str:
         metrics = self.metrics
@@ -214,6 +218,18 @@ class SessionReport:
             ),
             f"RUNTIME_INVARIANTS {self.invariant_status}",
         ]
+        if self.strategy_transitions:
+            transition_lines = [
+                (
+                    "STRATEGY_TRANSITION "
+                    f"time_us={item['simulation_timestamp']} "
+                    f"{item['previous_state']}->{item['current_state']} "
+                    f"signal={item['signal']} qualifier={item['qualifier']} "
+                    f"reason={item['reason']}"
+                )
+                for item in self.strategy_transitions
+            ]
+            lines[-2:-2] = transition_lines
         return "\n".join(lines)
 
 
@@ -608,6 +624,7 @@ def build_session_report(session: LiveMarketSession) -> SessionReport:
         state_sha256=session.state_sha256(),
         timeline_sha256=session.timeline_sha256(),
         invariant_status="PASS",
+        strategy_transitions=_state_machine_transition_report(session.timeline),
     )
 
 
@@ -630,6 +647,14 @@ def _reading_score(records: tuple[TimelineRecord, ...]) -> ScoreFamily:
             raise RuntimeError("traffic transition lacks evaluation details")
         state = str(evaluation["state"])
         state_counts[state] += 1
+        if evaluation.get("kind") == "state_machine":
+            conditions = evaluation.get("condition_results", [])
+            if not isinstance(conditions, list):
+                raise RuntimeError("state-machine transition conditions must be a list")
+            supports.append(
+                Decimal(1) if not conditions else _condition_match_ratio(conditions)
+            )
+            continue
         green = evaluation["green_conditions"]
         wait = evaluation["wait_conditions"]
         if not isinstance(green, list) or not isinstance(wait, list):
@@ -657,6 +682,40 @@ def _reading_score(records: tuple[TimelineRecord, ...]) -> ScoreFamily:
         ),
         {"state_counts": state_counts, "transition_count": len(transitions)},
     )
+
+
+def _state_machine_transition_report(
+    records: tuple[TimelineRecord, ...],
+) -> tuple[dict[str, object], ...]:
+    result: list[dict[str, object]] = []
+    for record in records:
+        if record.kind is not TimelineKind.TRAFFIC:
+            continue
+        evaluation = record.data.get("evaluation")
+        if not isinstance(evaluation, dict) or evaluation.get("kind") != "state_machine":
+            continue
+        result.append(
+            {
+                "condition_results": evaluation.get("condition_results", []),
+                "current_state": str(evaluation["machine_state"]),
+                "entry_permission": str(evaluation["entry_permission"]),
+                "exit_permission": str(evaluation["exit_permission"]),
+                "previous_state": (
+                    "INITIAL"
+                    if record.data.get("previous_machine_state") is None
+                    else str(record.data["previous_machine_state"])
+                ),
+                "qualifier": (
+                    "INITIAL"
+                    if evaluation.get("transition_qualifier") is None
+                    else str(evaluation["transition_qualifier"])
+                ),
+                "reason": str(evaluation["reason"]),
+                "signal": str(evaluation["state"]),
+                "simulation_timestamp": record.simulation_time_us,
+            }
+        )
+    return tuple(result)
 
 
 def _discipline_score(

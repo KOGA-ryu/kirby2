@@ -67,6 +67,12 @@ def render_terminal_frame(
         f"TRAFFIC LIGHT [ {snapshot.traffic_light:^12} ]  "
         f"SETUP {snapshot.traffic_setup or '-'}"
     )
+    if snapshot.strategy_state is not None:
+        traffic += (
+            f"  STATE {snapshot.strategy_state}  "
+            f"ENTRY {snapshot.strategy_entry_permission}  "
+            f"EXIT {snapshot.strategy_exit_permission}"
+        )
     traffic_reason = f"TRAFFIC WHY  {snapshot.traffic_reason}"
     objective = (
         "OBJECTIVE none"

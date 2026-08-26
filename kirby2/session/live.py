@@ -20,6 +20,9 @@ from kirby2.simulation import (
 from kirby2.simulation.clock import MICROSECONDS_PER_SECOND
 from kirby2.simulation.flow import FlowEvent
 from kirby2.strategy import (
+    StateMachineDefinition,
+    StateMachineRuntime,
+    StateMachineTransition,
     StrategyDefinition,
     TrafficLightRuntime,
     TrafficTransition,
@@ -88,6 +91,9 @@ class SessionSnapshot:
     working_orders: tuple[WorkingOrderView, ...]
     traffic_light: str
     traffic_setup: str | None
+    strategy_state: str | None
+    strategy_entry_permission: str
+    strategy_exit_permission: str
     traffic_reason: str
     objective_type: str | None
     objective_target_quantity: int
@@ -119,7 +125,7 @@ class LiveMarketSession:
         liquidity: LiquidityPreset | None = None,
         initial_quantity: int = 100,
         quantity_options: tuple[int, ...] = DEFAULT_QUANTITIES,
-        strategy_definition: StrategyDefinition | None = None,
+        strategy_definition: StrategyDefinition | StateMachineDefinition | None = None,
         objective: SessionObjective | None = None,
         curriculum_drill: CurriculumDrill | None = None,
     ) -> None:
@@ -154,7 +160,7 @@ class LiveMarketSession:
         self.status_message = "READY - SPACE starts simulated flow"
         self.engine: RegimeOrderFlow
         self.dimensions: ScenarioDimensions
-        self._traffic_runtime: TrafficLightRuntime | None
+        self._traffic_runtime: TrafficLightRuntime | StateMachineRuntime | None
         self._execution_tracker: ExecutionTracker | None
         if objective is not None and objective.time_limit_us > self.duration_us:
             raise ValueError("objective time limit cannot exceed session duration")
@@ -262,10 +268,16 @@ class LiveMarketSession:
             )
         self._traffic_runtime = None
         if self.strategy_definition is not None:
-            self._traffic_runtime = TrafficLightRuntime(
-                self.strategy_definition,
-                Decimal(str(self.dimensions.volume_scale.relative_volume)),
-            )
+            if isinstance(self.strategy_definition, StateMachineDefinition):
+                self._traffic_runtime = StateMachineRuntime(
+                    self.strategy_definition,
+                    Decimal(str(self.dimensions.volume_scale.relative_volume)),
+                )
+            else:
+                self._traffic_runtime = TrafficLightRuntime(
+                    self.strategy_definition,
+                    Decimal(str(self.dimensions.volume_scale.relative_volume)),
+                )
             initial_transition = self._traffic_runtime.reset(
                 self.simulation_time_us,
                 self.engine.book,
@@ -427,6 +439,11 @@ class LiveMarketSession:
             if self._traffic_runtime is None
             else self._traffic_runtime.current
         )
+        machine_runtime = (
+            self._traffic_runtime
+            if isinstance(self._traffic_runtime, StateMachineRuntime)
+            else None
+        )
         objective_progress = (
             None
             if self._execution_tracker is None
@@ -468,6 +485,21 @@ class LiveMarketSession:
             working_orders=self._working_order_views(),
             traffic_light="UNCONFIGURED" if traffic is None else traffic.state.value,
             traffic_setup=None if traffic is None else traffic.setup_name,
+            strategy_state=(
+                None
+                if machine_runtime is None or machine_runtime.current is None
+                else machine_runtime.current.machine_state
+            ),
+            strategy_entry_permission=(
+                "UNRESTRICTED"
+                if machine_runtime is None or machine_runtime.current is None
+                else machine_runtime.current.entry_permission.value
+            ),
+            strategy_exit_permission=(
+                "UNRESTRICTED"
+                if machine_runtime is None or machine_runtime.current is None
+                else machine_runtime.current.exit_permission.value
+            ),
             traffic_reason=(
                 "No strategy rule file loaded" if traffic is None else traffic.reason
             ),
@@ -569,6 +601,9 @@ class LiveMarketSession:
     ) -> CommandOutcome:
         if price_ticks is None:
             return self._outcome(command, False, f"{command.value} rejected: no touch")
+        denied = self._strategy_permission_rejection(side, self.selected_quantity)
+        if denied is not None:
+            return self._outcome(command, False, f"{command.value} rejected: {denied}")
         order = Order.limit(
             self._next_order_id(),
             side,
@@ -589,6 +624,9 @@ class LiveMarketSession:
         side: Side,
         quantity: int,
     ) -> CommandOutcome:
+        denied = self._strategy_permission_rejection(side, quantity)
+        if denied is not None:
+            return self._outcome(command, False, f"{command.value} rejected: {denied}")
         order = Order.market(
             self._next_order_id(),
             side,
@@ -713,6 +751,12 @@ class LiveMarketSession:
         )
         if target.side is None:
             raise RuntimeError("working player order must have a side")
+        denied = self._strategy_permission_rejection(
+            target.side,
+            self.selected_quantity,
+        )
+        if denied is not None:
+            return self._outcome(command, False, f"REPLACE rejected: {denied}")
         price_ticks = self._bid_price() if target.side is Side.BUY else self._ask_price()
         replacement = Order.limit(
             self._next_order_id(),
@@ -756,6 +800,12 @@ class LiveMarketSession:
         )
 
     def _flatten(self, command: SessionCommand) -> CommandOutcome:
+        position = self.engine.book.player_position.position
+        if position != 0:
+            side = Side.SELL if position > 0 else Side.BUY
+            denied = self._strategy_permission_rejection(side, abs(position))
+            if denied is not None:
+                return self._outcome(command, False, f"FLATTEN rejected: {denied}")
         cancelled: list[dict[str, object]] = []
         if self._player_orders():
             cancel_outcome = self._cancel_all(command)
@@ -1176,7 +1226,26 @@ class LiveMarketSession:
         if transition is not None:
             self._record_traffic_transition(transition)
 
-    def _record_traffic_transition(self, transition: TrafficTransition) -> None:
+    def _record_traffic_transition(
+        self,
+        transition: TrafficTransition | StateMachineTransition,
+    ) -> None:
+        if isinstance(transition, StateMachineTransition):
+            evaluation = transition.evaluation
+            previous = transition.previous_state or "INITIAL"
+            self._append_timeline(
+                TimelineKind.TRAFFIC,
+                (
+                    f"STRATEGY {previous} -> {evaluation.machine_state} "
+                    f"signal={evaluation.state.value} "
+                    f"entry={evaluation.entry_permission.value} "
+                    f"exit={evaluation.exit_permission.value} "
+                    f"[{evaluation.setup_name}]: {evaluation.reason}"
+                ),
+                transition.as_dict(),
+                evaluation.simulation_time_us,
+            )
+            return
         previous = (
             "INITIAL"
             if transition.previous_state is None
@@ -1191,6 +1260,39 @@ class LiveMarketSession:
             ),
             transition.as_dict(),
             evaluation.simulation_time_us,
+        )
+
+    def _strategy_permission_rejection(
+        self,
+        side: Side,
+        quantity: int,
+    ) -> str | None:
+        runtime = self._traffic_runtime
+        if not isinstance(runtime, StateMachineRuntime):
+            return None
+        current = runtime.current
+        if current is None:
+            raise RuntimeError("state-machine strategy lacks a current state")
+        position = self.engine.book.player_position.position
+        requires_exit = position != 0 and (
+            (position > 0 and side is Side.SELL)
+            or (position < 0 and side is Side.BUY)
+        )
+        requires_entry = (
+            position == 0
+            or not requires_exit
+            or quantity > abs(position)
+        )
+        denied: list[str] = []
+        if requires_exit and not runtime.exit_allowed():
+            denied.append("exit")
+        if requires_entry and not runtime.entry_allowed():
+            denied.append("entry")
+        if not denied:
+            return None
+        return (
+            f"strategy state {current.machine_state} denies "
+            f"{' and '.join(denied)} permission"
         )
 
     def _timeline_midpoint_x2(self) -> int | None:

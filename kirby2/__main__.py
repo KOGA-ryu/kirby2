@@ -534,7 +534,7 @@ def main() -> None:
         return
 
     if args.command == "strategy":
-        from kirby2.strategy import FeatureName
+        from kirby2.strategy import FeatureName, PositionFeature, StateMachineDefinition
 
         definition = _load_strategy_file(args.rule_file)
         print("KIRBY2_TRAFFIC_STRATEGY")
@@ -543,6 +543,11 @@ def main() -> None:
             "OBSERVABLE_FEATURES "
             + ",".join(feature.value for feature in FeatureName)
         )
+        if isinstance(definition, StateMachineDefinition):
+            print(
+                "POSITION_FEATURES "
+                + ",".join(feature.value for feature in PositionFeature)
+            )
         print("STRATEGY_VALID PASS arbitrary_code=DISABLED hidden_regime=UNAVAILABLE")
         return
 

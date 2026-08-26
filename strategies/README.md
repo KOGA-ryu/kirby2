@@ -5,6 +5,7 @@ or access simulator regime labels. Validate a file before launching the UI:
 
 ```bash
 python3 -m kirby2 strategy strategies/momentum_long.k2
+python3 -m kirby2 strategy strategies/momentum_stateful.k2
 ```
 
 Launch and record a session with the rule file embedded in its replay artifact:
@@ -61,3 +62,44 @@ their complete feature and condition explanations are available through:
 ```bash
 python3 -m kirby2 timeline .kirby2/recordings/momentum-session.json --kind TRAFFIC
 ```
+
+## Stateful grammar
+
+The stateful form keeps the same restricted observable vocabulary and adds named
+states, deterministic transitions, entry/exit permissions, position predicates,
+and simulation-time qualifiers. It cannot execute Python or inspect hidden regime
+labels.
+
+```text
+machine setup_name
+window 1s
+initial IDLE
+
+state IDLE signal WAIT entry DENY exit ALLOW
+state ARMED signal WAIT entry DENY exit ALLOW
+state GREEN signal GREEN entry ALLOW exit ALLOW
+state COOLDOWN signal RED entry DENY exit ALLOW cooldown 2s
+
+transition IDLE -> ARMED when for 500ms
+    book_imbalance > 0.50
+
+transition ARMED -> GREEN when events 3 within 1s
+    ask_depletion_rate > 0
+
+transition GREEN -> COOLDOWN after entry
+
+transition COOLDOWN -> IDLE when
+    position == 0
+```
+
+Transitions are considered in source order. Supported qualifiers are an immediate
+`when`, continuously true `when for TIME`, `when events N within TIME`,
+`when occurred within TIME`, and `after entry`. Cooldown time is measured by the
+simulation clock. Event counts refer to matching exchange-driven evaluations.
+`after entry` means an accepted order with position-increasing or reversing intent,
+not an exit-only order. Position-aware conditions are `position`,
+`bought_quantity`, `sold_quantity`, and `working_order_count`. A reversal requires
+both exit and entry permission. A denied permission rejects the player action
+before it can change exchange state; cancellations remain available. Session
+reports and `timeline --kind TRAFFIC` include the transition reason, qualifier,
+condition evidence, and permissions.

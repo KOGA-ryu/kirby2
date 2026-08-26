@@ -7,6 +7,10 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .state_machine import StateMachineDefinition
 
 
 DEFAULT_WINDOW_US = 5_000_000
@@ -118,12 +122,17 @@ class StrategyDefinition:
         }
 
 
-def parse_strategy(source: str) -> StrategyDefinition:
+def parse_strategy(source: str) -> StrategyDefinition | StateMachineDefinition:
     if not isinstance(source, str):
         raise TypeError("strategy source must be text")
     lines = _meaningful_lines(source)
     if not lines:
         raise RuleSyntaxError(1, "strategy file is empty")
+
+    if lines[0][1].split()[0].lower() == "machine":
+        from .state_machine import parse_state_machine
+
+        return parse_state_machine(source)
 
     line_number, text = lines[0]
     setup_parts = text.split()

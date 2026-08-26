@@ -1,0 +1,31 @@
+# Declarative stateful example. State names do not expose simulator regimes.
+machine momentum_stateful
+window 1s
+initial IDLE
+
+state IDLE signal WAIT entry DENY exit ALLOW
+state WATCHING signal WAIT entry DENY exit ALLOW
+state ARMED signal WAIT entry DENY exit ALLOW
+state GREEN signal GREEN entry ALLOW exit ALLOW
+state INVALIDATED signal RED entry DENY exit ALLOW
+state COOLDOWN signal RED entry DENY exit ALLOW cooldown 2s
+
+transition IDLE -> WATCHING when
+    relative_volume > 0
+
+transition WATCHING -> ARMED when for 500ms
+    spread_ticks >= 1
+
+transition ARMED -> GREEN when events 3 within 1s
+    spread_ticks >= 1
+
+transition GREEN -> INVALIDATED when occurred within 2s
+    book_imbalance < 0
+
+transition GREEN -> COOLDOWN after entry
+
+transition INVALIDATED -> COOLDOWN when
+    position == 0
+
+transition COOLDOWN -> IDLE when
+    position == 0
