@@ -86,7 +86,8 @@ class SessionObjective:
         duration = str(seconds)
         if microseconds:
             duration += f".{microseconds:06d}".rstrip("0")
+        tick_unit = "tick" if self.preferred_slippage_ticks == 1 else "ticks"
         return (
             f"{action} within {duration}s; "
-            f"preferred slippage <= {self.preferred_slippage_ticks} ticks"
+            f"preferred slippage <= {self.preferred_slippage_ticks} {tick_unit}"
         )

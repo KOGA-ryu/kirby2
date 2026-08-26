@@ -763,12 +763,16 @@ def _execution_score(
             Decimal(100) - excess_slippage * Decimal(25),
         )
     time_component = Decimal(100 if metrics.completed_within_limit else 0)
-    missed_component = max(
-        Decimal(0),
-        Decimal(100)
-        - Decimal(metrics.missed_available_liquidity)
-        * Decimal(100)
-        / Decimal(objective.target_quantity),
+    missed_component = (
+        Decimal(0)
+        if metrics.completed_quantity == 0
+        else max(
+            Decimal(0),
+            Decimal(100)
+            - Decimal(metrics.missed_available_liquidity)
+            * Decimal(100)
+            / Decimal(objective.target_quantity),
+        )
     )
     score = (
         completion * Decimal("0.55")

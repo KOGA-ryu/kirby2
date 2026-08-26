@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from kirby2.curriculum.models import CurriculumDrill
 from kirby2.scenarios import ScenarioDefinition
 from kirby2.simulation import LiquidityPreset, VolumePreset
 from kirby2.strategy import parse_strategy
@@ -38,6 +39,7 @@ class SessionRecording:
     complete: bool
     expected_state_sha256: str
     expected_timeline_sha256: str
+    curriculum_drill: CurriculumDrill | None = None
 
     def __post_init__(self) -> None:
         if self.duration_seconds <= 0:
@@ -61,6 +63,23 @@ class SessionRecording:
         state_id_set = set(state_ids)
         if any(record.market_state_id not in state_id_set for record in self.input_records):
             raise ValueError("recorded input references a missing market state")
+        if self.curriculum_drill is not None:
+            drill = self.curriculum_drill
+            from kirby2.curriculum.catalog import get_lesson
+
+            get_lesson(drill.lesson_id).assert_contains(drill)
+            if str(self.scenario_definition.get("name")) != drill.scenario_name:
+                raise ValueError("recording curriculum scenario does not match")
+            if self.seed != drill.scenario_seed:
+                raise ValueError("recording curriculum seed does not match")
+            if self.duration_seconds != drill.duration_seconds:
+                raise ValueError("recording curriculum duration does not match")
+            if self.relative_volume is not drill.volume:
+                raise ValueError("recording curriculum volume does not match")
+            if self.liquidity is not drill.liquidity:
+                raise ValueError("recording curriculum liquidity does not match")
+            if self.objective != drill.player_objective:
+                raise ValueError("recording curriculum objective does not match")
 
     @classmethod
     def capture(
@@ -92,6 +111,7 @@ class SessionRecording:
             complete=session.complete,
             expected_state_sha256=session.state_sha256(),
             expected_timeline_sha256=session.timeline_sha256(),
+            curriculum_drill=session.curriculum_drill,
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -99,6 +119,11 @@ class SessionRecording:
             "auto_start": self.auto_start,
             "complete": self.complete,
             "completed_time_us": self.completed_time_us,
+            "curriculum_drill": (
+                None
+                if self.curriculum_drill is None
+                else self.curriculum_drill.as_dict()
+            ),
             "duration_seconds": self.duration_seconds,
             "expected_state_sha256": self.expected_state_sha256,
             "expected_timeline_sha256": self.expected_timeline_sha256,
@@ -142,6 +167,7 @@ class SessionRecording:
         market_states = payload.get("market_states")
         quantities = payload.get("quantity_options")
         objective = payload.get("objective")
+        curriculum_drill = payload.get("curriculum_drill")
         if not isinstance(scenario, dict):
             raise ValueError("recording scenario definition must be an object")
         if not isinstance(layout, dict):
@@ -156,6 +182,8 @@ class SessionRecording:
             raise ValueError("recording quantity options must be an array")
         if objective is not None and not isinstance(objective, dict):
             raise ValueError("recording objective must be an object or null")
+        if curriculum_drill is not None and not isinstance(curriculum_drill, dict):
+            raise ValueError("recording curriculum drill must be an object or null")
         return cls(
             scenario_definition=dict(scenario),
             seed=int(payload["seed"]),
@@ -187,6 +215,11 @@ class SessionRecording:
             complete=bool(payload["complete"]),
             expected_state_sha256=str(payload["expected_state_sha256"]),
             expected_timeline_sha256=str(payload["expected_timeline_sha256"]),
+            curriculum_drill=(
+                None
+                if curriculum_drill is None
+                else CurriculumDrill.from_dict(curriculum_drill)
+            ),
         )
 
 
@@ -245,6 +278,7 @@ def replay_recording(recording: SessionRecording) -> ReplayReport:
         quantity_options=recording.quantity_options,
         strategy_definition=strategy_definition,
         objective=recording.objective,
+        curriculum_drill=recording.curriculum_drill,
     )
     if recording.auto_start:
         session.start()

@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from kirby2.exchange import Order, OrderOwner, OrderStatus, Side
 from kirby2.scenarios import ScenarioDefinition, create_market_engine
@@ -29,6 +29,9 @@ from .bindings import BindingMap, SessionCommand
 from .objectives import SessionObjective
 from .records import InputRecord, MarketStateRecord, TimelineKind, TimelineRecord
 from .scoring import ExecutionTracker
+
+if TYPE_CHECKING:
+    from kirby2.curriculum import CurriculumDrill
 
 
 DEFAULT_QUANTITIES = (25, 50, 100, 200, 500, 1_000, 2_000)
@@ -68,7 +71,7 @@ class WorkingOrderView:
 class SessionSnapshot:
     scenario_name: str
     regime: str
-    seed: int
+    seed: int | None
     relative_volume: str
     liquidity: str
     simulation_time_us: int
@@ -118,6 +121,7 @@ class LiveMarketSession:
         quantity_options: tuple[int, ...] = DEFAULT_QUANTITIES,
         strategy_definition: StrategyDefinition | None = None,
         objective: SessionObjective | None = None,
+        curriculum_drill: CurriculumDrill | None = None,
     ) -> None:
         if type(duration_seconds) is not int or duration_seconds <= 0:
             raise ValueError("session duration must be a positive integer")
@@ -138,6 +142,7 @@ class LiveMarketSession:
         self.quantity_options = quantity_options
         self.strategy_definition = strategy_definition
         self.objective = objective
+        self.curriculum_drill = curriculum_drill
         self._initial_quantity = initial_quantity
         self._quantity_index = quantity_options.index(initial_quantity)
         self._order_sequence = 0
@@ -153,6 +158,19 @@ class LiveMarketSession:
         self._execution_tracker: ExecutionTracker | None
         if objective is not None and objective.time_limit_us > self.duration_us:
             raise ValueError("objective time limit cannot exceed session duration")
+        if curriculum_drill is not None:
+            if definition.name != curriculum_drill.scenario_name:
+                raise ValueError("curriculum drill scenario does not match session")
+            if self.seed != curriculum_drill.scenario_seed:
+                raise ValueError("curriculum drill seed does not match session")
+            if duration_seconds != curriculum_drill.duration_seconds:
+                raise ValueError("curriculum drill duration does not match session")
+            if relative_volume is not curriculum_drill.volume:
+                raise ValueError("curriculum drill volume does not match session")
+            if liquidity is not curriculum_drill.liquidity:
+                raise ValueError("curriculum drill liquidity does not match session")
+            if objective != curriculum_drill.player_objective:
+                raise ValueError("curriculum drill objective does not match session")
         self.reset()
 
     @property
@@ -214,6 +232,19 @@ class LiveMarketSession:
         self._latest_market_state_time_us = 0
         self._timeline_best_bid = self.engine.book.best_bid
         self._timeline_best_ask = self.engine.book.best_ask
+        if self.curriculum_drill is not None:
+            self._append_timeline(
+                TimelineKind.CURRICULUM,
+                (
+                    f"CURRICULUM START mode={self.curriculum_drill.mode.value} "
+                    f"variation={self.curriculum_drill.variation_id}"
+                ),
+                {
+                    "mode": self.curriculum_drill.mode.value,
+                    "variation_id": self.curriculum_drill.variation_id,
+                },
+                self.simulation_time_us,
+            )
         self._execution_tracker = None
         if self.objective is not None:
             self._execution_tracker = ExecutionTracker(
@@ -263,6 +294,16 @@ class LiveMarketSession:
                         "objective": self.objective.as_dict(),  # type: ignore[union-attr]
                         "progress": self._execution_tracker.progress().as_dict(),
                     },
+                    target,
+                )
+            if self.curriculum_drill is not None:
+                self._append_timeline(
+                    TimelineKind.CURRICULUM,
+                    (
+                        f"CURRICULUM COMPLETE lesson={self.curriculum_drill.lesson_id} "
+                        f"{self.curriculum_drill.title}"
+                    ),
+                    {"drill": self.curriculum_drill.as_dict()},
                     target,
                 )
         return flow_events
@@ -392,11 +433,27 @@ class LiveMarketSession:
             else self._execution_tracker.progress()
         )
         return SessionSnapshot(
-            scenario_name=self.definition.name,
-            regime=self.definition.regime.value,
-            seed=self.seed,
-            relative_volume=self.dimensions.volume.value,
-            liquidity=self.dimensions.liquidity.value,
+            scenario_name=(
+                self.definition.name
+                if self.curriculum_drill is None
+                else self.curriculum_drill.live_scenario_label
+            ),
+            regime=(
+                self.definition.regime.value
+                if self.curriculum_drill is None
+                else self.curriculum_drill.live_regime_label
+            ),
+            seed=self.seed if self.curriculum_drill is None else None,
+            relative_volume=(
+                self.dimensions.volume.value
+                if self.curriculum_drill is None
+                else self.curriculum_drill.live_dimension_label
+            ),
+            liquidity=(
+                self.dimensions.liquidity.value
+                if self.curriculum_drill is None
+                else self.curriculum_drill.live_dimension_label
+            ),
             simulation_time_us=self.simulation_time_us,
             duration_us=self.duration_us,
             running=self.running,
@@ -470,6 +527,8 @@ class LiveMarketSession:
                 ).as_dict(),
                 "objective": self.objective.as_dict(),  # type: ignore[union-attr]
             }
+        if self.curriculum_drill is not None:
+            payload["curriculum_drill"] = self.curriculum_drill.as_dict()
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import secrets
 import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -73,6 +74,15 @@ def _objective_type(value: str):
         raise argparse.ArgumentTypeError(
             f"unknown objective; choose one of: {allowed}"
         ) from error
+
+
+def _curriculum_mode(value: str):
+    from kirby2.curriculum import CurriculumMode
+
+    try:
+        return CurriculumMode.parse(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("curriculum mode must be LEARN or BLIND") from error
 
 
 def _positive_float(value: str) -> float:
@@ -243,6 +253,66 @@ def _parser() -> argparse.ArgumentParser:
     )
     report.add_argument("recording", type=Path)
 
+    curriculum = subcommands.add_parser(
+        "curriculum",
+        help="list or run controlled execution drills",
+    )
+    curriculum_actions = curriculum.add_subparsers(
+        dest="curriculum_action",
+        required=True,
+    )
+    curriculum_actions.add_parser("list", help="list the 14 execution lessons")
+    curriculum_run = curriculum_actions.add_parser(
+        "run",
+        help="launch one controlled lesson variation",
+    )
+    curriculum_run.add_argument(
+        "lesson",
+        choices=tuple(f"{index:02d}" for index in range(1, 15)),
+    )
+    curriculum_run.add_argument(
+        "--mode",
+        type=_curriculum_mode,
+        default=_curriculum_mode("learn"),
+    )
+    curriculum_run.add_argument(
+        "--variation-seed",
+        type=_nonnegative_int,
+        help="reproduce one controlled variation; generated when omitted",
+    )
+    curriculum_run.add_argument("--speed", type=_positive_float, default=10.0)
+    curriculum_run.add_argument(
+        "--quantity",
+        type=int,
+        choices=(25, 50, 100, 200, 500, 1000, 2000),
+        default=100,
+    )
+    curriculum_run.add_argument("--levels", type=int, choices=range(5, 11), default=7)
+    curriculum_run.add_argument("--layout", help="load a named hotkey layout")
+    curriculum_run.add_argument(
+        "--layout-dir",
+        type=Path,
+        default=Path(".kirby2/layouts"),
+    )
+    curriculum_run.add_argument(
+        "--bind",
+        type=_binding_assignment,
+        action="append",
+        default=[],
+    )
+    curriculum_run.add_argument(
+        "--unbind",
+        type=_binding_key,
+        action="append",
+        default=[],
+    )
+    curriculum_run.add_argument("--save-layout")
+    curriculum_run.add_argument(
+        "--record",
+        type=Path,
+        help="save the completed or interrupted drill for deterministic replay",
+    )
+
     timeline = subcommands.add_parser(
         "timeline",
         help="inspect the event-state timeline of a recorded session",
@@ -346,6 +416,83 @@ def main() -> None:
         print(f"HOTKEY_LAYOUT_SAVED name={saved.name} path={path.resolve()}")
         return
 
+    if args.command == "curriculum":
+        from kirby2.curriculum import load_curriculum, prepare_lesson
+        from kirby2.scenarios import get_scenario_definition
+        from kirby2.session.bindings import SessionCommand
+        from kirby2.session.layouts import HotkeyLayout, LayoutStore
+        from kirby2.session.live import LiveMarketSession
+        from kirby2.session.replay import SessionRecording
+        from kirby2.session.scoring import build_session_report
+        from kirby2.ui import TerminalUiConfig, run_terminal_ui
+
+        lessons = load_curriculum()
+        if args.curriculum_action == "list":
+            print("KIRBY2_EXECUTION_CURRICULUM")
+            for lesson in lessons.values():
+                print(
+                    f"{lesson.lesson_id}  {lesson.title}  -  "
+                    f"{lesson.learning_objective}"
+                )
+            print(f"LESSON_COUNT {len(lessons)} modes=LEARN,BLIND")
+            return
+
+        variation_seed = (
+            secrets.randbits(63)
+            if args.variation_seed is None
+            else args.variation_seed
+        )
+        drill = prepare_lesson(args.lesson, args.mode, variation_seed)
+        store = LayoutStore(args.layout_dir)
+        layout = store.load(args.layout) if args.layout else HotkeyLayout.default()
+        assignments = {
+            key: SessionCommand(command) for key, command in args.bind
+        }
+        bindings = layout.bindings.edited(assignments, tuple(args.unbind))
+        effective_layout = HotkeyLayout(args.save_layout or layout.name, bindings)
+        if args.save_layout:
+            saved_path = store.save(effective_layout)
+            print(
+                f"HOTKEY_LAYOUT_SAVED name={effective_layout.name} "
+                f"path={saved_path.resolve()}"
+            )
+        print(drill.render_briefing())
+        session = LiveMarketSession(
+            get_scenario_definition(drill.scenario_name),
+            seed=drill.scenario_seed,
+            duration_seconds=drill.duration_seconds,
+            relative_volume=drill.volume,
+            liquidity=drill.liquidity,
+            initial_quantity=args.quantity,
+            objective=drill.player_objective,
+            curriculum_drill=drill,
+        )
+        run_terminal_ui(
+            session,
+            bindings=effective_layout.bindings,
+            config=TerminalUiConfig(
+                speed=args.speed,
+                ladder_levels=args.levels,
+                layout_name=effective_layout.name,
+            ),
+        )
+        if args.record is not None:
+            recording = SessionRecording.capture(session, effective_layout)
+            recording.save(args.record)
+            print(
+                f"SESSION_RECORDING path={args.record.resolve()} "
+                f"complete={str(recording.complete).lower()} "
+                f"inputs={len(recording.input_records)}"
+            )
+            print(f"STATE_SHA256 {recording.expected_state_sha256}")
+            print(f"TIMELINE_SHA256 {recording.expected_timeline_sha256}")
+        print(build_session_report(session).render())
+        if session.complete:
+            print(drill.render_debrief())
+        else:
+            print("KIRBY2_CURRICULUM_DEBRIEF WITHHELD session_incomplete=true")
+        return
+
     if args.command == "ui":
         from kirby2.session.bindings import SessionCommand
         from kirby2.session.layouts import HotkeyLayout, LayoutStore
@@ -444,6 +591,14 @@ def main() -> None:
             print("KIRBY2_SESSION_REPLAY")
             print(json.dumps(report.summary(), sort_keys=True, separators=(",", ":")))
             print(f"SESSION_REPLAY {'PASS' if report.passed else 'FAIL'}")
+            if report.session.curriculum_drill is not None:
+                if report.session.complete:
+                    print(report.session.curriculum_drill.render_debrief())
+                else:
+                    print(
+                        "KIRBY2_CURRICULUM_DEBRIEF "
+                        "WITHHELD session_incomplete=true"
+                    )
         elif args.command == "timeline":
             kinds = (
                 {TimelineKind(value.upper()) for value in args.kind}
@@ -468,6 +623,14 @@ def main() -> None:
                 print(f"REPORT_ERROR {error}", file=sys.stderr)
                 raise SystemExit(2) from error
             print(training_report.render())
+            if report.session.curriculum_drill is not None:
+                if report.session.complete:
+                    print(report.session.curriculum_drill.render_debrief())
+                else:
+                    print(
+                        "KIRBY2_CURRICULUM_DEBRIEF "
+                        "WITHHELD session_incomplete=true"
+                    )
         if not report.passed:
             raise SystemExit(1)
         return

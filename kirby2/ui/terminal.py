@@ -54,7 +54,8 @@ def render_terminal_frame(
     if snapshot.complete:
         run_state = "COMPLETE"
     header = (
-        f"KIRBY2  {snapshot.scenario_name}/{snapshot.regime}  seed={snapshot.seed}  "
+        f"KIRBY2  {snapshot.scenario_name}/{snapshot.regime}  "
+        f"seed={snapshot.seed if snapshot.seed is not None else 'HIDDEN'}  "
         f"SIM {_market_time(snapshot.simulation_time_us)} / "
         f"{_elapsed_time(snapshot.duration_us)}  {run_state} {config.speed:g}x"
     )
