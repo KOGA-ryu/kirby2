@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kirby2"
+version = "0.1.0"
+description = "Deterministic market-execution training sandbox"
+requires-python = ">=3.11"
+
+[tool.setuptools.package-data]
+"kirby2.scenarios" = ["accepted_scenarios.json"]

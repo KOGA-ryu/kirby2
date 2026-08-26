@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "name": "balanced",
+      "regime": "BALANCED",
+      "seed": 101,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "8952e226de00aee92d6009e7090c86cc9da67232bdcefa3f9b40a3a384a8133b",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_buy_sell_ratio": 0.5},
+        "maximum": {"aggressive_buy_sell_ratio": 2.0, "average_abs_midpoint_displacement_ticks": 5.0}
+      }
+    },
+    {
+      "name": "buy_pressure",
+      "regime": "BUY_PRESSURE",
+      "seed": 202,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "dd80303bbee27cadd78ecc21a8131cf6b97a00c851638c150651a6ff1bde4e4b",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_buy_sell_ratio": 5.0, "average_imbalance": 0.8},
+        "maximum": {}
+      }
+    },
+    {
+      "name": "sell_pressure",
+      "regime": "SELL_PRESSURE",
+      "seed": 303,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "c0e30df4056b417df5195aab93c63a96478244f7ab4bfdf86a44b2f14b9417c1",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_sell_buy_ratio": 4.0},
+        "maximum": {"aggressive_buy_sell_ratio": 0.3, "average_imbalance": -0.8}
+      }
+    },
+    {
+      "name": "momentum_up",
+      "regime": "MOMENTUM_UP",
+      "seed": 404,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "5f988500ce9eb80c7522f24fdc716c600c6e8051210a3c25e3a9471da516a101",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_buy_sell_ratio": 20.0, "average_imbalance": 0.8, "price_displacement_ticks": 1.0, "side_empty_fraction": 0.7},
+        "maximum": {}
+      }
+    },
+    {
+      "name": "momentum_down",
+      "regime": "MOMENTUM_DOWN",
+      "seed": 505,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "5769524fb7b3ae26d921bdc50ceec7038678359dcec3af6cac6a0739b0d0d5f0",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_sell_buy_ratio": 20.0, "side_empty_fraction": 0.7},
+        "maximum": {"aggressive_buy_sell_ratio": 0.05, "average_imbalance": -0.8, "price_displacement_ticks": -1.0}
+      }
+    },
+    {
+      "name": "absorption_bid",
+      "regime": "ABSORPTION_BID",
+      "seed": 606,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "ce428c79532141f6995f17892004feb5f1b31e9f070130c80f81dc590952f67c",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_sell_buy_ratio": 3.0, "average_depth": 50000.0, "average_imbalance": 0.3},
+        "maximum": {"average_abs_midpoint_displacement_ticks": 1.5, "max_spread_ticks": 5.0, "side_empty_fraction": 0.1}
+      }
+    },
+    {
+      "name": "absorption_ask",
+      "regime": "ABSORPTION_ASK",
+      "seed": 707,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "48135e75d882ad36c5f1e232788113495fcc1792b41b574b33f0eaca6037bb19",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_buy_sell_ratio": 3.0, "average_depth": 50000.0},
+        "maximum": {"average_abs_midpoint_displacement_ticks": 1.5, "average_imbalance": -0.3, "max_spread_ticks": 5.0, "side_empty_fraction": 0.1}
+      }
+    },
+    {
+      "name": "thin_liquidity",
+      "regime": "THIN_LIQUIDITY",
+      "seed": 808,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 4,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "ced56e8f095ac2cb132c4553287f33e6f662c9d51fd6ff4b83d2d4a18664c8c1",
+      "behavioral_envelope": {
+        "minimum": {"side_empty_fraction": 0.5},
+        "maximum": {"average_depth": 500.0}
+      }
+    },
+    {
+      "name": "liquidity_vacuum",
+      "regime": "LIQUIDITY_VACUUM",
+      "seed": 909,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 3,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "eca301a46149dbb9c7536124cf82838676f496b875d2254aae55d7c19d842e19",
+      "behavioral_envelope": {
+        "minimum": {"side_empty_fraction": 0.9},
+        "maximum": {"average_depth": 100.0, "total_trades": 100.0}
+      }
+    },
+    {
+      "name": "mean_reversion",
+      "regime": "MEAN_REVERSION",
+      "seed": 1010,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "fb36ba597a2485bafaa9e396e243680fdebea2dba8e5d738e4c0488f494f8988",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_buy_sell_ratio": 0.5},
+        "maximum": {"aggressive_buy_sell_ratio": 2.0, "average_abs_midpoint_displacement_ticks": 0.5, "max_spread_ticks": 6.0, "side_empty_fraction": 0.1}
+      }
+    },
+    {
+      "name": "high_cancellation",
+      "regime": "HIGH_CANCELLATION",
+      "seed": 1111,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 8,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "dd1325ebe46b387ab9d895200b5ec3b13b9c994e0f151f0df9bad62a157af1ad",
+      "behavioral_envelope": {
+        "minimum": {"cancellation_count": 400.0},
+        "maximum": {}
+      }
+    },
+    {
+      "name": "panic",
+      "regime": "PANIC",
+      "seed": 1212,
+      "duration_seconds": 90,
+      "initial_mid_ticks": 10000,
+      "initial_depth": 4,
+      "parameter_overrides": {"event_intensity": 1.0},
+      "accepted_replay_sha256": "c9d707dc08d264fbd9f3a912e0f58f74f3b17748eedbb81ef36f85256ac468f9",
+      "behavioral_envelope": {
+        "minimum": {"aggressive_sell_buy_ratio": 100.0, "cancellation_arrival_count": 500.0, "event_count": 1500.0, "side_empty_fraction": 0.9},
+        "maximum": {"aggressive_buy_sell_ratio": 0.02, "price_displacement_ticks": -1.0}
+      }
+    }
+  ]
+}
