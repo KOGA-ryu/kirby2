@@ -21,6 +21,11 @@ from kirby2.simulation import (
 from kirby2.simulation.regimes import regime_profiles
 from kirby2.simulation.flow_models import FlowModel
 from kirby2.simulation.queue_reactive import FlowIntensityModifier
+from kirby2.simulation.intraday import (
+    IntradayProfile,
+    IntradayWindow,
+    ObservedVolumeCurve,
+)
 from kirby2.simulation.distribution_framework import (
     DistributionProfile,
     DistributionPurpose,
@@ -272,9 +277,22 @@ def run_market_scenario(
     flow_model: FlowModel | None = None,
     intensity_modifier: FlowIntensityModifier | None = None,
     distribution_profile: DistributionProfile | None = None,
+    intraday_profile: IntradayProfile | None = None,
+    intraday_window: IntradayWindow | None = None,
+    observed_intraday_volume: ObservedVolumeCurve | None = None,
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
+    if intraday_profile is not None and intraday_window is None:
+        intraday_window = IntradayWindow(
+            intraday_profile.start_second,
+            intraday_profile.start_second + actual_seconds,
+        )
+    if (
+        intraday_window is not None
+        and intraday_window.duration_us != actual_seconds * 1_000_000
+    ):
+        raise ValueError("scenario duration must equal the intraday exercise window")
     engine, dimensions = create_market_engine(
         definition,
         seed=actual_seed,
@@ -283,6 +301,9 @@ def run_market_scenario(
         flow_model=flow_model,
         intensity_modifier=intensity_modifier,
         distribution_profile=distribution_profile,
+        intraday_profile=intraday_profile,
+        intraday_window=intraday_window,
+        observed_intraday_volume=observed_intraday_volume,
     )
     simulation = engine.run(actual_seconds)
     return ScenarioRun(
@@ -303,6 +324,9 @@ def create_market_engine(
     flow_model: FlowModel | None = None,
     intensity_modifier: FlowIntensityModifier | None = None,
     distribution_profile: DistributionProfile | None = None,
+    intraday_profile: IntradayProfile | None = None,
+    intraday_window: IntradayWindow | None = None,
+    observed_intraday_volume: ObservedVolumeCurve | None = None,
 ) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
     actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
@@ -331,6 +355,9 @@ def create_market_engine(
         flow_model=flow_model,
         intensity_modifier=intensity_modifier,
         distribution_profile=distribution_profile,
+        intraday_profile=intraday_profile,
+        intraday_window=intraday_window,
+        observed_intraday_volume=observed_intraday_volume,
     )
     return engine, dimensions
 

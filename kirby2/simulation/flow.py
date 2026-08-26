@@ -74,6 +74,7 @@ class SimulationResult:
     flow_model_config: dict[str, object] | None = None
     intensity_modifier_config: dict[str, object] | None = None
     distribution_profile_config: dict[str, object] | None = None
+    intraday_profile_config: dict[str, object] | None = None
 
     def replay_json_lines(self) -> str:
         header = {
@@ -88,6 +89,8 @@ class SimulationResult:
             header["intensity_modifier"] = self.intensity_modifier_config
         if self.distribution_profile_config is not None:
             header["distribution_profile"] = self.distribution_profile_config
+        if self.intraday_profile_config is not None:
+            header["intraday_profile"] = self.intraday_profile_config
         lines = [json.dumps(header, sort_keys=True, separators=(",", ":"))]
         exchange_events = {event.sequence: event for event in self.book.journal.events}
 
@@ -160,6 +163,8 @@ class SimulationResult:
             summary["intensity_modifier"] = self.intensity_modifier_config
         if self.distribution_profile_config is not None:
             summary["distribution_profile"] = self.distribution_profile_config
+        if self.intraday_profile_config is not None:
+            summary["intraday_profile"] = self.intraday_profile_config
         return summary
 
     def _price_string(self, price_ticks: int | None) -> str | None:
@@ -238,14 +243,17 @@ class SyntheticOrderFlow:
                 + self.config.initial_half_spread_ticks
                 + depth
             )
-            bid_quantity = self.config.queue_size_distribution.draw(self.rng)
-            ask_quantity = self.config.queue_size_distribution.draw(self.rng)
+            bid_quantity = self._draw_initial_queue_size()
+            ask_quantity = self._draw_initial_queue_size()
             self.book.process(
                 Order.limit(f"INIT-B-{depth + 1:03d}", Side.BUY, bid_quantity, bid_price)
             )
             self.book.process(
                 Order.limit(f"INIT-A-{depth + 1:03d}", Side.SELL, ask_quantity, ask_price)
             )
+
+    def _draw_initial_queue_size(self) -> int:
+        return self.config.queue_size_distribution.draw(self.rng)
 
     def _effective_rates(self) -> dict[FlowEventFamily, float]:
         rates = self.config.rates

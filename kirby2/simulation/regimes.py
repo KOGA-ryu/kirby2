@@ -19,6 +19,13 @@ from .distribution_framework import (
 )
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
 from .flow_models import FlowModel, SimpleFlowModel
+from .intraday import (
+    IntradayClock,
+    IntradayModifiers,
+    IntradayProfile,
+    IntradayWindow,
+    ObservedVolumeCurve,
+)
 from .queue_reactive import FlowIntensityModifier, IntensityInspection
 from .scaling import ScenarioDimensions
 
@@ -244,12 +251,14 @@ class RegimePolicy:
         parameter_overrides: dict[str, Any] | None = None,
         dimensions: ScenarioDimensions | None = None,
         distribution_profile: DistributionProfile | None = None,
+        intraday_clock: IntradayClock | None = None,
     ) -> None:
         self.profile = profile
         self.config = config
         self.parameter_overrides = parameter_overrides or {}
         self.dimensions = dimensions or ScenarioDimensions()
         self.distribution_profile = distribution_profile
+        self.intraday_clock = intraday_clock
 
     def rates(self, book: OrderBook) -> dict[FlowEventFamily, float]:
         base_rates = self.config.rates
@@ -298,8 +307,28 @@ class RegimePolicy:
                 * math.exp(exponent)
                 * self.dimensions.rate_scale(family)
             )
+            modifiers = self.intraday_modifiers
+            if modifiers is not None:
+                rate *= modifiers.relative_volume * modifiers.event_intensity
+                if family in {FlowEventFamily.LIMIT_BUY, FlowEventFamily.LIMIT_SELL}:
+                    rate *= modifiers.depth / modifiers.spread_tendency
+                elif family in {
+                    FlowEventFamily.MARKET_BUY,
+                    FlowEventFamily.MARKET_SELL,
+                }:
+                    rate *= modifiers.volatility * modifiers.spread_tendency
+                else:
+                    rate *= (
+                        modifiers.cancellation_activity
+                        * modifiers.spread_tendency
+                        / modifiers.depth
+                    )
             rates[family] = min(100.0, max(0.0, rate))
         return rates
+
+    @property
+    def intraday_modifiers(self) -> IntradayModifiers | None:
+        return None if self.intraday_clock is None else self.intraday_clock.modifiers
 
     def size_distribution(self, family: FlowEventFamily) -> IntegerSampleDistribution:
         if self.distribution_profile is not None:
@@ -343,8 +372,29 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         flow_model: FlowModel | None = None,
         intensity_modifier: FlowIntensityModifier | None = None,
         distribution_profile: DistributionProfile | None = None,
+        intraday_profile: IntradayProfile | None = None,
+        intraday_window: IntradayWindow | None = None,
+        observed_intraday_volume: ObservedVolumeCurve | None = None,
     ) -> None:
         super().__init__(seed=seed, config=config)
+        if intraday_profile is None and (
+            intraday_window is not None or observed_intraday_volume is not None
+        ):
+            raise ValueError("intraday window and observed volume require a profile")
+        if intraday_profile is not None and intraday_window is None:
+            intraday_window = IntradayWindow(
+                intraday_profile.start_second,
+                intraday_profile.end_second,
+            )
+        self.intraday_clock = (
+            None
+            if intraday_profile is None or intraday_window is None
+            else IntradayClock(
+                intraday_profile,
+                intraday_window,
+                observed_intraday_volume,
+            )
+        )
         self.regime = regime
         self.profile = regime_profiles()[regime]
         self.dimensions = dimensions or ScenarioDimensions()
@@ -354,6 +404,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             parameter_overrides,
             self.dimensions,
             distribution_profile,
+            self.intraday_clock,
         )
         self.distribution_profile = distribution_profile
         self.flow_model = flow_model or SimpleFlowModel()
@@ -366,6 +417,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._initial_trade_count = 0
         self._pending_arrival_time_us: int | None = None
         self._pending_family: FlowEventFamily | None = None
+        self._pending_is_intraday_transition = False
 
     @property
     def flow_events(self) -> tuple[FlowEvent, ...]:
@@ -399,6 +451,11 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             raise TypeError("simulation time must be integer microseconds")
         if simulation_time_us < self.clock.current_time_us:
             raise ValueError("simulation clock cannot move backward")
+        if (
+            self.intraday_clock is not None
+            and simulation_time_us > self.intraday_clock.window.duration_us
+        ):
+            raise ValueError("simulation time exceeds the intraday exercise window")
         self.start()
         first_new_event = len(self._flow_events)
 
@@ -408,9 +465,19 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         ):
             arrival_time_us = self._pending_arrival_time_us
             family = self._pending_family
+            if self._pending_is_intraday_transition:
+                self.clock.advance_to(arrival_time_us)
+                if self.intraday_clock is None:
+                    raise RuntimeError("intraday transition lacks an intraday clock")
+                self.intraday_clock.advance_to(arrival_time_us)
+                self._pending_is_intraday_transition = False
+                self._schedule_next_arrival()
+                continue
             if family is None:
                 raise RuntimeError("scheduled regime arrival lacks an event family")
             self.clock.advance_to(arrival_time_us)
+            if self.intraday_clock is not None:
+                self.intraday_clock.advance_to(arrival_time_us)
             event = self._apply_arrival(len(self._flow_events) + 1, family)
             self._flow_events.append(event)
             if self.intensity_modifier is not None:
@@ -421,6 +488,8 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             self._schedule_next_arrival()
 
         self.clock.advance_to(simulation_time_us)
+        if self.intraday_clock is not None:
+            self.intraday_clock.advance_to(simulation_time_us)
         self.book.assert_invariants()
         return tuple(self._flow_events[first_new_event:])
 
@@ -456,6 +525,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
                 if self.distribution_profile is None
                 else self.distribution_profile.as_dict()
             ),
+            intraday_profile_config=self._intraday_replay_config(),
         )
 
     def _schedule_next_arrival(self) -> None:
@@ -472,24 +542,65 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             rates,
             self.rng,
         )
+        transition_time_us = (
+            None
+            if self.intraday_clock is None
+            else self.intraday_clock.next_transition_time_us
+        )
+        if transition_time_us is not None and (
+            arrival is None or arrival.simulation_time_us >= transition_time_us
+        ):
+            self._pending_arrival_time_us = transition_time_us
+            self._pending_family = None
+            self._pending_is_intraday_transition = True
+            return
         if arrival is None:
             self._pending_arrival_time_us = None
             self._pending_family = None
+            self._pending_is_intraday_transition = False
             return
         self._pending_arrival_time_us = arrival.simulation_time_us
         self._pending_family = arrival.family
+        self._pending_is_intraday_transition = False
 
     def _draw_order_size(self, family: FlowEventFamily) -> int:
         distribution = self.policy.size_distribution(family)
         size = distribution.draw(self.rng)
         scale = float(self.policy.parameter_overrides.get("order_size_scale", 1.0))
         scale *= self.dimensions.order_size_scale(family)
+        modifiers = self.policy.intraday_modifiers
+        if modifiers is not None:
+            scale *= (
+                modifiers.trade_size
+                if family in {FlowEventFamily.MARKET_BUY, FlowEventFamily.MARKET_SELL}
+                else modifiers.depth
+            )
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError("order_size_scale must be finite and positive")
         return max(1, round(size * scale))
 
     def _draw_depth(self, family: FlowEventFamily) -> int:
-        return self.policy.depth_distribution(family).draw(self.rng)
+        depth = self.policy.depth_distribution(family).draw(self.rng)
+        modifiers = self.policy.intraday_modifiers
+        if modifiers is None:
+            return depth
+        return max(0, round((depth + 1) * modifiers.spread_tendency) - 1)
+
+    def _draw_initial_queue_size(self) -> int:
+        size = super()._draw_initial_queue_size()
+        modifiers = self.policy.intraday_modifiers
+        return size if modifiers is None else max(1, round(size * modifiers.depth))
+
+    def _intraday_replay_config(self) -> dict[str, object] | None:
+        if self.intraday_clock is None:
+            return None
+        result: dict[str, object] = {
+            "profile": self.intraday_clock.profile.as_dict(),
+            "window": self.intraday_clock.window.as_dict(),
+        }
+        if self.intraday_clock.observed_volume is not None:
+            result["observed_volume"] = self.intraday_clock.observed_volume.as_dict()
+        return result
 
     def _after_flow_event(self, event: FlowEvent) -> None:
         bid_size = best_level_size(self.book, Side.BUY)

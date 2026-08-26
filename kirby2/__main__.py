@@ -92,6 +92,15 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _session_time(value: str) -> int:
+    from kirby2.simulation import parse_session_time
+
+    try:
+        return parse_session_time(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _binding_key(value: str) -> str:
     key = " " if value.upper() == "SPACE" else value
     if len(key) != 1 and not key.startswith("KEY_"):
@@ -234,6 +243,14 @@ def _parser() -> argparse.ArgumentParser:
     inspect_distribution.add_argument("--scenario", default="balanced")
     inspect_distribution.add_argument("--seed", type=int, default=42)
     inspect_distribution.add_argument("--samples", type=_positive_int, default=10_000)
+
+    inspect_session = subcommands.add_parser(
+        "inspect-session",
+        help="inspect expected activity modifiers across an intraday profile",
+    )
+    inspect_session.add_argument("--scenario", default="balanced")
+    inspect_session.add_argument("--start", type=_session_time)
+    inspect_session.add_argument("--end", type=_session_time)
 
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
@@ -751,6 +768,90 @@ def main() -> None:
         )
         print(json.dumps(inspection.as_dict(), sort_keys=True, separators=(",", ":")))
         print("DISTRIBUTION_INVARIANTS PASS integer_samples=true owned_rng=true")
+        return
+
+    if args.command == "inspect-session":
+        from kirby2.simulation import (
+            FlowEventFamily,
+            IntradayWindow,
+            ScenarioDimensions,
+            equity_u_shaped_profile,
+            format_session_second,
+        )
+
+        try:
+            definition = get_scenario_definition(args.scenario)
+            profile = equity_u_shaped_profile()
+            if (args.start is None) != (args.end is None):
+                raise ValueError("--start and --end must be supplied together")
+            window = (
+                IntradayWindow(profile.start_second, profile.end_second)
+                if args.start is None
+                else IntradayWindow(args.start, args.end)
+            )
+            if (
+                window.start_second < profile.start_second
+                or window.end_second > profile.end_second
+            ):
+                raise ValueError("inspection window exceeds the intraday profile")
+        except ValueError as error:
+            print(f"SESSION_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+
+        dimensions = ScenarioDimensions(
+            definition.relative_volume,
+            definition.liquidity,
+        )
+        print(
+            f"KIRBY2_INTRADAY_PROFILE id={profile.profile_id} "
+            f"scenario={definition.name} "
+            f"window={format_session_second(window.start_second)}-"
+            f"{format_session_second(window.end_second)}"
+        )
+        for segment in profile.segments:
+            if (
+                segment.end_second <= window.start_second
+                or segment.start_second >= window.end_second
+            ):
+                continue
+            modifiers = segment.modifiers
+            composition = {
+                "cancel_activity_multiplier": round(
+                    modifiers.relative_volume
+                    * modifiers.event_intensity
+                    * modifiers.cancellation_activity
+                    * modifiers.spread_tendency
+                    / modifiers.depth,
+                    6,
+                ),
+                "limit_activity_multiplier": round(
+                    modifiers.relative_volume
+                    * modifiers.event_intensity
+                    * modifiers.depth
+                    / modifiers.spread_tendency,
+                    6,
+                ),
+                "market_activity_multiplier": round(
+                    modifiers.relative_volume
+                    * modifiers.event_intensity
+                    * modifiers.volatility
+                    * modifiers.spread_tendency,
+                    6,
+                ),
+                "market_size_multiplier": modifiers.trade_size,
+                "scenario_rate_scale": {
+                    family.value: dimensions.rate_scale(family)
+                    for family in FlowEventFamily
+                },
+            }
+            print(
+                json.dumps(
+                    {**segment.as_dict(), "composed_activity": composition},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print("SESSION_PROFILE_INVARIANTS PASS contiguous=true positive=true")
         return
 
     if args.command == "matrix":
