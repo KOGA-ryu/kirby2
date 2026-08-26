@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "package://kirby2.calibration/normalized_event_schema.json",
+  "title": "Kirby2 normalized observable market event",
+  "type": "object",
+  "required": ["record_type", "sequence", "timestamp_us", "event_type"],
+  "properties": {
+    "record_type": {"const": "normalized_market_event"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "timestamp_us": {"type": "integer", "minimum": 0},
+    "event_type": {"enum": ["LIMIT", "MARKET", "CANCEL", "TRADE", "BOOK"]},
+    "side": {"enum": ["buy", "sell"]},
+    "aggressor_side": {"enum": ["buy", "sell"]},
+    "quantity": {"type": "integer", "minimum": 1},
+    "remaining_quantity": {"type": "integer", "minimum": 0},
+    "price_ticks": {"type": "integer", "minimum": 1},
+    "spread_ticks": {"type": "integer", "minimum": 1},
+    "order_id": {"type": "string", "minLength": 1},
+    "target_order_id": {"type": "string", "minLength": 1},
+    "maker_order_id": {"type": "string", "minLength": 1},
+    "taker_order_id": {"type": "string", "minLength": 1},
+    "bid_levels": {"$ref": "#/$defs/levels"},
+    "ask_levels": {"$ref": "#/$defs/levels"}
+  },
+  "$defs": {
+    "levels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["price_ticks", "quantity"],
+        "properties": {
+          "price_ticks": {"type": "integer", "minimum": 1},
+          "quantity": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

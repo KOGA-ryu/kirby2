@@ -15,3 +15,4 @@ kirby2 = "kirby2.__main__:main"
 "kirby2.scenarios" = ["accepted_scenarios.json"]
 "kirby2.historical" = ["fixtures/*.json"]
 "kirby2.simulation" = ["accepted_hawkes.json", "empirical/*.json"]
+"kirby2.calibration" = ["normalized_event_schema.json"]

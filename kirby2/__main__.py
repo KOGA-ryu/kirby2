@@ -252,6 +252,21 @@ def _parser() -> argparse.ArgumentParser:
     inspect_session.add_argument("--start", type=_session_time)
     inspect_session.add_argument("--end", type=_session_time)
 
+    measure_compare = subcommands.add_parser(
+        "measure-compare",
+        help="compare descriptive calibration measurements for two normalized sources",
+    )
+    measure_compare.add_argument(
+        "reference",
+        help="fixture:ID, scenario:NAME, normalized JSONL, or Kirby2 replay JSONL",
+    )
+    measure_compare.add_argument(
+        "candidate",
+        help="fixture:ID, scenario:NAME, normalized JSONL, or Kirby2 replay JSONL",
+    )
+    measure_compare.add_argument("--seed", type=int, default=42)
+    measure_compare.add_argument("--seconds", type=_positive_int, default=30)
+
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
         "name",
@@ -852,6 +867,67 @@ def main() -> None:
                 )
             )
         print("SESSION_PROFILE_INVARIANTS PASS contiguous=true positive=true")
+        return
+
+    if args.command == "measure-compare":
+        from kirby2.calibration import (
+            compare_reports,
+            measure_stream,
+            resolve_measurement_source,
+        )
+
+        try:
+            reference_stream = resolve_measurement_source(
+                args.reference,
+                seed=args.seed,
+                seconds=args.seconds,
+            )
+            candidate_stream = resolve_measurement_source(
+                args.candidate,
+                seed=args.seed,
+                seconds=args.seconds,
+            )
+            reference_report = measure_stream(reference_stream)
+            candidate_report = measure_stream(candidate_stream)
+            comparison = compare_reports(reference_report, candidate_report)
+        except (OSError, TypeError, ValueError) as error:
+            print(f"MEASUREMENT_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+
+        print(
+            f"KIRBY2_MEASURE_COMPARE reference={reference_report.source_id} "
+            f"candidate={candidate_report.source_id}"
+        )
+        print(
+            "REFERENCE_REPORT "
+            + json.dumps(
+                reference_report.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(
+            "CANDIDATE_REPORT "
+            + json.dumps(
+                candidate_report.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print("MAJOR_MEASUREMENT_DIFFERENCES")
+        for difference in comparison.differences:
+            print(
+                json.dumps(
+                    difference.as_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print(
+            "STATISTICAL_CLAIM descriptive_only=true "
+            "equivalence_claimed=false"
+        )
+        print("MEASUREMENT_INVARIANTS PASS units=true sample_counts=true")
         return
 
     if args.command == "matrix":
