@@ -23,6 +23,7 @@ class TerminalUiConfig:
     ladder_levels: int = 7
     tape_rows: int = 12
     working_order_rows: int = 5
+    layout_name: str = "layout_default"
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.speed) or self.speed <= 0:
@@ -35,6 +36,8 @@ class TerminalUiConfig:
             raise ValueError("Time & Sales row count must be positive")
         if type(self.working_order_rows) is not int or self.working_order_rows <= 0:
             raise ValueError("working-order row count must be positive")
+        if not self.layout_name:
+            raise ValueError("hotkey layout name must not be empty")
 
     @property
     def simulation_step_us(self) -> int:
@@ -52,9 +55,12 @@ def render_terminal_frame(
         run_state = "COMPLETE"
     header = (
         f"KIRBY2  {snapshot.scenario_name}/{snapshot.regime}  seed={snapshot.seed}  "
-        f"vol={snapshot.relative_volume} liq={snapshot.liquidity}  "
         f"SIM {_market_time(snapshot.simulation_time_us)} / "
         f"{_elapsed_time(snapshot.duration_us)}  {run_state} {config.speed:g}x"
+    )
+    configuration = (
+        f"VOLUME {snapshot.relative_volume}  LIQUIDITY {snapshot.liquidity}  "
+        f"LAYOUT {config.layout_name}"
     )
     account = (
         f"POSITION {snapshot.position:+d}  BOUGHT {snapshot.bought_quantity}  "
@@ -67,7 +73,7 @@ def render_terminal_frame(
     ladder = _ladder_lines(snapshot, config.ladder_levels, left_width)
     tape = _tape_lines(snapshot, config.tape_rows, right_width)
     body_rows = max(len(ladder), len(tape))
-    lines = [header[:width], account[:width], ""]
+    lines = [header[:width], configuration[:width], account[:width], ""]
     for index in range(body_rows):
         left = ladder[index] if index < len(ladder) else ""
         right = tape[index] if index < len(tape) else ""
@@ -127,16 +133,14 @@ def _run(
             key = screen.get_wch()
         except curses.error:
             continue
-        if not isinstance(key, str):
-            continue
-        command = bindings.resolve(key)
-        if command is None:
-            session.status_message = f"UNBOUND KEY {key!r}"
-            continue
-        if command is SessionCommand.QUIT:
+        input_key = (
+            key
+            if isinstance(key, str)
+            else curses.keyname(key).decode("ascii", errors="replace")
+        )
+        record = session.handle_input(input_key, bindings)
+        if record.resolved_command == SessionCommand.QUIT.value:
             should_quit = True
-            continue
-        session.execute(command)
 
 
 def _draw(

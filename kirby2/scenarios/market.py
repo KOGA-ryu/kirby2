@@ -38,6 +38,21 @@ class ScenarioDefinition:
     accepted_replay_sha256: str
     behavioral_envelope: dict[str, dict[str, float]]
 
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "accepted_replay_sha256": self.accepted_replay_sha256,
+            "behavioral_envelope": self.behavioral_envelope,
+            "duration_seconds": self.duration_seconds,
+            "initial_depth": self.initial_depth,
+            "initial_mid_ticks": self.initial_mid_ticks,
+            "liquidity": self.liquidity.value,
+            "name": self.name,
+            "parameter_overrides": self.parameter_overrides,
+            "regime": self.regime.value,
+            "relative_volume": self.relative_volume.value,
+            "seed": self.seed,
+        }
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ScenarioDefinition:
         definition = cls(

@@ -17,6 +17,7 @@ class SessionCommand(str, Enum):
     MARKET_SELL = "market_sell"
     CANCEL_NEAREST = "cancel_nearest"
     CANCEL_ALL = "cancel_all"
+    REPLACE_NEAREST = "replace_nearest"
     FLATTEN = "flatten"
     INCREASE_QUANTITY = "increase_quantity"
     DECREASE_QUANTITY = "decrease_quantity"
@@ -35,6 +36,7 @@ COMMAND_LABELS: Mapping[SessionCommand, str] = MappingProxyType(
         SessionCommand.MARKET_SELL: "MKT SELL",
         SessionCommand.CANCEL_NEAREST: "CXL NEAR",
         SessionCommand.CANCEL_ALL: "CXL ALL",
+        SessionCommand.REPLACE_NEAREST: "REPLACE",
         SessionCommand.FLATTEN: "FLATTEN",
         SessionCommand.INCREASE_QUANTITY: "QTY +",
         SessionCommand.DECREASE_QUANTITY: "QTY -",
@@ -55,6 +57,7 @@ DEFAULT_KEY_BINDINGS: Mapping[str, SessionCommand] = MappingProxyType(
         "l": SessionCommand.MARKET_SELL,
         "c": SessionCommand.CANCEL_NEAREST,
         "C": SessionCommand.CANCEL_ALL,
+        "v": SessionCommand.REPLACE_NEAREST,
         "f": SessionCommand.FLATTEN,
         "]": SessionCommand.INCREASE_QUANTITY,
         "[": SessionCommand.DECREASE_QUANTITY,
@@ -85,13 +88,17 @@ class BindingMap:
             raise ValueError("at least one key binding is required")
         normalized: dict[str, SessionCommand] = {}
         for key, command in bindings.items():
-            if not isinstance(key, str) or len(key) != 1:
-                raise ValueError("binding keys must be single characters")
+            if not isinstance(key, str) or not key:
+                raise ValueError("binding keys must be nonempty strings")
             if not isinstance(command, SessionCommand):
                 raise TypeError("binding values must be SessionCommand members")
             if key in normalized:
                 raise ValueError(f"duplicate key binding: {key!r}")
             normalized[key] = command
+        missing = set(SessionCommand) - set(normalized.values())
+        if missing:
+            names = ", ".join(sorted(command.value for command in missing))
+            raise ValueError(f"hotkey layout is missing required commands: {names}")
         self._bindings = MappingProxyType(normalized)
 
     @classmethod
@@ -105,3 +112,16 @@ class BindingMap:
     def resolve(self, key: str) -> SessionCommand | None:
         return self._bindings.get(key)
 
+    def as_dict(self) -> dict[str, str]:
+        return {key: command.value for key, command in self._bindings.items()}
+
+    def edited(
+        self,
+        assignments: Mapping[str, SessionCommand] | None = None,
+        removals: tuple[str, ...] = (),
+    ) -> BindingMap:
+        values = dict(self._bindings)
+        for key in removals:
+            values.pop(key, None)
+        values.update(assignments or {})
+        return BindingMap(values)

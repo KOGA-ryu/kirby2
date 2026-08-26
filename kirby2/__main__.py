@@ -62,6 +62,22 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _binding_key(value: str) -> str:
+    key = " " if value.upper() == "SPACE" else value
+    if len(key) != 1 and not key.startswith("KEY_"):
+        raise argparse.ArgumentTypeError(
+            "binding key must be one character, SPACE, or a KEY_* terminal key"
+        )
+    return key
+
+
+def _binding_assignment(value: str) -> tuple[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("binding must use KEY=COMMAND")
+    raw_key, command = value.split("=", 1)
+    return _binding_key(raw_key), command
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kirby2")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -143,6 +159,37 @@ def _parser() -> argparse.ArgumentParser:
         default=100,
     )
     ui.add_argument("--levels", type=int, choices=range(5, 11), default=7)
+    ui.add_argument("--layout", help="load a named hotkey layout")
+    ui.add_argument("--layout-dir", type=Path, default=Path(".kirby2/layouts"))
+    ui.add_argument("--bind", type=_binding_assignment, action="append", default=[])
+    ui.add_argument("--unbind", type=_binding_key, action="append", default=[])
+    ui.add_argument("--save-layout", help="save the effective bindings under this name")
+    ui.add_argument("--record", type=Path, help="save an event-state session recording")
+
+    layout = subcommands.add_parser("layout", help="manage named hotkey layouts")
+    layout_actions = layout.add_subparsers(dest="layout_action", required=True)
+    layout_list = layout_actions.add_parser("list", help="list saved layouts")
+    layout_list.add_argument("--directory", type=Path, default=Path(".kirby2/layouts"))
+    layout_show = layout_actions.add_parser("show", help="show one saved layout")
+    layout_show.add_argument("name")
+    layout_show.add_argument("--directory", type=Path, default=Path(".kirby2/layouts"))
+    layout_save = layout_actions.add_parser("save", help="save an edited layout")
+    layout_save.add_argument("name")
+    layout_save.add_argument("--base", help="existing layout to edit")
+    layout_save.add_argument("--directory", type=Path, default=Path(".kirby2/layouts"))
+    layout_save.add_argument("--bind", type=_binding_assignment, action="append", default=[])
+    layout_save.add_argument("--unbind", type=_binding_key, action="append", default=[])
+
+    replay = subcommands.add_parser("replay", help="replay a recorded execution session")
+    replay.add_argument("recording", type=Path)
+
+    timeline = subcommands.add_parser(
+        "timeline",
+        help="inspect the event-state timeline of a recorded session",
+    )
+    timeline.add_argument("recording", type=Path)
+    timeline.add_argument("--limit", type=_positive_int)
+    timeline.add_argument("--kind", action="append")
     return parser
 
 
@@ -200,11 +247,52 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+    if args.command == "layout":
+        from kirby2.session.bindings import SessionCommand
+        from kirby2.session.layouts import HotkeyLayout, LayoutStore
+
+        store = LayoutStore(args.directory)
+        if args.layout_action == "list":
+            names = store.list_names()
+            print("KIRBY2_HOTKEY_LAYOUTS")
+            for name in names:
+                print(name)
+            print(f"LAYOUT_COUNT {len(names)}")
+            return
+        if args.layout_action == "show":
+            saved = store.load(args.name)
+            print(json.dumps(saved.as_dict(), sort_keys=True, indent=2))
+            return
+        base = store.load(args.base) if args.base else HotkeyLayout.default()
+        assignments = {
+            key: SessionCommand(command) for key, command in args.bind
+        }
+        bindings = base.bindings.edited(assignments, tuple(args.unbind))
+        saved = HotkeyLayout(args.name, bindings)
+        path = store.save(saved)
+        print(f"HOTKEY_LAYOUT_SAVED name={saved.name} path={path.resolve()}")
+        return
+
     if args.command == "ui":
-        from kirby2.session.bindings import BindingMap
+        from kirby2.session.bindings import SessionCommand
+        from kirby2.session.layouts import HotkeyLayout, LayoutStore
         from kirby2.session.live import LiveMarketSession
+        from kirby2.session.replay import SessionRecording
         from kirby2.ui import TerminalUiConfig, run_terminal_ui
 
+        store = LayoutStore(args.layout_dir)
+        layout = store.load(args.layout) if args.layout else HotkeyLayout.default()
+        assignments = {
+            key: SessionCommand(command) for key, command in args.bind
+        }
+        bindings = layout.bindings.edited(assignments, tuple(args.unbind))
+        effective_layout = HotkeyLayout(args.save_layout or layout.name, bindings)
+        if args.save_layout:
+            saved_path = store.save(effective_layout)
+            print(
+                f"HOTKEY_LAYOUT_SAVED name={effective_layout.name} "
+                f"path={saved_path.resolve()}"
+            )
         definition = get_scenario_definition(args.scenario)
         session = LiveMarketSession(
             definition,
@@ -216,12 +304,58 @@ def main() -> None:
         )
         run_terminal_ui(
             session,
-            bindings=BindingMap.default(),
+            bindings=effective_layout.bindings,
             config=TerminalUiConfig(
                 speed=args.speed,
                 ladder_levels=args.levels,
+                layout_name=effective_layout.name,
             ),
         )
+        if args.record is not None:
+            recording = SessionRecording.capture(session, effective_layout)
+            recording.save(args.record)
+            print(
+                f"SESSION_RECORDING path={args.record.resolve()} "
+                f"complete={str(recording.complete).lower()} "
+                f"inputs={len(recording.input_records)}"
+            )
+            print(f"STATE_SHA256 {recording.expected_state_sha256}")
+            print(f"TIMELINE_SHA256 {recording.expected_timeline_sha256}")
+        return
+
+    if args.command in {"replay", "timeline"}:
+        from kirby2.session.records import TimelineKind
+        from kirby2.session.replay import (
+            SessionRecording,
+            TimelineInspector,
+            replay_recording,
+        )
+
+        recording = SessionRecording.load(args.recording)
+        report = replay_recording(recording)
+        if args.command == "replay":
+            print("KIRBY2_SESSION_REPLAY")
+            print(json.dumps(report.summary(), sort_keys=True, separators=(",", ":")))
+            print(f"SESSION_REPLAY {'PASS' if report.passed else 'FAIL'}")
+        else:
+            kinds = (
+                {TimelineKind(value.upper()) for value in args.kind}
+                if args.kind
+                else None
+            )
+            print("KIRBY2_TIMELINE")
+            rendered = TimelineInspector(report.session.timeline).render(
+                kinds=kinds,
+                limit=args.limit,
+            )
+            if rendered:
+                print(rendered)
+            print(
+                f"TIMELINE_REPLAY {'PASS' if report.passed else 'FAIL'} "
+                f"records={len(report.session.timeline)}"
+            )
+        if not report.passed:
+            raise SystemExit(1)
         return
 
     if args.command == "audit-scenarios":

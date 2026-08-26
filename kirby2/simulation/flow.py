@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from kirby2.exchange import Order, OrderBook, OrderType, Side
+from kirby2.exchange import Order, OrderBook, OrderOwner, OrderType, Side
 from kirby2.session import EventType
 
 from .clock import MICROSECONDS_PER_SECOND, SimulationClock
@@ -315,7 +315,9 @@ class SyntheticOrderFlow:
             (
                 order
                 for order in self.book.active_orders.values()
-                if order.side is side and order.order_type is OrderType.LIMIT
+                if order.side is side
+                and order.order_type is OrderType.LIMIT
+                and order.owner is OrderOwner.SIMULATED
             ),
             key=lambda order: (order.resting_sequence, order.order_id),
         )
