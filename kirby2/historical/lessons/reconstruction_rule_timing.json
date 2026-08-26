@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "lesson_id": "reconstruction_rule_timing",
+  "title": "Rule Timing During a Reconstructed Retracement",
+  "date": "2000-01-03",
+  "instrument": "KIRBY2-AGGREGATE-DEMO",
+  "market": "LOCAL PEDAGOGICAL FIXTURE",
+  "mode": "RECONSTRUCTION",
+  "data_provenance": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "This lesson reuses the repository's local aggregate-observation fixture and makes no real-market identity claim."
+    },
+    {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "The event-by-event market path and all Level 2 behavior are deterministic synthetic reconstruction."
+    }
+  ],
+  "time_window": {
+    "start_us": 0,
+    "end_us": 30000000
+  },
+  "historical_context": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "The same aggregate teaching constraints are viewed through a rule-confirmation and invalidation lens."
+    },
+    {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "Observable imbalance, depletion, and spread sequences come from the selected reconstruction and may differ from any unavailable historical path."
+    }
+  ],
+  "learning_objectives": [
+    "Distinguish setup formation, confirmation, invalidation, and cooldown timing.",
+    "Evaluate whether traffic-light rules respond too early or too slowly to observable flow.",
+    "Keep rule evaluation conditional on the synthetic scenario rather than treating it as historical proof."
+  ],
+  "source": {
+    "fixture_id": "reconstruction_demo",
+    "source_locator": "package://kirby2.historical/fixtures/reconstruction_demo.json"
+  },
+  "reveal_policy": "BLIND_UNTIL_COMPLETION",
+  "post_session_explanation": {
+    "event": {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "A directional aggregate teaching pattern included a brief retracement before the configured close."
+    },
+    "market_context": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "Rule inputs were computed from one generated queue path constrained only by the disclosed aggregate fixture."
+    },
+    "what_happened_next": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "The selected reconstruction resumed directional flow after its synthetic retracement and ended at its generated book state."
+    },
+    "why_session_matters": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "It exposes rule latency and invalidation tradeoffs without pretending the unseen historical order sequence is known."
+    }
+  },
+  "known_limitations": [
+    "Historical Level 2 is missing; rule inputs reflect synthetic reconstruction rather than recovered historical queues.",
+    "The source fixture is pedagogical and locally authored, so no real instrument event is asserted.",
+    "A different deterministic reconstruction seed could produce another path consistent with similar aggregate constraints."
+  ],
+  "training_questions": [
+    "Did your traffic-light rules react too slowly?",
+    "Which observable confirmed the setup, and which invalidated it?",
+    "Would the conclusion survive a different reconstruction path?"
+  ]
+}

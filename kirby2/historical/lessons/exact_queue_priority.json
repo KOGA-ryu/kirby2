@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "lesson_id": "exact_queue_priority",
+  "title": "Queue Priority Under Alternating Aggression",
+  "date": "2000-01-03",
+  "instrument": "KIRBY2-EXACT-DEMO",
+  "market": "LOCAL PEDAGOGICAL FIXTURE",
+  "mode": "EXACT_REPLAY",
+  "data_provenance": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "The source is a locally authored pedagogical message fixture, not data from a real security or venue."
+    },
+    {
+      "category": "DERIVED_FROM_SOURCE",
+      "text": "The ladder and tape are deterministic consequences of replaying the supplied source fixture messages through the FIFO exchange."
+    }
+  ],
+  "time_window": {
+    "start_us": 0,
+    "end_us": 5000000
+  },
+  "historical_context": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "This pack validates exact-message teaching architecture with alternating aggressive buys and sells around a two-sided book."
+    }
+  ],
+  "learning_objectives": [
+    "Relate aggressive order flow to FIFO queue depletion.",
+    "Decide when crossing a displayed spread is justified by available liquidity.",
+    "Separate exact source-message replay from claims about a real historical market."
+  ],
+  "source": {
+    "fixture_id": "exact_demo",
+    "source_locator": "package://kirby2.historical/fixtures/exact_demo.json"
+  },
+  "reveal_policy": "BLIND_UNTIL_COMPLETION",
+  "post_session_explanation": {
+    "event": {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "A fixed pedagogical message sequence alternated aggressive buying, cancellation, and aggressive selling."
+    },
+    "market_context": {
+      "category": "DERIVED_FROM_SOURCE",
+      "text": "Displayed queues at 100.01 and 99.99 absorbed the first aggressive orders before deeper prices traded."
+    },
+    "what_happened_next": {
+      "category": "DERIVED_FROM_SOURCE",
+      "text": "The replay produced six FIFO trades and ended with the surviving source orders at their exact replayed prices."
+    },
+    "why_session_matters": {
+      "category": "DERIVED_FROM_SOURCE",
+      "text": "It makes queue priority, spread crossing, and source-message causality inspectable without adding synthetic orders."
+    }
+  },
+  "known_limitations": [
+    "The source is not real-market data and cannot support claims about an actual instrument or venue.",
+    "The fixture supplies order and trade messages but does not claim source-provided full book snapshots.",
+    "The lesson is a five-second architecture fixture, not a representative trading day."
+  ],
+  "training_questions": [
+    "Did displayed liquidity disappear before the next price traded?",
+    "Was crossing the spread justified by the source-visible queue?",
+    "Which source order held FIFO priority at each trade?"
+  ]
+}

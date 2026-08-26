@@ -506,7 +506,31 @@ def _parser() -> argparse.ArgumentParser:
     timeline.add_argument("--limit", type=_positive_int)
     timeline.add_argument("--kind", action="append")
 
-    from kirby2.historical import load_historical_fixtures
+    from kirby2.historical import load_historical_fixtures, load_historical_lessons
+
+    lesson_list = subcommands.add_parser(
+        "lesson-list",
+        help="list packaged historical teaching lessons",
+    )
+    lesson_run = subcommands.add_parser(
+        "lesson-run",
+        help="run one historical lesson and reveal its structured debrief",
+    )
+    lesson_run.add_argument(
+        "lesson",
+        choices=tuple(sorted(load_historical_lessons())),
+    )
+    lesson_run.add_argument("--levels", type=int, choices=range(1, 11), default=4)
+    lesson_run.add_argument(
+        "--events-jsonl",
+        type=Path,
+        help="save the complete exact or reconstructed replay stream",
+    )
+    lesson_run.add_argument(
+        "--debrief-json",
+        type=Path,
+        help="save the structured revealed debrief",
+    )
 
     historical = subcommands.add_parser(
         "historical",
@@ -579,6 +603,55 @@ def main() -> None:
             raise SystemExit(2) from error
         print(result.render())
         print(f"ARTIFACT_DIRECTORY {output_directory.resolve()}")
+        return
+
+    if args.command == "lesson-list":
+        from kirby2.historical import load_historical_lessons
+
+        lessons = load_historical_lessons()
+        print("KIRBY2_HISTORICAL_LESSONS")
+        for lesson in lessons.values():
+            print(
+                f"{lesson.lesson_id}  mode={lesson.mode.value} "
+                f"reveal={lesson.reveal_policy.value}  title={lesson.title}"
+            )
+        print(f"LESSON_COUNT {len(lessons)}")
+        print("LESSON_CATALOG PASS provenance_validated=true")
+        return
+
+    if args.command == "lesson-run":
+        from kirby2.historical import (
+            historical_lesson_debrief,
+            load_historical_lessons,
+            render_historical_lesson,
+            run_historical_lesson,
+        )
+
+        try:
+            lesson = load_historical_lessons()[args.lesson]
+            session = run_historical_lesson(lesson)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"LESSON_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print(render_historical_lesson(session, args.levels))
+        if args.events_jsonl is not None:
+            args.events_jsonl.write_text(
+                session.run.replay_json_lines() + "\n",
+                encoding="utf-8",
+            )
+            print(f"LESSON_REPLAY_STREAM {args.events_jsonl.resolve()}")
+        if args.debrief_json is not None:
+            args.debrief_json.write_text(
+                json.dumps(
+                    historical_lesson_debrief(session),
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"LESSON_DEBRIEF_JSON {args.debrief_json.resolve()}")
+        print("HISTORICAL_LESSON PASS")
         return
 
     if args.command == "historical":

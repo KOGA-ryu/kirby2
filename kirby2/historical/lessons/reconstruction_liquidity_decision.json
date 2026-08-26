@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "lesson_id": "reconstruction_liquidity_decision",
+  "title": "Liquidity Decisions Under Aggregate Constraints",
+  "date": "2000-01-03",
+  "instrument": "KIRBY2-AGGREGATE-DEMO",
+  "market": "LOCAL PEDAGOGICAL FIXTURE",
+  "mode": "RECONSTRUCTION",
+  "data_provenance": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "The source contains locally authored aggregate OHLC, volume, spread, volatility, and print constraints; it is not real-market data."
+    },
+    {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "Every displayed order, queue position, cancellation, and exchange event in the lesson is generated synthetic reconstruction."
+    }
+  ],
+  "time_window": {
+    "start_us": 0,
+    "end_us": 30000000
+  },
+  "historical_context": [
+    {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "The aggregate fixture describes directional flow with a brief retracement over a thirty-second teaching window."
+    },
+    {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "A bounded deterministic seed search selects one generated path that approximates the supplied aggregate constraints."
+    }
+  ],
+  "learning_objectives": [
+    "Judge spread crossing while treating reconstructed queues as scenarios rather than observations.",
+    "Compare generated outcomes with disclosed aggregate targets and residuals.",
+    "Identify which apparent Level 2 facts are unavailable from the source."
+  ],
+  "source": {
+    "fixture_id": "reconstruction_demo",
+    "source_locator": "package://kirby2.historical/fixtures/reconstruction_demo.json"
+  },
+  "reveal_policy": "BLIND_UNTIL_COMPLETION",
+  "post_session_explanation": {
+    "event": {
+      "category": "LOCAL_FIXTURE_METADATA",
+      "text": "A pedagogical aggregate constraint set described upward net movement with an intervening retracement."
+    },
+    "market_context": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "The visible ladder was one deterministic synthetic path fitted to aggregate targets, not a recovered historical order book."
+    },
+    "what_happened_next": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "Generated order flow depleted and replenished queues until the selected path reached its disclosed synthetic ending state."
+    },
+    "why_session_matters": {
+      "category": "SYNTHETIC_RECONSTRUCTION",
+      "text": "It trains execution decisions under a plausible constrained scenario while preserving the refusal to invent missing historical queues."
+    }
+  },
+  "known_limitations": [
+    "Historical Level 2 is missing; all displayed queues and order events are synthetic reconstruction.",
+    "The aggregate constraints are locally authored pedagogical inputs, not measured observations from a real instrument.",
+    "Constraint fitting does not make the selected order path historically true."
+  ],
+  "training_questions": [
+    "Did displayed liquidity disappear before the move?",
+    "Was crossing the spread justified within this scenario?",
+    "Which conclusions would require historical Level 2 that the source does not provide?"
+  ]
+}
