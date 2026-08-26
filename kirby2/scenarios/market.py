@@ -251,6 +251,30 @@ def run_market_scenario(
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
+    engine, dimensions = create_market_engine(
+        definition,
+        seed=actual_seed,
+        relative_volume=relative_volume,
+        liquidity=liquidity,
+    )
+    simulation = engine.run(actual_seconds)
+    return ScenarioRun(
+        definition=definition,
+        seed=actual_seed,
+        duration_seconds=actual_seconds,
+        simulation=simulation,
+        observations=tuple(engine.observations),
+        dimensions=dimensions,
+    )
+
+
+def create_market_engine(
+    definition: ScenarioDefinition,
+    seed: int | None = None,
+    relative_volume: VolumePreset | None = None,
+    liquidity: LiquidityPreset | None = None,
+) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
+    actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
     dimensions = ScenarioDimensions(
         definition.relative_volume if relative_volume is None else relative_volume,
@@ -270,15 +294,7 @@ def run_market_scenario(
         parameter_overrides=definition.parameter_overrides,
         dimensions=dimensions,
     )
-    simulation = engine.run(actual_seconds)
-    return ScenarioRun(
-        definition=definition,
-        seed=actual_seed,
-        duration_seconds=actual_seconds,
-        simulation=simulation,
-        observations=tuple(engine.observations),
-        dimensions=dimensions,
-    )
+    return engine, dimensions
 
 
 def evaluate_behavioral_envelope(

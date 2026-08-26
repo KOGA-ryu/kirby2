@@ -330,44 +330,97 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             self.dimensions,
         )
         self.observations: list[BookObservation] = []
+        self._started = False
+        self._flow_events: list[FlowEvent] = []
+        self._initial_exchange_event_count = 0
+        self._initial_trade_count = 0
+        self._pending_arrival_time_us: int | None = None
+        self._pending_weights: tuple[float, ...] | None = None
+
+    @property
+    def flow_events(self) -> tuple[FlowEvent, ...]:
+        return tuple(self._flow_events)
+
+    @property
+    def initial_exchange_event_count(self) -> int:
+        return self._initial_exchange_event_count
+
+    @property
+    def initial_trade_count(self) -> int:
+        return self._initial_trade_count
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._initialize_book()
+        self._initial_exchange_event_count = len(self.book.journal.events)
+        self._initial_trade_count = len(self.book.trades)
+        self._started = True
+        self._schedule_next_arrival()
+
+    def advance_to(self, simulation_time_us: int) -> tuple[FlowEvent, ...]:
+        if type(simulation_time_us) is not int:
+            raise TypeError("simulation time must be integer microseconds")
+        if simulation_time_us < self.clock.current_time_us:
+            raise ValueError("simulation clock cannot move backward")
+        self.start()
+        first_new_event = len(self._flow_events)
+
+        while (
+            self._pending_arrival_time_us is not None
+            and self._pending_arrival_time_us <= simulation_time_us
+        ):
+            arrival_time_us = self._pending_arrival_time_us
+            weights = self._pending_weights
+            if weights is None:
+                raise RuntimeError("scheduled regime arrival lacks family weights")
+            self.clock.advance_to(arrival_time_us)
+            family = _FAMILIES[self.rng.weighted_float_index(weights)]
+            self._flow_events.append(
+                self._apply_arrival(len(self._flow_events) + 1, family)
+            )
+            self._schedule_next_arrival()
+
+        self.clock.advance_to(simulation_time_us)
+        self.book.assert_invariants()
+        return tuple(self._flow_events[first_new_event:])
+
+    def advance_by(self, delta_us: int) -> tuple[FlowEvent, ...]:
+        if type(delta_us) is not int or delta_us < 0:
+            raise ValueError("simulation delta must be a nonnegative integer")
+        return self.advance_to(self.clock.current_time_us + delta_us)
 
     def run(self, seconds: int) -> SimulationResult:
         if type(seconds) is not int or seconds <= 0:
             raise ValueError("seconds must be a positive integer")
-        self._initialize_book()
-        initial_exchange_event_count = len(self.book.journal.events)
-        initial_trade_count = len(self.book.trades)
+        if self._started:
+            raise RuntimeError("regime flow has already started")
         end_time_us = seconds * MICROSECONDS_PER_SECOND
-        flow_events: list[FlowEvent] = []
-
-        while self.clock.current_time_us < end_time_us:
-            rates = self.policy.rates(self.book)
-            weights = [rates[family] for family in _FAMILIES]
-            total_rate = sum(weights)
-            if total_rate <= 0:
-                break
-            arrival_time_us = (
-                self.clock.current_time_us
-                + self.rng.exponential_interval_microseconds(total_rate)
-            )
-            if arrival_time_us > end_time_us:
-                break
-            self.clock.advance_to(arrival_time_us)
-            family = _FAMILIES[self.rng.weighted_float_index(weights)]
-            flow_events.append(self._apply_arrival(len(flow_events) + 1, family))
-
-        self.clock.advance_to(end_time_us)
-        self.book.assert_invariants()
+        self.advance_to(end_time_us)
         return SimulationResult(
             seed=self.seed,
             seconds=seconds,
             config=self.config,
             clock=self.clock,
             book=self.book,
-            flow_events=tuple(flow_events),
-            initial_exchange_event_count=initial_exchange_event_count,
-            initial_trade_count=initial_trade_count,
+            flow_events=self.flow_events,
+            initial_exchange_event_count=self._initial_exchange_event_count,
+            initial_trade_count=self._initial_trade_count,
         )
+
+    def _schedule_next_arrival(self) -> None:
+        rates = self.policy.rates(self.book)
+        weights = tuple(rates[family] for family in _FAMILIES)
+        total_rate = sum(weights)
+        if total_rate <= 0:
+            self._pending_arrival_time_us = None
+            self._pending_weights = None
+            return
+        self._pending_arrival_time_us = (
+            self.clock.current_time_us
+            + self.rng.exponential_interval_microseconds(total_rate)
+        )
+        self._pending_weights = weights
 
     def _draw_order_size(self, family: FlowEventFamily) -> int:
         distribution = self.policy.size_distribution(family)

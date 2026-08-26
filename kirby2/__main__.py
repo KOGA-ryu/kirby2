@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -45,6 +46,20 @@ def _liquidity_preset(value: str) -> LiquidityPreset:
         return LiquidityPreset.parse(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -109,6 +124,25 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("name", choices=sorted(load_scenario_definitions()))
     matrix.add_argument("--seed", type=int, help="shared comparison seed")
     matrix.add_argument("--seconds", type=int, default=30, help="duration of each matrix cell")
+
+    ui = subcommands.add_parser("ui", help="launch the minimal execution interface")
+    ui.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="balanced",
+    )
+    ui.add_argument("--seed", type=int, help="override the scenario seed")
+    ui.add_argument("--seconds", type=_positive_int, default=300)
+    ui.add_argument("--speed", type=_positive_float, default=10.0)
+    ui.add_argument("--volume", type=_volume_preset)
+    ui.add_argument("--liquidity", type=_liquidity_preset)
+    ui.add_argument(
+        "--quantity",
+        type=int,
+        choices=(25, 50, 100, 200, 500, 1000, 2000),
+        default=100,
+    )
+    ui.add_argument("--levels", type=int, choices=range(5, 11), default=7)
     return parser
 
 
@@ -164,6 +198,30 @@ def main() -> None:
         )
         if failures:
             raise SystemExit(1)
+        return
+
+    if args.command == "ui":
+        from kirby2.session.bindings import BindingMap
+        from kirby2.session.live import LiveMarketSession
+        from kirby2.ui import TerminalUiConfig, run_terminal_ui
+
+        definition = get_scenario_definition(args.scenario)
+        session = LiveMarketSession(
+            definition,
+            seed=args.seed,
+            duration_seconds=args.seconds,
+            relative_volume=args.volume,
+            liquidity=args.liquidity,
+            initial_quantity=args.quantity,
+        )
+        run_terminal_ui(
+            session,
+            bindings=BindingMap.default(),
+            config=TerminalUiConfig(
+                speed=args.speed,
+                ladder_levels=args.levels,
+            ),
+        )
         return
 
     if args.command == "audit-scenarios":

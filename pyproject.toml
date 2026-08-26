@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "Deterministic market-execution training sandbox"
 requires-python = ">=3.11"
 
+[project.scripts]
+kirby2 = "kirby2.__main__:main"
+
 [tool.setuptools.package-data]
 "kirby2.scenarios" = ["accepted_scenarios.json"]
