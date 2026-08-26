@@ -127,7 +127,7 @@ def _flow_model(name: str, regime: Regime) -> tuple[FlowModel, str | None]:
         config,
         baseline_mu=tuple(value * normalization for value in shaped_mu),
     )
-    return HawkesFlowModel(composed_config), profile_id
+    return HawkesFlowModel(composed_config, use_runtime_baseline=False), profile_id
 
 
 def _comparison_metrics(

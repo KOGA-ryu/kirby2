@@ -14,6 +14,7 @@ from .config import SimulationConfig
 from .distributions import WeightedDiscreteDistribution
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
 from .flow_models import FlowModel, SimpleFlowModel
+from .queue_reactive import FlowIntensityModifier, IntensityInspection
 from .scaling import ScenarioDimensions
 
 
@@ -320,6 +321,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         parameter_overrides: dict[str, Any] | None = None,
         dimensions: ScenarioDimensions | None = None,
         flow_model: FlowModel | None = None,
+        intensity_modifier: FlowIntensityModifier | None = None,
     ) -> None:
         super().__init__(seed=seed, config=config)
         self.regime = regime
@@ -332,6 +334,8 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             self.dimensions,
         )
         self.flow_model = flow_model or SimpleFlowModel()
+        self.intensity_modifier = intensity_modifier
+        self.last_intensity_inspection: IntensityInspection | None = None
         self.observations: list[BookObservation] = []
         self._started = False
         self._flow_events: list[FlowEvent] = []
@@ -358,6 +362,8 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._initialize_book()
         self._initial_exchange_event_count = len(self.book.journal.events)
         self._initial_trade_count = len(self.book.trades)
+        if self.intensity_modifier is not None:
+            self.intensity_modifier.initialize(self.book, self.clock.current_time_us)
         self._started = True
         self._schedule_next_arrival()
 
@@ -384,6 +390,8 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             self.clock.advance_to(arrival_time_us)
             event = self._apply_arrival(len(self._flow_events) + 1, family)
             self._flow_events.append(event)
+            if self.intensity_modifier is not None:
+                self.intensity_modifier.observe(event, self.book, arrival_time_us)
             self.flow_model.observe(family, arrival_time_us)
             if on_event is not None:
                 on_event(event)
@@ -415,10 +423,22 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             initial_exchange_event_count=self._initial_exchange_event_count,
             initial_trade_count=self._initial_trade_count,
             flow_model_config=self.flow_model.replay_config(),
+            intensity_modifier_config=(
+                None
+                if self.intensity_modifier is None
+                else self.intensity_modifier.replay_config()
+            ),
         )
 
     def _schedule_next_arrival(self) -> None:
         rates = self.policy.rates(self.book)
+        if self.intensity_modifier is not None:
+            self.last_intensity_inspection = self.intensity_modifier.inspect(
+                rates,
+                self.book,
+                self.clock.current_time_us,
+            )
+            rates = self.last_intensity_inspection.final_intensities
         arrival = self.flow_model.schedule_next(
             self.clock.current_time_us,
             rates,

@@ -20,6 +20,7 @@ from kirby2.simulation import (
 )
 from kirby2.simulation.regimes import regime_profiles
 from kirby2.simulation.flow_models import FlowModel
+from kirby2.simulation.queue_reactive import FlowIntensityModifier
 
 
 DEFINITIONS_PATH = Path(__file__).with_name("accepted_scenarios.json")
@@ -264,6 +265,8 @@ def run_market_scenario(
     seconds: int | None = None,
     relative_volume: VolumePreset | None = None,
     liquidity: LiquidityPreset | None = None,
+    flow_model: FlowModel | None = None,
+    intensity_modifier: FlowIntensityModifier | None = None,
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
@@ -272,6 +275,8 @@ def run_market_scenario(
         seed=actual_seed,
         relative_volume=relative_volume,
         liquidity=liquidity,
+        flow_model=flow_model,
+        intensity_modifier=intensity_modifier,
     )
     simulation = engine.run(actual_seconds)
     return ScenarioRun(
@@ -290,6 +295,7 @@ def create_market_engine(
     relative_volume: VolumePreset | None = None,
     liquidity: LiquidityPreset | None = None,
     flow_model: FlowModel | None = None,
+    intensity_modifier: FlowIntensityModifier | None = None,
 ) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
     actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
@@ -311,6 +317,7 @@ def create_market_engine(
         parameter_overrides=definition.parameter_overrides,
         dimensions=dimensions,
         flow_model=flow_model,
+        intensity_modifier=intensity_modifier,
     )
     return engine, dimensions
 

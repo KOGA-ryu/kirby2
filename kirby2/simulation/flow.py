@@ -72,6 +72,7 @@ class SimulationResult:
     initial_exchange_event_count: int
     initial_trade_count: int
     flow_model_config: dict[str, object] | None = None
+    intensity_modifier_config: dict[str, object] | None = None
 
     def replay_json_lines(self) -> str:
         header = {
@@ -82,6 +83,8 @@ class SimulationResult:
         }
         if self.flow_model_config is not None:
             header["flow_model"] = self.flow_model_config
+        if self.intensity_modifier_config is not None:
+            header["intensity_modifier"] = self.intensity_modifier_config
         lines = [json.dumps(header, sort_keys=True, separators=(",", ":"))]
         exchange_events = {event.sequence: event for event in self.book.journal.events}
 
@@ -150,6 +153,8 @@ class SimulationResult:
         }
         if self.flow_model_config is not None:
             summary["flow_model"] = self.flow_model_config
+        if self.intensity_modifier_config is not None:
+            summary["intensity_modifier"] = self.intensity_modifier_config
         return summary
 
     def _price_string(self, price_ticks: int | None) -> str | None:

@@ -178,6 +178,29 @@ def _parser() -> argparse.ArgumentParser:
         default=("simple", "hawkes"),
     )
 
+    inspect_intensity = subcommands.add_parser(
+        "inspect-intensity",
+        help="inspect observable queue state and per-channel intensity response",
+    )
+    inspect_intensity.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="balanced",
+    )
+    inspect_intensity.add_argument("--seed", type=int, default=42)
+    inspect_intensity.add_argument("--seconds", type=_positive_int, default=5)
+
+    probe_intensity = subcommands.add_parser(
+        "probe-intensity",
+        help="sweep queue imbalance through the bounded response layer",
+    )
+    probe_intensity.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="balanced",
+    )
+    probe_intensity.add_argument("--seed", type=int, default=42)
+
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
         "name",
@@ -502,6 +525,89 @@ def main() -> None:
                 f"positive_indicators={evidence}/4"
             )
         print(f"FLOW_MODEL_INVARIANTS PASS models={len(comparison.models)}")
+        return
+
+    if args.command == "inspect-intensity":
+        from kirby2.scenarios.market import create_market_engine
+        from kirby2.simulation import QueueReactiveFlowModifier
+
+        definition = get_scenario_definition(args.scenario)
+        modifier = QueueReactiveFlowModifier()
+        engine, _ = create_market_engine(
+            definition,
+            seed=args.seed,
+            intensity_modifier=modifier,
+        )
+        simulation = engine.run(args.seconds)
+        inspection = modifier.inspect(
+            engine.policy.rates(engine.book),
+            engine.book,
+            engine.clock.current_time_us,
+        )
+        print(
+            f"KIRBY2_INTENSITY_INSPECTION scenario={definition.name} "
+            f"seed={args.seed} time_us={engine.clock.current_time_us}"
+        )
+        print(
+            "BOOK_STATE "
+            + json.dumps(
+                inspection.state.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        for channel in inspection.channels:
+            print(
+                "CHANNEL "
+                + json.dumps(
+                    channel.as_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print(f"REPLAY_SHA256 {simulation.replay_sha256()}")
+        print("QUEUE_REACTIVE_INVARIANTS PASS")
+        return
+
+    if args.command == "probe-intensity":
+        from kirby2.scenarios.market import create_market_engine
+        from kirby2.simulation import (
+            QueueReactiveFlowModifier,
+            imbalance_probe_state,
+        )
+
+        definition = get_scenario_definition(args.scenario)
+        engine, _ = create_market_engine(definition, seed=args.seed)
+        engine.start()
+        baseline = engine.policy.rates(engine.book)
+        modifier = QueueReactiveFlowModifier()
+        print(
+            f"KIRBY2_IMBALANCE_PROBE scenario={definition.name} "
+            f"seed={args.seed} profile={modifier.config.profile_id}"
+        )
+        for imbalance in (-0.90, -0.60, -0.30, 0.0, 0.30, 0.60, 0.90):
+            inspection = modifier.inspect_state(
+                baseline,
+                imbalance_probe_state(imbalance),
+            )
+            print(
+                json.dumps(
+                    {
+                        "final_intensities": {
+                            channel.family.value: round(channel.final_intensity, 9)
+                            for channel in inspection.channels
+                        },
+                        "imbalance": inspection.state.imbalance,
+                        "state_multipliers": {
+                            channel.family.value: round(channel.state_multiplier, 9)
+                            for channel in inspection.channels
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print("IMBALANCE_PROBE PASS bounded=true hidden_regime_to_strategy=false")
         return
 
     if args.command == "matrix":

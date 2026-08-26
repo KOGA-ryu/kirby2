@@ -183,7 +183,7 @@ class HawkesFlowModel:
         self,
         config: HawkesConfig,
         *,
-        use_runtime_baseline: bool = False,
+        use_runtime_baseline: bool = True,
     ) -> None:
         if type(use_runtime_baseline) is not bool:
             raise TypeError("Hawkes runtime-baseline selection must be boolean")
