@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "channels": [
+    "limit_buy",
+    "limit_sell",
+    "market_buy",
+    "market_sell",
+    "cancel_bid",
+    "cancel_ask"
+  ],
+  "profiles": [
+    {
+      "profile_id": "balanced",
+      "baseline_mu": {
+        "limit_buy": 2.5,
+        "limit_sell": 2.5,
+        "market_buy": 1.5,
+        "market_sell": 1.5,
+        "cancel_bid": 1.25,
+        "cancel_ask": 1.25
+      },
+      "default_beta": 4.0,
+      "max_total_intensity": 90.0,
+      "alpha": {
+        "limit_buy": {"limit_buy": 0.4, "market_buy": 0.9},
+        "limit_sell": {"limit_sell": 0.4, "market_sell": 0.9},
+        "market_buy": {"market_buy": 1.8},
+        "market_sell": {"market_sell": 1.8},
+        "cancel_bid": {"market_sell": 0.8, "cancel_bid": 0.5},
+        "cancel_ask": {"market_buy": 0.8, "cancel_ask": 0.5}
+      },
+      "beta": {
+        "limit_buy": {"market_buy": 3.0},
+        "limit_sell": {"market_sell": 3.0},
+        "cancel_bid": {"market_sell": 3.0},
+        "cancel_ask": {"market_buy": 3.0}
+      }
+    },
+    {
+      "profile_id": "momentum",
+      "baseline_mu": {
+        "limit_buy": 2.0,
+        "limit_sell": 2.0,
+        "market_buy": 1.4,
+        "market_sell": 1.4,
+        "cancel_bid": 1.0,
+        "cancel_ask": 1.0
+      },
+      "default_beta": 4.0,
+      "max_total_intensity": 120.0,
+      "stability_warning_threshold": 0.8,
+      "alpha": {
+        "limit_buy": {"limit_buy": 0.4, "market_buy": 1.3},
+        "limit_sell": {"limit_sell": 0.4, "market_sell": 1.3},
+        "market_buy": {"limit_buy": 0.2, "market_buy": 2.6, "cancel_ask": 0.4},
+        "market_sell": {"limit_sell": 0.2, "market_sell": 2.6, "cancel_bid": 0.4},
+        "cancel_bid": {"market_sell": 1.2, "cancel_bid": 0.5},
+        "cancel_ask": {"market_buy": 1.2, "cancel_ask": 0.5}
+      },
+      "beta": {
+        "limit_buy": {"market_buy": 3.5},
+        "limit_sell": {"market_sell": 3.5},
+        "cancel_bid": {"market_sell": 3.5},
+        "cancel_ask": {"market_buy": 3.5}
+      }
+    },
+    {
+      "profile_id": "panic",
+      "baseline_mu": {
+        "limit_buy": 1.0,
+        "limit_sell": 2.5,
+        "market_buy": 0.8,
+        "market_sell": 2.5,
+        "cancel_bid": 2.0,
+        "cancel_ask": 0.8
+      },
+      "default_beta": 4.0,
+      "max_total_intensity": 140.0,
+      "stability_warning_threshold": 0.8,
+      "alpha": {
+        "limit_buy": {"limit_buy": 0.3},
+        "limit_sell": {"market_sell": 1.0, "limit_sell": 0.5},
+        "market_buy": {"market_buy": 1.4},
+        "market_sell": {"market_sell": 3.0, "cancel_bid": 0.4},
+        "cancel_bid": {"market_sell": 1.5, "cancel_bid": 0.5},
+        "cancel_ask": {"market_buy": 0.6, "cancel_ask": 0.3}
+      },
+      "beta": {
+        "limit_sell": {"market_sell": 3.0},
+        "cancel_bid": {"market_sell": 4.0}
+      }
+    },
+    {
+      "profile_id": "absorption",
+      "baseline_mu": {
+        "limit_buy": 3.0,
+        "limit_sell": 3.0,
+        "market_buy": 1.5,
+        "market_sell": 1.5,
+        "cancel_bid": 0.7,
+        "cancel_ask": 0.7
+      },
+      "default_beta": 4.0,
+      "max_total_intensity": 120.0,
+      "alpha": {
+        "limit_buy": {"limit_buy": 0.5, "market_sell": 2.0},
+        "limit_sell": {"limit_sell": 0.5, "market_buy": 2.0},
+        "market_buy": {"limit_sell": 0.2, "market_buy": 2.0},
+        "market_sell": {"limit_buy": 0.2, "market_sell": 2.0},
+        "cancel_bid": {"cancel_bid": 0.3},
+        "cancel_ask": {"cancel_ask": 0.3}
+      },
+      "beta": {
+        "limit_buy": {"market_sell": 3.0},
+        "limit_sell": {"market_buy": 3.0}
+      }
+    }
+  ]
+}

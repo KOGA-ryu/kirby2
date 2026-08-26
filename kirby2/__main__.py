@@ -108,6 +108,19 @@ def _binding_assignment(value: str) -> tuple[str, str]:
     return _binding_key(raw_key), command
 
 
+def _flow_model_names(value: str) -> tuple[str, ...]:
+    allowed = {"simple", "hawkes"}
+    models = tuple(item.strip().lower() for item in value.split(",") if item.strip())
+    if not models or len(models) != len(set(models)):
+        raise argparse.ArgumentTypeError("flow models must be nonempty and unique")
+    unknown = set(models) - allowed
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "flow models must be a comma-separated subset of simple,hawkes"
+        )
+    return models
+
+
 def _load_strategy_file(path: Path):
     from kirby2.strategy import RuleSyntaxError, parse_strategy
 
@@ -147,6 +160,22 @@ def _parser() -> argparse.ArgumentParser:
         "--events-jsonl",
         type=Path,
         help="optional path for the complete replay stream",
+    )
+
+    compare_flow = subcommands.add_parser(
+        "compare-flow",
+        help="compare simple Poisson and Hawkes arrivals on one scenario",
+    )
+    compare_flow.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="momentum_up",
+    )
+    compare_flow.add_argument("--seed", type=int, default=42)
+    compare_flow.add_argument(
+        "--models",
+        type=_flow_model_names,
+        default=("simple", "hawkes"),
     )
 
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
@@ -438,6 +467,43 @@ def main() -> None:
         print("RUNTIME_INVARIANTS PASS")
         return
 
+    if args.command == "compare-flow":
+        from kirby2.simulation.comparison import compare_flow_models
+
+        definition = get_scenario_definition(args.scenario)
+        comparison = compare_flow_models(
+            definition,
+            seed=args.seed,
+            models=args.models,
+        )
+        print(
+            f"KIRBY2_FLOW_COMPARISON scenario={comparison.scenario} "
+            f"seed={comparison.seed} models={','.join(args.models)}"
+        )
+        for result in comparison.models:
+            print(json.dumps(result.as_dict(), sort_keys=True, separators=(",", ":")))
+        delta = comparison.clustering_delta()
+        if delta is not None:
+            print(
+                "CLUSTERING_DELTA hawkes_minus_simple "
+                + json.dumps(delta, sort_keys=True, separators=(",", ":"))
+            )
+            evidence = sum(
+                delta[key] > 0
+                for key in (
+                    "aggressive_flow_fano_1s",
+                    "cancel_flow_fano_1s",
+                    "trade_fano_1s",
+                    "event_interarrival_cv",
+                )
+            )
+            print(
+                f"HAWKES_CLUSTERING {'EVIDENT' if evidence >= 3 else 'MIXED'} "
+                f"positive_indicators={evidence}/4"
+            )
+        print(f"FLOW_MODEL_INVARIANTS PASS models={len(comparison.models)}")
+        return
+
     if args.command == "matrix":
         definition = get_scenario_definition(args.name)
         matrix = run_scenario_matrix(
@@ -491,7 +557,6 @@ def main() -> None:
 
     if args.command == "curriculum":
         from kirby2.curriculum import load_curriculum, prepare_lesson
-        from kirby2.scenarios import get_scenario_definition
         from kirby2.session.bindings import SessionCommand
         from kirby2.session.layouts import HotkeyLayout, LayoutStore
         from kirby2.session.live import LiveMarketSession

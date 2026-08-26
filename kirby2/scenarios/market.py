@@ -19,6 +19,7 @@ from kirby2.simulation import (
     VolumePreset,
 )
 from kirby2.simulation.regimes import regime_profiles
+from kirby2.simulation.flow_models import FlowModel
 
 
 DEFINITIONS_PATH = Path(__file__).with_name("accepted_scenarios.json")
@@ -288,6 +289,7 @@ def create_market_engine(
     seed: int | None = None,
     relative_volume: VolumePreset | None = None,
     liquidity: LiquidityPreset | None = None,
+    flow_model: FlowModel | None = None,
 ) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
     actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
@@ -308,6 +310,7 @@ def create_market_engine(
         config=config,
         parameter_overrides=definition.parameter_overrides,
         dimensions=dimensions,
+        flow_model=flow_model,
     )
     return engine, dimensions
 

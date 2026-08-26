@@ -71,6 +71,7 @@ class SimulationResult:
     flow_events: tuple[FlowEvent, ...]
     initial_exchange_event_count: int
     initial_trade_count: int
+    flow_model_config: dict[str, object] | None = None
 
     def replay_json_lines(self) -> str:
         header = {
@@ -79,6 +80,8 @@ class SimulationResult:
             "record_type": "simulation_config",
             "seed": self.seed,
         }
+        if self.flow_model_config is not None:
+            header["flow_model"] = self.flow_model_config
         lines = [json.dumps(header, sort_keys=True, separators=(",", ":"))]
         exchange_events = {event.sequence: event for event in self.book.journal.events}
 
@@ -115,7 +118,7 @@ class SimulationResult:
         )
         best_bid = self.book.best_bid
         best_ask = self.book.best_ask
-        return {
+        summary = {
             "applied_event_count": sum(event.applied for event in self.flow_events),
             "applied_event_family_counts": {
                 family.value: applied_family_counts[family.value] for family in _FAMILY_ORDER
@@ -145,6 +148,9 @@ class SimulationResult:
             "total_traded_volume": sum(trade.quantity for trade in trades),
             "trade_count": len(trades),
         }
+        if self.flow_model_config is not None:
+            summary["flow_model"] = self.flow_model_config
+        return summary
 
     def _price_string(self, price_ticks: int | None) -> str | None:
         if price_ticks is None:

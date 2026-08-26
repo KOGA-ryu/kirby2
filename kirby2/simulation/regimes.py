@@ -13,6 +13,7 @@ from .clock import MICROSECONDS_PER_SECOND
 from .config import SimulationConfig
 from .distributions import WeightedDiscreteDistribution
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
+from .flow_models import FlowModel, SimpleFlowModel
 from .scaling import ScenarioDimensions
 
 
@@ -318,6 +319,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         config: SimulationConfig,
         parameter_overrides: dict[str, Any] | None = None,
         dimensions: ScenarioDimensions | None = None,
+        flow_model: FlowModel | None = None,
     ) -> None:
         super().__init__(seed=seed, config=config)
         self.regime = regime
@@ -329,13 +331,14 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             parameter_overrides,
             self.dimensions,
         )
+        self.flow_model = flow_model or SimpleFlowModel()
         self.observations: list[BookObservation] = []
         self._started = False
         self._flow_events: list[FlowEvent] = []
         self._initial_exchange_event_count = 0
         self._initial_trade_count = 0
         self._pending_arrival_time_us: int | None = None
-        self._pending_weights: tuple[float, ...] | None = None
+        self._pending_family: FlowEventFamily | None = None
 
     @property
     def flow_events(self) -> tuple[FlowEvent, ...]:
@@ -375,13 +378,13 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             and self._pending_arrival_time_us <= simulation_time_us
         ):
             arrival_time_us = self._pending_arrival_time_us
-            weights = self._pending_weights
-            if weights is None:
-                raise RuntimeError("scheduled regime arrival lacks family weights")
+            family = self._pending_family
+            if family is None:
+                raise RuntimeError("scheduled regime arrival lacks an event family")
             self.clock.advance_to(arrival_time_us)
-            family = _FAMILIES[self.rng.weighted_float_index(weights)]
             event = self._apply_arrival(len(self._flow_events) + 1, family)
             self._flow_events.append(event)
+            self.flow_model.observe(family, arrival_time_us)
             if on_event is not None:
                 on_event(event)
             self._schedule_next_arrival()
@@ -411,21 +414,22 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             flow_events=self.flow_events,
             initial_exchange_event_count=self._initial_exchange_event_count,
             initial_trade_count=self._initial_trade_count,
+            flow_model_config=self.flow_model.replay_config(),
         )
 
     def _schedule_next_arrival(self) -> None:
         rates = self.policy.rates(self.book)
-        weights = tuple(rates[family] for family in _FAMILIES)
-        total_rate = sum(weights)
-        if total_rate <= 0:
-            self._pending_arrival_time_us = None
-            self._pending_weights = None
-            return
-        self._pending_arrival_time_us = (
-            self.clock.current_time_us
-            + self.rng.exponential_interval_microseconds(total_rate)
+        arrival = self.flow_model.schedule_next(
+            self.clock.current_time_us,
+            rates,
+            self.rng,
         )
-        self._pending_weights = weights
+        if arrival is None:
+            self._pending_arrival_time_us = None
+            self._pending_family = None
+            return
+        self._pending_arrival_time_us = arrival.simulation_time_us
+        self._pending_family = arrival.family
 
     def _draw_order_size(self, family: FlowEventFamily) -> int:
         distribution = self.policy.size_distribution(family)

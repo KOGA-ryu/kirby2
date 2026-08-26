@@ -20,6 +20,10 @@ class SeededRng:
             raise ValueError("stop must be positive")
         return self._random.randrange(stop)
 
+    def unit_interval(self) -> float:
+        """Draw from [0, 1) using only this explicitly owned RNG."""
+        return self._random.random()
+
     def weighted_index(self, weights: Sequence[int]) -> int:
         if not weights or any(type(weight) is not int or weight <= 0 for weight in weights):
             raise ValueError("weights must be positive integers")
