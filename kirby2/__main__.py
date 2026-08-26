@@ -320,6 +320,36 @@ def _parser() -> argparse.ArgumentParser:
     timeline.add_argument("recording", type=Path)
     timeline.add_argument("--limit", type=_positive_int)
     timeline.add_argument("--kind", action="append")
+
+    from kirby2.historical import load_historical_fixtures
+
+    historical = subcommands.add_parser(
+        "historical",
+        help="list or run explicit-provenance historical fixtures",
+    )
+    historical_actions = historical.add_subparsers(
+        dest="historical_action",
+        required=True,
+    )
+    historical_actions.add_parser("list", help="list the local demonstration fixtures")
+    historical_run = historical_actions.add_parser(
+        "run",
+        help="run one exact replay or constrained reconstruction fixture",
+    )
+    historical_run.add_argument(
+        "fixture",
+        choices=tuple(sorted(load_historical_fixtures())),
+    )
+    historical_run.add_argument(
+        "--seed",
+        type=_nonnegative_int,
+        help="override the reconstruction seed; invalid for exact replay",
+    )
+    historical_run.add_argument(
+        "--events-jsonl",
+        type=Path,
+        help="save the complete provenance-labeled replay stream",
+    )
     return parser
 
 
@@ -340,6 +370,49 @@ def main() -> None:
             + ",".join(feature.value for feature in FeatureName)
         )
         print("STRATEGY_VALID PASS arbitrary_code=DISABLED hidden_regime=UNAVAILABLE")
+        return
+
+    if args.command == "historical":
+        from kirby2.historical import (
+            ExactReplayFixture,
+            load_historical_fixtures,
+            render_historical_report,
+            render_historical_ui,
+            run_historical_fixture,
+        )
+
+        fixtures = load_historical_fixtures()
+        if args.historical_action == "list":
+            print("KIRBY2_HISTORICAL_FIXTURES")
+            for fixture in fixtures.values():
+                mode = (
+                    "EXACT_REPLAY"
+                    if isinstance(fixture, ExactReplayFixture)
+                    else "RECONSTRUCTION"
+                )
+                print(
+                    f"{fixture.fixture_id}  mode={mode} "
+                    f"real_market_data={str(fixture.provenance.real_market_data).lower()} "
+                    f"label={fixture.label}"
+                )
+            print(f"FIXTURE_COUNT {len(fixtures)}")
+            return
+        try:
+            run = run_historical_fixture(fixtures[args.fixture], seed=args.seed)
+        except (RuntimeError, ValueError) as error:
+            print(f"HISTORICAL_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print(render_historical_ui(run))
+        print()
+        print(render_historical_report(run))
+        if args.events_jsonl is not None:
+            args.events_jsonl.write_text(
+                run.replay_json_lines() + "\n",
+                encoding="utf-8",
+            )
+            print(f"HISTORICAL_REPLAY_STREAM path={args.events_jsonl.resolve()}")
+        else:
+            print("HISTORICAL_REPLAY_STREAM available_via=HistoricalRun.replay_json_lines")
         return
 
     if args.command == "scenario":

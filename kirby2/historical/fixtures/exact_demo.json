@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "fixture_id": "exact_demo",
+  "label": "Local exact-event replay demonstration",
+  "mode": "EXACT_REPLAY",
+  "duration_us": 5000000,
+  "tick_size": "0.01",
+  "session_start": "2000-01-03T09:30:00Z",
+  "provenance": {
+    "dataset_id": "kirby2_local_exact_fixture_v1",
+    "source_name": "Kirby2 pedagogical exact-event fixture",
+    "source_locator": "package://kirby2.historical/fixtures/exact_demo.json",
+    "description": "A locally authored message fixture for validating exact replay architecture. It is not data from a real security or venue.",
+    "license_note": "Part of the Kirby2 project fixture set.",
+    "real_market_data": false,
+    "provides_order_events": true,
+    "provides_trade_events": true,
+    "provides_book_events": false
+  },
+  "messages": [
+    {"sequence": 1, "timestamp_us": 0, "action": "limit", "order_id": "SRC-B1", "side": "buy", "quantity": 500, "price_ticks": 9999},
+    {"sequence": 2, "timestamp_us": 0, "action": "limit", "order_id": "SRC-B2", "side": "buy", "quantity": 400, "price_ticks": 9998},
+    {"sequence": 3, "timestamp_us": 0, "action": "limit", "order_id": "SRC-A1", "side": "sell", "quantity": 300, "price_ticks": 10001},
+    {"sequence": 4, "timestamp_us": 0, "action": "limit", "order_id": "SRC-A2", "side": "sell", "quantity": 500, "price_ticks": 10002},
+    {"sequence": 5, "timestamp_us": 1000000, "action": "market", "order_id": "SRC-MB1", "side": "buy", "quantity": 200},
+    {"sequence": 6, "timestamp_us": 1500000, "action": "limit", "order_id": "SRC-A3", "side": "sell", "quantity": 250, "price_ticks": 10001},
+    {"sequence": 7, "timestamp_us": 2000000, "action": "market", "order_id": "SRC-MB2", "side": "buy", "quantity": 250},
+    {"sequence": 8, "timestamp_us": 2500000, "action": "cancel", "order_id": "SRC-C1", "target_order_id": "SRC-A3"},
+    {"sequence": 9, "timestamp_us": 3000000, "action": "market", "order_id": "SRC-MS1", "side": "sell", "quantity": 600},
+    {"sequence": 10, "timestamp_us": 3500000, "action": "limit", "order_id": "SRC-B3", "side": "buy", "quantity": 700, "price_ticks": 9999},
+    {"sequence": 11, "timestamp_us": 4000000, "action": "market", "order_id": "SRC-MS2", "side": "sell", "quantity": 300}
+  ],
+  "expected_trades": [
+    {"trade_id": "T000001", "price_ticks": 10001, "quantity": 200, "maker_order_id": "SRC-A1", "taker_order_id": "SRC-MB1", "taker_side": "buy"},
+    {"trade_id": "T000002", "price_ticks": 10001, "quantity": 100, "maker_order_id": "SRC-A1", "taker_order_id": "SRC-MB2", "taker_side": "buy"},
+    {"trade_id": "T000003", "price_ticks": 10001, "quantity": 150, "maker_order_id": "SRC-A3", "taker_order_id": "SRC-MB2", "taker_side": "buy"},
+    {"trade_id": "T000004", "price_ticks": 9999, "quantity": 500, "maker_order_id": "SRC-B1", "taker_order_id": "SRC-MS1", "taker_side": "sell"},
+    {"trade_id": "T000005", "price_ticks": 9998, "quantity": 100, "maker_order_id": "SRC-B2", "taker_order_id": "SRC-MS1", "taker_side": "sell"},
+    {"trade_id": "T000006", "price_ticks": 9999, "quantity": 300, "maker_order_id": "SRC-B3", "taker_order_id": "SRC-MS2", "taker_side": "sell"}
+  ]
+}

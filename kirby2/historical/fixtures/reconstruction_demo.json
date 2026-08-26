@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "fixture_id": "reconstruction_demo",
+  "label": "Local aggregate-observation reconstruction demonstration",
+  "mode": "RECONSTRUCTION",
+  "seed": 42,
+  "provenance": {
+    "dataset_id": "kirby2_local_aggregate_fixture_v1",
+    "source_name": "Kirby2 pedagogical aggregate-observation fixture",
+    "source_locator": "package://kirby2.historical/fixtures/reconstruction_demo.json",
+    "description": "Locally authored aggregate observations used only to validate reconstruction interfaces. They are not observations of a real security.",
+    "license_note": "Part of the Kirby2 project fixture set.",
+    "real_market_data": false,
+    "provides_order_events": false,
+    "provides_trade_events": false,
+    "provides_book_events": false
+  },
+  "constraints": {
+    "session_start": "2000-01-03T09:30:00Z",
+    "duration_us": 30000000,
+    "tick_size": "0.01",
+    "open_ticks": 10000,
+    "high_ticks": 10005,
+    "low_ticks": 9998,
+    "close_ticks": 10003,
+    "aggregate_volume": 18000,
+    "realized_volatility_bps": "7.5",
+    "spread_observations": [
+      {"timestamp_us": 0, "spread_ticks": 2},
+      {"timestamp_us": 10000000, "spread_ticks": 2},
+      {"timestamp_us": 20000000, "spread_ticks": 3},
+      {"timestamp_us": 30000000, "spread_ticks": 2}
+    ],
+    "trade_prints": [
+      {"timestamp_us": 5000000, "price_ticks": 10001, "quantity": 500},
+      {"timestamp_us": 12000000, "price_ticks": 10003, "quantity": 800},
+      {"timestamp_us": 19000000, "price_ticks": 10000, "quantity": 600},
+      {"timestamp_us": 27000000, "price_ticks": 10003, "quantity": 900}
+    ],
+    "known_market_events": [
+      "Pedagogical fixture note: directional aggregate flow with a brief retracement."
+    ]
+  }
+}
