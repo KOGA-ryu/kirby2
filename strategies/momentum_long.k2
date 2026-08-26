@@ -1,0 +1,15 @@
+# Observable-only example. No simulator regime labels are available here.
+setup momentum_long
+window 5s
+
+GREEN when
+    book_imbalance > 0.20
+    buy_sell_ratio > 1.10
+    ask_depletion_rate > 20
+    spread_ticks <= 3
+
+WAIT when
+    book_imbalance > -0.20
+    spread_ticks <= 5
+
+RED otherwise

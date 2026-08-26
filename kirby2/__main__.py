@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -76,6 +77,21 @@ def _binding_assignment(value: str) -> tuple[str, str]:
         raise argparse.ArgumentTypeError("binding must use KEY=COMMAND")
     raw_key, command = value.split("=", 1)
     return _binding_key(raw_key), command
+
+
+def _load_strategy_file(path: Path):
+    from kirby2.strategy import RuleSyntaxError, parse_strategy
+
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"STRATEGY_ERROR {path}: {error}", file=sys.stderr)
+        raise SystemExit(2) from error
+    try:
+        return parse_strategy(source)
+    except RuleSyntaxError as error:
+        print(f"STRATEGY_ERROR {path}:{error}", file=sys.stderr)
+        raise SystemExit(2) from error
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -165,6 +181,17 @@ def _parser() -> argparse.ArgumentParser:
     ui.add_argument("--unbind", type=_binding_key, action="append", default=[])
     ui.add_argument("--save-layout", help="save the effective bindings under this name")
     ui.add_argument("--record", type=Path, help="save an event-state session recording")
+    ui.add_argument(
+        "--strategy",
+        type=Path,
+        help="observable-only traffic-light rule file",
+    )
+
+    strategy = subcommands.add_parser(
+        "strategy",
+        help="validate and inspect a traffic-light rule file",
+    )
+    strategy.add_argument("rule_file", type=Path)
 
     layout = subcommands.add_parser("layout", help="manage named hotkey layouts")
     layout_actions = layout.add_subparsers(dest="layout_action", required=True)
@@ -197,6 +224,19 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "demo":
         print(run_demo(args.seed))
+        return
+
+    if args.command == "strategy":
+        from kirby2.strategy import FeatureName
+
+        definition = _load_strategy_file(args.rule_file)
+        print("KIRBY2_TRAFFIC_STRATEGY")
+        print(json.dumps(definition.as_dict(), sort_keys=True, separators=(",", ":")))
+        print(
+            "OBSERVABLE_FEATURES "
+            + ",".join(feature.value for feature in FeatureName)
+        )
+        print("STRATEGY_VALID PASS arbitrary_code=DISABLED hidden_regime=UNAVAILABLE")
         return
 
     if args.command == "scenario":
@@ -294,6 +334,9 @@ def main() -> None:
                 f"path={saved_path.resolve()}"
             )
         definition = get_scenario_definition(args.scenario)
+        strategy_definition = (
+            None if args.strategy is None else _load_strategy_file(args.strategy)
+        )
         session = LiveMarketSession(
             definition,
             seed=args.seed,
@@ -301,6 +344,7 @@ def main() -> None:
             relative_volume=args.volume,
             liquidity=args.liquidity,
             initial_quantity=args.quantity,
+            strategy_definition=strategy_definition,
         )
         run_terminal_ui(
             session,

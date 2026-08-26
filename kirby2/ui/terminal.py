@@ -13,7 +13,7 @@ from kirby2.session.live import LevelView, LiveMarketSession, SessionSnapshot
 
 
 MINIMUM_WIDTH = 116
-MINIMUM_HEIGHT = 32
+MINIMUM_HEIGHT = 34
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +62,15 @@ def render_terminal_frame(
         f"VOLUME {snapshot.relative_volume}  LIQUIDITY {snapshot.liquidity}  "
         f"LAYOUT {config.layout_name}"
     )
+    traffic = (
+        f"TRAFFIC LIGHT [ {snapshot.traffic_light:^12} ]  "
+        f"SETUP {snapshot.traffic_setup or '-'}"
+    )
+    traffic_reason = f"TRAFFIC WHY  {snapshot.traffic_reason}"
     account = (
         f"POSITION {snapshot.position:+d}  BOUGHT {snapshot.bought_quantity}  "
         f"SOLD {snapshot.sold_quantity}  ORDER QTY {snapshot.selected_quantity}  "
-        f"WORKING {len(snapshot.working_orders)}  TRAFFIC {snapshot.traffic_light}"
+        f"WORKING {len(snapshot.working_orders)}"
     )
 
     left_width = 64
@@ -73,7 +78,14 @@ def render_terminal_frame(
     ladder = _ladder_lines(snapshot, config.ladder_levels, left_width)
     tape = _tape_lines(snapshot, config.tape_rows, right_width)
     body_rows = max(len(ladder), len(tape))
-    lines = [header[:width], configuration[:width], account[:width], ""]
+    lines = [
+        header[:width],
+        configuration[:width],
+        traffic[:width],
+        traffic_reason[:width],
+        account[:width],
+        "",
+    ]
     for index in range(body_rows):
         left = ladder[index] if index < len(ladder) else ""
         right = tape[index] if index < len(tape) else ""

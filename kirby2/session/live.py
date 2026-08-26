@@ -19,6 +19,11 @@ from kirby2.simulation import (
 )
 from kirby2.simulation.clock import MICROSECONDS_PER_SECOND
 from kirby2.simulation.flow import FlowEvent
+from kirby2.strategy import (
+    StrategyDefinition,
+    TrafficLightRuntime,
+    TrafficTransition,
+)
 
 from .bindings import BindingMap, SessionCommand
 from .records import InputRecord, MarketStateRecord, TimelineKind, TimelineRecord
@@ -77,6 +82,8 @@ class SessionSnapshot:
     tape: tuple[TapePrint, ...]
     working_orders: tuple[WorkingOrderView, ...]
     traffic_light: str
+    traffic_setup: str | None
+    traffic_reason: str
     status_message: str
     exchange_event_sequence: int
     market_state_id: str
@@ -102,6 +109,7 @@ class LiveMarketSession:
         liquidity: LiquidityPreset | None = None,
         initial_quantity: int = 100,
         quantity_options: tuple[int, ...] = DEFAULT_QUANTITIES,
+        strategy_definition: StrategyDefinition | None = None,
     ) -> None:
         if type(duration_seconds) is not int or duration_seconds <= 0:
             raise ValueError("session duration must be a positive integer")
@@ -120,6 +128,7 @@ class LiveMarketSession:
         self.relative_volume = relative_volume
         self.liquidity = liquidity
         self.quantity_options = quantity_options
+        self.strategy_definition = strategy_definition
         self._initial_quantity = initial_quantity
         self._quantity_index = quantity_options.index(initial_quantity)
         self._order_sequence = 0
@@ -131,6 +140,7 @@ class LiveMarketSession:
         self.status_message = "READY - SPACE starts simulated flow"
         self.engine: RegimeOrderFlow
         self.dimensions: ScenarioDimensions
+        self._traffic_runtime: TrafficLightRuntime | None
         self.reset()
 
     @property
@@ -188,6 +198,17 @@ class LiveMarketSession:
         self._latest_market_state_time_us = 0
         self._timeline_best_bid = self.engine.book.best_bid
         self._timeline_best_ask = self.engine.book.best_ask
+        self._traffic_runtime = None
+        if self.strategy_definition is not None:
+            self._traffic_runtime = TrafficLightRuntime(
+                self.strategy_definition,
+                Decimal(str(self.dimensions.volume_scale.relative_volume)),
+            )
+            initial_transition = self._traffic_runtime.reset(
+                self.simulation_time_us,
+                self.engine.book,
+            )
+            self._record_traffic_transition(initial_transition)
         self.complete = False
         self.running = start
         self.status_message = "RUNNING" if start else "RESET - SPACE starts simulated flow"
@@ -198,9 +219,7 @@ class LiveMarketSession:
         if not self.running or self.complete or delta_us == 0:
             return ()
         target = min(self.duration_us, self.simulation_time_us + delta_us)
-        flow_events = self.engine.advance_to(target)
-        for flow_event in flow_events:
-            self._capture_flow_trades(flow_event)
+        flow_events = self.engine.advance_to(target, on_event=self._capture_flow_trades)
         if target == self.duration_us:
             self.running = False
             self.complete = True
@@ -321,6 +340,11 @@ class LiveMarketSession:
         if not isinstance(player, dict):
             raise RuntimeError("exchange player snapshot must be an object")
         market_state_id = self._market_state_id(book_snapshot)
+        traffic = (
+            None
+            if self._traffic_runtime is None
+            else self._traffic_runtime.current
+        )
         return SessionSnapshot(
             scenario_name=self.definition.name,
             regime=self.definition.regime.value,
@@ -339,7 +363,11 @@ class LiveMarketSession:
             asks=self._level_views(book_snapshot, "asks"),
             tape=tuple(self._tape),
             working_orders=self._working_order_views(),
-            traffic_light="AMBER PLACEHOLDER",
+            traffic_light="UNCONFIGURED" if traffic is None else traffic.state.value,
+            traffic_setup=None if traffic is None else traffic.setup_name,
+            traffic_reason=(
+                "No strategy rule file loaded" if traffic is None else traffic.reason
+            ),
             status_message=self.status_message,
             exchange_event_sequence=len(self.engine.book.journal.events),
             market_state_id=market_state_id,
@@ -362,6 +390,14 @@ class LiveMarketSession:
                 for item in self._tape
             ],
         }
+        if self._traffic_runtime is not None:
+            current = self._traffic_runtime.current
+            if current is None:
+                raise RuntimeError("configured traffic runtime lacks an evaluation")
+            payload["traffic_light"] = {
+                "evaluation": current.as_dict(),
+                "strategy": self.strategy_definition.as_dict(),  # type: ignore[union-attr]
+            }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -755,6 +791,7 @@ class LiveMarketSession:
         self._capture_exchange_trades(captured, simulation_time_us)
         self._capture_player_fill_status(captured)
         self._capture_timeline_activity(captured, simulation_time_us)
+        self._update_traffic(captured, simulation_time_us)
 
     def _capture_exchange_trades(
         self,
@@ -905,6 +942,11 @@ class LiveMarketSession:
             "selected_quantity": self.selected_quantity,
             "working_order_ids": [order.order_id for order in self._player_orders()],
         }
+        if self._traffic_runtime is not None:
+            current = self._traffic_runtime.current
+            if current is None:
+                raise RuntimeError("configured traffic runtime lacks an evaluation")
+            snapshot["traffic_light"] = current.as_dict()
         record = MarketStateRecord(
             state_id=state_id,
             simulation_time_us=self.simulation_time_us,
@@ -922,6 +964,11 @@ class LiveMarketSession:
             "selected_quantity": self.selected_quantity,
             "simulation_time_us": self.simulation_time_us,
         }
+        if self._traffic_runtime is not None:
+            current = self._traffic_runtime.current
+            if current is None:
+                raise RuntimeError("configured traffic runtime lacks an evaluation")
+            payload["traffic_light"] = current.as_dict()
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"MS-{digest[:20]}"
@@ -941,6 +988,38 @@ class LiveMarketSession:
                 message=message,
                 data=data,
             )
+        )
+
+    def _update_traffic(
+        self,
+        events: Iterable[SimulationEvent],
+        simulation_time_us: int,
+    ) -> None:
+        if self._traffic_runtime is None:
+            return
+        transition = self._traffic_runtime.observe(
+            simulation_time_us,
+            events,
+            self.engine.book,
+        )
+        if transition is not None:
+            self._record_traffic_transition(transition)
+
+    def _record_traffic_transition(self, transition: TrafficTransition) -> None:
+        previous = (
+            "INITIAL"
+            if transition.previous_state is None
+            else transition.previous_state.value
+        )
+        evaluation = transition.evaluation
+        self._append_timeline(
+            TimelineKind.TRAFFIC,
+            (
+                f"TRAFFIC {previous} -> {evaluation.state.value} "
+                f"[{evaluation.setup_name}]: {evaluation.reason}"
+            ),
+            transition.as_dict(),
+            evaluation.simulation_time_us,
         )
 
     def _timeline_midpoint_x2(self) -> int | None:

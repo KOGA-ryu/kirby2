@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from kirby2.exchange import OrderBook, Side
 
@@ -358,7 +358,11 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._started = True
         self._schedule_next_arrival()
 
-    def advance_to(self, simulation_time_us: int) -> tuple[FlowEvent, ...]:
+    def advance_to(
+        self,
+        simulation_time_us: int,
+        on_event: Callable[[FlowEvent], None] | None = None,
+    ) -> tuple[FlowEvent, ...]:
         if type(simulation_time_us) is not int:
             raise TypeError("simulation time must be integer microseconds")
         if simulation_time_us < self.clock.current_time_us:
@@ -376,9 +380,10 @@ class RegimeOrderFlow(SyntheticOrderFlow):
                 raise RuntimeError("scheduled regime arrival lacks family weights")
             self.clock.advance_to(arrival_time_us)
             family = _FAMILIES[self.rng.weighted_float_index(weights)]
-            self._flow_events.append(
-                self._apply_arrival(len(self._flow_events) + 1, family)
-            )
+            event = self._apply_arrival(len(self._flow_events) + 1, family)
+            self._flow_events.append(event)
+            if on_event is not None:
+                on_event(event)
             self._schedule_next_arrival()
 
         self.clock.advance_to(simulation_time_us)

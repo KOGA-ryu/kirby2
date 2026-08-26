@@ -8,6 +8,7 @@ from pathlib import Path
 
 from kirby2.scenarios import ScenarioDefinition
 from kirby2.simulation import LiquidityPreset, VolumePreset
+from kirby2.strategy import parse_strategy
 
 from .layouts import HotkeyLayout
 from .live import LiveMarketSession
@@ -27,6 +28,7 @@ class SessionRecording:
     initial_quantity: int
     quantity_options: tuple[int, ...]
     layout: HotkeyLayout
+    strategy_source: str | None
     auto_start: bool
     input_records: tuple[InputRecord, ...]
     market_states: tuple[MarketStateRecord, ...]
@@ -75,6 +77,11 @@ class SessionRecording:
             initial_quantity=session.initial_quantity,
             quantity_options=session.quantity_options,
             layout=layout,
+            strategy_source=(
+                None
+                if session.strategy_definition is None
+                else session.strategy_definition.source
+            ),
             auto_start=auto_start,
             input_records=session.input_records,
             market_states=session.market_states,
@@ -103,6 +110,7 @@ class SessionRecording:
             "scenario_definition": self.scenario_definition,
             "schema_version": RECORDING_SCHEMA_VERSION,
             "seed": self.seed,
+            "strategy_source": self.strategy_source,
         }
 
     def save(self, path: Path) -> Path:
@@ -150,6 +158,11 @@ class SessionRecording:
             initial_quantity=int(payload["initial_quantity"]),
             quantity_options=tuple(int(value) for value in quantities),
             layout=HotkeyLayout.from_dict(layout),
+            strategy_source=(
+                None
+                if payload.get("strategy_source") is None
+                else str(payload["strategy_source"])
+            ),
             auto_start=bool(payload["auto_start"]),
             input_records=tuple(
                 InputRecord.from_dict(item) for item in inputs  # type: ignore[arg-type]
@@ -205,6 +218,11 @@ class ReplayReport:
 
 def replay_recording(recording: SessionRecording) -> ReplayReport:
     definition = ScenarioDefinition.from_dict(recording.scenario_definition)
+    strategy_definition = (
+        None
+        if recording.strategy_source is None
+        else parse_strategy(recording.strategy_source)
+    )
     session = LiveMarketSession(
         definition,
         seed=recording.seed,
@@ -213,6 +231,7 @@ def replay_recording(recording: SessionRecording) -> ReplayReport:
         liquidity=recording.liquidity,
         initial_quantity=recording.initial_quantity,
         quantity_options=recording.quantity_options,
+        strategy_definition=strategy_definition,
     )
     if recording.auto_start:
         session.start()
