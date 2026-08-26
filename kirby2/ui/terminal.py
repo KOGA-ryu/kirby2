@@ -67,6 +67,17 @@ def render_terminal_frame(
         f"SETUP {snapshot.traffic_setup or '-'}"
     )
     traffic_reason = f"TRAFFIC WHY  {snapshot.traffic_reason}"
+    objective = (
+        "OBJECTIVE none"
+        if snapshot.objective_type is None
+        else (
+            f"OBJECTIVE {snapshot.objective_type}  "
+            f"{snapshot.objective_completed_quantity}/"
+            f"{snapshot.objective_target_quantity} "
+            f"({snapshot.objective_completion_percentage}%)  "
+            f"LIMIT {_elapsed_time(snapshot.objective_time_limit_us or 0)}"
+        )
+    )
     account = (
         f"POSITION {snapshot.position:+d}  BOUGHT {snapshot.bought_quantity}  "
         f"SOLD {snapshot.sold_quantity}  ORDER QTY {snapshot.selected_quantity}  "
@@ -83,6 +94,7 @@ def render_terminal_frame(
         configuration[:width],
         traffic[:width],
         traffic_reason[:width],
+        objective[:width],
         account[:width],
         "",
     ]

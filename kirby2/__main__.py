@@ -56,6 +56,25 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
+
+
+def _objective_type(value: str):
+    from kirby2.session.objectives import ObjectiveType
+
+    try:
+        return ObjectiveType.parse(value)
+    except ValueError as error:
+        allowed = ", ".join(item.value.lower() for item in ObjectiveType)
+        raise argparse.ArgumentTypeError(
+            f"unknown objective; choose one of: {allowed}"
+        ) from error
+
+
 def _positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
@@ -186,6 +205,14 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="observable-only traffic-light rule file",
     )
+    ui.add_argument(
+        "--objective",
+        type=_objective_type,
+        default=_objective_type("observe_only"),
+    )
+    ui.add_argument("--target-quantity", type=_nonnegative_int)
+    ui.add_argument("--objective-seconds", type=_positive_int)
+    ui.add_argument("--preferred-slippage-ticks", type=_nonnegative_int)
 
     strategy = subcommands.add_parser(
         "strategy",
@@ -209,6 +236,12 @@ def _parser() -> argparse.ArgumentParser:
 
     replay = subcommands.add_parser("replay", help="replay a recorded execution session")
     replay.add_argument("recording", type=Path)
+
+    report = subcommands.add_parser(
+        "report",
+        help="replay and score a recorded training session",
+    )
+    report.add_argument("recording", type=Path)
 
     timeline = subcommands.add_parser(
         "timeline",
@@ -317,7 +350,9 @@ def main() -> None:
         from kirby2.session.bindings import SessionCommand
         from kirby2.session.layouts import HotkeyLayout, LayoutStore
         from kirby2.session.live import LiveMarketSession
+        from kirby2.session.objectives import ObjectiveType, SessionObjective
         from kirby2.session.replay import SessionRecording
+        from kirby2.session.scoring import build_session_report
         from kirby2.ui import TerminalUiConfig, run_terminal_ui
 
         store = LayoutStore(args.layout_dir)
@@ -337,6 +372,31 @@ def main() -> None:
         strategy_definition = (
             None if args.strategy is None else _load_strategy_file(args.strategy)
         )
+        target_quantity = (
+            0 if args.target_quantity is None else args.target_quantity
+        )
+        preferred_slippage_ticks = (
+            0
+            if args.objective is ObjectiveType.OBSERVE_ONLY
+            and args.preferred_slippage_ticks is None
+            else (
+                2
+                if args.preferred_slippage_ticks is None
+                else args.preferred_slippage_ticks
+            )
+        )
+        try:
+            objective = SessionObjective(
+                objective_type=args.objective,
+                target_quantity=target_quantity,
+                time_limit_us=(args.objective_seconds or args.seconds) * 1_000_000,
+                preferred_slippage_ticks=preferred_slippage_ticks,
+            )
+            if objective.time_limit_us > args.seconds * 1_000_000:
+                raise ValueError("objective time limit cannot exceed session duration")
+        except ValueError as error:
+            print(f"OBJECTIVE_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
         session = LiveMarketSession(
             definition,
             seed=args.seed,
@@ -345,6 +405,7 @@ def main() -> None:
             liquidity=args.liquidity,
             initial_quantity=args.quantity,
             strategy_definition=strategy_definition,
+            objective=objective,
         )
         run_terminal_ui(
             session,
@@ -365,15 +426,17 @@ def main() -> None:
             )
             print(f"STATE_SHA256 {recording.expected_state_sha256}")
             print(f"TIMELINE_SHA256 {recording.expected_timeline_sha256}")
+        print(build_session_report(session).render())
         return
 
-    if args.command in {"replay", "timeline"}:
+    if args.command in {"replay", "timeline", "report"}:
         from kirby2.session.records import TimelineKind
         from kirby2.session.replay import (
             SessionRecording,
             TimelineInspector,
             replay_recording,
         )
+        from kirby2.session.scoring import build_session_report
 
         recording = SessionRecording.load(args.recording)
         report = replay_recording(recording)
@@ -381,7 +444,7 @@ def main() -> None:
             print("KIRBY2_SESSION_REPLAY")
             print(json.dumps(report.summary(), sort_keys=True, separators=(",", ":")))
             print(f"SESSION_REPLAY {'PASS' if report.passed else 'FAIL'}")
-        else:
+        elif args.command == "timeline":
             kinds = (
                 {TimelineKind(value.upper()) for value in args.kind}
                 if args.kind
@@ -398,6 +461,13 @@ def main() -> None:
                 f"TIMELINE_REPLAY {'PASS' if report.passed else 'FAIL'} "
                 f"records={len(report.session.timeline)}"
             )
+        else:
+            try:
+                training_report = build_session_report(report.session)
+            except ValueError as error:
+                print(f"REPORT_ERROR {error}", file=sys.stderr)
+                raise SystemExit(2) from error
+            print(training_report.render())
         if not report.passed:
             raise SystemExit(1)
         return

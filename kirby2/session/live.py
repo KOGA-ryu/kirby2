@@ -26,7 +26,9 @@ from kirby2.strategy import (
 )
 
 from .bindings import BindingMap, SessionCommand
+from .objectives import SessionObjective
 from .records import InputRecord, MarketStateRecord, TimelineKind, TimelineRecord
+from .scoring import ExecutionTracker
 
 
 DEFAULT_QUANTITIES = (25, 50, 100, 200, 500, 1_000, 2_000)
@@ -84,6 +86,11 @@ class SessionSnapshot:
     traffic_light: str
     traffic_setup: str | None
     traffic_reason: str
+    objective_type: str | None
+    objective_target_quantity: int
+    objective_completed_quantity: int
+    objective_completion_percentage: str
+    objective_time_limit_us: int | None
     status_message: str
     exchange_event_sequence: int
     market_state_id: str
@@ -110,6 +117,7 @@ class LiveMarketSession:
         initial_quantity: int = 100,
         quantity_options: tuple[int, ...] = DEFAULT_QUANTITIES,
         strategy_definition: StrategyDefinition | None = None,
+        objective: SessionObjective | None = None,
     ) -> None:
         if type(duration_seconds) is not int or duration_seconds <= 0:
             raise ValueError("session duration must be a positive integer")
@@ -129,6 +137,7 @@ class LiveMarketSession:
         self.liquidity = liquidity
         self.quantity_options = quantity_options
         self.strategy_definition = strategy_definition
+        self.objective = objective
         self._initial_quantity = initial_quantity
         self._quantity_index = quantity_options.index(initial_quantity)
         self._order_sequence = 0
@@ -141,6 +150,9 @@ class LiveMarketSession:
         self.engine: RegimeOrderFlow
         self.dimensions: ScenarioDimensions
         self._traffic_runtime: TrafficLightRuntime | None
+        self._execution_tracker: ExecutionTracker | None
+        if objective is not None and objective.time_limit_us > self.duration_us:
+            raise ValueError("objective time limit cannot exceed session duration")
         self.reset()
 
     @property
@@ -166,6 +178,10 @@ class LiveMarketSession:
     @property
     def timeline(self) -> tuple[TimelineRecord, ...]:
         return tuple(self._timeline)
+
+    @property
+    def execution_tracker(self) -> ExecutionTracker | None:
+        return self._execution_tracker
 
     def start(self) -> None:
         if self.complete:
@@ -198,6 +214,21 @@ class LiveMarketSession:
         self._latest_market_state_time_us = 0
         self._timeline_best_bid = self.engine.book.best_bid
         self._timeline_best_ask = self.engine.book.best_ask
+        self._execution_tracker = None
+        if self.objective is not None:
+            self._execution_tracker = ExecutionTracker(
+                self.objective,
+                self.engine.book,
+            )
+            self._append_timeline(
+                TimelineKind.OBJECTIVE,
+                f"OBJECTIVE START: {self.objective.describe()}",
+                {
+                    "objective": self.objective.as_dict(),
+                    "progress": self._execution_tracker.progress().as_dict(),
+                },
+                self.simulation_time_us,
+            )
         self._traffic_runtime = None
         if self.strategy_definition is not None:
             self._traffic_runtime = TrafficLightRuntime(
@@ -224,6 +255,16 @@ class LiveMarketSession:
             self.running = False
             self.complete = True
             self.status_message = "SESSION COMPLETE"
+            if self._execution_tracker is not None:
+                self._append_timeline(
+                    TimelineKind.OBJECTIVE,
+                    "OBJECTIVE SESSION END",
+                    {
+                        "objective": self.objective.as_dict(),  # type: ignore[union-attr]
+                        "progress": self._execution_tracker.progress().as_dict(),
+                    },
+                    target,
+                )
         return flow_events
 
     def handle_input(self, key: str, bindings: BindingMap) -> InputRecord:
@@ -345,6 +386,11 @@ class LiveMarketSession:
             if self._traffic_runtime is None
             else self._traffic_runtime.current
         )
+        objective_progress = (
+            None
+            if self._execution_tracker is None
+            else self._execution_tracker.progress()
+        )
         return SessionSnapshot(
             scenario_name=self.definition.name,
             regime=self.definition.regime.value,
@@ -367,6 +413,25 @@ class LiveMarketSession:
             traffic_setup=None if traffic is None else traffic.setup_name,
             traffic_reason=(
                 "No strategy rule file loaded" if traffic is None else traffic.reason
+            ),
+            objective_type=(
+                None
+                if self.objective is None
+                else self.objective.objective_type.value
+            ),
+            objective_target_quantity=(
+                0 if objective_progress is None else objective_progress.target_quantity
+            ),
+            objective_completed_quantity=(
+                0 if objective_progress is None else objective_progress.completed_quantity
+            ),
+            objective_completion_percentage=(
+                "0"
+                if objective_progress is None
+                else str(objective_progress.completion_percentage)
+            ),
+            objective_time_limit_us=(
+                None if self.objective is None else self.objective.time_limit_us
             ),
             status_message=self.status_message,
             exchange_event_sequence=len(self.engine.book.journal.events),
@@ -397,6 +462,13 @@ class LiveMarketSession:
             payload["traffic_light"] = {
                 "evaluation": current.as_dict(),
                 "strategy": self.strategy_definition.as_dict(),  # type: ignore[union-attr]
+            }
+        if self._execution_tracker is not None:
+            payload["training_objective"] = {
+                "metrics": self._execution_tracker.metrics(
+                    self.simulation_time_us
+                ).as_dict(),
+                "objective": self.objective.as_dict(),  # type: ignore[union-attr]
             }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -446,6 +518,8 @@ class LiveMarketSession:
             OrderOwner.PLAYER,
         )
         self._order_submitted_at[order.order_id] = self.simulation_time_us
+        if self._execution_tracker is not None:
+            self._execution_tracker.register_order(order, self.simulation_time_us)
         exchange_events = self.engine.book.process(order)
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
         return self._order_outcome(command, order)
@@ -463,6 +537,8 @@ class LiveMarketSession:
             OrderOwner.PLAYER,
         )
         self._order_submitted_at[order.order_id] = self.simulation_time_us
+        if self._execution_tracker is not None:
+            self._execution_tracker.register_order(order, self.simulation_time_us)
         exchange_events = self.engine.book.process(order)
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
         return self._order_outcome(command, order)
@@ -512,6 +588,8 @@ class LiveMarketSession:
         submitted_at = self._order_submitted_at.get(target.order_id, self.simulation_time_us)
         cancel_latency_us = self.simulation_time_us - submitted_at
         exchange_events = self.engine.book.cancel(target.order_id, self._next_cancel_id())
+        if self._execution_tracker is not None:
+            self._execution_tracker.record_cancel()
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
         return self._outcome(
             command,
@@ -543,6 +621,8 @@ class LiveMarketSession:
                 order.order_id,
                 self._next_cancel_id(),
             )
+            if self._execution_tracker is not None:
+                self._execution_tracker.record_cancel()
             self._consume_exchange_activity(exchange_events, self.simulation_time_us)
             order_ids.append(order.order_id)
             cancel_timings.append(
@@ -584,12 +664,19 @@ class LiveMarketSession:
         )
         submitted_at = self._order_submitted_at.get(target.order_id, self.simulation_time_us)
         replace_latency_us = self.simulation_time_us - submitted_at
+        if self._execution_tracker is not None:
+            self._execution_tracker.register_order(
+                replacement,
+                self.simulation_time_us,
+            )
         exchange_events = self.engine.book.replace(
             target.order_id,
             replacement,
             self._next_cancel_id(),
         )
         self._order_submitted_at[replacement.order_id] = self.simulation_time_us
+        if self._execution_tracker is not None:
+            self._execution_tracker.record_replace()
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
         return self._outcome(
             command,
@@ -792,6 +879,23 @@ class LiveMarketSession:
         self._capture_player_fill_status(captured)
         self._capture_timeline_activity(captured, simulation_time_us)
         self._update_traffic(captured, simulation_time_us)
+        if self._execution_tracker is not None:
+            completed_now = self._execution_tracker.observe_exchange_activity(
+                simulation_time_us,
+                captured,
+                self.engine.book,
+            )
+            if completed_now:
+                progress = self._execution_tracker.progress()
+                self._append_timeline(
+                    TimelineKind.OBJECTIVE,
+                    (
+                        f"OBJECTIVE COMPLETE qty={progress.completed_quantity} "
+                        f"time_us={progress.completion_time_us}"
+                    ),
+                    {"progress": progress.as_dict()},
+                    simulation_time_us,
+                )
 
     def _capture_exchange_trades(
         self,
@@ -947,6 +1051,10 @@ class LiveMarketSession:
             if current is None:
                 raise RuntimeError("configured traffic runtime lacks an evaluation")
             snapshot["traffic_light"] = current.as_dict()
+        if self._execution_tracker is not None:
+            snapshot["objective_progress"] = (
+                self._execution_tracker.progress().as_dict()
+            )
         record = MarketStateRecord(
             state_id=state_id,
             simulation_time_us=self.simulation_time_us,
@@ -969,6 +1077,10 @@ class LiveMarketSession:
             if current is None:
                 raise RuntimeError("configured traffic runtime lacks an evaluation")
             payload["traffic_light"] = current.as_dict()
+        if self._execution_tracker is not None:
+            payload["objective_progress"] = (
+                self._execution_tracker.progress().as_dict()
+            )
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"MS-{digest[:20]}"

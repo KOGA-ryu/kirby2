@@ -17,6 +17,7 @@ class TimelineKind(str, Enum):
     CANCEL = "CANCEL"
     REPLACE = "REPLACE"
     TRAFFIC = "TRAFFIC"
+    OBJECTIVE = "OBJECTIVE"
     MID = "MID"
     BOOK = "BOOK"
 

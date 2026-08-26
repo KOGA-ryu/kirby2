@@ -12,6 +12,7 @@ from kirby2.strategy import parse_strategy
 
 from .layouts import HotkeyLayout
 from .live import LiveMarketSession
+from .objectives import SessionObjective
 from .records import InputRecord, MarketStateRecord, TimelineKind, TimelineRecord
 
 
@@ -29,6 +30,7 @@ class SessionRecording:
     quantity_options: tuple[int, ...]
     layout: HotkeyLayout
     strategy_source: str | None
+    objective: SessionObjective | None
     auto_start: bool
     input_records: tuple[InputRecord, ...]
     market_states: tuple[MarketStateRecord, ...]
@@ -82,6 +84,7 @@ class SessionRecording:
                 if session.strategy_definition is None
                 else session.strategy_definition.source
             ),
+            objective=session.objective,
             auto_start=auto_start,
             input_records=session.input_records,
             market_states=session.market_states,
@@ -104,6 +107,7 @@ class SessionRecording:
             "layout": self.layout.as_dict(),
             "liquidity": self.liquidity.value,
             "market_states": [state.as_dict() for state in self.market_states],
+            "objective": None if self.objective is None else self.objective.as_dict(),
             "quantity_options": list(self.quantity_options),
             "record_type": "kirby2_session_recording",
             "relative_volume": self.relative_volume.value,
@@ -137,6 +141,7 @@ class SessionRecording:
         inputs = payload.get("inputs")
         market_states = payload.get("market_states")
         quantities = payload.get("quantity_options")
+        objective = payload.get("objective")
         if not isinstance(scenario, dict):
             raise ValueError("recording scenario definition must be an object")
         if not isinstance(layout, dict):
@@ -149,6 +154,8 @@ class SessionRecording:
             raise ValueError("every recorded market state must be an object")
         if not isinstance(quantities, list):
             raise ValueError("recording quantity options must be an array")
+        if objective is not None and not isinstance(objective, dict):
+            raise ValueError("recording objective must be an object or null")
         return cls(
             scenario_definition=dict(scenario),
             seed=int(payload["seed"]),
@@ -162,6 +169,11 @@ class SessionRecording:
                 None
                 if payload.get("strategy_source") is None
                 else str(payload["strategy_source"])
+            ),
+            objective=(
+                None
+                if objective is None
+                else SessionObjective.from_dict(objective)
             ),
             auto_start=bool(payload["auto_start"]),
             input_records=tuple(
@@ -232,6 +244,7 @@ def replay_recording(recording: SessionRecording) -> ReplayReport:
         initial_quantity=recording.initial_quantity,
         quantity_options=recording.quantity_options,
         strategy_definition=strategy_definition,
+        objective=recording.objective,
     )
     if recording.auto_start:
         session.start()
