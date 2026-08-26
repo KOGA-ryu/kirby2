@@ -201,6 +201,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     probe_intensity.add_argument("--seed", type=int, default=42)
 
+    features = subcommands.add_parser(
+        "features",
+        help="print a compact causal microstructure feature stream",
+    )
+    features.add_argument(
+        "--scenario",
+        default="absorption",
+        help="accepted scenario name; absorption aliases absorption_bid",
+    )
+    features.add_argument("--seed", type=int, default=42)
+    features.add_argument("--seconds", type=_positive_int, default=5)
+    features.add_argument("--interval-ms", type=_positive_int, default=250)
+    features.add_argument("--catalog", action="store_true")
+
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
         "name",
@@ -608,6 +622,79 @@ def main() -> None:
                 )
             )
         print("IMBALANCE_PROBE PASS bounded=true hidden_regime_to_strategy=false")
+        return
+
+    if args.command == "features":
+        from kirby2.features import (
+            FEATURE_CATALOG,
+            FeatureKey,
+            feature_catalog_sha256,
+            inspect_scenario_features,
+        )
+
+        scenario_name = (
+            "absorption_bid" if args.scenario.lower() == "absorption" else args.scenario
+        )
+        try:
+            definition = get_scenario_definition(scenario_name)
+        except ValueError as error:
+            print(f"FEATURE_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        stream = inspect_scenario_features(
+            definition,
+            seed=args.seed,
+            seconds=args.seconds,
+            emit_interval_us=args.interval_ms * 1_000,
+        )
+        print(
+            f"KIRBY2_FEATURE_STREAM scenario={stream.scenario} seed={stream.seed} "
+            f"windows_us={','.join(str(value) for value in stream.windows_us)}"
+        )
+        print(
+            f"FEATURE_CATALOG count={len(FEATURE_CATALOG)} "
+            f"sha256={feature_catalog_sha256()}"
+        )
+        if args.catalog:
+            for key in FeatureKey:
+                print(
+                    "FEATURE_DEFINITION "
+                    + json.dumps(
+                        FEATURE_CATALOG[key].as_dict(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+        selected = (
+            "mid_price",
+            "microprice",
+            "spread_ticks",
+            "top_level_imbalance",
+            "multi_level_imbalance",
+            "trade_velocity_250ms",
+            "trade_velocity_1s",
+            "trade_velocity_5s",
+            "trade_imbalance_1s",
+            "cancel_velocity_bid_1s",
+            "cancel_velocity_ask_1s",
+            "short_term_return_1s",
+            "short_term_volatility_1s",
+            "price_velocity_1s",
+            "price_acceleration_1s",
+        )
+        for frame in stream.frames:
+            values = frame.as_dict()
+            print(
+                json.dumps(
+                    {
+                        "simulation_time_us": frame.simulation_time_us,
+                        **{key: values[key] for key in selected},
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print(f"FEATURE_STREAM_SHA256 {stream.replay_sha256()}")
+        print("FEATURE_INVARIANTS PASS causal=true hidden_future=false")
         return
 
     if args.command == "matrix":
