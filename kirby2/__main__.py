@@ -130,6 +130,36 @@ def _flow_model_names(value: str) -> tuple[str, ...]:
     return models
 
 
+def _integer_tuple(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be comma-separated integers") from error
+    if not values or len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("integer list must be nonempty and unique")
+    return values
+
+
+def _calibration_stages(value: str) -> tuple[int, ...]:
+    stages = _integer_tuple(value)
+    if stages != tuple(range(1, max(stages) + 1)) or max(stages) > 4:
+        raise argparse.ArgumentTypeError("stages must be contiguous from 1 through at most 4")
+    return stages
+
+
+def _parameter_assignment(value: str) -> tuple[str, float]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("fixed parameter must use NAME=VALUE")
+    name, raw_value = value.split("=", 1)
+    try:
+        parsed = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("fixed parameter value must be numeric") from error
+    if not name or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("fixed parameter name and finite value are required")
+    return name, parsed
+
+
 def _load_strategy_file(path: Path):
     from kirby2.strategy import RuleSyntaxError, parse_strategy
 
@@ -266,6 +296,32 @@ def _parser() -> argparse.ArgumentParser:
     )
     measure_compare.add_argument("--seed", type=int, default=42)
     measure_compare.add_argument("--seconds", type=_positive_int, default=30)
+
+    calibrate = subcommands.add_parser(
+        "calibrate",
+        help="fit a reusable market profile with deterministic staged search",
+    )
+    calibrate.add_argument(
+        "reference",
+        help="fixture:ID, scenario:NAME, normalized JSONL, or Kirby2 replay JSONL",
+    )
+    calibrate.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="balanced",
+    )
+    calibrate.add_argument("--seconds", type=_positive_int)
+    calibrate.add_argument("--stages", type=_calibration_stages, default=(1, 2, 3, 4))
+    calibrate.add_argument("--fit-seeds", type=_integer_tuple, default=(101, 202, 303))
+    calibrate.add_argument("--heldout-seeds", type=_integer_tuple, default=(404, 505))
+    calibrate.add_argument("--reference-seed", type=int, default=42)
+    calibrate.add_argument("--search-seed", type=int, default=17)
+    calibrate.add_argument("--candidates", type=_positive_int, default=24)
+    calibrate.add_argument("--fixed", type=_parameter_assignment, action="append", default=[])
+    calibrate.add_argument("--profile-id", default="calibrated_market_v1")
+    calibrate.add_argument("--output", type=Path, help="optional calibrated profile JSON path")
+    calibrate.add_argument("--record", type=Path, help="optional full calibration-run JSON path")
+    calibrate.add_argument("--require-heldout-improvement", action="store_true")
 
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
@@ -928,6 +984,98 @@ def main() -> None:
             "equivalence_claimed=false"
         )
         print("MEASUREMENT_INVARIANTS PASS units=true sample_counts=true")
+        return
+
+    if args.command == "calibrate":
+        from kirby2.calibration import (
+            CalibrationConfig,
+            calibrate_market,
+            resolve_measurement_source,
+        )
+
+        try:
+            reference_stream = resolve_measurement_source(
+                args.reference,
+                seed=args.reference_seed,
+                seconds=args.seconds or 30,
+            )
+            if args.seconds is None:
+                if reference_stream.duration_us % 1_000_000:
+                    raise ValueError(
+                        "reference duration is not whole seconds; pass --seconds"
+                    )
+                calibration_seconds = reference_stream.duration_us // 1_000_000
+            else:
+                calibration_seconds = args.seconds
+            fixed_parameters: dict[str, float] = {}
+            for name, value in args.fixed:
+                if name in fixed_parameters:
+                    raise ValueError(f"fixed parameter repeated: {name}")
+                fixed_parameters[name] = value
+            config = CalibrationConfig(
+                scenario_name=args.scenario,
+                seconds=calibration_seconds,
+                stages=args.stages,
+                fitting_seeds=args.fit_seeds,
+                heldout_seeds=args.heldout_seeds,
+                search_seed=args.search_seed,
+                candidate_count_per_stage=args.candidates,
+                profile_id=args.profile_id,
+                fixed_parameters=fixed_parameters,
+            )
+            run = calibrate_market(reference_stream, config)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            print(f"CALIBRATION_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+
+        print(
+            f"KIRBY2_CALIBRATION reference={run.reference_report.source_id} "
+            f"scenario={args.scenario} stages={','.join(map(str, args.stages))}"
+        )
+        for outcome in run.stage_outcomes:
+            print(
+                "STAGE "
+                + json.dumps(
+                    outcome.as_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        print(
+            "BEST_PARAMETERS "
+            + json.dumps(
+                run.market_profile.parameters,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(
+            f"FITTING_LOSS initial={run.initial_fitting.mean_loss:.9f} "
+            f"final={run.final_fitting.mean_loss:.9f}"
+        )
+        print(
+            f"HELDOUT_LOSS initial={run.initial_heldout.mean_loss:.9f} "
+            f"final={run.final_heldout.mean_loss:.9f} "
+            f"improvement={run.heldout_improvement:.9f}"
+        )
+        print(f"HELDOUT_GATE {'PASS' if run.heldout_improved else 'FAIL'}")
+        print(f"CALIBRATION_RUN_SHA256 {run.sha256()}")
+        print(f"MARKET_PROFILE {run.market_profile.canonical_json()}")
+        if args.output is not None:
+            args.output.write_text(
+                json.dumps(run.market_profile.as_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(f"MARKET_PROFILE_PATH {args.output.resolve()}")
+        if args.record is not None:
+            args.record.write_text(
+                json.dumps(run.as_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(f"CALIBRATION_RECORD_PATH {args.record.resolve()}")
+        print("CALIBRATION_INVARIANTS PASS bounded=true multi_seed=true heldout=true")
+        if args.require_heldout_improvement and not run.heldout_improved:
+            raise SystemExit(1)
         return
 
     if args.command == "matrix":

@@ -62,6 +62,7 @@ class NormalizedMarketEvent:
     aggressor_side: str | None = None
     remaining_quantity: int | None = None
     spread_ticks: int | None = None
+    placement_depth_ticks: int | None = None
     bid_levels: tuple[BookLevel, ...] = ()
     ask_levels: tuple[BookLevel, ...] = ()
 
@@ -79,6 +80,7 @@ class NormalizedMarketEvent:
             (self.price_ticks, "price_ticks", True),
             (self.remaining_quantity, "remaining_quantity", False),
             (self.spread_ticks, "spread_ticks", True),
+            (self.placement_depth_ticks, "placement_depth_ticks", False),
         ):
             if value is not None and (
                 type(value) is not int or value < (1 if positive else 0)
@@ -112,6 +114,7 @@ class NormalizedMarketEvent:
             "aggressor_side": self.aggressor_side,
             "maker_order_id": self.maker_order_id,
             "order_id": self.order_id,
+            "placement_depth_ticks": self.placement_depth_ticks,
             "price_ticks": self.price_ticks,
             "quantity": self.quantity,
             "remaining_quantity": self.remaining_quantity,
@@ -151,6 +154,7 @@ class NormalizedMarketEvent:
             aggressor_side=_optional_string(payload, "aggressor_side"),
             remaining_quantity=_optional_int(payload, "remaining_quantity"),
             spread_ticks=_optional_int(payload, "spread_ticks"),
+            placement_depth_ticks=_optional_int(payload, "placement_depth_ticks"),
             bid_levels=levels("bid_levels"),
             ask_levels=levels("ask_levels"),
         )

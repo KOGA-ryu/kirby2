@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from kirby2.simulation import (
     SimulationConfig,
     SimulationResult,
     VolumePreset,
+    WeightedDiscreteDistribution,
 )
 from kirby2.simulation.regimes import regime_profiles
 from kirby2.simulation.flow_models import FlowModel
@@ -280,6 +282,7 @@ def run_market_scenario(
     intraday_profile: IntradayProfile | None = None,
     intraday_window: IntradayWindow | None = None,
     observed_intraday_volume: ObservedVolumeCurve | None = None,
+    parameter_overrides: dict[str, Any] | None = None,
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
@@ -304,6 +307,7 @@ def run_market_scenario(
         intraday_profile=intraday_profile,
         intraday_window=intraday_window,
         observed_intraday_volume=observed_intraday_volume,
+        parameter_overrides=parameter_overrides,
     )
     simulation = engine.run(actual_seconds)
     return ScenarioRun(
@@ -327,6 +331,7 @@ def create_market_engine(
     intraday_profile: IntradayProfile | None = None,
     intraday_window: IntradayWindow | None = None,
     observed_intraday_volume: ObservedVolumeCurve | None = None,
+    parameter_overrides: dict[str, Any] | None = None,
 ) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
     actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
@@ -334,15 +339,49 @@ def create_market_engine(
         definition.relative_volume if relative_volume is None else relative_volume,
         definition.liquidity if liquidity is None else liquidity,
     )
-    intensity = float(definition.parameter_overrides.get("event_intensity", 1.0))
+    effective_overrides = {
+        **definition.parameter_overrides,
+        **(parameter_overrides or {}),
+    }
+    intensity = float(effective_overrides.get("event_intensity", 1.0))
     queue_distribution = (
         dimensions.queue_distribution(profile.initial_queue_sizes)
         if distribution_profile is None
         else distribution_profile.distribution(DistributionPurpose.QUEUE_DEPTH)
     )
+    queue_scale = float(effective_overrides.get("initial_queue_scale", 1.0))
+    if not math.isfinite(queue_scale) or queue_scale <= 0:
+        raise ValueError("initial_queue_scale must be finite and positive")
+    if queue_scale != 1.0:
+        if not isinstance(queue_distribution, WeightedDiscreteDistribution):
+            raise ValueError("initial_queue_scale requires a weighted discrete queue")
+        queue_distribution = WeightedDiscreteDistribution(
+            values=tuple(
+                max(1, round(value * queue_scale))
+                for value in queue_distribution.values
+            ),
+            weights=queue_distribution.weights,
+        )
+    initial_depth_scale = float(
+        effective_overrides.get("initial_depth_scale", 1.0)
+    )
+    if not math.isfinite(initial_depth_scale) or initial_depth_scale <= 0:
+        raise ValueError("initial_depth_scale must be finite and positive")
+    initial_half_spread_ticks = round(
+        float(effective_overrides.get("initial_half_spread_ticks", 1.0))
+    )
+    if initial_half_spread_ticks <= 0:
+        raise ValueError("initial_half_spread_ticks must round to a positive integer")
     config = SimulationConfig(
         initial_mid_ticks=definition.initial_mid_ticks,
-        initial_depth=dimensions.initial_depth(definition.initial_depth),
+        initial_depth=max(
+            1,
+            round(
+                dimensions.initial_depth(definition.initial_depth)
+                * initial_depth_scale
+            ),
+        ),
+        initial_half_spread_ticks=initial_half_spread_ticks,
         event_intensity=intensity,
         queue_size_distribution=queue_distribution,
     )
@@ -350,7 +389,7 @@ def create_market_engine(
         seed=actual_seed,
         regime=definition.regime,
         config=config,
-        parameter_overrides=definition.parameter_overrides,
+        parameter_overrides=effective_overrides,
         dimensions=dimensions,
         flow_model=flow_model,
         intensity_modifier=intensity_modifier,

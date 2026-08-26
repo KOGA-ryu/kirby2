@@ -64,6 +64,11 @@ def measure_stream(stream: NormalizedMarketStream) -> CalibrationReport:
     ]
     trade_sizes = [event.quantity for event in trades if event.quantity is not None]
     limit_sizes = [event.quantity for event in limits if event.quantity is not None]
+    placement_depths = [
+        event.placement_depth_ticks
+        for event in limits
+        if event.placement_depth_ticks is not None
+    ]
     cancel_sizes = [event.quantity for event in cancels if event.quantity is not None]
     inter_event_times = [
         current.timestamp_us - previous.timestamp_us
@@ -117,6 +122,17 @@ def measure_stream(stream: NormalizedMarketStream) -> CalibrationReport:
         if has_orders
         else _unavailable(
             "limit_order_size_distribution", "shares", "order events not supplied"
+        ),
+        _distribution_metric(
+            "limit_placement_depth_distribution",
+            "ticks_behind_same_side_touch",
+            placement_depths,
+        )
+        if has_orders
+        else _unavailable(
+            "limit_placement_depth_distribution",
+            "ticks_behind_same_side_touch",
+            "order events not supplied",
         ),
         _distribution_metric("cancel_size_distribution", "shares", cancel_sizes)
         if has_orders

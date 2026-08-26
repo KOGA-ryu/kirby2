@@ -278,9 +278,24 @@ class RegimePolicy:
             -1.0,
             min(1.0, mid_displacement_ticks(book, self.config.initial_mid_ticks) / 5.0),
         )
+        imbalance_feedback_scale = float(
+            self.parameter_overrides.get("imbalance_feedback_scale", 1.0)
+        )
+        trend_feedback_scale = float(
+            self.parameter_overrides.get("trend_feedback_scale", 1.0)
+        )
+        if any(
+            not math.isfinite(value)
+            for value in (imbalance_feedback_scale, trend_feedback_scale)
+        ):
+            raise ValueError("regime feedback scales must be finite")
         directional_signal = (
-            self.profile.imbalance_feedback * imbalance
-            + self.profile.trend_feedback * displacement
+            self.profile.imbalance_feedback
+            * imbalance_feedback_scale
+            * imbalance
+            + self.profile.trend_feedback
+            * trend_feedback_scale
+            * displacement
         )
         direction_weights = (0.40, -0.40, 1.00, -1.00, -0.50, 0.50)
         reversion_trend_weights = (0.80, -0.80, -1.00, 1.00, 0.00, 0.00)
@@ -307,6 +322,19 @@ class RegimePolicy:
                 * math.exp(exponent)
                 * self.dimensions.rate_scale(family)
             )
+            family_scale_key = (
+                "limit_rate_scale"
+                if family in {FlowEventFamily.LIMIT_BUY, FlowEventFamily.LIMIT_SELL}
+                else "market_rate_scale"
+                if family in {FlowEventFamily.MARKET_BUY, FlowEventFamily.MARKET_SELL}
+                else "cancel_rate_scale"
+            )
+            family_scale = float(
+                self.parameter_overrides.get(family_scale_key, 1.0)
+            )
+            if not math.isfinite(family_scale) or family_scale < 0:
+                raise ValueError(f"{family_scale_key} must be finite and nonnegative")
+            rate *= family_scale
             modifiers = self.intraday_modifiers
             if modifiers is not None:
                 rate *= modifiers.relative_volume * modifiers.event_intensity
@@ -568,6 +596,12 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         size = distribution.draw(self.rng)
         scale = float(self.policy.parameter_overrides.get("order_size_scale", 1.0))
         scale *= self.dimensions.order_size_scale(family)
+        family_scale_key = (
+            "market_size_scale"
+            if family in {FlowEventFamily.MARKET_BUY, FlowEventFamily.MARKET_SELL}
+            else "limit_size_scale"
+        )
+        scale *= float(self.policy.parameter_overrides.get(family_scale_key, 1.0))
         modifiers = self.policy.intraday_modifiers
         if modifiers is not None:
             scale *= (
@@ -582,9 +616,21 @@ class RegimeOrderFlow(SyntheticOrderFlow):
     def _draw_depth(self, family: FlowEventFamily) -> int:
         depth = self.policy.depth_distribution(family).draw(self.rng)
         modifiers = self.policy.intraday_modifiers
-        if modifiers is None:
-            return depth
-        return max(0, round((depth + 1) * modifiers.spread_tendency) - 1)
+        spread_scale = 1.0 if modifiers is None else modifiers.spread_tendency
+        placement_scale = float(
+            self.policy.parameter_overrides.get("placement_depth_scale", 1.0)
+        )
+        placement_offset = int(
+            self.policy.parameter_overrides.get("placement_depth_offset", 0)
+        )
+        if not math.isfinite(placement_scale) or placement_scale < 0:
+            raise ValueError("placement_depth_scale must be finite and nonnegative")
+        return max(
+            0,
+            round((depth + 1) * spread_scale * placement_scale)
+            - 1
+            + placement_offset,
+        )
 
     def _draw_initial_queue_size(self) -> int:
         size = super()._draw_initial_queue_size()

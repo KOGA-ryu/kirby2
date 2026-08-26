@@ -37,12 +37,28 @@ class _StreamBuilder:
             raise ValueError("normalized command lacks an order or command ID")
         target: str | None = None
         cancelled_quantity: int | None = None
+        placement_depth_ticks: int | None = None
         if order_type == OrderType.LIMIT.value:
+            side = Side(str(command["side"]))
+            price_ticks = int(command["price_ticks"])
+            best_same_side = (
+                self.book.best_bid if side is Side.BUY else self.book.best_ask
+            )
+            placement_depth_ticks = (
+                0
+                if best_same_side is None
+                else max(
+                    0,
+                    best_same_side - price_ticks
+                    if side is Side.BUY
+                    else price_ticks - best_same_side,
+                )
+            )
             order = Order.limit(
                 order_id,
-                Side(str(command["side"])),
+                side,
                 int(command["quantity"]),
-                int(command["price_ticks"]),
+                price_ticks,
             )
         elif order_type == OrderType.MARKET.value:
             order = Order.market(
@@ -75,6 +91,7 @@ class _StreamBuilder:
                 quantity=int(command["quantity"]),
                 price_ticks=int(command["price_ticks"]),
                 order_id=order_id,
+                placement_depth_ticks=placement_depth_ticks,
                 remaining_quantity=0 if active is None else active.remaining_quantity,
             )
         elif order_type == OrderType.MARKET.value:

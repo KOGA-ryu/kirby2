@@ -14,6 +14,7 @@
     "quantity": {"type": "integer", "minimum": 1},
     "remaining_quantity": {"type": "integer", "minimum": 0},
     "price_ticks": {"type": "integer", "minimum": 1},
+    "placement_depth_ticks": {"type": "integer", "minimum": 0},
     "spread_ticks": {"type": "integer", "minimum": 1},
     "order_id": {"type": "string", "minLength": 1},
     "target_order_id": {"type": "string", "minLength": 1},
