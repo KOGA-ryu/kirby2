@@ -13,6 +13,7 @@ from .clock import MICROSECONDS_PER_SECOND
 from .config import SimulationConfig
 from .distributions import WeightedDiscreteDistribution
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
+from .scaling import ScenarioDimensions
 
 
 class Regime(str, Enum):
@@ -234,10 +235,12 @@ class RegimePolicy:
         profile: RegimeProfile,
         config: SimulationConfig,
         parameter_overrides: dict[str, Any] | None = None,
+        dimensions: ScenarioDimensions | None = None,
     ) -> None:
         self.profile = profile
         self.config = config
         self.parameter_overrides = parameter_overrides or {}
+        self.dimensions = dimensions or ScenarioDimensions()
 
     def rates(self, book: OrderBook) -> dict[FlowEventFamily, float]:
         base_rates = self.config.rates
@@ -284,6 +287,7 @@ class RegimePolicy:
                 * profile_multiplier
                 * override
                 * math.exp(exponent)
+                * self.dimensions.rate_scale(family)
             )
             rates[family] = min(100.0, max(0.0, rate))
         return rates
@@ -300,9 +304,9 @@ class RegimePolicy:
 
     def depth_distribution(self, family: FlowEventFamily) -> WeightedDiscreteDistribution:
         if family is FlowEventFamily.LIMIT_BUY:
-            return self.profile.bid_depth
+            return self.dimensions.depth_distribution(self.profile.bid_depth)
         if family is FlowEventFamily.LIMIT_SELL:
-            return self.profile.ask_depth
+            return self.dimensions.depth_distribution(self.profile.ask_depth)
         raise ValueError("only limit flow has a placement depth")
 
 
@@ -313,11 +317,18 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         regime: Regime,
         config: SimulationConfig,
         parameter_overrides: dict[str, Any] | None = None,
+        dimensions: ScenarioDimensions | None = None,
     ) -> None:
         super().__init__(seed=seed, config=config)
         self.regime = regime
         self.profile = regime_profiles()[regime]
-        self.policy = RegimePolicy(self.profile, config, parameter_overrides)
+        self.dimensions = dimensions or ScenarioDimensions()
+        self.policy = RegimePolicy(
+            self.profile,
+            config,
+            parameter_overrides,
+            self.dimensions,
+        )
         self.observations: list[BookObservation] = []
 
     def run(self, seconds: int) -> SimulationResult:
@@ -362,6 +373,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         distribution = self.policy.size_distribution(family)
         size = distribution.draw(self.rng)
         scale = float(self.policy.parameter_overrides.get("order_size_scale", 1.0))
+        scale *= self.dimensions.order_size_scale(family)
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError("order_size_scale must be finite and positive")
         return max(1, round(size * scale))

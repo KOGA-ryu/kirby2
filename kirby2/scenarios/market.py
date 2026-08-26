@@ -10,10 +10,13 @@ from typing import Any
 from kirby2.exchange import Side
 from kirby2.simulation import (
     BookObservation,
+    LiquidityPreset,
     Regime,
     RegimeOrderFlow,
+    ScenarioDimensions,
     SimulationConfig,
     SimulationResult,
+    VolumePreset,
 )
 from kirby2.simulation.regimes import regime_profiles
 
@@ -29,6 +32,8 @@ class ScenarioDefinition:
     duration_seconds: int
     initial_mid_ticks: int
     initial_depth: int
+    relative_volume: VolumePreset
+    liquidity: LiquidityPreset
     parameter_overrides: dict[str, Any]
     accepted_replay_sha256: str
     behavioral_envelope: dict[str, dict[str, float]]
@@ -42,6 +47,10 @@ class ScenarioDefinition:
             duration_seconds=int(data["duration_seconds"]),
             initial_mid_ticks=int(data["initial_mid_ticks"]),
             initial_depth=int(data["initial_depth"]),
+            relative_volume=VolumePreset.parse(
+                str(data.get("relative_volume", "1.00x"))
+            ),
+            liquidity=LiquidityPreset.parse(str(data.get("liquidity", "NORMAL"))),
             parameter_overrides=dict(data.get("parameter_overrides", {})),
             accepted_replay_sha256=str(data["accepted_replay_sha256"]),
             behavioral_envelope={
@@ -67,6 +76,7 @@ class ScenarioRun:
     duration_seconds: int
     simulation: SimulationResult
     observations: tuple[BookObservation, ...]
+    dimensions: ScenarioDimensions
 
     def replay_json_lines(self) -> str:
         return self.simulation.replay_json_lines()
@@ -178,12 +188,14 @@ class ScenarioRun:
             "executed_buy_volume": executed_buy_volume,
             "executed_sell_volume": executed_sell_volume,
             "invariant_status": "PASS",
+            "liquidity": self.dimensions.liquidity.value,
             "max_spread_ticks": max(spreads) if spreads else None,
             "midpoint_displacement_ticks": round(midpoint_displacements[-1], 3)
             if midpoint_displacements
             else 0.0,
             "price_displacement_ticks": displacement,
             "replay_sha256": self.simulation.replay_sha256(),
+            "relative_volume": self.dimensions.volume.value,
             "seed": self.seed,
             "side_empty_fraction": round(
                 sum(
@@ -234,22 +246,29 @@ def run_market_scenario(
     definition: ScenarioDefinition,
     seed: int | None = None,
     seconds: int | None = None,
+    relative_volume: VolumePreset | None = None,
+    liquidity: LiquidityPreset | None = None,
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
     profile = regime_profiles()[definition.regime]
+    dimensions = ScenarioDimensions(
+        definition.relative_volume if relative_volume is None else relative_volume,
+        definition.liquidity if liquidity is None else liquidity,
+    )
     intensity = float(definition.parameter_overrides.get("event_intensity", 1.0))
     config = SimulationConfig(
         initial_mid_ticks=definition.initial_mid_ticks,
-        initial_depth=definition.initial_depth,
+        initial_depth=dimensions.initial_depth(definition.initial_depth),
         event_intensity=intensity,
-        queue_size_distribution=profile.initial_queue_sizes,
+        queue_size_distribution=dimensions.queue_distribution(profile.initial_queue_sizes),
     )
     engine = RegimeOrderFlow(
         seed=actual_seed,
         regime=definition.regime,
         config=config,
         parameter_overrides=definition.parameter_overrides,
+        dimensions=dimensions,
     )
     simulation = engine.run(actual_seconds)
     return ScenarioRun(
@@ -258,6 +277,7 @@ def run_market_scenario(
         duration_seconds=actual_seconds,
         simulation=simulation,
         observations=tuple(engine.observations),
+        dimensions=dimensions,
     )
 
 

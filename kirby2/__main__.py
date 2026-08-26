@@ -12,8 +12,15 @@ from kirby2.scenarios import (
     load_scenario_definitions,
     run_demo,
     run_market_scenario,
+    run_scenario_matrix,
 )
-from kirby2.simulation import EventRates, SimulationConfig, run_simulation
+from kirby2.simulation import (
+    EventRates,
+    LiquidityPreset,
+    SimulationConfig,
+    VolumePreset,
+    run_simulation,
+)
 
 
 def _decimal(value: str) -> Decimal:
@@ -24,6 +31,20 @@ def _decimal(value: str) -> Decimal:
     if not parsed.is_finite() or parsed <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
+
+
+def _volume_preset(value: str) -> VolumePreset:
+    try:
+        return VolumePreset.parse(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _liquidity_preset(value: str) -> LiquidityPreset:
+    try:
+        return LiquidityPreset.parse(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -61,6 +82,16 @@ def _parser() -> argparse.ArgumentParser:
     scenario.add_argument("--seed", type=int, help="override the accepted scenario seed")
     scenario.add_argument("--seconds", type=int, help="override the scenario duration")
     scenario.add_argument(
+        "--volume",
+        type=_volume_preset,
+        help="override the scenario relative-volume preset",
+    )
+    scenario.add_argument(
+        "--liquidity",
+        type=_liquidity_preset,
+        help="override the scenario displayed-liquidity preset",
+    )
+    scenario.add_argument(
         "--events-jsonl",
         type=Path,
         help="optional path for the raw replay stream; regime labels are omitted",
@@ -70,6 +101,14 @@ def _parser() -> argparse.ArgumentParser:
         "audit-scenarios",
         help="rerun accepted regime seeds, digests, invariants, and behavioral envelopes",
     )
+
+    matrix = subcommands.add_parser(
+        "matrix",
+        help="inspect all volume and liquidity combinations for one regime scenario",
+    )
+    matrix.add_argument("name", choices=sorted(load_scenario_definitions()))
+    matrix.add_argument("--seed", type=int, help="shared comparison seed")
+    matrix.add_argument("--seconds", type=int, default=30, help="duration of each matrix cell")
     return parser
 
 
@@ -81,7 +120,13 @@ def main() -> None:
 
     if args.command == "scenario":
         definition = get_scenario_definition(args.name)
-        result = run_market_scenario(definition, seed=args.seed, seconds=args.seconds)
+        result = run_market_scenario(
+            definition,
+            seed=args.seed,
+            seconds=args.seconds,
+            relative_volume=args.volume,
+            liquidity=args.liquidity,
+        )
         print(
             f"KIRBY2_SCENARIO name={definition.name} "
             f"seed={result.seed} seconds={result.duration_seconds}"
@@ -94,6 +139,31 @@ def main() -> None:
         else:
             print("RAW_REPLAY_STREAM available_via=ScenarioRun.replay_json_lines regime_label=OMITTED")
         print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "matrix":
+        definition = get_scenario_definition(args.name)
+        matrix = run_scenario_matrix(
+            definition,
+            seed=args.seed,
+            seconds=args.seconds,
+        )
+        print(
+            f"KIRBY2_MATRIX name={definition.name} "
+            f"seed={matrix.seed} seconds_per_cell={matrix.seconds}"
+        )
+        print(matrix.render())
+        failures = [
+            cell
+            for cell in matrix.cells
+            if cell.run.metrics()["invariant_status"] != "PASS"
+        ]
+        print(
+            f"MATRIX_INVARIANTS {'FAIL' if failures else 'PASS'} "
+            f"cells={len(matrix.cells)} failures={len(failures)}"
+        )
+        if failures:
+            raise SystemExit(1)
         return
 
     if args.command == "audit-scenarios":
