@@ -10,6 +10,19 @@ from .comparison import (
 )
 from .config import EventRates, SimulationConfig
 from .distributions import IntegerDistribution, WeightedDiscreteDistribution
+from .distribution_framework import (
+    CategoricalIntegerDistribution,
+    DistributionProfile,
+    DistributionPurpose,
+    EmpiricalIntegerDistribution,
+    FixedDistribution,
+    GammaIntegerDistribution,
+    GeometricIntegerDistribution,
+    IntegerSampleDistribution,
+    LognormalIntegerDistribution,
+    UniformIntegerDistribution,
+)
+from .distribution_inspection import DistributionInspection, inspect_distribution
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow, run_simulation
 from .flow_models import (
     FLOW_CHANNELS,
@@ -21,6 +34,12 @@ from .flow_models import (
     load_accepted_hawkes_configs,
 )
 from .regimes import BookObservation, Regime, RegimeOrderFlow, RegimePolicy, RegimeProfile
+from .distribution_profiles import (
+    absorption_distribution_profile,
+    balanced_distribution_profile,
+    distribution_profile_for_regime,
+    panic_distribution_profile,
+)
 from .queue_reactive import (
     BoundedLinearResponse,
     ChannelIntensity,
@@ -90,4 +109,20 @@ __all__ = [
     "default_queue_reactive_config",
     "imbalance_probe_state",
     "load_accepted_hawkes_configs",
+    "CategoricalIntegerDistribution",
+    "DistributionInspection",
+    "DistributionProfile",
+    "DistributionPurpose",
+    "EmpiricalIntegerDistribution",
+    "FixedDistribution",
+    "GammaIntegerDistribution",
+    "GeometricIntegerDistribution",
+    "IntegerSampleDistribution",
+    "LognormalIntegerDistribution",
+    "UniformIntegerDistribution",
+    "absorption_distribution_profile",
+    "balanced_distribution_profile",
+    "distribution_profile_for_regime",
+    "inspect_distribution",
+    "panic_distribution_profile",
 ]

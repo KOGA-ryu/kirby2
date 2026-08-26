@@ -24,6 +24,15 @@ class SeededRng:
         """Draw from [0, 1) using only this explicitly owned RNG."""
         return self._random.random()
 
+    def uniform(self, minimum: float, maximum: float) -> float:
+        return self._random.uniform(minimum, maximum)
+
+    def lognormal(self, mu: float, sigma: float) -> float:
+        return self._random.lognormvariate(mu, sigma)
+
+    def gamma(self, shape: float, scale: float) -> float:
+        return self._random.gammavariate(shape, scale)
+
     def weighted_index(self, weights: Sequence[int]) -> int:
         if not weights or any(type(weight) is not int or weight <= 0 for weight in weights):
             raise ValueError("weights must be positive integers")

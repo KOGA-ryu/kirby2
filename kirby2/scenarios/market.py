@@ -21,6 +21,10 @@ from kirby2.simulation import (
 from kirby2.simulation.regimes import regime_profiles
 from kirby2.simulation.flow_models import FlowModel
 from kirby2.simulation.queue_reactive import FlowIntensityModifier
+from kirby2.simulation.distribution_framework import (
+    DistributionProfile,
+    DistributionPurpose,
+)
 
 
 DEFINITIONS_PATH = Path(__file__).with_name("accepted_scenarios.json")
@@ -267,6 +271,7 @@ def run_market_scenario(
     liquidity: LiquidityPreset | None = None,
     flow_model: FlowModel | None = None,
     intensity_modifier: FlowIntensityModifier | None = None,
+    distribution_profile: DistributionProfile | None = None,
 ) -> ScenarioRun:
     actual_seed = definition.seed if seed is None else seed
     actual_seconds = definition.duration_seconds if seconds is None else seconds
@@ -277,6 +282,7 @@ def run_market_scenario(
         liquidity=liquidity,
         flow_model=flow_model,
         intensity_modifier=intensity_modifier,
+        distribution_profile=distribution_profile,
     )
     simulation = engine.run(actual_seconds)
     return ScenarioRun(
@@ -296,6 +302,7 @@ def create_market_engine(
     liquidity: LiquidityPreset | None = None,
     flow_model: FlowModel | None = None,
     intensity_modifier: FlowIntensityModifier | None = None,
+    distribution_profile: DistributionProfile | None = None,
 ) -> tuple[RegimeOrderFlow, ScenarioDimensions]:
     actual_seed = definition.seed if seed is None else seed
     profile = regime_profiles()[definition.regime]
@@ -304,11 +311,16 @@ def create_market_engine(
         definition.liquidity if liquidity is None else liquidity,
     )
     intensity = float(definition.parameter_overrides.get("event_intensity", 1.0))
+    queue_distribution = (
+        dimensions.queue_distribution(profile.initial_queue_sizes)
+        if distribution_profile is None
+        else distribution_profile.distribution(DistributionPurpose.QUEUE_DEPTH)
+    )
     config = SimulationConfig(
         initial_mid_ticks=definition.initial_mid_ticks,
         initial_depth=dimensions.initial_depth(definition.initial_depth),
         event_intensity=intensity,
-        queue_size_distribution=dimensions.queue_distribution(profile.initial_queue_sizes),
+        queue_size_distribution=queue_distribution,
     )
     engine = RegimeOrderFlow(
         seed=actual_seed,
@@ -318,6 +330,7 @@ def create_market_engine(
         dimensions=dimensions,
         flow_model=flow_model,
         intensity_modifier=intensity_modifier,
+        distribution_profile=distribution_profile,
     )
     return engine, dimensions
 

@@ -12,6 +12,11 @@ from kirby2.exchange import OrderBook, Side
 from .clock import MICROSECONDS_PER_SECOND
 from .config import SimulationConfig
 from .distributions import WeightedDiscreteDistribution
+from .distribution_framework import (
+    DistributionProfile,
+    DistributionPurpose,
+    IntegerSampleDistribution,
+)
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
 from .flow_models import FlowModel, SimpleFlowModel
 from .queue_reactive import FlowIntensityModifier, IntensityInspection
@@ -238,11 +243,13 @@ class RegimePolicy:
         config: SimulationConfig,
         parameter_overrides: dict[str, Any] | None = None,
         dimensions: ScenarioDimensions | None = None,
+        distribution_profile: DistributionProfile | None = None,
     ) -> None:
         self.profile = profile
         self.config = config
         self.parameter_overrides = parameter_overrides or {}
         self.dimensions = dimensions or ScenarioDimensions()
+        self.distribution_profile = distribution_profile
 
     def rates(self, book: OrderBook) -> dict[FlowEventFamily, float]:
         base_rates = self.config.rates
@@ -294,7 +301,14 @@ class RegimePolicy:
             rates[family] = min(100.0, max(0.0, rate))
         return rates
 
-    def size_distribution(self, family: FlowEventFamily) -> WeightedDiscreteDistribution:
+    def size_distribution(self, family: FlowEventFamily) -> IntegerSampleDistribution:
+        if self.distribution_profile is not None:
+            purpose = (
+                DistributionPurpose.TRADE_SIZE
+                if family in {FlowEventFamily.MARKET_BUY, FlowEventFamily.MARKET_SELL}
+                else DistributionPurpose.ORDER_SIZE
+            )
+            return self.distribution_profile.distribution(purpose)
         return {
             FlowEventFamily.LIMIT_BUY: self.profile.limit_buy_sizes,
             FlowEventFamily.LIMIT_SELL: self.profile.limit_sell_sizes,
@@ -304,7 +318,13 @@ class RegimePolicy:
             FlowEventFamily.CANCEL_ASK: NORMAL_SIZES,
         }[family]
 
-    def depth_distribution(self, family: FlowEventFamily) -> WeightedDiscreteDistribution:
+    def depth_distribution(self, family: FlowEventFamily) -> IntegerSampleDistribution:
+        if self.distribution_profile is not None:
+            if family not in {FlowEventFamily.LIMIT_BUY, FlowEventFamily.LIMIT_SELL}:
+                raise ValueError("only limit flow has a placement depth")
+            return self.distribution_profile.distribution(
+                DistributionPurpose.LIMIT_PLACEMENT_DEPTH
+            )
         if family is FlowEventFamily.LIMIT_BUY:
             return self.dimensions.depth_distribution(self.profile.bid_depth)
         if family is FlowEventFamily.LIMIT_SELL:
@@ -322,6 +342,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         dimensions: ScenarioDimensions | None = None,
         flow_model: FlowModel | None = None,
         intensity_modifier: FlowIntensityModifier | None = None,
+        distribution_profile: DistributionProfile | None = None,
     ) -> None:
         super().__init__(seed=seed, config=config)
         self.regime = regime
@@ -332,7 +353,9 @@ class RegimeOrderFlow(SyntheticOrderFlow):
             config,
             parameter_overrides,
             self.dimensions,
+            distribution_profile,
         )
+        self.distribution_profile = distribution_profile
         self.flow_model = flow_model or SimpleFlowModel()
         self.intensity_modifier = intensity_modifier
         self.last_intensity_inspection: IntensityInspection | None = None
@@ -427,6 +450,11 @@ class RegimeOrderFlow(SyntheticOrderFlow):
                 None
                 if self.intensity_modifier is None
                 else self.intensity_modifier.replay_config()
+            ),
+            distribution_profile_config=(
+                None
+                if self.distribution_profile is None
+                else self.distribution_profile.as_dict()
             ),
         )
 

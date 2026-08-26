@@ -215,6 +215,26 @@ def _parser() -> argparse.ArgumentParser:
     features.add_argument("--interval-ms", type=_positive_int, default=250)
     features.add_argument("--catalog", action="store_true")
 
+    inspect_distribution = subcommands.add_parser(
+        "inspect-distribution",
+        help="sample and summarize one regime-specific distribution",
+    )
+    inspect_distribution.add_argument(
+        "purpose",
+        choices=(
+            "order_size",
+            "trade_size",
+            "cancel_size",
+            "queue_depth",
+            "limit_placement_depth",
+            "inter_event_timing_modifier",
+            "spread_state_duration",
+        ),
+    )
+    inspect_distribution.add_argument("--scenario", default="balanced")
+    inspect_distribution.add_argument("--seed", type=int, default=42)
+    inspect_distribution.add_argument("--samples", type=_positive_int, default=10_000)
+
     scenario = subcommands.add_parser("scenario", help="run a deterministic market regime")
     scenario.add_argument(
         "name",
@@ -695,6 +715,42 @@ def main() -> None:
             )
         print(f"FEATURE_STREAM_SHA256 {stream.replay_sha256()}")
         print("FEATURE_INVARIANTS PASS causal=true hidden_future=false")
+        return
+
+    if args.command == "inspect-distribution":
+        from kirby2.simulation import (
+            DistributionPurpose,
+            distribution_profile_for_regime,
+            inspect_distribution,
+        )
+
+        try:
+            definition = get_scenario_definition(args.scenario)
+        except ValueError as error:
+            print(f"DISTRIBUTION_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        purpose = DistributionPurpose(args.purpose)
+        profile = distribution_profile_for_regime(definition.regime)
+        inspection = inspect_distribution(
+            profile,
+            purpose,
+            seed=args.seed,
+            sample_count=args.samples,
+        )
+        print(
+            f"KIRBY2_DISTRIBUTION_INSPECTION scenario={definition.name} "
+            f"purpose={purpose.value}"
+        )
+        print(
+            "CONFIG "
+            + json.dumps(
+                profile.distribution(purpose).as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(json.dumps(inspection.as_dict(), sort_keys=True, separators=(",", ":")))
+        print("DISTRIBUTION_INVARIANTS PASS integer_samples=true owned_rng=true")
         return
 
     if args.command == "matrix":
