@@ -1,0 +1,31 @@
+{
+  "decision_interval_milliseconds": 50,
+  "duration_seconds": 3,
+  "entry_side": "buy",
+  "exit_signals": [
+    "RED"
+  ],
+  "experiment_id": "momentum_rules_passive",
+  "fork_time_seconds": 1,
+  "mode": "PASSIVE_OBSERVER",
+  "quantity": 100,
+  "scenarios": [
+    "balanced",
+    "momentum_up"
+  ],
+  "schema_version": 1,
+  "seeds": [
+    42,
+    43
+  ],
+  "strategies": [
+    {
+      "name": "simple",
+      "rule_file": "../strategies/momentum_long.k2"
+    },
+    {
+      "name": "stateful",
+      "rule_file": "../strategies/momentum_stateful.k2"
+    }
+  ]
+}

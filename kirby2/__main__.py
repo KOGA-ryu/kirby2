@@ -404,6 +404,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     strategy.add_argument("rule_file", type=Path)
 
+    experiment = subcommands.add_parser(
+        "experiment",
+        help="run a controlled multi-seed strategy experiment",
+    )
+    experiment.add_argument("manifest", type=Path)
+    experiment.add_argument(
+        "--output",
+        type=Path,
+        help="new directory for resolved manifest, results, and complete replays",
+    )
+
     layout = subcommands.add_parser("layout", help="manage named hotkey layouts")
     layout_actions = layout.add_subparsers(dest="layout_action", required=True)
     layout_list = layout_actions.add_parser("list", help="list saved layouts")
@@ -549,6 +560,25 @@ def main() -> None:
                 + ",".join(feature.value for feature in PositionFeature)
             )
         print("STRATEGY_VALID PASS arbitrary_code=DISABLED hidden_regime=UNAVAILABLE")
+        return
+
+    if args.command == "experiment":
+        from kirby2.experiments import ExperimentManifest, run_strategy_experiment
+
+        try:
+            manifest = ExperimentManifest.load(args.manifest)
+            result = run_strategy_experiment(manifest)
+            output_directory = (
+                args.output
+                if args.output is not None
+                else Path(".kirby2") / "experiments" / manifest.experiment_id
+            )
+            result.save(output_directory)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"EXPERIMENT_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print(result.render())
+        print(f"ARTIFACT_DIRECTORY {output_directory.resolve()}")
         return
 
     if args.command == "historical":
