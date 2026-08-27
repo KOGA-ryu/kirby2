@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from kirby2.agents.models import PublicEcologyEvent
+from kirby2.agents.populations import BOUNDED_POPULATION_TEMPLATES
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
 from kirby2.auditlab.executors import (
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
+    ECOLOGY_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
     FRAGMENTED_RECORDING_TYPE,
     LATENCY_RECORDING_TYPE,
@@ -86,6 +89,7 @@ _IMPLEMENTED_EXECUTOR_LANES = (
     ExecutorLane.MECHANICS,
     ExecutorLane.LATENCY,
     ExecutorLane.FRAGMENTED,
+    ExecutorLane.ECOLOGY,
 )
 
 
@@ -151,6 +155,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _real_mechanics_executor_case(),
             _real_latency_executor_case(),
             _real_fragmented_executor_case(),
+            _real_ecology_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -1401,6 +1406,250 @@ def _real_fragmented_executor_case() -> ModelRiskLabAuditCase:
             "venue_ids": sorted(venue_ids),
         },
         () if passed else ("real fragmented-market executor proof failed",),
+    )
+
+
+def _real_ecology_executor_case() -> ModelRiskLabAuditCase:
+    expected_pairs = {
+        (str(population), count)
+        for population in AXES["agent_population"]
+        for count in range(1, 9)
+    }
+    selected: dict[tuple[str, int], GeneratedConfiguration] = {}
+    for configuration in generate_configurations(seed=771, budget=4_200):
+        pair = (configuration.agent_population, configuration.agent_count)
+        if (
+            configuration.lane is ExecutorLane.ECOLOGY
+            and configuration.replicate_index == 0
+            and pair in expected_pairs
+        ):
+            selected.setdefault(pair, configuration)
+    configurations = tuple(
+        selected[pair] for pair in sorted(expected_pairs) if pair in selected
+    )
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.ECOLOGY]
+    coverage = evidence_coverage_report(results)
+    ecology_coverage = coverage["lanes"][ExecutorLane.ECOLOGY.value]
+
+    observed_pairs: set[tuple[str, int]] = set()
+    public_digests: set[str] = set()
+    truth_digests: set[str] = set()
+    state_digests: set[str] = set()
+    event_record_types: set[str] = set()
+    observed_families: set[str] = set()
+    populations_with_seed_behavior_change: set[str] = set()
+    public_boundary_clean = True
+    native_definition_exact = True
+    event_backed_exercises = True
+    result_evidence: dict[str, object] = {}
+    tapes: dict[str, object] = {}
+    for result, repeat, replay in zip(results, repeated, replayed):
+        configuration = result.configuration
+        observed_pairs.add(
+            (configuration.agent_population, configuration.agent_count)
+        )
+        payload = thaw_json(result.recording.payload)
+        native = payload["native_recording"]
+        probe = payload["different_seed_probe"]
+        definition = native["population_definition"]
+        agents = definition["agents"]
+        families = [str(item["family"]) for item in agents]
+        observed_families.update(families)
+        expected_template = BOUNDED_POPULATION_TEMPLATES[
+            configuration.agent_population
+        ]
+        expected_counts = Counter(
+            expected_template[index % len(expected_template)].value
+            for index in range(configuration.agent_count)
+        )
+        actual_counts = Counter(families)
+        native_definition_exact = native_definition_exact and all(
+            (
+                native["population_id"] == configuration.agent_population,
+                native["seed"] == configuration.seed,
+                definition["duration_us"] == configuration.duration_us,
+                len(agents) == configuration.agent_count,
+                actual_counts == expected_counts,
+                len({item["agent_id"] for item in agents}) == len(agents),
+            )
+        )
+        public_digest = str(native["expected_public_event_sha256"])
+        truth_digest = str(native["expected_truth_event_sha256"])
+        state_digest = str(native["expected_state_sha256"])
+        public_digests.add(public_digest)
+        truth_digests.add(truth_digest)
+        state_digests.add(state_digest)
+        if (
+            probe["public_event_sha256"] != public_digest
+            or probe["truth_event_sha256"] != truth_digest
+        ):
+            populations_with_seed_behavior_change.add(
+                configuration.agent_population
+            )
+        event_record_types.update(
+            str(item["record_type"]) for item in result.event_projection
+        )
+        exercises = {
+            exercise.capability: thaw_json(exercise.evidence)
+            for exercise in result.exercises
+        }
+        decision_counts = exercises["agent_population"]["decision_counts"]
+        event_backed_exercises = event_backed_exercises and all(
+            (
+                len(decision_counts) == configuration.agent_count,
+                all(int(value) > 0 for value in decision_counts.values()),
+                exercises["agent_count"]["runtime_agent_count"]
+                == configuration.agent_count,
+                exercises["agent_count"]["actor_summary_count"]
+                == configuration.agent_count,
+            )
+        )
+        boundary = next(
+            check
+            for check in result.checks
+            if check.name == "observable_projection_boundary"
+        )
+        boundary_evidence = thaw_json(boundary.evidence)
+        public_boundary_clean = public_boundary_clean and not boundary_evidence[
+            "forbidden_fields_found"
+        ]
+        tapes[configuration.cell_id] = {
+            "agent_ids": [item["agent_id"] for item in agents],
+            "definition_sha256": native["population_definition_sha256"],
+            "native_result_sha256": native["expected_result_sha256"],
+            "public_event_sha256": public_digest,
+            "recording_sha256": result.recording.sha256,
+            "state_sha256": state_digest,
+            "truth_event_sha256": truth_digest,
+        }
+        result_evidence[configuration.cell_id] = {
+            "agent_count": configuration.agent_count,
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "event_sha256": result.event_sha256,
+            "population": configuration.agent_population,
+            "repeated_result_match": (
+                result.result_sha256 == repeat.result_sha256
+            ),
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": (
+                result.result_sha256 == replay.result_sha256
+            ),
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+        }
+
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    ecology_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            ecology_coverage["dimensions"],
+            ecology_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
+            len(configurations) == len(expected_pairs),
+            observed_pairs == expected_pairs,
+            exact_exercises,
+            event_backed_exercises,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            ecology_coverage_passed,
+            public_boundary_clean,
+            native_definition_exact,
+            len(public_digests) == len(expected_pairs),
+            len(truth_digests) == len(expected_pairs),
+            len(state_digests) == len(expected_pairs),
+            populations_with_seed_behavior_change
+            == set(BOUNDED_POPULATION_TEMPLATES),
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == ECOLOGY_RECORDING_TYPE
+                for item in results
+            ),
+            {
+                "agent_truth_event",
+                "mechanics_event",
+                "public_ecology_event",
+            }
+            <= event_record_types,
+            observed_families
+            == {
+                family.value
+                for template in BOUNDED_POPULATION_TEMPLATES.values()
+                for family in template
+            },
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_agent_population_and_count_replay_natively",
+        {
+            "distinct_public_event_digests": len(public_digests),
+            "distinct_state_digests": len(state_digests),
+            "distinct_truth_event_digests": len(truth_digests),
+            "ecology_coverage": ecology_coverage,
+            "event_backed_exercises": event_backed_exercises,
+            "event_record_types": sorted(event_record_types),
+            "native_definition_exact": native_definition_exact,
+            "observed_axis_pairs": [
+                [population, count]
+                for population, count in sorted(observed_pairs)
+            ],
+            "observed_families": sorted(observed_families),
+            "populations_with_seed_behavior_change": sorted(
+                populations_with_seed_behavior_change
+            ),
+            "public_boundary_clean": public_boundary_clean,
+            "results": result_evidence,
+            "tapes": tapes,
+        },
+        () if passed else ("real agent-ecology executor proof failed",),
     )
 
 

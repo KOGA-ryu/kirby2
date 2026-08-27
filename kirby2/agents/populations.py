@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 
 from kirby2.exchange import SessionState, Side
@@ -34,6 +35,27 @@ ADVERSARIAL_DRILL_IDS = (
     "auction_imbalance_reversal",
     "halt_disorderly_reopen",
 )
+
+BOUNDED_POPULATION_TEMPLATES: Mapping[str, tuple[AgentFamily, ...]] = {
+    "liquidity_provision": (
+        AgentFamily.NOISE_TRADER,
+        AgentFamily.PASSIVE_MARKET_MAKER,
+        AgentFamily.LIQUIDITY_WITHDRAWER,
+        AgentFamily.SCHEDULED_METAORDER,
+    ),
+    "momentum_ecology": (
+        AgentFamily.MOMENTUM_TRADER,
+        AgentFamily.INVENTORY_SENSITIVE_MARKET_MAKER,
+        AgentFamily.NOISE_TRADER,
+        AgentFamily.MEAN_REVERSION_TRADER,
+    ),
+    "liquidation_ecology": (
+        AgentFamily.DISTRESSED_LIQUIDATOR,
+        AgentFamily.LIQUIDITY_WITHDRAWER,
+        AgentFamily.MEAN_REVERSION_TRADER,
+        AgentFamily.NOISE_TRADER,
+    ),
+}
 
 
 def _bounds(
@@ -81,6 +103,7 @@ def _spec(
     budget: int = 1_600,
     working: int = 400,
     max_order: int = 200,
+    rate: int = 5,
     latency_us: int = 2_000,
     interval_us: int = 250_000,
     quote_offset: int = 0,
@@ -104,6 +127,7 @@ def _spec(
             budget=budget,
             working=working,
             max_order=max_order,
+            rate=rate,
             latency_us=latency_us,
             interval_us=interval_us,
             information_set=information,
@@ -129,6 +153,9 @@ def compose_population(
     *,
     duration_us: int = 4_000_000,
     description: str = "User-composed bounded synthetic participant population.",
+    max_orders_per_second: int = 5,
+    latency_us: int = 2_000,
+    decision_interval_us: int = 250_000,
 ) -> PopulationDefinition:
     """Compose safe synthetic families; recognition-only agents use named drills."""
 
@@ -161,7 +188,15 @@ def compose_population(
                     family,
                     duration_us,
                     side=side,
+                    withdrawal_us=(
+                        duration_us // 2
+                        if family is AgentFamily.LIQUIDITY_WITHDRAWER
+                        else None
+                    ),
                     latent_value=latent,
+                    rate=max_orders_per_second,
+                    latency_us=latency_us,
+                    interval_us=decision_interval_us,
                     safety=safety,
                 )
             )
@@ -172,6 +207,44 @@ def compose_population(
         description,
         tuple(agents),
         duration_us,
+    )
+
+
+def compose_bounded_population(
+    population_id: str,
+    agent_count: int,
+    *,
+    duration_us: int,
+) -> PopulationDefinition:
+    """Cycle a named safe template into exactly one through eight agents."""
+
+    try:
+        template = BOUNDED_POPULATION_TEMPLATES[population_id]
+    except KeyError as error:
+        available = ", ".join(sorted(BOUNDED_POPULATION_TEMPLATES))
+        raise ValueError(
+            f"unknown bounded population {population_id!r}; available: {available}"
+        ) from error
+    if type(agent_count) is not int or not 1 <= agent_count <= 8:
+        raise ValueError("bounded population agent count must be from one through eight")
+    if type(duration_us) is not int or duration_us <= 0:
+        raise ValueError("bounded population duration must be positive simulation time")
+    families = tuple(template[index % len(template)] for index in range(agent_count))
+    decision_interval_us = max(1, duration_us // 5)
+    return compose_population(
+        population_id,
+        Counter(families),
+        duration_us=duration_us,
+        description=(
+            "Deterministically cycled bounded audit population with exactly "
+            f"{agent_count} agents."
+        ),
+        max_orders_per_second=(
+            1_000_000 + decision_interval_us - 1
+        )
+        // decision_interval_us,
+        latency_us=min(2_000, max(0, duration_us // 10)),
+        decision_interval_us=decision_interval_us,
     )
 
 
