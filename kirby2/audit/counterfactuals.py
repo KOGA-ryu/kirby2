@@ -23,6 +23,7 @@ from kirby2.counterfactual import (
     run_timing_sweep,
 )
 from kirby2.exchange import OrderType, Side
+from kirby2.immutable import thaw_json
 from kirby2.research import RunStore
 from kirby2.scenarios import get_scenario_definition
 from kirby2.session.bindings import SessionCommand
@@ -58,7 +59,7 @@ class CounterfactualAuditCase:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "evidence": self.evidence,
+            "evidence": thaw_json(self.evidence),
             "failures": list(self.failures),
             "name": self.name,
             "status": "PASS" if self.passed else "FAIL",

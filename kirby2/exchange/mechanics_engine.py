@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 
 from kirby2.simulation.clock import SimulationClock
@@ -1005,7 +1006,7 @@ def _timeline_details(event: MechanicsEvent) -> str:
     )
     values = [f"{key}={event.data[key]}" for key in keys if key in event.data]
     indication = event.data.get("indication")
-    if isinstance(indication, dict):
+    if isinstance(indication, Mapping):
         values.extend(
             f"indicative_{key}={indication.get(key)}"
             for key in (

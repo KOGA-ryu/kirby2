@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from kirby2.exchange import Order, OrderBook, OrderOwner, OrderStatus, Side
@@ -509,13 +510,16 @@ def _valid_order_transitions(book: OrderBook) -> bool:
 
 
 def _recursive_keys(value: object) -> set[str]:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return set(value) | {
             key
             for child in value.values()
             for key in _recursive_keys(child)
         }
-    if isinstance(value, list):
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
         return {key for child in value for key in _recursive_keys(child)}
     return set()
 

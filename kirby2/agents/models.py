@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 from kirby2.exchange import OrderType, SessionState, Side
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.multivenue.models import canonical_sha256
 
 
@@ -415,11 +417,17 @@ class PublicEcologyEvent:
     sequence: int
     simulation_time_us: int
     event_type: str
-    data: dict[str, object]
+    data: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("public ecology event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type,
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,

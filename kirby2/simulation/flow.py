@@ -6,11 +6,13 @@ import hashlib
 import heapq
 import json
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from kirby2.exchange import Order, OrderBook, OrderOwner, OrderType, Side
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.session import EventType
 
 from .clock import MICROSECONDS_PER_SECOND, SimulationClock
@@ -44,16 +46,26 @@ class FlowEvent:
     simulation_time_us: int
     family: FlowEventFamily
     applied: bool
-    command: dict[str, Any] | None
+    command: Mapping[str, object] | None
     reason: str | None
     exchange_event_start: int | None
     exchange_event_end: int | None
-    diagnostic: dict[str, Any] | None = None
+    diagnostic: Mapping[str, object] | None = None
 
-    def as_dict(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
+        for field_name in ("command", "diagnostic"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            frozen = freeze_json(value)
+            if not isinstance(frozen, Mapping):
+                raise TypeError(f"flow event {field_name} must be a JSON object")
+            object.__setattr__(self, field_name, frozen)
+
+    def as_dict(self) -> dict[str, object]:
         result = {
             "applied": self.applied,
-            "command": self.command,
+            "command": None if self.command is None else thaw_json(self.command),
             "exchange_event_end": self.exchange_event_end,
             "exchange_event_start": self.exchange_event_start,
             "family": self.family.value,
@@ -62,7 +74,7 @@ class FlowEvent:
             "simulation_time_us": self.simulation_time_us,
         }
         if self.diagnostic is not None:
-            result["diagnostic"] = self.diagnostic
+            result["diagnostic"] = thaw_json(self.diagnostic)
         return result
 
 

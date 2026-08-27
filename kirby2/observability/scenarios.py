@@ -411,7 +411,9 @@ def _apparent_wall() -> HiddenLiquidityScenarioResult:
             "cancelled_ground_truth_quantity": cancelled,
             "market_filled_quantity": filled,
             "public_cause_attribution": ambiguous[-1].data["cause_attribution"],
-            "public_possible_causes": ambiguous[-1].data["possible_causes"],
+            "public_possible_causes": list(
+                ambiguous[-1].data["possible_causes"]  # type: ignore[arg-type]
+            ),
         },
     )
 

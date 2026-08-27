@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 from kirby2.exchange import OrderType
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.multivenue.models import canonical_sha256
 from kirby2.session.bindings import SessionCommand
 
@@ -159,18 +161,20 @@ class SnapshotComponent:
             raise ValueError("preserved snapshot component requires a payload")
         if self.status is ComponentStatus.ABSENT and self.payload is not None:
             raise ValueError("absent snapshot component cannot carry a payload")
+        if self.payload is not None:
+            object.__setattr__(self, "payload", freeze_json(self.payload))
 
     @property
     def sha256(self) -> str | None:
         if self.payload is None:
             return None
-        return canonical_sha256({"payload": self.payload})
+        return canonical_sha256({"payload": thaw_json(self.payload)})
 
     def as_dict(self) -> dict[str, object]:
         return {
             "detail": self.detail,
             "name": self.name,
-            "payload": self.payload,
+            "payload": None if self.payload is None else thaw_json(self.payload),
             "sha256": self.sha256,
             "status": self.status.value,
         }
@@ -252,12 +256,18 @@ class CounterfactualTimelineEntry:
     sequence: int
     simulation_time_us: int
     kind: str
-    payload: dict[str, object]
+    payload: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.payload)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("counterfactual timeline payload must be a JSON object")
+        object.__setattr__(self, "payload", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "kind": self.kind,
-            "payload": self.payload,
+            "payload": thaw_json(self.payload),
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,
         }
@@ -266,16 +276,28 @@ class CounterfactualTimelineEntry:
 @dataclass(frozen=True, slots=True)
 class FirstDivergence:
     index: int | None
-    original: dict[str, object] | None
-    branch: dict[str, object] | None
+    original: Mapping[str, object] | None
+    branch: Mapping[str, object] | None
     explanation: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("original", "branch"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            frozen = freeze_json(value)
+            if not isinstance(frozen, Mapping):
+                raise TypeError(f"divergence {field_name} must be a JSON object")
+            object.__setattr__(self, field_name, frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "branch": self.branch,
+            "branch": None if self.branch is None else thaw_json(self.branch),
             "explanation": self.explanation,
             "index": self.index,
-            "original": self.original,
+            "original": (
+                None if self.original is None else thaw_json(self.original)
+            ),
         }
 
 
@@ -283,14 +305,20 @@ class FirstDivergence:
 class CounterfactualOutcome:
     state_sha256: str
     timeline_sha256: str
-    metrics: dict[str, object]
+    metrics: Mapping[str, object]
     timeline: tuple[CounterfactualTimelineEntry, ...]
     invariant_status: str
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.metrics)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("counterfactual metrics must be a JSON object")
+        object.__setattr__(self, "metrics", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "invariant_status": self.invariant_status,
-            "metrics": self.metrics,
+            "metrics": thaw_json(self.metrics),
             "state_sha256": self.state_sha256,
             "timeline": [item.as_dict() for item in self.timeline],
             "timeline_sha256": self.timeline_sha256,
@@ -307,13 +335,18 @@ class CounterfactualReport:
     original: CounterfactualOutcome
     branch: CounterfactualOutcome
     first_divergence: FirstDivergence
-    comparison: dict[str, object]
+    comparison: Mapping[str, object]
     exogenous_reference_path_sha256: str | None
-    hindsight_guard: dict[str, object]
+    hindsight_guard: Mapping[str, object]
     cautious_interpretation: str = CAUTIOUS_INTERPRETATION
     schema_version: int = COUNTERFACTUAL_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        for field_name in ("comparison", "hindsight_guard"):
+            frozen = freeze_json(getattr(self, field_name))
+            if not isinstance(frozen, Mapping):
+                raise TypeError(f"counterfactual {field_name} must be a JSON object")
+            object.__setattr__(self, field_name, frozen)
         if self.parent_run_id != self.snapshot.parent_run_id:
             raise ValueError("counterfactual report parent linkage is inconsistent")
         if not self.snapshot_reconstruction_match:
@@ -330,10 +363,10 @@ class CounterfactualReport:
         return {
             "branch": self.branch.as_dict(),
             "cautious_interpretation": self.cautious_interpretation,
-            "comparison": self.comparison,
+            "comparison": thaw_json(self.comparison),
             "exogenous_reference_path_sha256": self.exogenous_reference_path_sha256,
             "first_divergence": self.first_divergence.as_dict(),
-            "hindsight_guard": self.hindsight_guard,
+            "hindsight_guard": thaw_json(self.hindsight_guard),
             "mode": self.mode.value,
             "mutation_manifest": self.mutation_manifest.as_dict(),
             "original": self.original.as_dict(),
@@ -352,13 +385,19 @@ class TimingSweepCell:
     timing_delta_us: int
     branch_run_id: str
     report_result_sha256: str
-    branch_metrics: dict[str, object]
+    branch_metrics: Mapping[str, object]
     first_divergence_index: int | None
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.branch_metrics)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("timing-sweep metrics must be a JSON object")
+        object.__setattr__(self, "branch_metrics", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "branch_run_id": self.branch_run_id,
-            "branch_metrics": self.branch_metrics,
+            "branch_metrics": thaw_json(self.branch_metrics),
             "first_divergence_index": self.first_divergence_index,
             "report_result_sha256": self.report_result_sha256,
             "timing_delta_us": self.timing_delta_us,

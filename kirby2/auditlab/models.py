@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+from kirby2.immutable import freeze_json, thaw_json
 
 
 AUDIT_LAB_SCHEMA_VERSION = 1
@@ -161,7 +164,13 @@ class FaultEvidence:
     expected_code: str
     detected_code: str | None
     injection_event: int
-    details: dict[str, object]
+    details: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.details)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("fault details must be a JSON object")
+        object.__setattr__(self, "details", frozen)
 
     @property
     def detected(self) -> bool:
@@ -169,7 +178,7 @@ class FaultEvidence:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "details": self.details,
+            "details": thaw_json(self.details),
             "detected": self.detected,
             "detected_code": self.detected_code,
             "detector": self.detector,
@@ -182,21 +191,57 @@ class FaultEvidence:
 @dataclass(frozen=True, slots=True)
 class KernelResult:
     configuration: GeneratedConfiguration
-    event_stream: tuple[dict[str, object], ...]
-    venue_states: tuple[dict[str, object], ...]
-    observable_layer: dict[str, object]
-    metrics: dict[str, int | float | str | None]
-    invariant_checks: dict[str, bool]
+    event_stream: tuple[Mapping[str, object], ...]
+    venue_states: tuple[Mapping[str, object], ...]
+    observable_layer: Mapping[str, object]
+    metrics: Mapping[str, int | float | str | None]
+    invariant_checks: Mapping[str, bool]
     violations: tuple[str, ...]
     fault_evidence: FaultEvidence | None
 
+    def __post_init__(self) -> None:
+        for field_name in (
+            "event_stream",
+            "venue_states",
+            "observable_layer",
+            "metrics",
+            "invariant_checks",
+            "violations",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                freeze_json(getattr(self, field_name)),
+            )
+        if not isinstance(self.event_stream, tuple) or any(
+            not isinstance(item, Mapping) for item in self.event_stream
+        ):
+            raise TypeError("kernel event stream must contain JSON objects")
+        if not isinstance(self.venue_states, tuple) or any(
+            not isinstance(item, Mapping) for item in self.venue_states
+        ):
+            raise TypeError("kernel venue states must contain JSON objects")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                self.observable_layer,
+                self.metrics,
+                self.invariant_checks,
+            )
+        ):
+            raise TypeError("kernel result mappings must be JSON objects")
+        if not isinstance(self.violations, tuple) or any(
+            type(item) is not str for item in self.violations
+        ):
+            raise TypeError("kernel violations must be a JSON string sequence")
+
     @property
     def event_digest(self) -> str:
-        return canonical_sha256(self.event_stream)
+        return canonical_sha256(thaw_json(self.event_stream))
 
     @property
     def state_digest(self) -> str:
-        return canonical_sha256(self.venue_states)
+        return canonical_sha256(thaw_json(self.venue_states))
 
     @property
     def result_digest(self) -> str:
@@ -215,7 +260,9 @@ class KernelResult:
             ),
             "invariant_checks": dict(sorted(self.invariant_checks.items())),
             "metrics": dict(sorted(self.metrics.items())),
-            "observable_layer_sha256": canonical_sha256(self.observable_layer),
+            "observable_layer_sha256": canonical_sha256(
+                thaw_json(self.observable_layer)
+            ),
             "state_digest": self.state_digest,
             "violations": list(self.violations),
         }
@@ -224,13 +271,13 @@ class KernelResult:
         payload = {
             "configuration": self.configuration.as_dict(),
             "declared_outputs": self.declared_outputs(),
-            "observable_layer": self.observable_layer,
+            "observable_layer": thaw_json(self.observable_layer),
             "result_digest": self.result_digest,
             "status": "PASS" if self.passed else "FAIL",
-            "venue_states": list(self.venue_states),
+            "venue_states": thaw_json(self.venue_states),
         }
         if include_events:
-            payload["event_stream"] = list(self.event_stream)
+            payload["event_stream"] = thaw_json(self.event_stream)
         return payload
 
 
@@ -258,12 +305,18 @@ class MinimizedFailure:
 class StatisticalCheck:
     name: str
     status: str
-    evidence: dict[str, object]
+    evidence: Mapping[str, object]
     threshold: str
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.evidence)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("statistical evidence must be a JSON object")
+        object.__setattr__(self, "evidence", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "evidence": self.evidence,
+            "evidence": thaw_json(self.evidence),
             "name": self.name,
             "status": self.status,
             "threshold": self.threshold,
@@ -278,10 +331,14 @@ class AcceptanceRecord:
     reviewer_decision: str
     observed_characteristics: tuple[str, ...]
     known_defects: tuple[str, ...]
-    artifact_digests: dict[str, str]
+    artifact_digests: Mapping[str, str]
     supersedes_record_id: str | None = None
 
     def __post_init__(self) -> None:
+        frozen_digests = freeze_json(self.artifact_digests)
+        if not isinstance(frozen_digests, Mapping):
+            raise TypeError("acceptance artifact digests must be a JSON object")
+        object.__setattr__(self, "artifact_digests", frozen_digests)
         if not _ACCEPTANCE_ID.fullmatch(self.record_id):
             raise ValueError("acceptance record ID is invalid")
         if type(self.scenario_version) is not int or self.scenario_version <= 0:

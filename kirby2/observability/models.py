@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
 from kirby2.exchange.models import OrderOwner, OrderType, Side
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.session.events import SimulationEvent
 
 
@@ -483,9 +485,13 @@ class ObservableEvent:
     source_time_us: int
     received_time_us: int
     event_type: ObservableEventType
-    data: dict[str, object]
+    data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("observable event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
         if (
             type(self.sequence) is not int
             or self.sequence <= 0
@@ -498,7 +504,7 @@ class ObservableEvent:
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type.value,
             "received_time_us": self.received_time_us,
             "sequence": self.sequence,
@@ -559,11 +565,17 @@ class TruthEvent:
     sequence: int
     simulation_time_us: int
     event_type: TruthEventType
-    data: dict[str, object]
+    data: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("truth event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type.value,
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,

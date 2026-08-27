@@ -7,14 +7,43 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from kirby2.agents.models import PublicEcologyEvent
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
 from kirby2.auditlab.models import (
     AUDIT_PACKET_SCHEMA_VERSION,
     LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
+    AcceptanceRecord,
+    FaultEvidence,
+    GeneratedConfiguration,
+    KernelResult,
+    StatisticalCheck,
     canonical_json,
     canonical_sha256,
 )
-from kirby2.immutable import freeze_json
+from kirby2.counterfactual.models import (
+    ActionMutation,
+    BranchSnapshot,
+    ComponentStatus,
+    CounterfactualMode,
+    CounterfactualOutcome,
+    CounterfactualReport,
+    CounterfactualTimelineEntry,
+    FirstDivergence,
+    MutationManifest,
+    SnapshotComponent,
+    TimingSweepCell,
+)
+from kirby2.exchange.mechanics_models import MechanicsEvent, MechanicsEventType
+from kirby2.immutable import freeze_json, thaw_json
+from kirby2.latency.models import LatencyEvent, LatencyEventType
+from kirby2.multivenue.models import CoordinatorEvent, CoordinatorEventType
+from kirby2.observability.models import (
+    ObservableEvent,
+    ObservableEventType,
+    TruthEvent,
+    TruthEventType,
+)
+from kirby2.observability.venue import _PendingObservable
 from kirby2.session.events import EventJournal, EventType
 from kirby2.session.records import (
     InputRecord,
@@ -22,6 +51,7 @@ from kirby2.session.records import (
     TimelineKind,
     TimelineRecord,
 )
+from kirby2.simulation.flow import FlowEvent, FlowEventFamily
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +118,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _statistics_case(result),
             _probe_case(result),
             _core_replay_payload_ownership_case(),
+            _subsystem_evidence_payload_ownership_case(),
             _artifact_path_boundary_case(root / "artifact-path-boundary"),
             _packet_identity_scope_case(
                 root / "packet-identity-scope",
@@ -371,6 +402,490 @@ def _core_replay_payload_ownership_case() -> ModelRiskLabAuditCase:
             ),
         },
         () if passed else ("core replay payload ownership boundary failed",),
+    )
+
+
+def _subsystem_evidence_payload_ownership_case() -> ModelRiskLabAuditCase:
+    probes: dict[str, dict[str, object]] = {}
+
+    def nested_payload() -> dict[str, object]:
+        return {
+            "nested": {
+                "queue": [
+                    {
+                        "flags": [True, None],
+                        "quantity": 10,
+                    }
+                ]
+            }
+        }
+
+    def set_nested_quantity(root, quantity: int) -> None:
+        root["nested"]["queue"][0]["quantity"] = quantity
+
+    def set_artifact_digest(root, value: int) -> None:
+        root["artifact.json"] = f"{value:064x}"
+
+    def probe(
+        name,
+        source,
+        stored,
+        render,
+        export_root,
+        mutate=set_nested_quantity,
+    ) -> None:
+        wire_before = canonical_json(render())
+        mutate(source, 991)
+        caller_stable = canonical_json(render()) == wire_before
+
+        direct_mutation_rejected = False
+        try:
+            mutate(stored, 992)
+        except (AttributeError, TypeError):
+            direct_mutation_rejected = True
+
+        exported = render()
+        export_mutable = True
+        try:
+            mutate(export_root(exported), 993)
+        except (AttributeError, IndexError, KeyError, TypeError):
+            export_mutable = False
+        export_stable = canonical_json(render()) == wire_before
+        passed = all(
+            (
+                caller_stable,
+                direct_mutation_rejected,
+                export_mutable,
+                export_stable,
+            )
+        )
+        probes[name] = {
+            "caller_mutation_preserved_wire": caller_stable,
+            "direct_mutation_rejected": direct_mutation_rejected,
+            "export_is_detached_and_mutable": export_mutable,
+            "export_mutation_preserved_wire": export_stable,
+            "passed": passed,
+            "wire_sha256": hashlib.sha256(wire_before.encode("utf-8")).hexdigest(),
+        }
+
+    flow_command = nested_payload()
+    flow_diagnostic = nested_payload()
+    flow_event = FlowEvent(
+        sequence=1,
+        simulation_time_us=10,
+        family=FlowEventFamily.LIMIT_BUY,
+        applied=True,
+        command=flow_command,
+        reason=None,
+        exchange_event_start=1,
+        exchange_event_end=2,
+        diagnostic=flow_diagnostic,
+    )
+    probe(
+        "flow_event.command",
+        flow_command,
+        flow_event.command,
+        flow_event.as_dict,
+        lambda payload: payload["command"],
+    )
+    probe(
+        "flow_event.diagnostic",
+        flow_diagnostic,
+        flow_event.diagnostic,
+        flow_event.as_dict,
+        lambda payload: payload["diagnostic"],
+    )
+
+    mechanics_data = nested_payload()
+    mechanics_event = MechanicsEvent(
+        1,
+        10,
+        MechanicsEventType.ORDER_ACCEPTED,
+        mechanics_data,
+    )
+    probe(
+        "mechanics_event.data",
+        mechanics_data,
+        mechanics_event.data,
+        mechanics_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    latency_data = nested_payload()
+    latency_event = LatencyEvent(
+        1,
+        10,
+        LatencyEventType.KEY_PRESSED,
+        "PLAYER-O-000001",
+        latency_data,
+    )
+    probe(
+        "latency_event.data",
+        latency_data,
+        latency_event.data,
+        latency_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    observable_data = nested_payload()
+    observable_event = ObservableEvent(
+        1,
+        10,
+        11,
+        ObservableEventType.BOOK_SNAPSHOT,
+        observable_data,
+    )
+    probe(
+        "observable_event.data",
+        observable_data,
+        observable_event.data,
+        observable_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    truth_data = nested_payload()
+    truth_event = TruthEvent(
+        1,
+        10,
+        TruthEventType.ORDER_ACCEPTED,
+        truth_data,
+    )
+    probe(
+        "truth_event.data",
+        truth_data,
+        truth_event.data,
+        truth_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    coordinator_data = nested_payload()
+    coordinator_event = CoordinatorEvent(
+        1,
+        10,
+        CoordinatorEventType.ROUTE_DECISION,
+        coordinator_data,
+    )
+    probe(
+        "coordinator_event.data",
+        coordinator_data,
+        coordinator_event.data,
+        coordinator_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    ecology_data = nested_payload()
+    ecology_event = PublicEcologyEvent(1, 10, "BOOK_SNAPSHOT", ecology_data)
+    probe(
+        "public_ecology_event.data",
+        ecology_data,
+        ecology_event.data,
+        ecology_event.as_dict,
+        lambda payload: payload["data"],
+    )
+
+    queued_data = nested_payload()
+    queued_strategy_data = nested_payload()
+    pending = _PendingObservable(
+        due_time_us=11,
+        source_time_us=10,
+        ordinal=1,
+        event_type=ObservableEventType.BOOK_SNAPSHOT,
+        data=queued_data,
+        strategy_event_type=EventType.ORDER_SUBMITTED,
+        strategy_data=queued_strategy_data,
+    )
+
+    def render_pending() -> dict[str, object]:
+        return {
+            "data": thaw_json(pending.data),
+            "strategy_data": thaw_json(pending.strategy_data),
+        }
+
+    probe(
+        "pending_observable.data",
+        queued_data,
+        pending.data,
+        render_pending,
+        lambda payload: payload["data"],
+    )
+    probe(
+        "pending_observable.strategy_data",
+        queued_strategy_data,
+        pending.strategy_data,
+        render_pending,
+        lambda payload: payload["strategy_data"],
+    )
+
+    component_data = nested_payload()
+    component = SnapshotComponent(
+        "agent_state",
+        ComponentStatus.PRESERVED,
+        component_data,
+        "subsystem payload ownership probe",
+    )
+    probe(
+        "snapshot_component.payload",
+        component_data,
+        component.payload,
+        component.as_dict,
+        lambda payload: payload["payload"],
+    )
+
+    timeline_data = nested_payload()
+    timeline = CounterfactualTimelineEntry(1, 10, "PROBE", timeline_data)
+    probe(
+        "counterfactual_timeline.payload",
+        timeline_data,
+        timeline.payload,
+        timeline.as_dict,
+        lambda payload: payload["payload"],
+    )
+
+    divergence_original = nested_payload()
+    divergence_branch = nested_payload()
+    divergence = FirstDivergence(
+        0,
+        divergence_original,
+        divergence_branch,
+        "payload ownership probe",
+    )
+    probe(
+        "first_divergence.original",
+        divergence_original,
+        divergence.original,
+        divergence.as_dict,
+        lambda payload: payload["original"],
+    )
+    probe(
+        "first_divergence.branch",
+        divergence_branch,
+        divergence.branch,
+        divergence.as_dict,
+        lambda payload: payload["branch"],
+    )
+
+    outcome_metrics = nested_payload()
+    outcome = CounterfactualOutcome(
+        state_sha256="1" * 64,
+        timeline_sha256="2" * 64,
+        metrics=outcome_metrics,
+        timeline=(timeline,),
+        invariant_status="PASS",
+    )
+    probe(
+        "counterfactual_outcome.metrics",
+        outcome_metrics,
+        outcome.metrics,
+        outcome.as_dict,
+        lambda payload: payload["metrics"],
+    )
+
+    sweep_metrics = nested_payload()
+    sweep_cell = TimingSweepCell(
+        0,
+        "run-payload-ownership",
+        "3" * 64,
+        sweep_metrics,
+        0,
+    )
+    probe(
+        "timing_sweep_cell.branch_metrics",
+        sweep_metrics,
+        sweep_cell.branch_metrics,
+        sweep_cell.as_dict,
+        lambda payload: payload["branch_metrics"],
+    )
+
+    component_names = (
+        "agent_state",
+        "all_venue_states",
+        "exchange_state",
+        "feature_windows",
+        "flow_model_state",
+        "hawkes_decay_state",
+        "historical_replay_cursor",
+        "pending_latency_messages",
+        "player_state",
+        "rng_state",
+        "simulation_clock",
+        "strategy_state",
+        "working_orders",
+    )
+    snapshot = BranchSnapshot(
+        "run-payload-ownership",
+        10,
+        (component,)
+        + tuple(
+            SnapshotComponent(
+                name,
+                ComponentStatus.PRESERVED,
+                {"component": name},
+                "subsystem payload ownership probe",
+            )
+            for name in component_names[1:]
+        ),
+    )
+    comparison = nested_payload()
+    hindsight_guard = nested_payload()
+    report = CounterfactualReport(
+        parent_run_id="run-payload-ownership",
+        mode=CounterfactualMode.ENDOGENOUS_FORK,
+        mutation_manifest=MutationManifest((ActionMutation(1, timing_delta_us=1),)),
+        snapshot=snapshot,
+        snapshot_reconstruction_match=True,
+        original=outcome,
+        branch=outcome,
+        first_divergence=divergence,
+        comparison=comparison,
+        exogenous_reference_path_sha256=None,
+        hindsight_guard=hindsight_guard,
+    )
+    probe(
+        "counterfactual_report.comparison",
+        comparison,
+        report.comparison,
+        report.as_dict,
+        lambda payload: payload["comparison"],
+    )
+    probe(
+        "counterfactual_report.hindsight_guard",
+        hindsight_guard,
+        report.hindsight_guard,
+        report.as_dict,
+        lambda payload: payload["hindsight_guard"],
+    )
+
+    fault_details = nested_payload()
+    fault = FaultEvidence(
+        FaultKind.DUPLICATE_MESSAGE,
+        "payload_ownership_probe",
+        "DUPLICATE_MESSAGE",
+        "DUPLICATE_MESSAGE",
+        1,
+        fault_details,
+    )
+    probe(
+        "fault_evidence.details",
+        fault_details,
+        fault.details,
+        fault.as_dict,
+        lambda payload: payload["details"],
+    )
+
+    configuration = GeneratedConfiguration(
+        sequence=1,
+        seed=771,
+        duration_us=1_000,
+        duration_events=1,
+        agent_count=1,
+        flow_model="POISSON",
+        regime="BASELINE",
+        volume="NORMAL",
+        liquidity="NORMAL",
+        latency="ZERO",
+        session_phase="CONTINUOUS",
+        order_types="LIMIT",
+        hidden_liquidity="NONE",
+        venue_count=1,
+        auction_state="NONE",
+        agent_population="ONE",
+        strategy="NONE",
+        objective="PAYLOAD_OWNERSHIP",
+    )
+    kernel_event = nested_payload()
+    kernel_state = nested_payload()
+    kernel_observable = nested_payload()
+    kernel = KernelResult(
+        configuration=configuration,
+        event_stream=(kernel_event,),
+        venue_states=(kernel_state,),
+        observable_layer=kernel_observable,
+        metrics={"event_count": 1},
+        invariant_checks={"payload_ownership": True},
+        violations=(),
+        fault_evidence=fault,
+    )
+    probe(
+        "kernel_result.event_stream",
+        kernel_event,
+        kernel.event_stream[0],
+        kernel.as_dict,
+        lambda payload: payload["event_stream"][0],
+    )
+    probe(
+        "kernel_result.venue_states",
+        kernel_state,
+        kernel.venue_states[0],
+        kernel.as_dict,
+        lambda payload: payload["venue_states"][0],
+    )
+    probe(
+        "kernel_result.observable_layer",
+        kernel_observable,
+        kernel.observable_layer,
+        kernel.as_dict,
+        lambda payload: payload["observable_layer"],
+    )
+
+    statistic_evidence = nested_payload()
+    statistic = StatisticalCheck(
+        "payload_ownership_probe",
+        "PASS",
+        statistic_evidence,
+        "immutable",
+    )
+    probe(
+        "statistical_check.evidence",
+        statistic_evidence,
+        statistic.evidence,
+        statistic.as_dict,
+        lambda payload: payload["evidence"],
+    )
+
+    acceptance_digests = {"artifact.json": "0" * 64}
+    acceptance = AcceptanceRecord(
+        "acceptance-payload-ownership-probe",
+        1,
+        771,
+        "PENDING_HUMAN_REVIEW",
+        ("payload ownership probe",),
+        (),
+        acceptance_digests,
+    )
+    probe(
+        "acceptance_record.artifact_digests",
+        acceptance_digests,
+        acceptance.artifact_digests,
+        acceptance.as_dict,
+        lambda payload: payload["artifact_digests"],
+        set_artifact_digest,
+    )
+
+    required_event_probes = {
+        "coordinator_event.data",
+        "flow_event.command",
+        "flow_event.diagnostic",
+        "latency_event.data",
+        "mechanics_event.data",
+        "observable_event.data",
+        "public_ecology_event.data",
+        "truth_event.data",
+    }
+    failed = sorted(name for name, evidence in probes.items() if not evidence["passed"])
+    missing_event_probes = sorted(required_event_probes.difference(probes))
+    failures = []
+    if failed:
+        failures.append(f"mutable or aliased subsystem payloads: {failed}")
+    if missing_event_probes:
+        failures.append(f"unexercised subsystem event payloads: {missing_event_probes}")
+    return ModelRiskLabAuditCase(
+        "subsystem_evidence_payloads_are_deeply_owned_and_detached",
+        {
+            "named_event_family_probes": sorted(required_event_probes),
+            "probe_count": len(probes),
+            "probes": probes,
+        },
+        tuple(failures),
     )
 
 

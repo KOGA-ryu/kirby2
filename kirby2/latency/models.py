@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
 from kirby2.exchange import OrderType, Side
+from kirby2.immutable import freeze_json, thaw_json
 
 
 LATENCY_RECORDING_SCHEMA_VERSION = 1
@@ -119,15 +121,19 @@ class LatencyEvent:
     simulation_time_us: int
     event_type: LatencyEventType
     order_id: str | None
-    data: dict[str, object]
+    data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("latency event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
         if self.sequence <= 0 or self.simulation_time_us < 0:
             raise ValueError("latency event sequence or time is invalid")
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type.value,
             "order_id": self.order_id,
             "sequence": self.sequence,

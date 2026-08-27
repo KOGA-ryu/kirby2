@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
+
+from kirby2.immutable import freeze_json, thaw_json
 
 from .models import OrderOwner, Side
 
@@ -427,15 +430,19 @@ class MechanicsEvent:
     sequence: int
     simulation_time_us: int
     event_type: MechanicsEventType
-    data: dict[str, object]
+    data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("market-mechanics event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
         if self.sequence <= 0 or self.simulation_time_us < 0:
             raise ValueError("market-mechanics event identity is invalid")
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type.value,
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,

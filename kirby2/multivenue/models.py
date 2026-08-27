@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 
 from kirby2.exchange import OrderInstruction, SessionState
 from kirby2.exchange.models import Side
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.latency import LatencyComponent, LatencyProfile
 from kirby2.observability import HiddenLiquidityRules, ObservableDepthBook
 
@@ -527,11 +529,17 @@ class CoordinatorEvent:
     sequence: int
     simulation_time_us: int
     event_type: CoordinatorEventType
-    data: dict[str, object]
+    data: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("coordinator event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "event_type": self.event_type.value,
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,

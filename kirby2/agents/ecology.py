@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -857,10 +858,13 @@ def _market_safe_mechanics_data(event: MechanicsEvent) -> dict[str, object]:
 
 
 def _contains_forbidden_key(value: object, forbidden: set[str]) -> bool:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return bool(set(value) & forbidden) or any(
             _contains_forbidden_key(item, forbidden) for item in value.values()
         )
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
         return any(_contains_forbidden_key(item, forbidden) for item in value)
     return False

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 
 from kirby2.exchange.models import OrderOwner, Side
+from kirby2.immutable import freeze_json, thaw_json
 from kirby2.session.events import EventType, SimulationEvent
 from kirby2.simulation.clock import SimulationClock
 
@@ -126,13 +128,24 @@ class _PendingObservable:
     source_time_us: int
     ordinal: int
     event_type: ObservableEventType
-    data: dict[str, object]
+    data: Mapping[str, object]
     book: ObservableDepthBook | None = None
     trade: PublicTrade | None = None
     own_order: OwnOrderState | None = None
     player_position: ObservablePlayerPosition | None = None
     strategy_event_type: EventType | None = None
-    strategy_data: dict[str, object] | None = None
+    strategy_data: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        frozen_data = freeze_json(self.data)
+        if not isinstance(frozen_data, Mapping):
+            raise TypeError("queued observable data must be a JSON object")
+        object.__setattr__(self, "data", frozen_data)
+        if self.strategy_data is not None:
+            frozen_strategy = freeze_json(self.strategy_data)
+            if not isinstance(frozen_strategy, Mapping):
+                raise TypeError("queued strategy data must be a JSON object")
+            object.__setattr__(self, "strategy_data", frozen_strategy)
 
 
 class HiddenLiquidityVenue:
@@ -456,7 +469,7 @@ class HiddenLiquidityVenue:
             "pending": [
                 {
                     "book": None if item.book is None else item.book.as_dict(),
-                    "data": item.data,
+                    "data": thaw_json(item.data),
                     "due_time_us": item.due_time_us,
                     "event_type": item.event_type.value,
                     "own_order": (
@@ -469,7 +482,11 @@ class HiddenLiquidityVenue:
                         else item.player_position.as_dict()
                     ),
                     "source_time_us": item.source_time_us,
-                    "strategy_data": item.strategy_data,
+                    "strategy_data": (
+                        None
+                        if item.strategy_data is None
+                        else thaw_json(item.strategy_data)
+                    ),
                     "strategy_event_type": (
                         None
                         if item.strategy_event_type is None
@@ -929,14 +946,14 @@ class HiddenLiquidityVenue:
     def _schedule_observable(
         self,
         event_type: ObservableEventType,
-        data: dict[str, object],
+        data: Mapping[str, object],
         *,
         book: ObservableDepthBook | None = None,
         trade: PublicTrade | None = None,
         own_order: OwnOrderState | None = None,
         player_position: ObservablePlayerPosition | None = None,
         strategy_event_type: EventType | None = None,
-        strategy_data: dict[str, object] | None = None,
+        strategy_data: Mapping[str, object] | None = None,
     ) -> None:
         self._pending_ordinal += 1
         source = self.clock.current_time_us
