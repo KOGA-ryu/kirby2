@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import json
 
-from kirby2.exchange import Order, OrderBook, OrderOwner, OrderStatus, Side
+from kirby2.exchange import (
+    Order,
+    OrderBook,
+    OrderOwner,
+    OrderStatus,
+    OrderView,
+    Side,
+)
 from kirby2.session import EventType
 from kirby2.simulation import SeededRng
 
@@ -57,7 +64,7 @@ def run_demo(seed: int) -> str:
 
     _accept_demo(
         book,
-        player_order,
+        book.all_orders[player_order.order_id],
         first_player_fill_quantity,
         final_player_fill_quantity,
     )
@@ -93,7 +100,7 @@ def run_demo(seed: int) -> str:
 
 def _accept_demo(
     book: OrderBook,
-    player_order: Order,
+    player_order: OrderView,
     first_player_fill_quantity: int,
     final_player_fill_quantity: int,
 ) -> None:
@@ -127,4 +134,3 @@ def _accept_demo(
         "demo did not produce a cancellation event",
     )
     _require(book.best_bid == 2430 and book.best_ask == 2434, "spread did not move as expected")
-

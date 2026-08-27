@@ -67,6 +67,12 @@ class Order:
     def __post_init__(self) -> None:
         if not self.order_id:
             raise ValueError("order_id must not be empty")
+        if not isinstance(self.order_type, OrderType):
+            raise TypeError("order_type must use the canonical enum")
+        if not isinstance(self.owner, OrderOwner):
+            raise TypeError("order owner must use the canonical enum")
+        if self.side is not None and not isinstance(self.side, Side):
+            raise TypeError("order side must use the canonical enum")
         _require_integer(self.original_quantity, "original_quantity")
         if self.order_type is OrderType.CANCEL:
             if self.original_quantity != 0:
@@ -161,6 +167,62 @@ class PriceLevel:
                 self.orders.remove(order)
                 return order
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderView:
+    """Detached scalar snapshot of exchange-owned order lifecycle state."""
+
+    order_id: str
+    order_type: OrderType
+    original_quantity: int
+    side: Side | None
+    price_ticks: int | None
+    owner: OrderOwner
+    cancel_target_id: str | None
+    remaining_quantity: int
+    filled_quantity: int
+    cancelled_quantity: int
+    resting_sequence: int | None
+    status: OrderStatus
+
+    @classmethod
+    def _from_order(cls, order: Order) -> OrderView:
+        return cls(
+            order_id=order.order_id,
+            order_type=order.order_type,
+            original_quantity=order.original_quantity,
+            side=order.side,
+            price_ticks=order.price_ticks,
+            owner=order.owner,
+            cancel_target_id=order.cancel_target_id,
+            remaining_quantity=order.remaining_quantity,
+            filled_quantity=order.filled_quantity,
+            cancelled_quantity=order.cancelled_quantity,
+            resting_sequence=order.resting_sequence,
+            status=order.status,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PriceLevelView:
+    """Detached FIFO snapshot containing only immutable order views."""
+
+    price_ticks: int
+    side: Side
+    orders: tuple[OrderView, ...]
+
+    @classmethod
+    def _from_level(cls, level: PriceLevel) -> PriceLevelView:
+        return cls(
+            price_ticks=level.price_ticks,
+            side=level.side,
+            orders=tuple(OrderView._from_order(order) for order in level.orders),
+        )
+
+    @property
+    def total_quantity(self) -> int:
+        return sum(order.remaining_quantity for order in self.orders)
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Iterable
+from collections.abc import Iterable, Mapping
+from types import MappingProxyType
 
 from kirby2.audit.invariants import assert_order_book_invariants
 from kirby2.player.position import PlayerPosition
 from kirby2.session.events import EventJournal, EventType, SimulationEvent
 
-from .models import Fill, Order, OrderOwner, OrderStatus, OrderType, PriceLevel, Side, Trade
+from .models import (
+    Fill,
+    Order,
+    OrderOwner,
+    OrderStatus,
+    OrderType,
+    OrderView,
+    PriceLevel,
+    PriceLevelView,
+    Side,
+    Trade,
+)
 
 
 class OrderBook:
@@ -33,12 +45,22 @@ class OrderBook:
         self._fills: list[Fill] = []
 
     @property
-    def bids(self) -> dict[int, PriceLevel]:
-        return self._bids
+    def bids(self) -> Mapping[int, PriceLevelView]:
+        return MappingProxyType(
+            {
+                price: PriceLevelView._from_level(level)
+                for price, level in self._bids.items()
+            }
+        )
 
     @property
-    def asks(self) -> dict[int, PriceLevel]:
-        return self._asks
+    def asks(self) -> Mapping[int, PriceLevelView]:
+        return MappingProxyType(
+            {
+                price: PriceLevelView._from_level(level)
+                for price, level in self._asks.items()
+            }
+        )
 
     @property
     def bid_prices(self) -> list[int]:
@@ -49,20 +71,30 @@ class OrderBook:
         return list(self._ask_prices)
 
     @property
-    def active_orders(self) -> dict[str, Order]:
-        return dict(self._active_orders)
+    def active_orders(self) -> Mapping[str, OrderView]:
+        return MappingProxyType(
+            {
+                order_id: OrderView._from_order(order)
+                for order_id, order in self._active_orders.items()
+            }
+        )
 
     @property
-    def all_orders(self) -> dict[str, Order]:
-        return dict(self._all_orders)
+    def all_orders(self) -> Mapping[str, OrderView]:
+        return MappingProxyType(
+            {
+                order_id: OrderView._from_order(order)
+                for order_id, order in self._all_orders.items()
+            }
+        )
 
     @property
     def trades(self) -> tuple[Trade, ...]:
         return tuple(self._trades)
 
     @property
-    def fills(self) -> list[Fill]:
-        return list(self._fills)
+    def fills(self) -> tuple[Fill, ...]:
+        return tuple(self._fills)
 
     @property
     def best_bid(self) -> int | None:
@@ -73,6 +105,10 @@ class OrderBook:
         return self._ask_prices[0] if self._ask_prices else None
 
     def process(self, order: Order) -> tuple[SimulationEvent, ...]:
+        owned_order = self._clone_pristine_order(order)
+        return self._process_owned(owned_order)
+
+    def _process_owned(self, order: Order) -> tuple[SimulationEvent, ...]:
         event_start = len(self.journal.events)
         self._register(order)
         self._emit_submitted(order)
@@ -103,18 +139,19 @@ class OrderBook:
         replacement: Order,
         command_id: str,
     ) -> tuple[SimulationEvent, ...]:
-        if replacement.order_type is not OrderType.LIMIT:
+        owned_replacement = self._clone_pristine_order(replacement)
+        if owned_replacement.order_type is not OrderType.LIMIT:
             raise ValueError("replacement must be a new limit order")
-        if replacement.order_id in self._seen_order_ids:
-            raise ValueError(f"duplicate order ID: {replacement.order_id}")
+        if owned_replacement.order_id in self._seen_order_ids:
+            raise ValueError(f"duplicate order ID: {owned_replacement.order_id}")
         event_start = len(self.journal.events)
         target_was_active = target_order_id in self._active_orders
         self.cancel(target_order_id, command_id)
         if target_was_active:
-            self.process(replacement)
+            self._process_owned(owned_replacement)
             self.journal.emit(
                 EventType.ORDER_REPLACED,
-                new_order_id=replacement.order_id,
+                new_order_id=owned_replacement.order_id,
                 old_order_id=target_order_id,
             )
             assert_order_book_invariants(self)
@@ -247,6 +284,34 @@ class OrderBook:
             }
             for price in prices
         ]
+
+    @staticmethod
+    def _clone_pristine_order(order: Order) -> Order:
+        if not isinstance(order, Order):
+            raise TypeError("exchange commands must use Order")
+        pristine = all(
+            (
+                type(order.remaining_quantity) is int,
+                order.remaining_quantity == order.original_quantity,
+                type(order.filled_quantity) is int,
+                order.filled_quantity == 0,
+                type(order.cancelled_quantity) is int,
+                order.cancelled_quantity == 0,
+                order.resting_sequence is None,
+                order.status is OrderStatus.NEW,
+            )
+        )
+        if not pristine:
+            raise ValueError("exchange commands must carry pristine lifecycle state")
+        return Order(
+            order_id=order.order_id,
+            order_type=order.order_type,
+            original_quantity=order.original_quantity,
+            side=order.side,
+            price_ticks=order.price_ticks,
+            owner=order.owner,
+            cancel_target_id=order.cancel_target_id,
+        )
 
     def _register(self, order: Order) -> None:
         if order.order_id in self._seen_order_ids:

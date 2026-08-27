@@ -21,7 +21,7 @@ from .mechanics_models import (
     SelfTradePreventionMode,
     SessionState,
 )
-from .models import Order, OrderOwner, OrderStatus, Side
+from .models import Order, OrderOwner, OrderStatus, OrderView, Side
 
 
 _ALLOWED_SESSION_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
@@ -697,7 +697,7 @@ class MarketMechanicsEngine:
     def _volatility_interruption(
         self,
         managed: ManagedOrder,
-        makers: list[Order],
+        makers: list[OrderView],
     ) -> bool:
         threshold = self.rules.volatility_interruption_ticks
         if threshold is None or not makers:
@@ -730,7 +730,7 @@ class MarketMechanicsEngine:
     def _execution_collar_interrupted(
         self,
         managed: ManagedOrder,
-        makers: list[Order],
+        makers: list[OrderView],
     ) -> bool:
         collar = self.rules.price_collar_ticks
         if collar is None or not makers:
@@ -816,11 +816,11 @@ class MarketMechanicsEngine:
                 ),
             )
 
-    def _potential_makers(self, request: AdvancedOrderRequest) -> list[Order]:
+    def _potential_makers(self, request: AdvancedOrderRequest) -> list[OrderView]:
         prices = self.book.ask_prices if request.side is Side.BUY else self.book.bid_prices
         levels = self.book.asks if request.side is Side.BUY else self.book.bids
         remaining = request.quantity
-        makers: list[Order] = []
+        makers: list[OrderView] = []
         for price in prices:
             if request.instruction is not OrderInstruction.MARKET:
                 if (

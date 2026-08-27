@@ -1,7 +1,18 @@
 """Deterministic price-time-priority exchange primitives."""
 
 from .book import OrderBook
-from .models import Fill, Order, OrderOwner, OrderStatus, OrderType, PriceLevel, Side, Trade
+from .models import (
+    Fill,
+    Order,
+    OrderOwner,
+    OrderStatus,
+    OrderType,
+    OrderView,
+    PriceLevel,
+    PriceLevelView,
+    Side,
+    Trade,
+)
 from .mechanics_engine import MarketMechanicsEngine, MechanicsTimelineInspector
 from .mechanics_models import (
     MECHANICS_RECORDING_SCHEMA_VERSION,
@@ -52,7 +63,9 @@ __all__ = [
     "OrderOwner",
     "OrderStatus",
     "OrderType",
+    "OrderView",
     "PriceLevel",
+    "PriceLevelView",
     "ScheduledSessionState",
     "SelfTradePreventionMode",
     "SessionSchedule",

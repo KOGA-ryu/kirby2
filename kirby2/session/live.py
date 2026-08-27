@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from typing import TYPE_CHECKING, Iterable
 
-from kirby2.exchange import Order, OrderOwner, OrderStatus, Side
+from kirby2.exchange import Order, OrderOwner, OrderStatus, OrderView, Side
 from kirby2.scenarios import ScenarioDefinition, create_market_engine
 from kirby2.session.events import EventType, SimulationEvent
 from kirby2.simulation import (
@@ -833,7 +833,10 @@ class LiveMarketSession:
             self._execution_tracker.register_order(order, self.simulation_time_us)
         exchange_events = self.engine.book.process(order)
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
-        return self._order_outcome(command, order)
+        return self._order_outcome(
+            command,
+            self.engine.book.all_orders[order.order_id],
+        )
 
     def _submit_market(
         self,
@@ -855,12 +858,15 @@ class LiveMarketSession:
             self._execution_tracker.register_order(order, self.simulation_time_us)
         exchange_events = self.engine.book.process(order)
         self._consume_exchange_activity(exchange_events, self.simulation_time_us)
-        return self._order_outcome(command, order)
+        return self._order_outcome(
+            command,
+            self.engine.book.all_orders[order.order_id],
+        )
 
     def _order_outcome(
         self,
         command: SessionCommand,
-        order: Order,
+        order: OrderView,
     ) -> CommandOutcome:
         price = "MKT" if order.price_ticks is None else self._format_price(order.price_ticks)
         details = (
@@ -1108,12 +1114,12 @@ class LiveMarketSession:
         return self.engine.config.initial_mid_ticks * 2
 
     @staticmethod
-    def _distance_from_reference_x2(order: Order, reference_x2: int) -> int:
+    def _distance_from_reference_x2(order: OrderView, reference_x2: int) -> int:
         if order.price_ticks is None:
             raise RuntimeError("working player order must have a limit price")
         return abs(order.price_ticks * 2 - reference_x2)
 
-    def _player_orders(self) -> list[Order]:
+    def _player_orders(self) -> list[OrderView]:
         return [
             order
             for order in self.engine.book.active_orders.values()
@@ -1171,7 +1177,7 @@ class LiveMarketSession:
             )
             queue_ahead = 0
             for queued in level.orders:
-                if queued is order:
+                if queued.order_id == order.order_id:
                     break
                 queue_ahead += queued.remaining_quantity
             views.append(

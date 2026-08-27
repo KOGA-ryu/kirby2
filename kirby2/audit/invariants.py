@@ -22,6 +22,13 @@ def assert_order_book_invariants(book: OrderBook) -> None:
     # is still initializing, without weakening enum identity checks.
     from kirby2.exchange.models import OrderOwner, OrderStatus, Side
 
+    bid_prices = book._bid_prices
+    ask_prices = book._ask_prices
+    bids = book._bids
+    asks = book._asks
+    active_orders = book._active_orders
+    all_orders = book._all_orders
+    fills = book._fills
     best_bid = book.best_bid
     best_ask = book.best_ask
     _require(
@@ -29,17 +36,17 @@ def assert_order_book_invariants(book: OrderBook) -> None:
         "best bid must remain below best ask",
     )
 
-    _require(book.bid_prices == sorted(book.bid_prices, reverse=True), "bid prices out of order")
-    _require(book.ask_prices == sorted(book.ask_prices), "ask prices out of order")
-    _require(len(book.bid_prices) == len(set(book.bid_prices)), "duplicate bid price level")
-    _require(len(book.ask_prices) == len(set(book.ask_prices)), "duplicate ask price level")
-    _require(set(book.bid_prices) == set(book.bids), "bid price index does not match levels")
-    _require(set(book.ask_prices) == set(book.asks), "ask price index does not match levels")
+    _require(bid_prices == sorted(bid_prices, reverse=True), "bid prices out of order")
+    _require(ask_prices == sorted(ask_prices), "ask prices out of order")
+    _require(len(bid_prices) == len(set(bid_prices)), "duplicate bid price level")
+    _require(len(ask_prices) == len(set(ask_prices)), "duplicate ask price level")
+    _require(set(bid_prices) == set(bids), "bid price index does not match levels")
+    _require(set(ask_prices) == set(asks), "ask price index does not match levels")
 
     queued_ids: list[str] = []
     for side, levels, prices in (
-        (Side.BUY, book.bids, book.bid_prices),
-        (Side.SELL, book.asks, book.ask_prices),
+        (Side.BUY, bids, bid_prices),
+        (Side.SELL, asks, ask_prices),
     ):
         for price in prices:
             level = levels[price]
@@ -59,9 +66,9 @@ def assert_order_book_invariants(book: OrderBook) -> None:
             _require(len(sequences) == len(set(sequences)), "duplicate resting sequence")
 
     _require(len(queued_ids) == len(set(queued_ids)), "duplicate active order ID")
-    _require(set(queued_ids) == set(book.active_orders), "active order index does not match queues")
+    _require(set(queued_ids) == set(active_orders), "active order index does not match queues")
 
-    for order in book.all_orders.values():
+    for order in all_orders.values():
         _require(type(order.original_quantity) is int, "original quantity must be an integer")
         _require(type(order.remaining_quantity) is int, "remaining quantity must be an integer")
         _require(type(order.filled_quantity) is int, "filled quantity must be an integer")
@@ -77,7 +84,7 @@ def assert_order_book_invariants(book: OrderBook) -> None:
             "order quantities do not conserve",
         )
 
-    for order_id, order in book.active_orders.items():
+    for order_id, order in active_orders.items():
         _require(order_id == order.order_id, "active order index key mismatch")
         _require(order.remaining_quantity > 0, "active order quantity must be positive")
 
@@ -87,7 +94,7 @@ def assert_order_book_invariants(book: OrderBook) -> None:
         "event sequence must be contiguous and monotonic",
     )
 
-    player_fills = [fill for fill in book.fills if fill.owner is OrderOwner.PLAYER]
+    player_fills = [fill for fill in fills if fill.owner is OrderOwner.PLAYER]
     expected_bought = sum(fill.quantity for fill in player_fills if fill.side is Side.BUY)
     expected_sold = sum(fill.quantity for fill in player_fills if fill.side is Side.SELL)
     _require(book.player_position.bought_quantity == expected_bought, "player buy ledger mismatch")

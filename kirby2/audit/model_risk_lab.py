@@ -33,6 +33,7 @@ from kirby2.counterfactual.models import (
     SnapshotComponent,
     TimingSweepCell,
 )
+from kirby2.exchange import Order, OrderBook, OrderOwner, OrderStatus, Side
 from kirby2.exchange.mechanics_models import MechanicsEvent, MechanicsEventType
 from kirby2.immutable import freeze_json, thaw_json
 from kirby2.latency.models import LatencyEvent, LatencyEventType
@@ -119,6 +120,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _probe_case(result),
             _core_replay_payload_ownership_case(),
             _subsystem_evidence_payload_ownership_case(),
+            _exchange_state_ownership_case(),
             _artifact_path_boundary_case(root / "artifact-path-boundary"),
             _packet_identity_scope_case(
                 root / "packet-identity-scope",
@@ -886,6 +888,192 @@ def _subsystem_evidence_payload_ownership_case() -> ModelRiskLabAuditCase:
             "probes": probes,
         },
         tuple(failures),
+    )
+
+
+def _exchange_state_ownership_case() -> ModelRiskLabAuditCase:
+    book = OrderBook()
+    submitted = Order.limit(
+        "OWNERSHIP-BID",
+        Side.BUY,
+        100,
+        100,
+        OrderOwner.PLAYER,
+    )
+    book.process(submitted)
+    caller_remained_pristine = all(
+        (
+            submitted.remaining_quantity == 100,
+            submitted.filled_quantity == 0,
+            submitted.cancelled_quantity == 0,
+            submitted.resting_sequence is None,
+            submitted.status is OrderStatus.NEW,
+        )
+    )
+    state_before_attacks = book.state_sha256()
+    events_before_attacks = book.journal.canonical_json_lines()
+    order_view = book.active_orders[submitted.order_id]
+    level_view = book.bids[100]
+    active_mapping = book.active_orders
+    all_mapping = book.all_orders
+    bid_mapping = book.bids
+
+    submitted.apply_fill(10)
+    submitted.price_ticks = 999
+    caller_mutation_preserved_state = book.state_sha256() == state_before_attacks
+    caller_mutation_preserved_events = (
+        book.journal.canonical_json_lines() == events_before_attacks
+    )
+
+    public_mutation_rejected: dict[str, bool] = {}
+    try:
+        order_view.remaining_quantity = 1  # type: ignore[misc]
+    except (AttributeError, TypeError):
+        public_mutation_rejected["order_view"] = True
+    else:
+        public_mutation_rejected["order_view"] = False
+    try:
+        level_view.orders.clear()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        public_mutation_rejected["price_level_queue"] = True
+    else:
+        public_mutation_rejected["price_level_queue"] = False
+    try:
+        active_mapping["FORGED"] = order_view  # type: ignore[index]
+    except (AttributeError, TypeError):
+        public_mutation_rejected["active_order_mapping"] = True
+    else:
+        public_mutation_rejected["active_order_mapping"] = False
+    try:
+        all_mapping["FORGED"] = order_view  # type: ignore[index]
+    except (AttributeError, TypeError):
+        public_mutation_rejected["all_order_mapping"] = True
+    else:
+        public_mutation_rejected["all_order_mapping"] = False
+    try:
+        bid_mapping[999] = level_view  # type: ignore[index]
+    except (AttributeError, TypeError):
+        public_mutation_rejected["price_level_mapping"] = True
+    else:
+        public_mutation_rejected["price_level_mapping"] = False
+
+    forged_process = Order.limit("FORGED-PROCESS", Side.BUY, 10, 99)
+    forged_process.apply_fill(1)
+    forged_process_rejected = False
+    try:
+        book.process(forged_process)
+    except ValueError:
+        forged_process_rejected = True
+
+    forged_replacement = Order.limit("FORGED-REPLACEMENT", Side.BUY, 10, 99)
+    forged_replacement.apply_fill(1)
+    forged_replacement_rejected = False
+    try:
+        book.replace(
+            submitted.order_id,
+            forged_replacement,
+            "FORGED-REPLACE-CANCEL",
+        )
+    except ValueError:
+        forged_replacement_rejected = True
+
+    attacks_preserved_state = book.state_sha256() == state_before_attacks
+    attacks_preserved_events = (
+        book.journal.canonical_json_lines() == events_before_attacks
+    )
+    owned_state_before_command = book.all_orders[submitted.order_id]
+
+    book.process(Order.market("OWNERSHIP-SELL", Side.SELL, 40))
+    owned_state_after_command = book.all_orders[submitted.order_id]
+    state_after_command = book.state_sha256()
+    events_after_command = book.journal.canonical_json_lines()
+    genuine_command_changed_state = state_after_command != state_before_attacks
+    genuine_command_changed_events = events_after_command != events_before_attacks
+    genuine_command_reconciled = all(
+        (
+            owned_state_before_command.remaining_quantity == 100,
+            owned_state_after_command.remaining_quantity == 60,
+            owned_state_after_command.filled_quantity == 40,
+            owned_state_after_command.status is OrderStatus.PARTIALLY_FILLED,
+            order_view.remaining_quantity == 100,
+            book.player_position.position == 40,
+        )
+    )
+
+    immutable_ledger_rejected: dict[str, bool] = {}
+    trades = book.trades
+    fills = book.fills
+    try:
+        trades.clear()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        immutable_ledger_rejected["trades_tuple"] = True
+    else:
+        immutable_ledger_rejected["trades_tuple"] = False
+    try:
+        fills.clear()  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        immutable_ledger_rejected["fills_tuple"] = True
+    else:
+        immutable_ledger_rejected["fills_tuple"] = False
+    try:
+        fills[0].quantity = 999  # type: ignore[misc]
+    except (AttributeError, TypeError):
+        immutable_ledger_rejected["frozen_fill"] = True
+    else:
+        immutable_ledger_rejected["frozen_fill"] = False
+    ledger_attacks_preserved_state = book.state_sha256() == state_after_command
+    ledger_attacks_preserved_events = (
+        book.journal.canonical_json_lines() == events_after_command
+    )
+    book.assert_invariants()
+
+    passed = all(
+        (
+            caller_remained_pristine,
+            caller_mutation_preserved_state,
+            caller_mutation_preserved_events,
+            all(public_mutation_rejected.values()),
+            len(public_mutation_rejected) == 5,
+            forged_process_rejected,
+            forged_replacement_rejected,
+            attacks_preserved_state,
+            attacks_preserved_events,
+            genuine_command_changed_state,
+            genuine_command_changed_events,
+            genuine_command_reconciled,
+            all(immutable_ledger_rejected.values()),
+            len(immutable_ledger_rejected) == 3,
+            ledger_attacks_preserved_state,
+            ledger_attacks_preserved_events,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "exchange_state_changes_only_through_owned_journaled_commands",
+        {
+            "attacks_preserved_events": attacks_preserved_events,
+            "attacks_preserved_state": attacks_preserved_state,
+            "caller_mutation_preserved_events": caller_mutation_preserved_events,
+            "caller_mutation_preserved_state": caller_mutation_preserved_state,
+            "caller_remained_pristine_after_process": caller_remained_pristine,
+            "event_sha256_after_command": hashlib.sha256(
+                events_after_command.encode("utf-8")
+            ).hexdigest(),
+            "event_sha256_before_attacks": hashlib.sha256(
+                events_before_attacks.encode("utf-8")
+            ).hexdigest(),
+            "forged_process_rejected": forged_process_rejected,
+            "forged_replacement_rejected": forged_replacement_rejected,
+            "genuine_command_changed_events": genuine_command_changed_events,
+            "genuine_command_changed_state": genuine_command_changed_state,
+            "genuine_command_reconciled": genuine_command_reconciled,
+            "immutable_ledger_rejected": immutable_ledger_rejected,
+            "ledger_attacks_preserved_events": ledger_attacks_preserved_events,
+            "ledger_attacks_preserved_state": ledger_attacks_preserved_state,
+            "public_mutation_rejected": public_mutation_rejected,
+            "state_sha256_after_command": state_after_command,
+            "state_sha256_before_attacks": state_before_attacks,
+        },
+        () if passed else ("exchange state ownership boundary failed",),
     )
 
 
