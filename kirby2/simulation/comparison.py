@@ -82,7 +82,7 @@ def compare_flow_models(
         raise ValueError(f"unsupported flow models: {sorted(unknown)!r}")
     results: list[FlowModelComparison] = []
     for name in requested:
-        model, profile_id = _flow_model(name, definition.regime)
+        model, profile_id = create_flow_model(name, definition.regime)
         engine, _ = create_market_engine(
             definition,
             seed=seed,
@@ -112,7 +112,14 @@ def accepted_hawkes_profile_for_regime(regime: Regime) -> str:
     return "balanced"
 
 
-def _flow_model(name: str, regime: Regime) -> tuple[FlowModel, str | None]:
+def create_flow_model(
+    name: str,
+    regime: Regime,
+) -> tuple[FlowModel, str | None]:
+    """Build the accepted production arrival model for one regime."""
+
+    if name not in SUPPORTED_FLOW_MODELS:
+        raise ValueError(f"unsupported flow model: {name!r}")
     if name == "simple":
         return SimpleFlowModel(), None
     profile_id = accepted_hawkes_profile_for_regime(regime)

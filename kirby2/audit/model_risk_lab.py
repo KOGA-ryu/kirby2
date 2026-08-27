@@ -11,6 +11,7 @@ from kirby2.agents.models import PublicEcologyEvent
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
 from kirby2.auditlab.executors import (
     CAPABILITY_MATRIX,
+    CORE_FLOW_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
     ExecutorRegistry,
 )
@@ -135,6 +136,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
         cases = (
             _coverage_case(result),
             _truthful_execution_contract_case(),
+            _real_core_flow_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -505,7 +507,7 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             direct_mutation_rejected,
             export_mutation_preserved,
             empty_registry_refused,
-            not EXECUTOR_REGISTRY.registered_lanes,
+            EXECUTOR_REGISTRY.registered_lanes == (ExecutorLane.CORE_FLOW,),
         )
     )
     return ModelRiskLabAuditCase(
@@ -542,6 +544,168 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             "unique_seed_count": len({item.seed for item in schedule}),
         },
         () if passed else ("truthful execution contract proof failed",),
+    )
+
+
+def _real_core_flow_executor_case() -> ModelRiskLabAuditCase:
+    candidates = tuple(
+        item
+        for item in generate_configurations(seed=771, budget=840)
+        if item.lane is ExecutorLane.CORE_FLOW
+    )
+    configurations = tuple(
+        replace(
+            next(item for item in candidates if item.flow_model == model),
+            duration_us=2_000_000,
+        )
+        for model in ("simple", "hawkes")
+    )
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    coverage = evidence_coverage_report(results)
+    core_coverage = coverage["lanes"][ExecutorLane.CORE_FLOW.value]
+    capability = CAPABILITY_MATRIX[ExecutorLane.CORE_FLOW]
+
+    tape_evidence: dict[str, object] = {}
+    tape_is_native = True
+    for result in results:
+        payload = thaw_json(result.recording.payload)
+        flow_events = payload["flow_events"]
+        tape_is_native = tape_is_native and all(
+            {
+                "applied",
+                "command",
+                "exchange_event_end",
+                "exchange_event_start",
+                "family",
+                "flow_sequence",
+                "reason",
+                "simulation_time_us",
+            }.issubset(event)
+            for event in flow_events
+        )
+        flow_model = payload["flow_model"]
+        replay_config = flow_model["replay_config"]
+        tape_evidence[result.configuration.flow_model] = {
+            "flow_event_count": len(flow_events),
+            "flow_model": flow_model["model"],
+            "flow_model_profile_id": flow_model["profile_id"],
+            "flow_model_replay_config_sha256": (
+                None
+                if replay_config is None
+                else canonical_sha256(replay_config)
+            ),
+            "recording_sha256": result.recording.sha256,
+            "skipped_flow_event_count": sum(
+                not event["applied"] for event in flow_events
+            ),
+        }
+
+    result_evidence: dict[str, object] = {}
+    for result, repeat, replay in zip(results, repeated, replayed):
+        result_evidence[result.configuration.flow_model] = {
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "event_sha256": result.event_sha256,
+            "exercise_names": [
+                exercise.capability for exercise in result.exercises
+            ],
+            "flow_event_count": result.metrics["flow_event_count"],
+            "recording_type": result.recording.recording_type,
+            "repeated_result_match": result.result_sha256 == repeat.result_sha256,
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": result.result_sha256 == replay.result_sha256,
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+            "skipped_flow_event_count": result.metrics[
+                "skipped_flow_event_count"
+            ],
+            "trade_count": result.metrics["trade_count"],
+        }
+
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    core_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            core_coverage["dimensions"],
+            core_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes == (ExecutorLane.CORE_FLOW,),
+            {item.configuration.flow_model for item in results}
+            == {"simple", "hawkes"},
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == CORE_FLOW_RECORDING_TYPE
+                for item in results
+            ),
+            all(int(item.metrics["flow_event_count"]) > 0 for item in results),
+            sum(int(item.metrics["skipped_flow_event_count"]) for item in results)
+            > 0,
+            sum(int(item.metrics["trade_count"]) for item in results) > 0,
+            exact_exercises,
+            "duration_events" not in capability.credited_dimensions,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            tape_is_native,
+            core_coverage_passed,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_simple_and_hawkes_flow_execute_and_replay_natively",
+        {
+            "core_flow_coverage": core_coverage,
+            "executor_lanes": [
+                item.value for item in EXECUTOR_REGISTRY.registered_lanes
+            ],
+            "results": result_evidence,
+            "tapes": tape_evidence,
+        },
+        () if passed else ("real core-flow executor proof failed",),
     )
 
 
