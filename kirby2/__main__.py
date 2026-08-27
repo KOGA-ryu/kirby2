@@ -367,6 +367,10 @@ def _parser() -> argparse.ArgumentParser:
         "audit-historical-features",
         help="audit causal historical feature replay, provenance, and strategy gates",
     )
+    subcommands.add_parser(
+        "audit-historical-lessons",
+        help="audit blind lesson phases, capability gates, overlays, and replay",
+    )
 
     matrix = subcommands.add_parser(
         "matrix",
@@ -530,7 +534,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     lesson_run = subcommands.add_parser(
         "lesson-run",
-        help="run one historical lesson and reveal its structured debrief",
+        help="start one blind historical lesson session",
     )
     lesson_run.add_argument(
         "lesson",
@@ -538,9 +542,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     lesson_run.add_argument("--levels", type=int, choices=range(1, 11), default=4)
     lesson_run.add_argument(
+        "--auto-complete",
+        action="store_true",
+        help="deterministically drive the lesson through freeze, reveal, and debrief",
+    )
+    lesson_run.add_argument(
+        "--answer",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="question response in configured order; repeat with --auto-complete",
+    )
+    lesson_run.add_argument(
         "--events-jsonl",
         type=Path,
-        help="save the complete exact or reconstructed replay stream",
+        help="save the canonical lesson input, event, response, and overlay stream",
     )
     lesson_run.add_argument(
         "--debrief-json",
@@ -646,16 +662,42 @@ def main() -> None:
         try:
             lesson = load_historical_lessons()[args.lesson]
             session = run_historical_lesson(lesson)
+            if args.answer and not args.auto_complete:
+                raise ValueError("--answer requires --auto-complete")
+            if args.debrief_json is not None and not args.auto_complete:
+                raise ValueError("--debrief-json requires --auto-complete")
+            if len(args.answer) > len(lesson.training_questions):
+                raise ValueError("more answers were supplied than configured questions")
+            if args.auto_complete:
+                session.start()
+                session.pause()
+                session.resume()
+                session.step()
+                if session.phase.value == "BLIND_RUNNING":
+                    session.advance_to(session.run.duration_us)
+                for index, _question in enumerate(
+                    lesson.training_questions,
+                    start=1,
+                ):
+                    response = (
+                        args.answer[index - 1]
+                        if index <= len(args.answer)
+                        else f"Auto-complete response {index}; no user response supplied."
+                    )
+                    session.answer(index, response)
+                session.freeze_responses()
+                session.reveal()
+                session.debrief()
         except (OSError, TypeError, ValueError, RuntimeError) as error:
             print(f"LESSON_ERROR {error}", file=sys.stderr)
             raise SystemExit(2) from error
         print(render_historical_lesson(session, args.levels))
         if args.events_jsonl is not None:
             args.events_jsonl.write_text(
-                session.run.replay_json_lines() + "\n",
+                session.replay_json_lines() + "\n",
                 encoding="utf-8",
             )
-            print(f"LESSON_REPLAY_STREAM {args.events_jsonl.resolve()}")
+            print(f"LESSON_SESSION_STREAM {args.events_jsonl.resolve()}")
         if args.debrief_json is not None:
             args.debrief_json.write_text(
                 json.dumps(
@@ -667,7 +709,13 @@ def main() -> None:
                 encoding="utf-8",
             )
             print(f"LESSON_DEBRIEF_JSON {args.debrief_json.resolve()}")
-        print("HISTORICAL_LESSON PASS")
+        if session.debrief_available:
+            print("HISTORICAL_LESSON PASS phase=DEBRIEFED responses_frozen=true")
+        else:
+            print(
+                "HISTORICAL_LESSON READY incomplete=true "
+                "identity_revealed=false"
+            )
         return
 
     if args.command == "historical":
@@ -1555,6 +1603,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"HISTORICAL_FEATURE_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-historical-lessons":
+        from kirby2.audit.historical_lessons import audit_historical_lessons
+
+        reports = audit_historical_lessons()
+        print("KIRBY2_HISTORICAL_LESSON_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"HISTORICAL_LESSON_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

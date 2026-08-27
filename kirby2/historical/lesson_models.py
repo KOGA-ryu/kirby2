@@ -10,7 +10,7 @@ from datetime import date
 from enum import Enum
 from typing import Any
 
-from .models import HistoricalDataMode, HistoricalRun
+from .models import HistoricalDataMode
 
 
 HISTORICAL_LESSON_SCHEMA_VERSION = 1
@@ -313,38 +313,6 @@ class HistoricalLesson:
             known_limitations=_text_array(payload, "known_limitations"),
             training_questions=_text_array(payload, "training_questions"),
         )
-
-
-@dataclass(frozen=True, slots=True)
-class HistoricalLessonSession:
-    lesson: HistoricalLesson
-    run: HistoricalRun
-    complete: bool = True
-
-    def __post_init__(self) -> None:
-        if self.lesson.mode is not self.run.mode:
-            raise ValueError("historical lesson mode does not match its run")
-        if self.lesson.source.fixture_id != self.run.fixture_id:
-            raise ValueError("historical lesson source does not match its run")
-        if self.lesson.time_window.end_us > self.run.duration_us:
-            raise ValueError("historical lesson window exceeds its replay source")
-        if (
-            self.lesson.time_window.start_us != 0
-            or self.lesson.time_window.end_us != self.run.duration_us
-        ):
-            raise ValueError(
-                "current historical lesson driver requires the complete fixture window"
-            )
-        if not self.complete:
-            raise ValueError("historical lesson session result must be complete")
-        self.run.book.assert_invariants()
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "complete": self.complete,
-            "lesson": self.lesson.as_dict(),
-            "replay_sha256": self.run.replay_sha256(),
-        }
 
 
 def _validate_text_collection(label: str, values: tuple[str, ...]) -> None:

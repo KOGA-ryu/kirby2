@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from kirby2.exchange.models import OrderOwner, OrderStatus, Side
-
 if TYPE_CHECKING:
     from kirby2.exchange.book import OrderBook
 
@@ -20,6 +18,10 @@ def _require(condition: bool, message: str) -> None:
 
 
 def assert_order_book_invariants(book: OrderBook) -> None:
+    # Imported here so the exchange can load this audit module while its package
+    # is still initializing, without weakening enum identity checks.
+    from kirby2.exchange.models import OrderOwner, OrderStatus, Side
+
     best_bid = book.best_bid
     best_ask = book.best_ask
     _require(

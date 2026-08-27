@@ -309,7 +309,7 @@ def replay_historical_features(
             and run.commands[command_index].action == "initial_limit"
             and run.commands[command_index].simulation_time_us == 0
         ):
-            _apply_command(run.commands[command_index], book, run)
+            apply_historical_command(run.commands[command_index], book, run)
             command_index += 1
     engine = MicrostructureFeatureEngine(windows_us=windows_us)
     engine.reset(0, book)
@@ -321,7 +321,7 @@ def replay_historical_features(
         ):
             command = run.commands[command_index]
             engine.advance_to(command.simulation_time_us, book)
-            events = _apply_command(command, book, run)
+            events = apply_historical_command(command, book, run)
             if events:
                 engine.observe(command.simulation_time_us, events, book)
             command_index += 1
@@ -485,7 +485,7 @@ def evaluate_historical_strategy(
     )
 
 
-def _apply_command(
+def apply_historical_command(
     command: HistoricalCommandRecord,
     book: OrderBook,
     source_run: HistoricalRun,

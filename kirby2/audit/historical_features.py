@@ -314,8 +314,14 @@ def _replay_lessons_and_report_case(exact, reconstruction) -> HistoricalFeatureA
             failures.append("historical report lost invariant status")
     if "RECONSTRUCTION_FEATURE_PROVENANCE" not in reconstruction_report:
         failures.append("reconstruction report omitted synthetic feature disclosure")
-    if any(not session.complete for session in sessions):
-        failures.append("packaged R04 lesson source replay did not complete")
+    if any(session.complete for session in sessions):
+        failures.append("packaged lesson runtime bypassed its READY phase")
+    if any(
+        len(session.run.exchange_events) == 0
+        or len(session.run.commands) == 0
+        for session in sessions
+    ):
+        failures.append("packaged lesson source replay did not produce commands and events")
     if any(not session.run.replay_sha256() for session in sessions):
         failures.append("historical lesson source replay omitted digest")
     return HistoricalFeatureAuditCase(
