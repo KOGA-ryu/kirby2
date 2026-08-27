@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
+from kirby2.auditlab.models import canonical_json, canonical_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _minimization_case(result),
             _statistics_case(result),
             _probe_case(result),
+            _artifact_path_boundary_case(root / "artifact-path-boundary"),
             _immutable_case(
                 packet.as_dict(),
                 initial_verification.verification_status,
@@ -185,6 +188,149 @@ def _probe_case(result) -> ModelRiskLabAuditCase:
         "real_subsystem_probes_cover_non_kernel_semantics",
         {"probes": result.probes},
         () if not failed else (f"subsystem probes failed: {failed}",),
+    )
+
+
+def _artifact_path_boundary_case(root: Path) -> ModelRiskLabAuditCase:
+    record_root = root / "record"
+    store = AuditLabStore(record_root)
+    identity = {"budget": 1, "probe": "artifact-path-boundary", "seed": 771}
+    relative_escape = record_root / "relative-escape.txt"
+    absolute_escape = record_root / "absolute-escape.txt"
+    invalid_names = {
+        "absolute_path": str(absolute_escape.resolve()),
+        "backslash_traversal": r"nested\..\escape.txt",
+        "deep_parent_escape": "../../../relative-escape.txt",
+        "dot_segment": "safe/./artifact.txt",
+        "parent_segment": "../escape.txt",
+        "reserved_manifest": "manifest.json",
+        "windows_drive": "C:/escape.txt",
+    }
+    rejected: dict[str, str] = {}
+    for label, name in invalid_names.items():
+        try:
+            store.record(identity, {name: "escape"})
+        except (TypeError, ValueError) as error:
+            rejected[label] = str(error)
+
+    staging_entries_after_rejection = sorted(
+        path.relative_to(store.staging).as_posix()
+        for path in store.staging.rglob("*")
+    )
+    packet_entries_after_rejection = sorted(
+        path.name for path in store.packets.iterdir()
+    )
+    safe = store.record(
+        {"budget": 1, "probe": "safe-nested-artifact", "seed": 771},
+        {
+            "failures/example.json": "{}\n",
+            "summary.txt": "safe nested artifact\n",
+        },
+    )
+    safe_verification = store.verify(safe.packet_id)
+
+    traversal_store = AuditLabStore(root / "verify-traversal")
+    traversal_identity = {
+        "budget": 1,
+        "probe": "manifest-traversal",
+        "seed": 771,
+    }
+    traversal_packet_id = f"audit-{canonical_sha256(traversal_identity)[:24]}"
+    traversal_directory = traversal_store.packets / traversal_packet_id
+    traversal_directory.mkdir()
+    traversal_outside = traversal_store.packets / "outside.txt"
+    traversal_content = "outside packet\n"
+    traversal_outside.write_text(traversal_content, encoding="utf-8")
+    traversal_manifest = {
+        "artifacts": {
+            "../outside.txt": {
+                "bytes": len(traversal_content.encode("utf-8")),
+                "sha256": hashlib.sha256(
+                    traversal_content.encode("utf-8")
+                ).hexdigest(),
+            }
+        },
+        "identity": traversal_identity,
+        "packet_id": traversal_packet_id,
+        "record_type": "IMMUTABLE_KIRBY2_MODEL_RISK_PACKET",
+        "schema_version": 1,
+    }
+    (traversal_directory / "manifest.json").write_text(
+        canonical_json(traversal_manifest) + "\n",
+        encoding="utf-8",
+    )
+    traversal_verification = traversal_store.verify(traversal_packet_id)
+
+    symlink_store = AuditLabStore(root / "verify-symlink")
+    symlink_identity = {"budget": 1, "probe": "symlink", "seed": 771}
+    symlink_packet_id = f"audit-{canonical_sha256(symlink_identity)[:24]}"
+    symlink_directory = symlink_store.packets / symlink_packet_id
+    symlink_directory.mkdir()
+    symlink_outside = symlink_store.root / "outside.txt"
+    symlink_content = "symlink target\n"
+    symlink_outside.write_text(symlink_content, encoding="utf-8")
+    (symlink_directory / "link.txt").symlink_to(symlink_outside)
+    symlink_manifest = {
+        "artifacts": {
+            "link.txt": {
+                "bytes": len(symlink_content.encode("utf-8")),
+                "sha256": hashlib.sha256(
+                    symlink_content.encode("utf-8")
+                ).hexdigest(),
+            }
+        },
+        "identity": symlink_identity,
+        "packet_id": symlink_packet_id,
+        "record_type": "IMMUTABLE_KIRBY2_MODEL_RISK_PACKET",
+        "schema_version": 1,
+    }
+    (symlink_directory / "manifest.json").write_text(
+        canonical_json(symlink_manifest) + "\n",
+        encoding="utf-8",
+    )
+    symlink_verification = symlink_store.verify(symlink_packet_id)
+
+    packet_id_traversal_rejected = False
+    try:
+        store.verify("../escape")
+    except ValueError:
+        packet_id_traversal_rejected = True
+
+    passed = all(
+        (
+            set(rejected) == set(invalid_names),
+            not relative_escape.exists(),
+            not absolute_escape.exists(),
+            not staging_entries_after_rejection,
+            not packet_entries_after_rejection,
+            safe_verification.verification_status == "PASS",
+            (safe.directory / "failures" / "example.json").is_file(),
+            not any(store.staging.iterdir()),
+            traversal_verification.verification_status.startswith("FAIL"),
+            "invalid artifact name" in traversal_verification.verification_status,
+            symlink_verification.verification_status.startswith("FAIL"),
+            "symlink" in symlink_verification.verification_status,
+            packet_id_traversal_rejected,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "packet_artifact_paths_are_contained_before_write_and_during_verify",
+        {
+            "absolute_escape_exists": absolute_escape.exists(),
+            "invalid_names": invalid_names,
+            "packet_entries_after_rejection": packet_entries_after_rejection,
+            "packet_id_traversal_rejected": packet_id_traversal_rejected,
+            "rejected": rejected,
+            "relative_escape_exists": relative_escape.exists(),
+            "safe_nested_artifact_exists": (
+                safe.directory / "failures" / "example.json"
+            ).is_file(),
+            "safe_verification": safe_verification.verification_status,
+            "staging_entries_after_rejection": staging_entries_after_rejection,
+            "symlink_verification": symlink_verification.verification_status,
+            "traversal_verification": traversal_verification.verification_status,
+        },
+        () if passed else ("audit packet path containment boundary failed",),
     )
 
 

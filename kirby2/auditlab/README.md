@@ -30,7 +30,13 @@ python3 -m kirby2 audit-lab --budget 10000 --seed 771 --save-failures
 ```
 
 Packets are content-addressed beneath `.kirby2/research/audit_lab/packets` and
-indexed by an append-only ledger. Passing automated gates creates a separate
-immutable acceptance record whose decision remains `PENDING_HUMAN_REVIEW`.
-`AuditLabStore.record_acceptance` can append a human decision that names this
-record in `supersedes_record_id`; earlier records are never rewritten.
+indexed by an append-only ledger. Artifact names must be canonical,
+packet-relative POSIX paths. Absolute paths, parent/dot segments, Windows path
+forms, backslashes, the reserved manifest name, and symlinks are rejected. The
+complete name inventory is validated before staging writes, and verification
+rechecks both lexical names and resolved containment before reading artifacts.
+
+Passing automated gates creates a separate immutable acceptance record whose
+decision remains `PENDING_HUMAN_REVIEW`. `AuditLabStore.record_acceptance` can
+append a human decision that names this record in `supersedes_record_id`;
+earlier records are never rewritten.

@@ -7,13 +7,15 @@ import json
 import re
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .models import AcceptanceRecord, canonical_json, canonical_sha256
 
 
 DEFAULT_AUDIT_LAB_STORE = Path(".kirby2") / "research" / "audit_lab"
 _ACCEPTANCE_ID = re.compile(r"^acceptance-[A-Za-z0-9_-]{1,96}$")
+_PACKET_ID = re.compile(r"^audit-[0-9a-f]{24}$")
+_RESERVED_ARTIFACT_NAMES = frozenset({"manifest.json"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +53,11 @@ class AuditLabStore:
         identity: dict[str, object],
         artifacts: dict[str, str],
     ) -> PacketRecord:
+        artifact_names = _validated_artifact_names(artifacts)
         packet_id = f"audit-{canonical_sha256(identity)[:24]}"
         target = self.packets / packet_id
+        if target.is_symlink():
+            raise RuntimeError("immutable audit packet target must not be a symlink")
         if target.exists():
             record = self.verify(packet_id)
             if record.verification_status != "PASS":
@@ -65,10 +70,11 @@ class AuditLabStore:
             directory = Path(temporary) / packet_id
             directory.mkdir()
             references: dict[str, dict[str, object]] = {}
-            for name, content in sorted(artifacts.items()):
-                path = directory / name
+            for name in artifact_names:
+                path = _contained_artifact_path(directory, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+                path = _contained_artifact_path(directory, name)
+                path.write_text(artifacts[name], encoding="utf-8")
                 references[name] = {
                     "bytes": path.stat().st_size,
                     "sha256": _file_sha256(path),
@@ -90,8 +96,13 @@ class AuditLabStore:
         return record
 
     def verify(self, packet_id: str) -> PacketRecord:
+        _validate_packet_id(packet_id)
         directory = self.packets / packet_id
+        if directory.is_symlink():
+            raise RuntimeError("audit packet directory must not be a symlink")
         manifest_path = directory / "manifest.json"
+        if manifest_path.is_symlink():
+            raise RuntimeError("audit packet manifest must not be a symlink")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -108,10 +119,35 @@ class AuditLabStore:
         if not isinstance(references, dict):
             failures.append("artifact inventory is missing")
             references = {}
+        validated_references: list[tuple[str, object]] = []
         for name, reference in references.items():
-            path = directory / name
+            try:
+                validated_name = _validate_artifact_name(name)
+            except (TypeError, ValueError) as error:
+                failures.append(f"invalid artifact name {name!r}: {error}")
+                continue
+            validated_references.append((validated_name, reference))
+
+        packet_entries = tuple(directory.rglob("*"))
+        symlinks = tuple(
+            path.relative_to(directory).as_posix()
+            for path in packet_entries
+            if path.is_symlink()
+        )
+        if symlinks:
+            failures.append(f"packet contains symlinks: {sorted(symlinks)!r}")
+
+        for name, reference in validated_references:
+            try:
+                path = _contained_artifact_path(directory, name)
+            except ValueError as error:
+                failures.append(f"unsafe artifact path {name!r}: {error}")
+                continue
             if not isinstance(reference, dict) or not path.is_file():
                 failures.append(f"missing artifact {name}")
+                continue
+            if path.is_symlink():
+                failures.append(f"artifact must not be a symlink {name}")
                 continue
             if _file_sha256(path) != reference.get("sha256"):
                 failures.append(f"artifact digest mismatch {name}")
@@ -119,8 +155,8 @@ class AuditLabStore:
                 failures.append(f"artifact byte-count mismatch {name}")
         actual_artifacts = {
             path.relative_to(directory).as_posix()
-            for path in directory.rglob("*")
-            if path.is_file() and path != manifest_path
+            for path in packet_entries
+            if path.is_file() and not path.is_symlink() and path != manifest_path
         }
         if actual_artifacts != set(references):
             failures.append("packet file inventory differs from immutable manifest")
@@ -259,3 +295,51 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validated_artifact_names(artifacts: dict[str, str]) -> tuple[str, ...]:
+    """Validate the complete inventory before packet staging or artifact writes."""
+
+    names = tuple(_validate_artifact_name(name) for name in artifacts)
+    if len(names) != len(set(names)):
+        raise ValueError("artifact names must be unique after canonicalization")
+    return tuple(sorted(names))
+
+
+def _validate_artifact_name(name: object) -> str:
+    if not isinstance(name, str):
+        raise TypeError("artifact name must be text")
+    if not name:
+        raise ValueError("artifact name must not be empty")
+    if "\x00" in name:
+        raise ValueError("artifact name must not contain NUL")
+    if "\\" in name:
+        raise ValueError("artifact name must use POSIX separators")
+    if name in _RESERVED_ARTIFACT_NAMES:
+        raise ValueError("artifact name is reserved by the packet format")
+
+    parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("artifact name contains an empty, dot, or parent segment")
+    posix = PurePosixPath(name)
+    windows = PureWindowsPath(name)
+    if posix.is_absolute() or windows.is_absolute() or windows.drive or windows.root:
+        raise ValueError("artifact name must be packet-relative")
+    if posix.as_posix() != name:
+        raise ValueError("artifact name is not canonical POSIX text")
+    return name
+
+
+def _contained_artifact_path(directory: Path, name: object) -> Path:
+    validated = _validate_artifact_name(name)
+    root = directory.resolve()
+    candidate = directory.joinpath(*PurePosixPath(validated).parts)
+    if not candidate.resolve(strict=False).is_relative_to(root):
+        raise ValueError("artifact resolves outside its packet directory")
+    return candidate
+
+
+def _validate_packet_id(packet_id: object) -> str:
+    if not isinstance(packet_id, str) or _PACKET_ID.fullmatch(packet_id) is None:
+        raise ValueError("audit packet ID is invalid")
+    return packet_id
