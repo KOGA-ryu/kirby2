@@ -3,6 +3,63 @@
 This file records prerequisite repairs discovered while executing the canonical
 sequence in `KIRBY2_AUDIT_TRUST_REPAIR_ROADMAP.md`.
 
+## ATR-13A — Refuse the facsimile-era event-expansion statistic
+
+Discovered: 2026-08-27 during the ATR-13 real-executor runner cutover at
+`afcae0f5e672037dd8f28dfeeb1491fab0430c15`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+```
+
+Observed failure:
+
+```text
+train_holdout_drift_overfit_seed_and_pathology_screens FAIL
+statistical risk gates failed: ['unrealistic_event_explosion']
+```
+
+Root cause: the legacy screen divides one generic `event_count` by
+`GeneratedConfiguration.duration_events`. The facsimile kernel used
+`duration_events` as its synthetic command count, but the seven real executors
+emit different native event families and advance by simulation time. After the
+cutover the numerator and denominator no longer share a scientific meaning.
+Preserving the threshold would turn a unit mismatch into either a false pass or
+a false failure.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/auditlab/statistics.py`
+
+Repair:
+
+1. Return `NOT_EXERCISED` for the legacy event-expansion screen.
+2. Record that real events per simulated second and the configured production
+   cap are required before the claim can be evaluated.
+3. Do not tune the old threshold or normalize heterogeneous lane events.
+4. Leave the controlled implementation to ATR-17, which owns the statistical
+   experiment design and makes an unexercised required statistic block the
+   substantial audit.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.statistics import statistical_checks; case={'configuration':{'duration_events':1,'strategy':'PROBE'},'metrics':{'event_count':999,'traded_volume':1,'trade_count':1,'price_displacement_ticks':0,'spread_ticks':1}}; result=next(item for item in statistical_checks((case,)) if item.name == 'unrealistic_event_explosion'); assert result.status == 'NOT_EXERCISED'; print('ATR_13A_EVENT_RATE_REFUSAL PASS')"
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+git diff --check
+```
+
+Acceptance: no audit labels heterogeneous native event counts divided by a
+facsimile command-count field as an event-rate measurement; the screen remains
+visibly unexercised until ATR-17 supplies common units and a production cap.
+
+Commit: `Refuse invalid mixed-lane event expansion rate`
+
+Handoff: resume ATR-13 from the preserved interrupted-slice changes.
+
 ## ATR-03A — Accept immutable replay mappings in session scoring
 
 Interrupted slice: ATR-03 (`Freeze core replay payloads`)

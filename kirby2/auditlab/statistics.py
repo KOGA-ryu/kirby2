@@ -135,17 +135,19 @@ def _hawkes_stability() -> StatisticalCheck:
 
 
 def _event_explosion(cases) -> StatisticalCheck:
-    ratios = [
-        _metric(item, "event_count")
-        / max(1.0, float(item["configuration"]["duration_events"]))
-        for item in cases
-    ]
-    maximum = max(ratios)
     return StatisticalCheck(
         "unrealistic_event_explosion",
-        "PASS" if maximum <= 30.0 else "FAIL",
-        {"maximum_exchange_events_per_generated_event": round(maximum, 6)},
-        "maximum exchange/lab expansion <= 30 events per generated event",
+        "NOT_EXERCISED",
+        {
+            "case_count": len(cases),
+            "missing_measurement": "events_per_simulated_second",
+            "reason": (
+                "duration_events is a facsimile command-count control and is "
+                "not a common time unit across real executor lanes"
+            ),
+            "required_reference": "configured_production_event_rate_cap",
+        },
+        "requires native events per simulated second and configured cap",
     )
 
 
