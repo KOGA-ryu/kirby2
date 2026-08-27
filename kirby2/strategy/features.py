@@ -73,6 +73,9 @@ class ObservableFeatureTracker:
     def snapshot(self, simulation_time_us: int, book: MarketDepthView) -> FeatureSnapshot:
         return self._adapt(self.engine.snapshot(simulation_time_us, book))
 
+    def runtime_state(self) -> dict[str, object]:
+        return self.engine.runtime_state()
+
     def _adapt(self, frame: FeatureFrame) -> FeatureSnapshot:
         window = self.window_us
         values = {

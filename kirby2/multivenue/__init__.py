@@ -25,6 +25,7 @@ from .replay import (
     MultiVenueCommand,
     MultiVenueRecording,
     MultiVenueReplayReport,
+    apply_multivenue_command,
     recording_json_round_trip,
     replay_multivenue_recording,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "MultiVenueRecording",
     "MultiVenueReplayReport",
     "MultiVenueScenarioResult",
+    "apply_multivenue_command",
     "PassiveQueueRouter",
     "RouteDecision",
     "RouteLegExecution",

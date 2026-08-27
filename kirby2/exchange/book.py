@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Iterable
 
 from kirby2.audit.invariants import assert_order_book_invariants
@@ -170,6 +172,59 @@ class OrderBook:
             "asks": self._levels_snapshot(self._asks, self._ask_prices),
             "bids": self._levels_snapshot(self._bids, self._bid_prices),
             "player": self.player_position.snapshot(),
+        }
+
+    def state_sha256(self) -> str:
+        payload = self.runtime_state()
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "all_orders": [
+                {
+                    "cancel_target_id": order.cancel_target_id,
+                    "cancelled_quantity": order.cancelled_quantity,
+                    "filled_quantity": order.filled_quantity,
+                    "order_id": order.order_id,
+                    "order_type": order.order_type.value,
+                    "original_quantity": order.original_quantity,
+                    "owner": order.owner.value,
+                    "price_ticks": order.price_ticks,
+                    "remaining_quantity": order.remaining_quantity,
+                    "resting_sequence": order.resting_sequence,
+                    "side": None if order.side is None else order.side.value,
+                    "status": order.status.value,
+                }
+                for _, order in sorted(self._all_orders.items())
+            ],
+            "events": [event.as_dict() for event in self.journal.events],
+            "fills": [
+                {
+                    "liquidity": fill.liquidity,
+                    "order_id": fill.order_id,
+                    "owner": fill.owner.value,
+                    "price_ticks": fill.price_ticks,
+                    "quantity": fill.quantity,
+                    "side": fill.side.value,
+                    "trade_id": fill.trade_id,
+                }
+                for fill in self._fills
+            ],
+            "resting_sequence": self._resting_sequence,
+            "seen_order_ids": sorted(self._seen_order_ids),
+            "snapshot": self.snapshot(),
+            "trades": [
+                {
+                    "maker_order_id": trade.maker_order_id,
+                    "price_ticks": trade.price_ticks,
+                    "quantity": trade.quantity,
+                    "taker_order_id": trade.taker_order_id,
+                    "taker_side": trade.taker_side.value,
+                    "trade_id": trade.trade_id,
+                }
+                for trade in self._trades
+            ],
         }
 
     def _levels_snapshot(

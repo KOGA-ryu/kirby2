@@ -518,6 +518,56 @@ class MarketCoordinator:
             }
         )
 
+    def branch_runtime_state(self) -> dict[str, object]:
+        """Complete fragmented-market state used by counterfactual forks."""
+
+        return {
+            "complete": self._complete,
+            "events": [event.as_dict() for event in self._events],
+            "feed": self.consolidated_feed().as_dict(),
+            "global_player_position": self._global_player_position,
+            "pending_latency_messages": [
+                {
+                    "due_time_us": item.due_time_us,
+                    "leg_index": item.leg_index,
+                    "order_id": item.order_id,
+                    "route_id": item.route_id,
+                    "routing_latency_us": item.routing_latency_us,
+                    "schedule_sequence": item.schedule_sequence,
+                }
+                for item in sorted(self._pending)
+            ],
+            "routes": {
+                route_id: self.route_result(route_id).as_dict()
+                for route_id in sorted(self._routes)
+            },
+            "seed": self.seed,
+            "simulation_time_us": self.clock.current_time_us,
+            "state_sha256": self.state_sha256(),
+            "venues": {
+                venue_id: {
+                    "config": venue.config.as_dict(),
+                    "engine_state": venue.engine.branch_runtime_state(),
+                    "engine_state_sha256": venue.engine.state_sha256(),
+                    "latency_rng": venue.latency_sampler.runtime_state(),
+                    "observable_feed": venue.observable_feed().as_dict(),
+                    "player_position": venue.player_position,
+                    "routing_state": venue.routing_state(),
+                    "session_state": venue.session_state.value,
+                }
+                for venue_id, venue in sorted(self.venues.items())
+            },
+            "working_orders": [
+                {
+                    **order.as_dict(),
+                    "venue_id": venue_id,
+                }
+                for venue_id, venue in sorted(self.venues.items())
+                for order in venue.observable_feed().own_orders
+                if order.remaining_quantity > 0
+            ],
+        }
+
     def assert_invariants(self) -> None:
         for venue in self.venues.values():
             venue.assert_invariants()

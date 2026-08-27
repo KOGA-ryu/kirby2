@@ -156,6 +156,39 @@ class MicrostructureFeatureEngine:
                     break
         return min(candidates) if candidates else None
 
+    def runtime_state(self) -> dict[str, object]:
+        """Canonical retained-window state for deterministic branch evidence."""
+
+        return {
+            "activities": [
+                {
+                    "aggressive_buy": item.aggressive_buy,
+                    "aggressive_sell": item.aggressive_sell,
+                    "cancel_ask": item.cancel_ask,
+                    "cancel_bid": item.cancel_bid,
+                    "depletion_ask": item.depletion_ask,
+                    "depletion_bid": item.depletion_bid,
+                    "replenishment_ask": item.replenishment_ask,
+                    "replenishment_bid": item.replenishment_bid,
+                    "time_us": item.time_us,
+                    "trades": item.trades,
+                }
+                for item in self._activities
+            ],
+            "depth_levels": self.depth_levels,
+            "initialized": self._initialized,
+            "last_time_us": self._last_time_us,
+            "midpoints": [
+                {
+                    "time_us": item.time_us,
+                    "value": None if item.value is None else str(item.value),
+                }
+                for item in self._midpoints
+            ],
+            "relative_volume": str(self.relative_volume),
+            "windows_us": list(self.windows_us),
+        }
+
     def snapshot(self, simulation_time_us: int, book: MarketDepthView) -> FeatureFrame:
         if not self._initialized:
             return self.reset(simulation_time_us, book)

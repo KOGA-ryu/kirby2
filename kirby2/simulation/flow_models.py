@@ -53,6 +53,8 @@ class FlowModel(Protocol):
 
     def replay_config(self) -> dict[str, object] | None: ...
 
+    def runtime_state(self) -> dict[str, object]: ...
+
 
 class SimpleFlowModel:
     """Competing independent Poisson arrivals, retained as the baseline."""
@@ -98,6 +100,9 @@ class SimpleFlowModel:
 
     def replay_config(self) -> dict[str, object] | None:
         return None
+
+    def runtime_state(self) -> dict[str, object]:
+        return {"model": self.model_name, "state": "STATELESS"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +364,18 @@ class HawkesFlowModel:
             ),
             "model": self.model_name,
             **self.config.as_dict(),
+        }
+
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "excitation": [list(row) for row in self._excitation],
+            "intensity_cap_hits": self._intensity_cap_hits,
+            "model": self.model_name,
+            "observed_events": self._observed_events,
+            "profile_id": self.config.profile_id,
+            "state_time_us": self._state_time_us,
+            "thinning_rejections": self._thinning_rejections,
+            "use_runtime_baseline": self.use_runtime_baseline,
         }
 
     def _baseline(

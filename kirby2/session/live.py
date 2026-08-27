@@ -351,30 +351,7 @@ class LiveMarketSession:
                         is_strategy_deadline or boundary_us == self.duration_us
                     ),
                 )
-        if target == self.duration_us:
-            self.running = False
-            self.complete = True
-            self.status_message = "SESSION COMPLETE"
-            if self._execution_tracker is not None:
-                self._append_timeline(
-                    TimelineKind.OBJECTIVE,
-                    "OBJECTIVE SESSION END",
-                    {
-                        "objective": self.objective.as_dict(),  # type: ignore[union-attr]
-                        "progress": self._execution_tracker.progress().as_dict(),
-                    },
-                    target,
-                )
-            if self.curriculum_drill is not None:
-                self._append_timeline(
-                    TimelineKind.CURRICULUM,
-                    (
-                        f"CURRICULUM COMPLETE lesson={self.curriculum_drill.lesson_id} "
-                        f"{self.curriculum_drill.title}"
-                    ),
-                    {"drill": self.curriculum_drill.as_dict()},
-                    target,
-                )
+        self._finish_if_due()
         return tuple(flow_events)
 
     def handle_input(self, key: str, bindings: BindingMap) -> InputRecord:
@@ -441,7 +418,40 @@ class LiveMarketSession:
         self._input_records.append(record)
         return record
 
-    def execute(self, command: SessionCommand) -> CommandOutcome:
+    def execute(
+        self,
+        command: SessionCommand,
+        *,
+        quantity_override: int | None = None,
+        price_ticks_override: int | None = None,
+    ) -> CommandOutcome:
+        if quantity_override is not None and (
+            type(quantity_override) is not int or quantity_override <= 0
+        ):
+            raise ValueError("counterfactual quantity must be a positive integer")
+        if price_ticks_override is not None and (
+            type(price_ticks_override) is not int or price_ticks_override <= 0
+        ):
+            raise ValueError("counterfactual price must be positive integer ticks")
+        order_commands = {
+            SessionCommand.BUY_BID,
+            SessionCommand.BUY_ASK,
+            SessionCommand.MARKET_BUY,
+            SessionCommand.SELL_ASK,
+            SessionCommand.SELL_BID,
+            SessionCommand.MARKET_SELL,
+            SessionCommand.REPLACE_NEAREST,
+        }
+        if quantity_override is not None and command not in order_commands:
+            raise ValueError("quantity override requires an order or replacement command")
+        if price_ticks_override is not None and command not in {
+            SessionCommand.BUY_BID,
+            SessionCommand.BUY_ASK,
+            SessionCommand.SELL_ASK,
+            SessionCommand.SELL_BID,
+            SessionCommand.REPLACE_NEAREST,
+        }:
+            raise ValueError("price override requires a limit or replacement command")
         if self.complete and command not in {SessionCommand.RESET, SessionCommand.QUIT}:
             return self._outcome(
                 command,
@@ -466,21 +476,53 @@ class LiveMarketSession:
         if command is SessionCommand.CANCEL_ALL:
             return self._cancel_all(command)
         if command is SessionCommand.REPLACE_NEAREST:
-            return self._replace_nearest(command)
+            return self._replace_nearest(
+                command,
+                quantity=quantity_override,
+                price_ticks=price_ticks_override,
+            )
         if command is SessionCommand.FLATTEN:
             return self._flatten(command)
         if command is SessionCommand.BUY_BID:
-            return self._submit_limit(command, Side.BUY, self._bid_price())
+            return self._submit_limit(
+                command,
+                Side.BUY,
+                self._bid_price() if price_ticks_override is None else price_ticks_override,
+                quantity_override,
+            )
         if command is SessionCommand.BUY_ASK:
-            return self._submit_limit(command, Side.BUY, self.engine.book.best_ask)
+            return self._submit_limit(
+                command,
+                Side.BUY,
+                self.engine.book.best_ask if price_ticks_override is None else price_ticks_override,
+                quantity_override,
+            )
         if command is SessionCommand.MARKET_BUY:
-            return self._submit_market(command, Side.BUY, self.selected_quantity)
+            return self._submit_market(
+                command,
+                Side.BUY,
+                self.selected_quantity if quantity_override is None else quantity_override,
+            )
         if command is SessionCommand.SELL_ASK:
-            return self._submit_limit(command, Side.SELL, self._ask_price())
+            return self._submit_limit(
+                command,
+                Side.SELL,
+                self._ask_price() if price_ticks_override is None else price_ticks_override,
+                quantity_override,
+            )
         if command is SessionCommand.SELL_BID:
-            return self._submit_limit(command, Side.SELL, self.engine.book.best_bid)
+            return self._submit_limit(
+                command,
+                Side.SELL,
+                self.engine.book.best_bid if price_ticks_override is None else price_ticks_override,
+                quantity_override,
+            )
         if command is SessionCommand.MARKET_SELL:
-            return self._submit_market(command, Side.SELL, self.selected_quantity)
+            return self._submit_market(
+                command,
+                Side.SELL,
+                self.selected_quantity if quantity_override is None else quantity_override,
+            )
         if command is SessionCommand.QUIT:
             return self._outcome(command, True, "QUIT")
         raise ValueError(f"unsupported session command: {command}")
@@ -621,6 +663,95 @@ class LiveMarketSession:
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    def branch_runtime_state(self) -> dict[str, object]:
+        """Canonical state inventory used to prove deterministic branch equality."""
+
+        book_snapshot = self.engine.book.snapshot()
+        strategy_state = (
+            None
+            if self._traffic_runtime is None
+            else self._traffic_runtime.runtime_state()
+        )
+        objective_state = (
+            None
+            if self._execution_tracker is None
+            else {
+                "fills": [
+                    {
+                        **asdict(item),
+                        "order_type": item.order_type.value,
+                        "side": item.side.value,
+                    }
+                    for item in self._execution_tracker.fills
+                ],
+                "metrics": self._execution_tracker.metrics(
+                    self.simulation_time_us
+                ).as_dict(),
+                "progress": self._execution_tracker.progress().as_dict(),
+            }
+        )
+        return {
+            "cancel_sequence": self._cancel_sequence,
+            "complete": self.complete,
+            "engine": self.engine.runtime_state(),
+            "exchange_state_sha256": self.engine.book.state_sha256(),
+            "input_records": [item.as_dict() for item in self._input_records],
+            "market_states": [item.as_dict() for item in self.market_states],
+            "objective": objective_state,
+            "order_sequence": self._order_sequence,
+            "order_submitted_at": dict(sorted(self._order_submitted_at.items())),
+            "player_state": book_snapshot["player"],
+            "running": self.running,
+            "selected_quantity": self.selected_quantity,
+            "simulation_clock_us": self.simulation_time_us,
+            "strategy_state": strategy_state,
+            "timeline_sha256": self.timeline_sha256(),
+            "working_orders": [
+                {**asdict(item), "side": item.side.value}
+                for item in self._working_order_views()
+            ],
+        }
+
+    def advance_exogenous_to(
+        self,
+        simulation_time_us: int,
+        *,
+        defer_strategy_at_target: bool = False,
+    ) -> None:
+        """Advance quiet time on a fixed external path without generating flow."""
+
+        if not self.running:
+            raise RuntimeError("exogenous replay cannot advance a paused session")
+        if simulation_time_us < self.simulation_time_us:
+            raise ValueError("exogenous replay cannot move backward")
+        if simulation_time_us > self.duration_us:
+            raise ValueError("exogenous replay exceeds session duration")
+        while True:
+            deadline = self._strategy_deadline_us()
+            if deadline is None or deadline > simulation_time_us:
+                break
+            if defer_strategy_at_target and deadline == simulation_time_us:
+                break
+            self.engine.advance_exogenous_clock_to(deadline)
+            if self._traffic_evaluation_time_us() < deadline:
+                self._update_traffic((), deadline, record_evaluation=True)
+        self.engine.advance_exogenous_clock_to(simulation_time_us)
+        if not defer_strategy_at_target:
+            if self._traffic_evaluation_time_us() < simulation_time_us:
+                self._update_traffic(
+                    (),
+                    simulation_time_us,
+                    record_evaluation=(simulation_time_us == self.duration_us),
+                )
+            self._finish_if_due()
+
+    def apply_exogenous_flow_event(self, reference: FlowEvent) -> FlowEvent:
+        if reference.simulation_time_us != self.simulation_time_us:
+            raise ValueError("fixed flow event must be applied at the current session time")
+        realized, exchange_events = self.engine.apply_exogenous_event(reference)
+        self._consume_exchange_activity(exchange_events, reference.simulation_time_us)
+        return realized
+
     def timeline_sha256(self) -> str:
         canonical = json.dumps(
             [record.as_dict() for record in self._timeline],
@@ -628,6 +759,33 @@ class LiveMarketSession:
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _finish_if_due(self) -> None:
+        if self.simulation_time_us != self.duration_us or self.complete:
+            return
+        self.running = False
+        self.complete = True
+        self.status_message = "SESSION COMPLETE"
+        if self._execution_tracker is not None:
+            self._append_timeline(
+                TimelineKind.OBJECTIVE,
+                "OBJECTIVE SESSION END",
+                {
+                    "objective": self.objective.as_dict(),  # type: ignore[union-attr]
+                    "progress": self._execution_tracker.progress().as_dict(),
+                },
+                self.duration_us,
+            )
+        if self.curriculum_drill is not None:
+            self._append_timeline(
+                TimelineKind.CURRICULUM,
+                (
+                    f"CURRICULUM COMPLETE lesson={self.curriculum_drill.lesson_id} "
+                    f"{self.curriculum_drill.title}"
+                ),
+                {"drill": self.curriculum_drill.as_dict()},
+                self.duration_us,
+            )
 
     def _change_quantity(
         self,
@@ -655,16 +813,18 @@ class LiveMarketSession:
         command: SessionCommand,
         side: Side,
         price_ticks: int | None,
+        quantity: int | None = None,
     ) -> CommandOutcome:
         if price_ticks is None:
             return self._outcome(command, False, f"{command.value} rejected: no touch")
-        denied = self._strategy_permission_rejection(side, self.selected_quantity)
+        actual_quantity = self.selected_quantity if quantity is None else quantity
+        denied = self._strategy_permission_rejection(side, actual_quantity)
         if denied is not None:
             return self._outcome(command, False, f"{command.value} rejected: {denied}")
         order = Order.limit(
             self._next_order_id(),
             side,
-            self.selected_quantity,
+            actual_quantity,
             price_ticks,
             OrderOwner.PLAYER,
         )
@@ -793,7 +953,13 @@ class LiveMarketSession:
             parameters={"cancelled_orders": cancel_timings},
         )
 
-    def _replace_nearest(self, command: SessionCommand) -> CommandOutcome:
+    def _replace_nearest(
+        self,
+        command: SessionCommand,
+        *,
+        quantity: int | None = None,
+        price_ticks: int | None = None,
+    ) -> CommandOutcome:
         active = self._player_orders()
         if not active:
             return self._outcome(command, False, "REPLACE rejected: no working orders")
@@ -808,18 +974,23 @@ class LiveMarketSession:
         )
         if target.side is None:
             raise RuntimeError("working player order must have a side")
+        actual_quantity = self.selected_quantity if quantity is None else quantity
         denied = self._strategy_permission_rejection(
             target.side,
-            self.selected_quantity,
+            actual_quantity,
         )
         if denied is not None:
             return self._outcome(command, False, f"REPLACE rejected: {denied}")
-        price_ticks = self._bid_price() if target.side is Side.BUY else self._ask_price()
+        actual_price_ticks = (
+            price_ticks
+            if price_ticks is not None
+            else (self._bid_price() if target.side is Side.BUY else self._ask_price())
+        )
         replacement = Order.limit(
             self._next_order_id(),
             target.side,
-            self.selected_quantity,
-            price_ticks,
+            actual_quantity,
+            actual_price_ticks,
             OrderOwner.PLAYER,
         )
         submitted_at = self._order_submitted_at.get(target.order_id, self.simulation_time_us)
@@ -843,13 +1014,13 @@ class LiveMarketSession:
             True,
             (
                 f"REPLACED {target.order_id} -> {replacement.order_id} "
-                f"{replacement.original_quantity} @ {self._format_price(price_ticks)}"
+                f"{replacement.original_quantity} @ {self._format_price(actual_price_ticks)}"
             ),
             (replacement.order_id,),
             {
                 "new_order_id": replacement.order_id,
                 "old_order_id": target.order_id,
-                "price_ticks": price_ticks,
+                "price_ticks": actual_price_ticks,
                 "quantity": replacement.original_quantity,
                 "replace_latency_us": replace_latency_us,
                 "side": replacement.side.value,

@@ -185,6 +185,39 @@ def _benchmark_algorithms(value: str):
     return algorithms
 
 
+def _action_selector(value: str) -> int:
+    prefix, separator, raw_sequence = value.partition(":")
+    if prefix.lower() != "action" or separator != ":":
+        raise argparse.ArgumentTypeError("branch point must use action:N")
+    try:
+        sequence = int(raw_sequence)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("action sequence must be an integer") from error
+    if sequence <= 0:
+        raise argparse.ArgumentTypeError("action sequence must be positive")
+    return sequence
+
+
+def _counterfactual_command(value: str):
+    from kirby2.counterfactual import parse_counterfactual_command
+
+    try:
+        return parse_counterfactual_command(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _counterfactual_mode(value: str):
+    from kirby2.counterfactual import CounterfactualMode
+
+    try:
+        return CounterfactualMode.parse(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "mode must be exogenous or endogenous"
+        ) from error
+
+
 def _calibration_stages(value: str) -> tuple[int, ...]:
     stages = _integer_tuple(value)
     if stages != tuple(range(1, max(stages) + 1)) or max(stages) > 4:
@@ -333,6 +366,45 @@ def _parser() -> argparse.ArgumentParser:
         "--store",
         type=Path,
         default=Path(".kirby2") / "research" / "algorithm_runs",
+    )
+
+    counterfactual = subcommands.add_parser(
+        "counterfactual",
+        help="branch an immutable session run under explicit causal semantics",
+    )
+    counterfactual.add_argument("run_id")
+    counterfactual.add_argument("--at", type=_action_selector, required=True)
+    counterfactual.add_argument("--replace", type=_counterfactual_command)
+    counterfactual.add_argument(
+        "--with",
+        dest="replacement_command",
+        type=_counterfactual_command,
+    )
+    counterfactual.add_argument(
+        "--mode",
+        type=_counterfactual_mode,
+        default=_counterfactual_mode("endogenous"),
+    )
+    counterfactual.add_argument(
+        "--order-type",
+        choices=("limit", "market", "cancel"),
+    )
+    counterfactual.add_argument("--price-ticks", type=_positive_int)
+    counterfactual.add_argument("--quantity", type=_positive_int)
+    counterfactual.add_argument("--venue")
+    counterfactual.add_argument("--timing-delta-us", type=int, default=0)
+    counterfactual.add_argument("--remove", action="store_true")
+    counterfactual.add_argument("--insert", action="store_true")
+    counterfactual.add_argument("--hotkey-outcome", type=_counterfactual_command)
+    counterfactual.add_argument(
+        "--sweep-timing",
+        action="store_true",
+        help="run and persist the canonical -500/-250/0/+250/+500 ms sweep",
+    )
+    counterfactual.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
     )
 
     defaults = EventRates()
@@ -552,6 +624,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-execution-algorithms",
         help="audit algorithm interfaces, forks, metrics, immutable runs, and replay",
+    )
+    subcommands.add_parser(
+        "audit-counterfactuals",
+        help="audit causal forks, mutations, paired timelines, and immutable branches",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -1192,6 +1268,140 @@ def main() -> None:
         )
         print(f"RESULT_SHA256 {result.result_sha256}")
         print("BENCHMARK_EXECUTION PASS")
+        return
+
+    if args.command == "counterfactual":
+        from kirby2.counterfactual import (
+            ActionMutation,
+            CounterfactualStore,
+            MutationManifest,
+            run_counterfactual,
+            run_timing_sweep,
+        )
+        from kirby2.exchange import OrderType
+
+        mutation_fields = (
+            args.replace,
+            args.replacement_command,
+            args.order_type,
+            args.price_ticks,
+            args.quantity,
+            args.venue,
+            args.hotkey_outcome,
+        )
+        try:
+            if args.sweep_timing:
+                if (
+                    any(value is not None for value in mutation_fields)
+                    or args.remove
+                    or args.insert
+                    or args.timing_delta_us != 0
+                ):
+                    raise ValueError(
+                        "--sweep-timing cannot be combined with a one-off mutation"
+                    )
+                sweep = run_timing_sweep(
+                    args.run_id,
+                    args.at,
+                    args.mode,
+                    parent_store_root=args.store,
+                )
+                print("KIRBY2_COUNTERFACTUAL_TIMING_SWEEP")
+                print(f"PARENT_RUN_ID {args.run_id}")
+                print(f"MODE {args.mode.value}")
+                for cell in sweep.cells:
+                    print(
+                        "CELL "
+                        + json.dumps(
+                            cell.as_dict(),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                print(
+                    "CAUSAL_GUARD policy_information=decision_time_only "
+                    "analysis_may_use_later_information=true"
+                )
+                print("COUNTERFACTUAL_TIMING_SWEEP PASS immutable_branches=5")
+                return
+            mutation = ActionMutation(
+                args.at,
+                expected_command=args.replace,
+                command=args.replacement_command,
+                order_type=(
+                    None if args.order_type is None else OrderType(args.order_type)
+                ),
+                price_ticks=args.price_ticks,
+                quantity=args.quantity,
+                venue_id=args.venue,
+                timing_delta_us=args.timing_delta_us,
+                remove=args.remove,
+                insert=args.insert,
+                hotkey_outcome=args.hotkey_outcome,
+            )
+            report = run_counterfactual(
+                args.run_id,
+                MutationManifest((mutation,)),
+                args.mode,
+                parent_store_root=args.store,
+            )
+            branch_store = CounterfactualStore(args.store / "counterfactual_runs")
+            manifest = branch_store.record(report)
+            verification = branch_store.verify_run(manifest.run_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"COUNTERFACTUAL_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_COUNTERFACTUAL_EXECUTION_DEBUGGER")
+        print(f"PARENT_RUN_ID {report.parent_run_id}")
+        print(f"BRANCH_RUN_ID {manifest.run_id}")
+        print(f"MODE {report.mode.value}")
+        print(
+            "MODE_CONTRACT "
+            + (
+                "external_path=fixed player_impact_on_reference=ignored"
+                if report.mode.value == "EXOGENOUS_REPLAY"
+                else "full_simulator=forked changed_orders_may_change_future_flow=true"
+            )
+        )
+        print(
+            f"SNAPSHOT time_us={report.snapshot.fork_time_us} "
+            f"sha256={report.snapshot.sha256()} "
+            f"reconstruction_match={str(report.snapshot_reconstruction_match).lower()}"
+        )
+        for component in report.snapshot.components:
+            print(
+                f"COMPONENT {component.name} status={component.status.value} "
+                f"sha256={component.sha256}"
+            )
+        print(
+            "FIRST_DIVERGENCE "
+            + json.dumps(
+                report.first_divergence.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(
+            "COMPARISON "
+            + json.dumps(report.comparison, sort_keys=True, separators=(",", ":"))
+        )
+        print(
+            "CAUSAL_GUARD "
+            + json.dumps(
+                report.hindsight_guard,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(f"INTERPRETATION {report.cautious_interpretation}")
+        print(f"RESULT_SHA256 {report.result_sha256()}")
+        print(f"BRANCH_DIRECTORY {branch_store.run_directory(manifest.run_id).resolve()}")
+        print(
+            f"COUNTERFACTUAL {'PASS' if verification.passed else 'FAIL'} "
+            f"invariants={report.branch.invariant_status} immutable=true"
+        )
+        if not verification.passed:
+            raise SystemExit(1)
         return
 
     if args.command == "strategy":
@@ -2541,6 +2751,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"EXECUTION_ALGORITHM_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-counterfactuals":
+        from kirby2.audit.counterfactuals import audit_counterfactuals
+
+        reports = audit_counterfactuals()
+        print("KIRBY2_COUNTERFACTUAL_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"COUNTERFACTUAL_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

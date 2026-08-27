@@ -466,6 +466,30 @@ class StateMachineRuntime:
             and self.current.exit_permission is StrategyPermission.ALLOW
         )
 
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "current": None if self.current is None else self.current.as_dict(),
+            "definition": self.definition.as_dict(),
+            "feature_windows": self.tracker.runtime_state(),
+            "last_occurred": [
+                {
+                    "condition": list(key),
+                    "time_us": time_us,
+                }
+                for key, time_us in sorted(self._last_occurred.items())
+            ],
+            "matched_events": {
+                str(index): list(values)
+                for index, values in sorted(self._matched_events.items())
+            },
+            "runtime": "STATE_MACHINE",
+            "state_entered_us": self._state_entered_us,
+            "true_since": {
+                str(index): time_us
+                for index, time_us in sorted(self._true_since.items())
+            },
+        }
+
     def _transition_matches(
         self,
         index: int,

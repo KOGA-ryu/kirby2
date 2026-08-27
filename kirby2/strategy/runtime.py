@@ -107,6 +107,14 @@ class TrafficLightRuntime:
             )
         return None
 
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "current": None if self.current is None else self.current.as_dict(),
+            "definition": self.definition.as_dict(),
+            "feature_windows": self.tracker.runtime_state(),
+            "runtime": "TRAFFIC_LIGHT",
+        }
+
     def _evaluate(self, features: FeatureSnapshot) -> EvaluationResult:
         green = self._condition_results(self.definition.green_conditions, features)
         wait = self._condition_results(self.definition.wait_conditions, features)

@@ -159,6 +159,16 @@ class LatencySampler:
     def draws(self) -> tuple[LatencyDraw, ...]:
         return tuple(self._draws)
 
+    def runtime_state(self) -> dict[str, object]:
+        version, internal, gaussian = self._rng.getstate()
+        return {
+            "draws": [item.as_dict() for item in self._draws],
+            "gaussian_cache": gaussian,
+            "internal_state": list(internal),
+            "random_state_version": version,
+            "seed": self.seed,
+        }
+
     def sample(
         self,
         component: LatencyComponent,

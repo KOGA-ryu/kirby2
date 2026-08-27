@@ -288,6 +288,18 @@ class AlgorithmRunStore:
             raise ValueError("algorithm run manifest is invalid")
         return ImmutableAlgorithmRunManifest.from_dict(payload)
 
+    def load_recording(self, run_id: str) -> MultiVenueRecording:
+        verification = self.verify_run(run_id)
+        if not verification.passed:
+            raise ValueError(
+                "immutable algorithm run failed verification: "
+                + "; ".join(verification.failures)
+            )
+        payload = _read_json(self.runs_directory / run_id / "recording.json")
+        if not isinstance(payload, dict):
+            raise ValueError("algorithm run recording artifact is invalid")
+        return MultiVenueRecording.from_dict(payload)
+
     def verify_run(self, run_id: str) -> AlgorithmRunVerification:
         failures: list[str] = []
         try:

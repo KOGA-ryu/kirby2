@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 from collections.abc import Sequence
@@ -64,3 +66,22 @@ class SeededRng:
         open_unit_interval = 1.0 - self._random.random()
         seconds = -math.log(open_unit_interval) / rate_per_second
         return max(1, math.ceil(seconds * 1_000_000))
+
+    def runtime_state(self) -> dict[str, object]:
+        """Return the complete portable PRNG state used by deterministic forks."""
+
+        version, internal, gaussian = self._random.getstate()
+        return {
+            "gaussian_cache": gaussian,
+            "internal_state": list(internal),
+            "random_state_version": version,
+            "seed": self.seed,
+        }
+
+    def state_sha256(self) -> str:
+        canonical = json.dumps(
+            self.runtime_state(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

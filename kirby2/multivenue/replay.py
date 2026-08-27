@@ -228,7 +228,7 @@ def recording_json_round_trip(recording: MultiVenueRecording) -> MultiVenueRecor
     )
 
 
-def _apply_command(
+def apply_multivenue_command(
     coordinator: MarketCoordinator,
     command: MultiVenueCommand,
 ) -> str | None:
@@ -265,3 +265,6 @@ def _apply_command(
     elif command.command_type != "ADVANCE":  # pragma: no cover - command validates
         raise RuntimeError("unsupported multi-venue replay command")
     return None
+
+
+_apply_command = apply_multivenue_command

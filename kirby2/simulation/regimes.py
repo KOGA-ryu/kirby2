@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from kirby2.exchange import OrderBook, OrderOwner, OrderType, Side
+from kirby2.exchange import Order, OrderBook, OrderOwner, OrderType, Side
 
 from .clock import MICROSECONDS_PER_SECOND
 from .config import SimulationConfig
@@ -459,6 +459,7 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._spread_placement_state: SpreadPlacementState | None = None
         self._spread_state_expiry_us: int | None = None
         self._distribution_draws: list[DistributionDrawRecord] = []
+        self._exogenous_replay_active = False
 
     @property
     def flow_events(self) -> tuple[FlowEvent, ...]:
@@ -485,6 +486,174 @@ class RegimeOrderFlow(SyntheticOrderFlow):
     @property
     def initial_trade_count(self) -> int:
         return self._initial_trade_count
+
+    def runtime_state(self) -> dict[str, object]:
+        """Complete active simulation state needed to verify a branch point."""
+
+        flow_model_state = self.flow_model.runtime_state()
+        modifier_state = (
+            None
+            if self.intensity_modifier is None
+            else self.intensity_modifier.runtime_state()
+        )
+        return {
+            "book_state_sha256": self.book.state_sha256(),
+            "clock_us": self.clock.current_time_us,
+            "distribution_draws": [item.as_dict() for item in self._distribution_draws],
+            "exogenous_replay_active": self._exogenous_replay_active,
+            "flow_events": [item.as_dict() for item in self._flow_events],
+            "flow_model": flow_model_state,
+            "initial_exchange_event_count": self._initial_exchange_event_count,
+            "initial_trade_count": self._initial_trade_count,
+            "intensity_modifier": modifier_state,
+            "intraday_clock": (
+                None if self.intraday_clock is None else self.intraday_clock.as_dict()
+            ),
+            "last_intensity_inspection": (
+                None
+                if self.last_intensity_inspection is None
+                else self.last_intensity_inspection.as_dict()
+            ),
+            "observations": [
+                {
+                    "best_ask_size": item.best_ask_size,
+                    "best_ask_ticks": item.best_ask_ticks,
+                    "best_bid_size": item.best_bid_size,
+                    "best_bid_ticks": item.best_bid_ticks,
+                    "imbalance": item.imbalance,
+                    "simulation_time_us": item.simulation_time_us,
+                    "spread_ticks": item.spread_ticks,
+                }
+                for item in self.observations
+            ],
+            "pending": {
+                "arrival_time_us": self._pending_arrival_time_us,
+                "family": None if self._pending_family is None else self._pending_family.value,
+                "is_intraday_transition": self._pending_is_intraday_transition,
+                "is_spread_transition": self._pending_is_spread_transition,
+                "scheduled_flow_family": (
+                    None
+                    if self._scheduled_flow_family is None
+                    else self._scheduled_flow_family.value
+                ),
+                "scheduled_flow_time_us": self._scheduled_flow_time_us,
+            },
+            "regime": self.regime.value,
+            "rng": self.rng.runtime_state(),
+            "spread_placement_state": (
+                None
+                if self._spread_placement_state is None
+                else self._spread_placement_state.value
+            ),
+            "spread_state_expiry_us": self._spread_state_expiry_us,
+            "started": self._started,
+        }
+
+    def advance_exogenous_clock_to(self, simulation_time_us: int) -> None:
+        """Move only owned clocks; never generate an endogenous arrival."""
+
+        if type(simulation_time_us) is not int:
+            raise TypeError("simulation time must be integer microseconds")
+        if simulation_time_us < self.clock.current_time_us:
+            raise ValueError("simulation clock cannot move backward")
+        self._activate_exogenous_replay()
+        self.clock.advance_to(simulation_time_us)
+        if self.intraday_clock is not None:
+            self.intraday_clock.advance_to(simulation_time_us)
+
+    def apply_exogenous_event(
+        self,
+        reference: FlowEvent,
+    ) -> tuple[FlowEvent, tuple[object, ...]]:
+        """Apply a fixed external command tape without scheduling new flow."""
+
+        if reference.sequence != len(self._flow_events) + 1:
+            raise ValueError("exogenous flow sequence is not contiguous with the fork")
+        self.advance_exogenous_clock_to(reference.simulation_time_us)
+        event_start = len(self.book.journal.events)
+        actual_applied = False
+        command = reference.command
+        if reference.applied and command is not None:
+            order_type = OrderType(str(command["order_type"]))
+            if order_type is OrderType.LIMIT:
+                self.book.process(
+                    Order.limit(
+                        str(command["order_id"]),
+                        Side(str(command["side"])),
+                        int(command["quantity"]),
+                        int(command["price_ticks"]),
+                    )
+                )
+                actual_applied = True
+            elif order_type is OrderType.MARKET:
+                self.book.process(
+                    Order.market(
+                        str(command["order_id"]),
+                        Side(str(command["side"])),
+                        int(command["quantity"]),
+                    )
+                )
+                actual_applied = True
+            else:
+                cancellations = command.get("affected_orders")
+                if isinstance(cancellations, list):
+                    targets = tuple(
+                        (str(item["command_id"]), str(item["target_order_id"]))
+                        for item in cancellations
+                        if isinstance(item, dict)
+                    )
+                else:
+                    targets = (
+                        (
+                            str(command["command_id"]),
+                            str(command["target_order_id"]),
+                        ),
+                    )
+                for command_id, target_id in targets:
+                    was_active = target_id in self.book.active_orders
+                    self.book.cancel(target_id, command_id)
+                    actual_applied = actual_applied or was_active
+        exchange_events = self.book.journal.events[event_start:]
+        realized = FlowEvent(
+            sequence=reference.sequence,
+            simulation_time_us=reference.simulation_time_us,
+            family=reference.family,
+            applied=actual_applied,
+            command=reference.command,
+            reason=(
+                reference.reason
+                if actual_applied or not reference.applied
+                else "fixed_external_command_had_no_active_target_in_branch"
+            ),
+            exchange_event_start=(event_start + 1 if exchange_events else None),
+            exchange_event_end=(
+                len(self.book.journal.events) if exchange_events else None
+            ),
+            diagnostic=reference.diagnostic,
+        )
+        self._after_flow_event(realized)
+        if self.intensity_modifier is not None:
+            self.intensity_modifier.observe(
+                realized,
+                self.book,
+                reference.simulation_time_us,
+            )
+        self.flow_model.observe(reference.family, reference.simulation_time_us)
+        self._flow_events.append(realized)
+        self.book.assert_invariants()
+        return realized, tuple(exchange_events)
+
+    def _activate_exogenous_replay(self) -> None:
+        if self._exogenous_replay_active:
+            return
+        self._exogenous_replay_active = True
+        self._pending_arrival_time_us = None
+        self._pending_family = None
+        self._scheduled_flow_time_us = None
+        self._scheduled_flow_family = None
+        self._pending_is_intraday_transition = False
+        self._pending_is_spread_transition = False
+        self._spread_state_expiry_us = None
 
     def start(self) -> None:
         if self._started:

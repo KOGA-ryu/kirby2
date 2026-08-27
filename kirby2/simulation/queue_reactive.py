@@ -372,6 +372,8 @@ class FlowIntensityModifier(Protocol):
 
     def replay_config(self) -> dict[str, object]: ...
 
+    def runtime_state(self) -> dict[str, object]: ...
+
 
 class QueueReactiveStateTracker:
     def __init__(self, window_us: int, near_touch_levels: int) -> None:
@@ -511,6 +513,19 @@ class QueueReactiveStateTracker:
             while records and records[0][0] < cutoff:
                 records.popleft()
 
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "aggressive_flow": [list(item) for item in self._aggressive_flow],
+            "initialized": self._initialized,
+            "last_trade_count": self._last_trade_count,
+            "midpoints": [list(item) for item in self._midpoints],
+            "near_touch_levels": self.near_touch_levels,
+            "previous_ask_depth": self._previous_ask_depth,
+            "previous_bid_depth": self._previous_bid_depth,
+            "queue_changes": [list(item) for item in self._queue_changes],
+            "window_us": self.window_us,
+        }
+
 
 class QueueReactiveFlowModifier:
     def __init__(self, config: QueueReactiveConfig | None = None) -> None:
@@ -586,6 +601,17 @@ class QueueReactiveFlowModifier:
 
     def replay_config(self) -> dict[str, object]:
         return {"kind": "queue_reactive", **self.config.as_dict()}
+
+    def runtime_state(self) -> dict[str, object]:
+        return {
+            "config": self.config.as_dict(),
+            "last_inspection": (
+                None
+                if self.last_inspection is None
+                else self.last_inspection.as_dict()
+            ),
+            "tracker": self.tracker.runtime_state(),
+        }
 
 
 def default_queue_reactive_config() -> QueueReactiveConfig:

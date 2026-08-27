@@ -442,30 +442,59 @@ class HiddenLiquidityVenue:
         return _sha256([event.as_dict() for event in self._observable_events])
 
     def state_sha256(self) -> str:
-        payload = {
+        return _sha256(self.branch_runtime_state())
+
+    def branch_runtime_state(self) -> dict[str, object]:
+        """Privileged simulator state for fork reconstruction, never policy input."""
+
+        return {
+            "arrival_sequence": self._arrival_sequence,
             "clock_us": self.clock.current_time_us,
             "complete": self._complete,
             "orders": [order.ground_truth().as_dict() for order in self._ordered_orders()],
+            "observable_events": [event.as_dict() for event in self._observable_events],
             "pending": [
                 {
+                    "book": None if item.book is None else item.book.as_dict(),
                     "data": item.data,
                     "due_time_us": item.due_time_us,
                     "event_type": item.event_type.value,
+                    "own_order": (
+                        None if item.own_order is None else item.own_order.as_dict()
+                    ),
                     "ordinal": item.ordinal,
+                    "player_position": (
+                        None
+                        if item.player_position is None
+                        else item.player_position.as_dict()
+                    ),
                     "source_time_us": item.source_time_us,
+                    "strategy_data": item.strategy_data,
+                    "strategy_event_type": (
+                        None
+                        if item.strategy_event_type is None
+                        else item.strategy_event_type.value
+                    ),
+                    "trade": None if item.trade is None else item.trade.as_dict(),
                 }
                 for item in sorted(
                     self._pending,
                     key=lambda value: (value.due_time_us, value.ordinal),
                 )
             ],
+            "pending_ordinal": self._pending_ordinal,
+            "player_bought_quantity": self._player_bought_quantity,
             "player_position": self._player_position,
+            "player_sold_quantity": self._player_sold_quantity,
+            "priority_sequence": self._priority_sequence,
+            "public_tape": [item.as_dict() for item in self._public_tape],
             "published_feed": self.observable_feed().as_dict(),
             "rules": self.rules.as_dict(),
             "seen_order_ids": sorted(self._seen_order_ids),
+            "strategy_events": [event.as_dict() for event in self._strategy_events],
+            "trade_sequence": self._trade_sequence,
             "truth_events": [event.as_dict() for event in self._truth_events],
         }
-        return _sha256(payload)
 
     def assert_invariants(self) -> None:
         arrival = [order.arrival_sequence for order in self._ordered_orders()]
