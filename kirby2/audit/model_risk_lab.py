@@ -13,6 +13,7 @@ from kirby2.auditlab.executors import (
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
+    MECHANICS_RECORDING_TYPE,
     ExecutorRegistry,
 )
 from kirby2.auditlab.generator import (
@@ -137,6 +138,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _coverage_case(result),
             _truthful_execution_contract_case(),
             _real_core_flow_executor_case(),
+            _real_mechanics_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -507,7 +509,8 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             direct_mutation_rejected,
             export_mutation_preserved,
             empty_registry_refused,
-            EXECUTOR_REGISTRY.registered_lanes == (ExecutorLane.CORE_FLOW,),
+            EXECUTOR_REGISTRY.registered_lanes
+            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
         )
     )
     return ModelRiskLabAuditCase(
@@ -673,7 +676,8 @@ def _real_core_flow_executor_case() -> ModelRiskLabAuditCase:
     )
     passed = all(
         (
-            EXECUTOR_REGISTRY.registered_lanes == (ExecutorLane.CORE_FLOW,),
+            EXECUTOR_REGISTRY.registered_lanes
+            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
             {item.configuration.flow_model for item in results}
             == {"simple", "hawkes"},
             all(item.automated_status is AutomatedStatus.PASS for item in results),
@@ -706,6 +710,222 @@ def _real_core_flow_executor_case() -> ModelRiskLabAuditCase:
             "tapes": tape_evidence,
         },
         () if passed else ("real core-flow executor proof failed",),
+    )
+
+
+def _real_mechanics_executor_case() -> ModelRiskLabAuditCase:
+    configurations = tuple(
+        item
+        for item in generate_configurations(seed=771, budget=840)
+        if item.lane is ExecutorLane.MECHANICS
+        and item.replicate_index == 0
+    )[: len(AXES["session_phase"])]
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.MECHANICS]
+    coverage = evidence_coverage_report(results)
+    mechanics_coverage = coverage["lanes"][ExecutorLane.MECHANICS.value]
+
+    instruction_inventory: set[str] = set()
+    command_types: set[str] = set()
+    event_types: set[str] = set()
+    rejection_reasons: set[str] = set()
+    event_backed_exercises = True
+    tapes: dict[str, object] = {}
+    result_evidence: dict[str, object] = {}
+    for result, repeat, replay in zip(results, repeated, replayed):
+        payload = thaw_json(result.recording.payload)
+        native = payload["native_recording"]
+        commands = native["commands"]
+        native_events = native["expected_events"]
+        command_types.update(item["command_type"] for item in commands)
+        for command in commands:
+            if command["command_type"] != "SUBMIT":
+                continue
+            request = command["parameters"]["request"]
+            instruction_inventory.add(request["instruction"])
+            instruction_inventory.add(request["time_in_force"])
+            instruction_inventory.update(request["modifiers"])
+        for event in native_events:
+            event_types.add(event["event_type"])
+            if event["event_type"] == "ORDER_REJECTED":
+                rejection_reasons.add(str(event["data"]["reason"]))
+        event_backed_exercises = event_backed_exercises and all(
+            bool(thaw_json(exercise.evidence).get("event_sequences"))
+            for exercise in result.exercises
+        )
+        tapes[result.configuration.cell_id] = {
+            "command_count": len(commands),
+            "command_types": sorted(
+                {item["command_type"] for item in commands}
+            ),
+            "event_count": len(native_events),
+            "native_event_sha256": native["expected_event_stream_sha256"],
+            "native_state_sha256": native["expected_state_sha256"],
+            "recording_sha256": result.recording.sha256,
+        }
+        result_evidence[result.configuration.cell_id] = {
+            "auction_state": result.configuration.auction_state,
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "event_sha256": result.event_sha256,
+            "exercise_names": [
+                exercise.capability for exercise in result.exercises
+            ],
+            "order_types": result.configuration.order_types,
+            "repeated_result_match": result.result_sha256 == repeat.result_sha256,
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": result.result_sha256 == replay.result_sha256,
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+            "session_phase": result.configuration.session_phase,
+        }
+
+    exact_axes = all(
+        {getattr(item, dimension) for item in configurations}
+        == set(AXES[dimension])
+        for dimension in capability.credited_dimensions
+    )
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    mechanics_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            mechanics_coverage["dimensions"],
+            mechanics_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    allocation_evidence = {
+        canonical_sha256(check.as_dict()["evidence"])
+        for result in results
+        for check in result.checks
+        if check.name == "auction_allocation_reconciliation"
+    }
+    lifecycle_evidence = {
+        canonical_sha256(check.as_dict()["evidence"])
+        for result in results
+        for check in result.checks
+        if check.name == "order_lifecycle_reconciliation"
+    }
+    required_instruction_inventory = {
+        "LIMIT",
+        "MARKET",
+        "IOC",
+        "FOK",
+        "POST_ONLY",
+        "DAY",
+        "GTC",
+        "SESSION",
+        "GOOD_UNTIL_TIME",
+    }
+    required_command_types = {
+        "TRANSITION",
+        "SUBMIT",
+        "CANCEL",
+        "REPLACE",
+        "UNCROSS",
+    }
+    required_event_types = {
+        "ORDER_ACCEPTED",
+        "ORDER_REJECTED",
+        "ORDER_CANCELLED",
+        "ORDER_EXPIRED",
+        "ORDER_REPLACED",
+        "PRIORITY_PRESERVED",
+        "PRIORITY_LOST",
+        "TRADE",
+        "SESSION_STATE_CHANGED",
+        "AUCTION_ORDER_ADDED",
+        "AUCTION_INDICATION",
+        "AUCTION_UNCROSS",
+        "AUCTION_FILL",
+    }
+    required_rejections = {
+        "FOK_INSUFFICIENT_IMMEDIATE_QUANTITY",
+        "POST_ONLY_WOULD_CROSS",
+    }
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes
+            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
+            len(configurations) == len(AXES["session_phase"]),
+            exact_axes,
+            exact_exercises,
+            event_backed_exercises,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            mechanics_coverage_passed,
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == MECHANICS_RECORDING_TYPE
+                for item in results
+            ),
+            required_instruction_inventory <= instruction_inventory,
+            required_command_types <= command_types,
+            required_event_types <= event_types,
+            required_rejections <= rejection_reasons,
+            len(allocation_evidence) > 1,
+            len(lifecycle_evidence) > 1,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_market_mechanics_execute_and_replay_natively",
+        {
+            "branch_evidence_variation": {
+                "auction_allocation_digest_count": len(allocation_evidence),
+                "order_lifecycle_digest_count": len(lifecycle_evidence),
+            },
+            "command_types": sorted(command_types),
+            "event_backed_exercises": event_backed_exercises,
+            "event_types": sorted(event_types),
+            "instruction_inventory": sorted(instruction_inventory),
+            "mechanics_coverage": mechanics_coverage,
+            "rejection_reasons": sorted(rejection_reasons),
+            "results": result_evidence,
+            "tapes": tapes,
+        },
+        () if passed else ("real market-mechanics executor proof failed",),
     )
 
 

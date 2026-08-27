@@ -10,6 +10,7 @@ from .mechanics_engine import MarketMechanicsEngine
 from .mechanics_models import (
     AdvancedOrderRequest,
     InstrumentRules,
+    ManagedOrder,
     MechanicsEventType,
     OrderInstruction,
     SessionState,
@@ -43,7 +44,9 @@ class MechanicsScenarioResult:
     summary: dict[str, object]
 
 
-class _ScenarioBuilder:
+class MechanicsScenarioBuilder:
+    """Build and replay one native market-mechanics command recording."""
+
     def __init__(self, rules: InstrumentRules | None = None) -> None:
         self.engine = MarketMechanicsEngine(rules)
         self.commands: list[MechanicsCommand] = []
@@ -61,6 +64,50 @@ class _ScenarioBuilder:
         self.engine.advance_to(time_us)
         self.engine.submit(request)
         self._record(time_us, "SUBMIT", {"request": request.as_dict()})
+
+    def cancel(
+        self,
+        time_us: int,
+        order_id: str,
+        *,
+        reason: str = "USER_CANCEL",
+    ) -> bool:
+        self.engine.advance_to(time_us)
+        cancelled = self.engine.cancel(order_id, reason=reason)
+        self._record(
+            time_us,
+            "CANCEL",
+            {"order_id": order_id, "reason": reason},
+        )
+        return cancelled
+
+    def replace(
+        self,
+        time_us: int,
+        order_id: str,
+        *,
+        new_order_id: str,
+        new_quantity: int,
+        new_price_ticks: int | None = None,
+    ) -> ManagedOrder | None:
+        self.engine.advance_to(time_us)
+        replacement = self.engine.replace_order(
+            order_id,
+            new_order_id=new_order_id,
+            new_quantity=new_quantity,
+            new_price_ticks=new_price_ticks,
+        )
+        self._record(
+            time_us,
+            "REPLACE",
+            {
+                "new_order_id": new_order_id,
+                "new_price_ticks": new_price_ticks,
+                "new_quantity": new_quantity,
+                "order_id": order_id,
+            },
+        )
+        return replacement
 
     def uncross(self, time_us: int):
         self.engine.advance_to(time_us)
@@ -131,7 +178,7 @@ def run_all_mechanics_scenarios() -> tuple[MechanicsScenarioResult, ...]:
 
 
 def _opening_auction() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     builder.transition(0, SessionState.PREOPEN, "OPENING_SEQUENCE")
     builder.submit(
         100,
@@ -185,7 +232,7 @@ def _opening_auction() -> MechanicsScenarioResult:
 
 
 def _closing_auction() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     _open_continuous(builder)
     builder.transition(100, SessionState.CLOSING_AUCTION, "CLOSING_CALL_START")
     builder.submit(
@@ -229,7 +276,7 @@ def _closing_auction() -> MechanicsScenarioResult:
 
 def _halt_during_momentum() -> MechanicsScenarioResult:
     rules = InstrumentRules(volatility_interruption_ticks=1)
-    builder = _ScenarioBuilder(rules)
+    builder = MechanicsScenarioBuilder(rules)
     _open_continuous(builder)
     builder.submit(
         100,
@@ -277,7 +324,7 @@ def _halt_during_momentum() -> MechanicsScenarioResult:
 
 
 def _reopening_gap() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     _open_continuous(builder)
     builder.transition(100, SessionState.HALTED, "MANUAL_VOLATILITY_HALT")
     builder.submit(
@@ -321,7 +368,7 @@ def _reopening_gap() -> MechanicsScenarioResult:
 
 
 def _ioc_partial_fill() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     _open_continuous(builder)
     builder.submit(
         100,
@@ -352,7 +399,7 @@ def _ioc_partial_fill() -> MechanicsScenarioResult:
 
 
 def _fok_rejection() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     _open_continuous(builder)
     builder.submit(
         100,
@@ -382,7 +429,7 @@ def _fok_rejection() -> MechanicsScenarioResult:
 
 
 def _post_only_rejection() -> MechanicsScenarioResult:
-    builder = _ScenarioBuilder()
+    builder = MechanicsScenarioBuilder()
     _open_continuous(builder)
     builder.submit(
         100,
@@ -411,7 +458,7 @@ def _post_only_rejection() -> MechanicsScenarioResult:
     )
 
 
-def _open_continuous(builder: _ScenarioBuilder) -> None:
+def _open_continuous(builder: MechanicsScenarioBuilder) -> None:
     builder.transition(0, SessionState.PREOPEN, "SESSION_START")
     builder.transition(0, SessionState.OPENING_AUCTION, "EMPTY_OPENING_CALL")
     builder.uncross(0)
