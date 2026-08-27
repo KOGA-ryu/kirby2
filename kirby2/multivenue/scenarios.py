@@ -56,7 +56,7 @@ class MultiVenueScenarioResult:
         return render_routing_timeline(self.coordinator.events)
 
 
-class _Builder:
+class MultiVenueScenarioBuilder:
     def __init__(
         self,
         configs: tuple[VenueConfig, ...],
@@ -172,7 +172,7 @@ def run_all_multivenue_scenarios() -> tuple[MultiVenueScenarioResult, ...]:
 
 
 def _better_price_poor_fill() -> MultiVenueScenarioResult:
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("CHEAP", "LOW_LATENCY", fill_bps=1_000, taker_fee=50),
             _config("RELIABLE", "LOW_LATENCY", fill_bps=9_800, taker_fee=20),
@@ -208,7 +208,7 @@ def _better_price_poor_fill() -> MultiVenueScenarioResult:
 
 
 def _deep_slow_shallow_fast() -> MultiVenueScenarioResult:
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("DEEP_SLOW", "NORMAL", fill_bps=5_000),
             _config("SHALLOW_FAST", "LOW_LATENCY", fill_bps=9_800),
@@ -239,7 +239,7 @@ def _deep_slow_shallow_fast() -> MultiVenueScenarioResult:
 
 
 def _sweep_momentum() -> MultiVenueScenarioResult:
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("SLOW", "NORMAL", fill_bps=9_000),
             _config("FAST", "LOW_LATENCY", fill_bps=9_000),
@@ -277,7 +277,7 @@ def _sweep_momentum() -> MultiVenueScenarioResult:
 
 
 def _passive_two_venues() -> MultiVenueScenarioResult:
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("ALPHA", "ZERO_LATENCY", maker_rebate=20),
             _config("BETA", "ZERO_LATENCY", maker_rebate=30),
@@ -328,7 +328,7 @@ def _passive_two_venues() -> MultiVenueScenarioResult:
 
 def _stale_composite() -> MultiVenueScenarioResult:
     delayed = HiddenLiquidityRules(feed_delay_us=1_000)
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("STALE", "NORMAL", rules=delayed),
             _config("OTHER", "LOW_LATENCY"),
@@ -360,7 +360,7 @@ def _stale_composite() -> MultiVenueScenarioResult:
 
 
 def _partial_completion() -> MultiVenueScenarioResult:
-    builder = _Builder(
+    builder = MultiVenueScenarioBuilder(
         (
             _config("ONE", "ZERO_LATENCY", taker_fee=40),
             _config("TWO", "ZERO_LATENCY", taker_fee=10),
@@ -416,7 +416,7 @@ def _config(
 
 
 def _seed_two_sided(
-    builder: _Builder,
+    builder: MultiVenueScenarioBuilder,
     venue_id: str,
     bid: int,
     ask: int,

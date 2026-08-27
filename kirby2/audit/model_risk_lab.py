@@ -13,6 +13,7 @@ from kirby2.auditlab.executors import (
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
+    FRAGMENTED_RECORDING_TYPE,
     LATENCY_RECORDING_TYPE,
     MECHANICS_RECORDING_TYPE,
     ExecutorRegistry,
@@ -80,6 +81,14 @@ from kirby2.session.records import (
 from kirby2.simulation.flow import FlowEvent, FlowEventFamily
 
 
+_IMPLEMENTED_EXECUTOR_LANES = (
+    ExecutorLane.CORE_FLOW,
+    ExecutorLane.MECHANICS,
+    ExecutorLane.LATENCY,
+    ExecutorLane.FRAGMENTED,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRiskLabAuditCase:
     name: str
@@ -141,6 +150,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _real_core_flow_executor_case(),
             _real_mechanics_executor_case(),
             _real_latency_executor_case(),
+            _real_fragmented_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -511,12 +521,7 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             direct_mutation_rejected,
             export_mutation_preserved,
             empty_registry_refused,
-            EXECUTOR_REGISTRY.registered_lanes
-            == (
-                ExecutorLane.CORE_FLOW,
-                ExecutorLane.MECHANICS,
-                ExecutorLane.LATENCY,
-            ),
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
         )
     )
     return ModelRiskLabAuditCase(
@@ -682,12 +687,7 @@ def _real_core_flow_executor_case() -> ModelRiskLabAuditCase:
     )
     passed = all(
         (
-            EXECUTOR_REGISTRY.registered_lanes
-            == (
-                ExecutorLane.CORE_FLOW,
-                ExecutorLane.MECHANICS,
-                ExecutorLane.LATENCY,
-            ),
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
             {item.configuration.flow_model for item in results}
             == {"simple", "hawkes"},
             all(item.automated_status is AutomatedStatus.PASS for item in results),
@@ -895,12 +895,7 @@ def _real_mechanics_executor_case() -> ModelRiskLabAuditCase:
     }
     passed = all(
         (
-            EXECUTOR_REGISTRY.registered_lanes
-            == (
-                ExecutorLane.CORE_FLOW,
-                ExecutorLane.MECHANICS,
-                ExecutorLane.LATENCY,
-            ),
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
             len(configurations) == len(AXES["session_phase"]),
             exact_axes,
             exact_exercises,
@@ -1099,12 +1094,7 @@ def _real_latency_executor_case() -> ModelRiskLabAuditCase:
     }
     passed = all(
         (
-            EXECUTOR_REGISTRY.registered_lanes
-            == (
-                ExecutorLane.CORE_FLOW,
-                ExecutorLane.MECHANICS,
-                ExecutorLane.LATENCY,
-            ),
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
             len(configurations) == len(AXES["latency"]),
             exact_profiles,
             native_profiles == set(AXES["latency"]),
@@ -1149,6 +1139,268 @@ def _real_latency_executor_case() -> ModelRiskLabAuditCase:
             "tapes": tapes,
         },
         () if passed else ("real asynchronous-latency executor proof failed",),
+    )
+
+
+def _real_fragmented_executor_case() -> ModelRiskLabAuditCase:
+    configurations = tuple(
+        item
+        for item in generate_configurations(seed=771, budget=4_200)
+        if item.lane is ExecutorLane.FRAGMENTED
+        and item.replicate_index == 0
+    )[: len(AXES["hidden_liquidity"]) * len(AXES["venue_count"])]
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.FRAGMENTED]
+    coverage = evidence_coverage_report(results)
+    fragmented_coverage = coverage["lanes"][ExecutorLane.FRAGMENTED.value]
+
+    command_types: set[str] = set()
+    coordinator_event_types: set[str] = set()
+    liquidity_sources: set[str] = set()
+    request_kinds: set[str] = set()
+    truth_event_types: set[str] = set()
+    venue_ids: set[str] = set()
+    tapes: dict[str, object] = {}
+    result_evidence: dict[str, object] = {}
+    event_backed_exercises = True
+    observable_boundary_clean = True
+    crossed_intervals_valid = True
+    for result, repeat, replay in zip(results, repeated, replayed):
+        payload = thaw_json(result.recording.payload)
+        native = payload["native_recording"]
+        commands = native["commands"]
+        native_events = native["expected_events"]
+        truth_venues = native["expected_ground_truth"]["venues"]
+        intervals = payload["observable_crossed_intervals"]
+        command_types.update(str(item["command_type"]) for item in commands)
+        coordinator_event_types.update(
+            str(item["event_type"]) for item in native_events
+        )
+        venue_ids.update(
+            str(item["venue_id"]) for item in native["venue_configs"]
+        )
+        for command in commands:
+            if command["command_type"] == "ADD":
+                request_kinds.add(
+                    str(command["parameters"]["request"]["kind"])
+                )
+        for venue in truth_venues:
+            for event in venue["state"]["events"]:
+                truth_event_types.add(str(event["event_type"]))
+                if event["event_type"] == "TRADE":
+                    liquidity_sources.add(
+                        str(event["data"]["liquidity_source"])
+                    )
+        exercises = {
+            exercise.capability: thaw_json(exercise.evidence)
+            for exercise in result.exercises
+        }
+        hidden_evidence = exercises["hidden_liquidity"]
+        venue_evidence = exercises["venue_count"]
+        if result.configuration.hidden_liquidity == "NONE":
+            hidden_events_present = bool(
+                hidden_evidence["request_kind_counts"].get("DISPLAYED_LIMIT")
+            )
+        elif result.configuration.hidden_liquidity == "ICEBERG":
+            hidden_events_present = bool(
+                hidden_evidence["iceberg_refresh_events"]
+            )
+        else:
+            hidden_events_present = bool(
+                hidden_evidence["midpoint_trade_events"]
+            )
+        event_backed_exercises = event_backed_exercises and all(
+            (
+                hidden_events_present,
+                bool(venue_evidence["route_event_sequences"]),
+            )
+        )
+        boundary = next(
+            check
+            for check in result.checks
+            if check.name == "observable_projection_boundary"
+        )
+        boundary_evidence = thaw_json(boundary.evidence)
+        observable_boundary_clean = (
+            observable_boundary_clean
+            and not boundary_evidence["forbidden_fields_found"]
+        )
+        crossed_intervals_valid = crossed_intervals_valid and (
+            (not intervals)
+            if result.configuration.venue_count == 1
+            else bool(intervals)
+            and all(
+                item["end_time_us"] is not None
+                and int(item["duration_us"]) >= 0
+                for item in intervals
+            )
+        )
+        tapes[result.configuration.cell_id] = {
+            "command_count": len(commands),
+            "coordinator_event_count": len(native_events),
+            "crossed_interval_count": len(intervals),
+            "native_event_sha256": canonical_sha256(native_events),
+            "native_feed_sha256": canonical_sha256(native["expected_feed"]),
+            "native_state_sha256": native["expected_state_sha256"],
+            "recording_sha256": result.recording.sha256,
+            "venue_ids": [
+                item["venue_id"] for item in native["venue_configs"]
+            ],
+        }
+        result_evidence[result.configuration.cell_id] = {
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "event_sha256": result.event_sha256,
+            "hidden_liquidity": result.configuration.hidden_liquidity,
+            "player_position": result.metrics[
+                "global_player_position_shares"
+            ],
+            "repeated_result_match": result.result_sha256 == repeat.result_sha256,
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": result.result_sha256 == replay.result_sha256,
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+            "route_completed_quantity": result.metrics[
+                "route_completed_quantity"
+            ],
+            "venue_count": result.configuration.venue_count,
+        }
+
+    expected_pairs = {
+        (str(hidden), int(count))
+        for hidden in AXES["hidden_liquidity"]
+        for count in AXES["venue_count"]
+    }
+    observed_pairs = {
+        (item.hidden_liquidity, item.venue_count) for item in configurations
+    }
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    fragmented_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            fragmented_coverage["dimensions"],
+            fragmented_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
+            len(configurations) == len(expected_pairs),
+            observed_pairs == expected_pairs,
+            exact_exercises,
+            event_backed_exercises,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            fragmented_coverage_passed,
+            observable_boundary_clean,
+            crossed_intervals_valid,
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == FRAGMENTED_RECORDING_TYPE
+                for item in results
+            ),
+            request_kinds
+            == {"DISPLAYED_LIMIT", "ICEBERG", "MIDPOINT_HIDDEN"},
+            {
+                "DISPLAYED",
+                "ICEBERG_INITIAL",
+                "ICEBERG_REFRESH",
+                "MIDPOINT_HIDDEN",
+            }
+            <= liquidity_sources,
+            {
+                "ADD",
+                "ADVANCE",
+                "CANCEL_ALL",
+                "COMPLETE",
+                "ROUTE",
+                "SIM_MARKET",
+            }
+            <= command_types,
+            {
+                "CANCEL_ALL_REQUESTED",
+                "GLOBAL_POSITION_CHANGED",
+                "ROUTE_DECISION",
+                "ROUTE_LEG_ACCEPTED",
+                "ROUTE_LEG_FILL",
+                "VENUE_MARKET_FLOW",
+                "VENUE_ORDER_CANCELLED",
+            }
+            <= coordinator_event_types,
+            {
+                "ICEBERG_REFRESHED",
+                "ORDER_ACCEPTED",
+                "ORDER_CANCELLED",
+                "SESSION_COMPLETE",
+                "TRADE",
+            }
+            <= truth_event_types,
+            venue_ids == {"AUDIT-V01", "AUDIT-V02", "AUDIT-V03", "AUDIT-V04"},
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_hidden_liquidity_and_fragmented_venues_replay_natively",
+        {
+            "command_types": sorted(command_types),
+            "coordinator_event_types": sorted(coordinator_event_types),
+            "crossed_intervals_valid": crossed_intervals_valid,
+            "event_backed_exercises": event_backed_exercises,
+            "fragmented_coverage": fragmented_coverage,
+            "liquidity_sources": sorted(liquidity_sources),
+            "observable_boundary_clean": observable_boundary_clean,
+            "observed_axis_pairs": [
+                [hidden, count] for hidden, count in sorted(observed_pairs)
+            ],
+            "request_kinds": sorted(request_kinds),
+            "results": result_evidence,
+            "tapes": tapes,
+            "truth_event_types": sorted(truth_event_types),
+            "venue_ids": sorted(venue_ids),
+        },
+        () if passed else ("real fragmented-market executor proof failed",),
     )
 
 

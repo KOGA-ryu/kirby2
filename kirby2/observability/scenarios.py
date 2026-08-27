@@ -60,7 +60,7 @@ class BlindExerciseResult:
     deep_score: ObservabilityScore
 
 
-class _Builder:
+class HiddenLiquidityScenarioBuilder:
     def __init__(self, rules: HiddenLiquidityRules | None = None) -> None:
         self.venue = HiddenLiquidityVenue(rules)
         self.commands: list[ObservabilityCommand] = []
@@ -184,17 +184,17 @@ def run_all_hidden_liquidity_scenarios(
 
 
 def run_blind_hidden_liquidity_exercise() -> BlindExerciseResult:
-    shallow_builder = _Builder()
-    deep_builder = _Builder()
+    shallow_builder = HiddenLiquidityScenarioBuilder()
+    deep_builder = HiddenLiquidityScenarioBuilder()
     for builder in (shallow_builder, deep_builder):
-        builder.submit(0, _displayed("BLIND-BID", Side.BUY, 100, 99))
+        builder.submit(0, displayed_order("BLIND-BID", Side.BUY, 100, 99))
     shallow_builder.submit(
         0,
-        _displayed("BLIND-ASK-SHALLOW", Side.SELL, 100, 101),
+        displayed_order("BLIND-ASK-SHALLOW", Side.SELL, 100, 101),
     )
     deep_builder.submit(
         0,
-        _iceberg(
+        iceberg_order(
             "BLIND-ASK-DEEP",
             Side.SELL,
             101,
@@ -291,11 +291,11 @@ def render_observable_timeline(events: tuple[ObservableEvent, ...]) -> str:
 
 
 def _iceberg_absorption() -> HiddenLiquidityScenarioResult:
-    builder = _Builder()
-    builder.submit(0, _displayed("ABSORB-BID", Side.BUY, 100, 99))
+    builder = HiddenLiquidityScenarioBuilder()
+    builder.submit(0, displayed_order("ABSORB-BID", Side.BUY, 100, 99))
     builder.submit(
         0,
-        _iceberg(
+        iceberg_order(
             "ABSORB-ASK",
             Side.SELL,
             101,
@@ -334,12 +334,17 @@ def _iceberg_absorption() -> HiddenLiquidityScenarioResult:
 
 
 def _hidden_midpoint_fill() -> HiddenLiquidityScenarioResult:
-    builder = _Builder()
-    builder.submit(0, _displayed("MID-BID", Side.BUY, 100, 99))
-    builder.submit(0, _displayed("MID-ASK", Side.SELL, 100, 102))
+    builder = HiddenLiquidityScenarioBuilder()
+    builder.submit(0, displayed_order("MID-BID", Side.BUY, 100, 99))
+    builder.submit(0, displayed_order("MID-ASK", Side.SELL, 100, 102))
     builder.submit(
         0,
-        _hidden("MID-HIDDEN-SELL", Side.SELL, 80, kind=LiquidityKind.MIDPOINT_HIDDEN),
+        hidden_order(
+            "MID-HIDDEN-SELL",
+            Side.SELL,
+            80,
+            kind=LiquidityKind.MIDPOINT_HIDDEN,
+        ),
     )
     before = builder.venue.observable_feed().book.as_dict()
     filled = builder.market(100, "MID-BUY", Side.BUY, 50)
@@ -358,11 +363,11 @@ def _hidden_midpoint_fill() -> HiddenLiquidityScenarioResult:
 
 
 def _repeated_displayed_refresh() -> HiddenLiquidityScenarioResult:
-    builder = _Builder()
-    builder.submit(0, _displayed("REFRESH-BID", Side.BUY, 100, 99))
+    builder = HiddenLiquidityScenarioBuilder()
+    builder.submit(0, displayed_order("REFRESH-BID", Side.BUY, 100, 99))
     builder.submit(
         0,
-        _iceberg(
+        iceberg_order(
             "REFRESH-ASK",
             Side.SELL,
             101,
@@ -392,9 +397,9 @@ def _repeated_displayed_refresh() -> HiddenLiquidityScenarioResult:
 
 
 def _apparent_wall() -> HiddenLiquidityScenarioResult:
-    builder = _Builder()
-    builder.submit(0, _displayed("WALL-BID", Side.BUY, 100, 99))
-    builder.submit(0, _displayed("WALL-ASK", Side.SELL, 500, 101))
+    builder = HiddenLiquidityScenarioBuilder()
+    builder.submit(0, displayed_order("WALL-BID", Side.BUY, 100, 99))
+    builder.submit(0, displayed_order("WALL-ASK", Side.SELL, 500, 101))
     cancelled = builder.cancel(100, "WALL-ASK")
     filled = builder.market(200, "WALL-BUY", Side.BUY, 200)
     builder.complete(300)
@@ -419,12 +424,12 @@ def _apparent_wall() -> HiddenLiquidityScenarioResult:
 
 
 def _small_displayed_deep_hidden() -> HiddenLiquidityScenarioResult:
-    builder = _Builder()
-    builder.submit(0, _displayed("DEEP-BID", Side.BUY, 100, 99))
-    builder.submit(0, _displayed("DEEP-ASK", Side.SELL, 50, 101))
+    builder = HiddenLiquidityScenarioBuilder()
+    builder.submit(0, displayed_order("DEEP-BID", Side.BUY, 100, 99))
+    builder.submit(0, displayed_order("DEEP-ASK", Side.SELL, 50, 101))
     builder.submit(
         0,
-        _hidden(
+        hidden_order(
             "DEEP-HIDDEN-ASK",
             Side.SELL,
             450,
@@ -446,7 +451,7 @@ def _small_displayed_deep_hidden() -> HiddenLiquidityScenarioResult:
     )
 
 
-def _displayed(
+def displayed_order(
     order_id: str,
     side: Side,
     quantity: int,
@@ -466,7 +471,7 @@ def _displayed(
     )
 
 
-def _iceberg(
+def iceberg_order(
     order_id: str,
     side: Side,
     price_ticks: int,
@@ -497,7 +502,7 @@ def _iceberg(
     )
 
 
-def _hidden(
+def hidden_order(
     order_id: str,
     side: Side,
     quantity: int,
