@@ -111,6 +111,36 @@ and the acceptance identity, and its canonical bytes are persisted as
 `PASS`, `WARNING`, `FAIL`, or `NOT_EXERCISED`; warnings remain visible and are
 not silently promoted.
 
+Provenance hashes `pyproject.toml`, the package entry points and immutable-data
+helper, and every regular source/configuration input beneath the audit,
+exchange, feature, historical, session, simulation, latency, observability,
+multi-venue, agent, algorithm, counterfactual, market-data, calibration,
+scenario, strategy, player, curriculum, and research roots executed by the
+laboratory. The packet stores the sorted path-to-SHA-256 map and its aggregate
+digest in `provenance.json`. At the end of execution, every repository-backed
+Python module present in the live import graph must resolve to one of those
+hashed inputs; an unbound loaded module fails provenance.
+Package version comes from installed `importlib.metadata` when available, with
+an explicitly labelled `pyproject.toml` fallback.
+
+A dirty worktree is not concealed or rejected merely for being dirty. Git
+porcelain status is paired with the current bytes and SHA-256 for each regular
+file, the link target for each symlink, or an explicit `DELETED` marker. The
+digest covers both status and this working-state evidence. Git command failure
+is `UNAVAILABLE` and blocks the provenance gate. Provenance is captured before
+and after execution; any implementation, dirty-state, commit, or version drift
+during the run fails the execution-window check.
+
+Reports keep automated and human judgments orthogonal. They render
+`STRUCTURAL_STATUS`, `COVERAGE_STATUS`, `REPLAY_STATUS`,
+`DETERMINISM_STATUS`, `FAULT_STATUS`, `STATISTICAL_STATUS`,
+`PROVENANCE_STATUS`, and `MANUAL_ACCEPTANCE` separately. Any automated failure
+or required `NOT_EXERCISED` gate yields aggregate `FAIL`; statistical warnings
+alone yield `PASS_WITH_WARNINGS`; a clean automated pass yields
+`AUTOMATED_PASS_PENDING_HUMAN`. `RUNTIME_INVARIANTS PASS` appears only when
+every required runtime gate was exercised and passed. An unexercised runtime
+gate is printed as `RUNTIME_INVARIANTS NOT_EXERCISED`, never as a pass.
+
 Run the requested substantial audit:
 
 ```text
@@ -123,6 +153,10 @@ run identity to the sorted byte count and SHA-256 inventory of every UTF-8
 artifact. Re-recording identical material is idempotent; changed artifact bytes
 produce a different packet ID. The human-readable report stores
 `PACKET id=SEE_MANIFEST` so the ID is never guessed before all artifacts exist.
+The v2 identity also declares the complete result-artifact digest map and binds
+the provenance-manifest digest, statistical-threshold-manifest digest, and
+exact acceptance-record artifact digest; recording refuses a declared digest
+map that differs from the bytes being written.
 
 Artifact names must be canonical, packet-relative POSIX paths. Absolute paths,
 parent/dot segments, Windows path forms, backslashes, the reserved manifest

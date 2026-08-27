@@ -6,6 +6,8 @@ import ast
 import hashlib
 import inspect
 import json
+import shutil
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,6 +57,8 @@ from kirby2.auditlab.models import (
     LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
     AcceptanceRecord,
     AutomatedStatus,
+    AuditGateReport,
+    AuditGateStatus,
     CaseRecording,
     CheckResult,
     CheckStatus,
@@ -74,6 +78,7 @@ from kirby2.auditlab.models import (
     canonical_sha256,
 )
 import kirby2.auditlab.faults as production_fault_adapters
+import kirby2.auditlab.runner as audit_runner
 import kirby2.auditlab.statistics as risk_statistics
 from kirby2.auditlab.fault_oracle import expected_fault_codes
 from kirby2.counterfactual.models import (
@@ -192,6 +197,10 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _determinism_case(result),
             _minimization_case(result),
             _statistics_case(result),
+            _provenance_and_gate_truth_case(
+                result,
+                root / "provenance-gate-truth",
+            ),
             _probe_case(result),
             _core_replay_payload_ownership_case(),
             _subsystem_evidence_payload_ownership_case(),
@@ -2741,6 +2750,11 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
     not_exercised_blocks_substantial = not replace(
         result,
         statistics=(not_exercised_probe,),
+        acceptance=replace(
+            result.acceptance,
+            record_id="acceptance-controlled-not-exercised",
+            reviewer_decision="REJECT_AUTOMATED_PRECHECK",
+        ),
     ).passed
     invalid_status_rejected = False
     try:
@@ -2841,6 +2855,351 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
             "threshold_manifest_sha256": manifest_digest,
         },
         () if passed else ("controlled statistical risk proof failed",),
+    )
+
+
+def _provenance_and_gate_truth_case(
+    result,
+    root: Path,
+) -> ModelRiskLabAuditCase:
+    provenance = result.provenance
+    implementation = provenance["implementation_manifest"]
+    if not isinstance(implementation, dict):
+        raise TypeError("audit provenance implementation manifest is not an object")
+    repository = Path(__file__).resolve().parents[2]
+    expected_paths = {
+        "kirby2/__init__.py",
+        "kirby2/__main__.py",
+        "kirby2/immutable.py",
+        "pyproject.toml",
+    }
+    for root_name in audit_runner.PROVENANCE_PACKAGE_ROOTS:
+        package_root = repository / "kirby2" / root_name
+        expected_paths.update(
+            path.relative_to(repository).as_posix()
+            for path in package_root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.relative_to(repository).parts
+            and path.suffix not in {".pyc", ".pyo"}
+        )
+    implementation_inventory_exact = set(implementation) == expected_paths
+    implementation_bytes_exact = implementation_inventory_exact and all(
+        implementation[name]
+        == hashlib.sha256((repository / name).read_bytes()).hexdigest()
+        for name in expected_paths
+    )
+    provenance_without_digest = dict(provenance)
+    provenance_digest = provenance_without_digest.pop(
+        "provenance_manifest_sha256"
+    )
+    provenance_self_digest_exact = (
+        canonical_sha256(provenance_without_digest) == provenance_digest
+    )
+    loaded_modules_bound = (
+        int(provenance["loaded_repository_module_count"]) > 0
+        and not provenance["unbound_loaded_repository_modules"]
+        and set(provenance["loaded_repository_modules"]).issubset(implementation)
+    )
+
+    copied_repository = root / "copied-source"
+    copied_source = copied_repository / "kirby2" / "auditlab" / "runner.py"
+    copied_source.parent.mkdir(parents=True)
+    shutil.copy2(Path(audit_runner.__file__), copied_source)
+    deleted_config = copied_source.parent / "deleted-config.toml"
+    deleted_config.write_text("mode = 'baseline'\n", encoding="utf-8")
+    shutil.copy2(repository / "pyproject.toml", copied_repository / "pyproject.toml")
+    git_commands = (
+        ("init", "-q"),
+        ("add", "--", "."),
+        (
+            "-c",
+            "user.name=Kirby2 Audit",
+            "-c",
+            "user.email=kirby2-audit@invalid",
+            "commit",
+            "-q",
+            "-m",
+            "baseline",
+        ),
+    )
+    git_setup: list[dict[str, object]] = []
+    git_setup_passed = True
+    for arguments in git_commands:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=copied_repository,
+            capture_output=True,
+            check=False,
+        )
+        git_setup.append(
+            {
+                "arguments": list(arguments),
+                "returncode": completed.returncode,
+            }
+        )
+        git_setup_passed = git_setup_passed and completed.returncode == 0
+
+    source_baseline = copied_source.read_bytes()
+    copied_source.write_bytes(source_baseline + b"\n# provenance-alpha\n")
+    deleted_config.unlink()
+    link_path = copied_source.parent / "linked-config.json"
+    link_path.symlink_to("target-config.json")
+    first_dirty = audit_runner._dirty_worktree_state(copied_repository)
+    copied_source.write_bytes(source_baseline + b"\n# provenance-beta\n")
+    second_dirty = audit_runner._dirty_worktree_state(copied_repository)
+
+    first_entries = {
+        item["path"]: item
+        for item in first_dirty["entries"]
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    second_entries = {
+        item["path"]: item
+        for item in second_dirty["entries"]
+        if isinstance(item, dict) and isinstance(item.get("path"), str)
+    }
+    copied_name = "kirby2/auditlab/runner.py"
+    deleted_name = "kirby2/auditlab/deleted-config.toml"
+    link_name = "kirby2/auditlab/linked-config.json"
+    same_dirty_paths = (
+        first_dirty["porcelain_records"] == second_dirty["porcelain_records"]
+        and set(first_entries) == set(second_entries)
+        and copied_name in first_entries
+    )
+    first_source_state = first_entries.get(copied_name, {}).get("working_path", {})
+    second_source_state = second_entries.get(copied_name, {}).get("working_path", {})
+    dirty_bytes_bound = all(
+        (
+            isinstance(first_source_state, dict),
+            isinstance(second_source_state, dict),
+            first_source_state.get("kind") == "REGULAR_FILE",
+            second_source_state.get("kind") == "REGULAR_FILE",
+            first_source_state.get("sha256") != second_source_state.get("sha256"),
+            first_dirty["sha256"] != second_dirty["sha256"],
+        )
+    )
+    deletion_explicit = (
+        first_entries.get(deleted_name, {})
+        .get("working_path", {})
+        .get("marker")
+        == "DELETED"
+    )
+    symlink_target_explicit = (
+        first_entries.get(link_name, {})
+        .get("working_path", {})
+        .get("target")
+        == "target-config.json"
+    )
+    unavailable_root = root / "not-a-git-repository"
+    unavailable_root.mkdir()
+    unavailable = audit_runner._repository_provenance(unavailable_root)
+    git_failure_unavailable = all(
+        (
+            unavailable["status"] == "UNAVAILABLE",
+            unavailable["git_commit"] == "UNAVAILABLE",
+            unavailable["git_porcelain_records"] == "UNAVAILABLE",
+        )
+    )
+
+    packet = result.packet
+    packet_identity_complete = False
+    provenance_artifact_exact = False
+    if packet is not None:
+        packet_manifest = json.loads(
+            (packet.directory / "manifest.json").read_text(encoding="utf-8")
+        )
+        references = packet_manifest["artifacts"]
+        identity = packet_manifest["identity"]
+        referenced_digests = {
+            name: reference["sha256"]
+            for name, reference in sorted(references.items())
+        }
+        packet_identity_complete = all(
+            (
+                identity["result_artifact_digests"] == referenced_digests,
+                identity["acceptance_record_sha256"]
+                == referenced_digests["acceptance_record.json"],
+                identity["provenance_manifest_sha256"] == provenance_digest,
+                identity["statistical_threshold_manifest_sha256"]
+                == risk_statistics.STATISTICAL_THRESHOLD_MANIFEST_SHA256,
+                result.acceptance.artifact_digests["provenance_manifest"]
+                == provenance_digest,
+            )
+        )
+        provenance_artifact_exact = json.loads(
+            (packet.directory / "provenance.json").read_text(encoding="utf-8")
+        ) == provenance
+    declared_digest_mismatch_rejected = False
+    try:
+        AuditLabStore(root / "declared-digest-mismatch").record(
+            {
+                "acceptance_record_sha256": "0" * 64,
+                "provenance_manifest_sha256": "1" * 64,
+                "result_artifact_digests": {
+                    "acceptance_record.json": "0" * 64
+                },
+                "statistical_threshold_manifest_sha256": "2" * 64,
+            },
+            {"acceptance_record.json": "{}\n"},
+        )
+    except ValueError:
+        declared_digest_mismatch_rejected = True
+
+    baseline_gates = AuditGateReport(
+        structural_status=AuditGateStatus.PASS,
+        coverage_status=AuditGateStatus.PASS,
+        replay_status=AuditGateStatus.PASS,
+        determinism_status=AuditGateStatus.PASS,
+        fault_status=AuditGateStatus.PASS,
+        statistical_status=AuditGateStatus.PASS,
+        provenance_status=AuditGateStatus.PASS,
+        manual_acceptance="PENDING_HUMAN_REVIEW",
+    )
+    warning_gates = replace(
+        baseline_gates,
+        statistical_status=AuditGateStatus.WARNING,
+    )
+    unexercised_gates = replace(
+        baseline_gates,
+        coverage_status=AuditGateStatus.NOT_EXERCISED,
+        manual_acceptance="REJECT_AUTOMATED_PRECHECK",
+    )
+    failure_gates = replace(
+        baseline_gates,
+        structural_status=AuditGateStatus.FAIL,
+        manual_acceptance="REJECT_AUTOMATED_PRECHECK",
+    )
+    rendered_states = {
+        name: "\n".join(report.render_lines())
+        for name, report in (
+            ("pending_human", baseline_gates),
+            ("runtime_failure", failure_gates),
+            ("unexercised", unexercised_gates),
+            ("warning_only", warning_gates),
+        )
+    }
+    gate_states_distinct = len(set(rendered_states.values())) == 4 and all(
+        (
+            "AGGREGATE_STATUS AUTOMATED_PASS_PENDING_HUMAN"
+            in rendered_states["pending_human"],
+            "MANUAL_ACCEPTANCE PENDING_HUMAN_REVIEW"
+            in rendered_states["pending_human"],
+            "AGGREGATE_STATUS PASS_WITH_WARNINGS"
+            in rendered_states["warning_only"],
+            "STATISTICAL_STATUS WARNING" in rendered_states["warning_only"],
+            "COVERAGE_STATUS NOT_EXERCISED"
+            in rendered_states["unexercised"],
+            "RUNTIME_INVARIANTS NOT_EXERCISED"
+            in rendered_states["unexercised"],
+            "RUNTIME_INVARIANTS PASS" not in rendered_states["unexercised"],
+            "STRUCTURAL_STATUS FAIL" in rendered_states["runtime_failure"],
+            "RUNTIME_INVARIANTS FAIL" in rendered_states["runtime_failure"],
+        )
+    )
+    real_gate_render_exact = all(
+        line in result.render()
+        for line in result.gate_report.render_lines()
+    )
+    required_gate_fields = {
+        "STRUCTURAL_STATUS",
+        "COVERAGE_STATUS",
+        "REPLAY_STATUS",
+        "DETERMINISM_STATUS",
+        "FAULT_STATUS",
+        "STATISTICAL_STATUS",
+        "PROVENANCE_STATUS",
+        "MANUAL_ACCEPTANCE",
+        "AGGREGATE_STATUS",
+    }
+    real_summary_fields_exact = required_gate_fields.issubset(
+        result.summary_dict()
+    )
+    version_source_explicit = (
+        provenance["software_version"] != "UNAVAILABLE"
+        and provenance["software_version_source"]
+        in {
+            "importlib.metadata:kirby2",
+            "pyproject.toml:[project].version",
+        }
+    )
+    version_resolution_source = inspect.getsource(audit_runner._software_version)
+    version_resolution_implemented = all(
+        token in version_resolution_source
+        for token in (
+            'metadata.version("kirby2")',
+            'repository / "pyproject.toml"',
+            'payload["project"]',
+        )
+    ) and '"0.1.0"' not in version_resolution_source
+    passed = all(
+        (
+            provenance["status"] == "PASS",
+            provenance["execution_window_stable"] is True,
+            implementation_inventory_exact,
+            implementation_bytes_exact,
+            provenance_self_digest_exact,
+            loaded_modules_bound,
+            version_source_explicit,
+            git_setup_passed,
+            first_dirty["status"] == "PASS",
+            second_dirty["status"] == "PASS",
+            same_dirty_paths,
+            dirty_bytes_bound,
+            deletion_explicit,
+            symlink_target_explicit,
+            git_failure_unavailable,
+            packet_identity_complete,
+            provenance_artifact_exact,
+            declared_digest_mismatch_rejected,
+            gate_states_distinct,
+            real_gate_render_exact,
+            real_summary_fields_exact,
+            version_resolution_implemented,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "byte_bound_provenance_and_orthogonal_gate_truth",
+        {
+            "deletion_marker_explicit": deletion_explicit,
+            "declared_digest_mismatch_rejected": (
+                declared_digest_mismatch_rejected
+            ),
+            "dirty_digest_changed_with_same_path": dirty_bytes_bound,
+            "dirty_paths_unchanged": same_dirty_paths,
+            "gate_aggregate_states": {
+                "pending_human": baseline_gates.aggregate_status.value,
+                "runtime_failure": failure_gates.aggregate_status.value,
+                "unexercised": unexercised_gates.aggregate_status.value,
+                "warning_only": warning_gates.aggregate_status.value,
+            },
+            "gate_render_sha256": {
+                name: hashlib.sha256(value.encode("utf-8")).hexdigest()
+                for name, value in rendered_states.items()
+            },
+            "gate_states_distinct": gate_states_distinct,
+            "git_failure_status": unavailable["status"],
+            "git_setup": git_setup,
+            "implementation_bytes_exact": implementation_bytes_exact,
+            "implementation_file_count": len(implementation),
+            "implementation_inventory_exact": implementation_inventory_exact,
+            "loaded_module_count": provenance["loaded_repository_module_count"],
+            "loaded_modules_bound": loaded_modules_bound,
+            "unbound_loaded_modules": provenance[
+                "unbound_loaded_repository_modules"
+            ],
+            "packet_identity_complete": packet_identity_complete,
+            "provenance_artifact_exact": provenance_artifact_exact,
+            "provenance_manifest_sha256": provenance_digest,
+            "provenance_self_digest_exact": provenance_self_digest_exact,
+            "real_gate_render_exact": real_gate_render_exact,
+            "real_summary_fields_exact": real_summary_fields_exact,
+            "same_path_first_dirty_sha256": first_dirty["sha256"],
+            "same_path_second_dirty_sha256": second_dirty["sha256"],
+            "symlink_target_explicit": symlink_target_explicit,
+            "version_source": provenance["software_version_source"],
+            "version_resolution_implemented": version_resolution_implemented,
+        },
+        () if passed else ("provenance or orthogonal gate truth proof failed",),
     )
 
 

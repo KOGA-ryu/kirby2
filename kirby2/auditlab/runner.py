@@ -7,9 +7,11 @@ import json
 import os
 import subprocess
 import sys
+import tomllib
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 from kirby2.immutable import thaw_json
@@ -22,6 +24,8 @@ from .models import (
     AUDIT_LAB_SCHEMA_VERSION,
     CASE_RECORDING_SCHEMA_VERSION,
     AcceptanceRecord,
+    AuditGateReport,
+    AuditGateStatus,
     CaseRecording,
     CheckResult,
     CheckStatus,
@@ -47,6 +51,38 @@ from .statistics import (
 from .store import DEFAULT_AUDIT_LAB_STORE, AuditLabStore, PacketRecord
 
 
+PROVENANCE_PACKAGE_ROOTS = (
+    "auditlab",
+    "audit",
+    "exchange",
+    "features",
+    "historical",
+    "session",
+    "simulation",
+    "latency",
+    "observability",
+    "multivenue",
+    "agents",
+    "algorithms",
+    "counterfactual",
+    "curriculum",
+    "marketdata",
+    "calibration",
+    "scenarios",
+    "strategy",
+    "player",
+    "research",
+)
+_PROVENANCE_TOP_LEVEL_FILES = (
+    "kirby2/__init__.py",
+    "kirby2/__main__.py",
+    "kirby2/immutable.py",
+    "pyproject.toml",
+)
+_PROVENANCE_IGNORED_PARTS = frozenset({"__pycache__"})
+_PROVENANCE_IGNORED_SUFFIXES = frozenset({".pyc", ".pyo"})
+
+
 @dataclass(frozen=True, slots=True)
 class AuditLabResult:
     seed: int
@@ -66,37 +102,34 @@ class AuditLabResult:
     packet: PacketRecord | None
 
     @property
-    def passed(self) -> bool:
-        return all(
-            (
-                not self.unexpected_violations,
-                self.coverage["status"] == "PASS",
-                self.determinism["status"] == "PASS",
-                self.replay_parity["status"] == "PASS",
-                self.fault_summary["status"] == "PASS",
-                all(item.preserved for item in self.minimized_failures),
-                all(
-                    item.status in {"PASS", "WARNING"}
-                    for item in self.statistics
-                ),
-                all(
-                    item.status is CheckStatus.PASS or not item.required
-                    for item in self.probes
-                ),
-                self.packet is None or self.packet.verification_status == "PASS",
-            )
+    def gate_report(self) -> AuditGateReport:
+        return _audit_gate_report(
+            cases=self.cases,
+            coverage=self.coverage,
+            determinism=self.determinism,
+            replay_parity=self.replay_parity,
+            fault_summary=self.fault_summary,
+            provenance=self.provenance,
+            minimized=self.minimized_failures,
+            statistics=self.statistics,
+            probes=self.probes,
+            acceptance=self.acceptance,
+            unexpected=self.unexpected_violations,
+            packet=self.packet,
         )
 
+    @property
+    def passed(self) -> bool:
+        return self.gate_report.automated_passed
+
     def summary_dict(self) -> dict[str, object]:
+        gates = self.gate_report
         return {
+            **gates.as_dict(),
             "acceptance_record": self.acceptance.as_dict(),
             "budget": self.budget,
             "case_result_sha256": canonical_sha256(self.cases),
-            "coverage_status": (
-                "PASS"
-                if self.coverage["status"] == "PASS"
-                else "PARTIAL"
-            ),
+            "coverage_evidence_status": self.coverage["status"],
             "determinism": self.determinism,
             "fault_summary": self.fault_summary,
             "fault_observation_sha256": canonical_sha256(
@@ -110,13 +143,13 @@ class AuditLabResult:
             },
             "replay_parity": self.replay_parity,
             "seed": self.seed,
-            "statistical_status": {
+            "statistical_checks": {
                 item.name: item.status for item in self.statistics
             },
             "statistical_threshold_manifest_sha256": (
                 STATISTICAL_THRESHOLD_MANIFEST_SHA256
             ),
-            "status": "PASS" if self.passed else "FAIL",
+            "status": gates.aggregate_status.value,
             "unexpected_violation_count": len(self.unexpected_violations),
         }
 
@@ -145,9 +178,11 @@ class AuditLabResult:
             ),
             (
                 "PROVENANCE "
+                f"status={self.provenance['status']} "
                 f"git_commit={self.provenance['git_commit']} "
                 f"working_tree_dirty={str(self.provenance['working_tree_dirty']).lower()} "
-                f"implementation_sha256={self.provenance['implementation_sha256']}"
+                f"implementation_sha256={self.provenance['implementation_sha256']} "
+                f"manifest_sha256={self.provenance['provenance_manifest_sha256']}"
             ),
             "STATISTICS " + " ".join(
                 f"{item.name}={item.status}" for item in self.statistics
@@ -155,19 +190,137 @@ class AuditLabResult:
             "PROBES " + " ".join(
                 f"{item.name}={item.status.value}" for item in self.probes
             ),
-            (
-                "MANUAL_ACCEPTANCE "
-                f"decision={self.acceptance.reviewer_decision} "
-                f"record_id={self.acceptance.record_id}"
-            ),
+            f"ACCEPTANCE_RECORD id={self.acceptance.record_id}",
         ]
         if self.packet is not None:
             lines.append(
                 f"PACKET id={self.packet.packet_id} path={self.packet.directory} "
                 f"verification={self.packet.verification_status}"
             )
-        lines.append(f"RUNTIME_INVARIANTS {'PASS' if self.passed else 'FAIL'}")
+        lines.extend(self.gate_report.render_lines())
         return "\n".join(lines)
+
+
+def _audit_gate_report(
+    *,
+    cases: tuple[dict[str, object], ...],
+    coverage: Mapping[str, object],
+    determinism: Mapping[str, object],
+    replay_parity: Mapping[str, object],
+    fault_summary: Mapping[str, object],
+    provenance: Mapping[str, object],
+    minimized: tuple[MinimizedFailure, ...],
+    statistics: tuple[StatisticalCheck, ...],
+    probes: tuple[CheckResult, ...],
+    acceptance: AcceptanceRecord,
+    unexpected: tuple[dict[str, object], ...],
+    packet: PacketRecord | None,
+) -> AuditGateReport:
+    required_statuses: list[str] = []
+    not_exercised_required_names: set[str] = set()
+    for case in cases:
+        checks = case.get("invariant_checks")
+        if not isinstance(checks, list):
+            required_statuses.append("FAIL")
+            continue
+        for check in checks:
+            if not isinstance(check, dict) or type(check.get("required")) is not bool:
+                required_statuses.append("FAIL")
+                continue
+            if check["required"] is not True:
+                continue
+            status = str(check.get("status"))
+            required_statuses.append(status)
+            if status == "NOT_EXERCISED" and isinstance(check.get("name"), str):
+                not_exercised_required_names.add(str(check["name"]))
+    for probe in probes:
+        if not probe.required:
+            continue
+        required_statuses.append(probe.status.value)
+        if probe.status is CheckStatus.NOT_EXERCISED:
+            not_exercised_required_names.add(probe.name)
+    separately_classified_predicates = {
+        FailurePredicateKind.REPLAY_MISMATCH.value,
+        FailurePredicateKind.DETERMINISM_MISMATCH.value,
+        FailurePredicateKind.FAULT_MISS.value,
+    }
+    structural_unexpected = False
+    for item in unexpected:
+        identity = item.get("identity")
+        if not isinstance(identity, dict):
+            structural_unexpected = True
+            break
+        if identity.get("predicate") in separately_classified_predicates:
+            continue
+        if identity.get("field_name") in not_exercised_required_names:
+            continue
+        structural_unexpected = True
+        break
+    packet_failed = (
+        packet is not None and packet.verification_status != "PASS"
+    )
+    if (
+        structural_unexpected
+        or any(not item.preserved for item in minimized)
+        or "FAIL" in required_statuses
+        or packet_failed
+    ):
+        structural_status = AuditGateStatus.FAIL
+    elif "NOT_EXERCISED" in required_statuses:
+        structural_status = AuditGateStatus.NOT_EXERCISED
+    else:
+        structural_status = AuditGateStatus.PASS
+
+    if coverage.get("status") == "PASS":
+        coverage_status = AuditGateStatus.PASS
+    elif (
+        coverage.get("status") == "FAIL"
+        or int(coverage.get("failed_required_check_count", 0)) > 0
+    ):
+        coverage_status = AuditGateStatus.FAIL
+    else:
+        coverage_status = AuditGateStatus.NOT_EXERCISED
+
+    statistical_values = {item.status for item in statistics}
+    if not statistics:
+        statistical_status = AuditGateStatus.NOT_EXERCISED
+    elif "FAIL" in statistical_values:
+        statistical_status = AuditGateStatus.FAIL
+    elif "NOT_EXERCISED" in statistical_values:
+        statistical_status = AuditGateStatus.NOT_EXERCISED
+    elif "WARNING" in statistical_values:
+        statistical_status = AuditGateStatus.WARNING
+    else:
+        statistical_status = AuditGateStatus.PASS
+
+    raw_provenance_status = provenance.get("status")
+    provenance_status = (
+        AuditGateStatus(str(raw_provenance_status))
+        if raw_provenance_status in {"PASS", "FAIL", "UNAVAILABLE"}
+        else AuditGateStatus.UNAVAILABLE
+    )
+    return AuditGateReport(
+        structural_status=structural_status,
+        coverage_status=coverage_status,
+        replay_status=_binary_gate_status(replay_parity.get("status")),
+        determinism_status=_binary_gate_status(determinism.get("status")),
+        fault_status=(
+            AuditGateStatus.NOT_EXERCISED
+            if int(fault_summary.get("injected_count", 0)) == 0
+            else _binary_gate_status(fault_summary.get("status"))
+        ),
+        statistical_status=statistical_status,
+        provenance_status=provenance_status,
+        manual_acceptance=acceptance.reviewer_decision,
+    )
+
+
+def _binary_gate_status(value: object) -> AuditGateStatus:
+    if value == "PASS":
+        return AuditGateStatus.PASS
+    if value == "NOT_EXERCISED":
+        return AuditGateStatus.NOT_EXERCISED
+    return AuditGateStatus.FAIL
 
 
 def run_audit_lab(
@@ -180,6 +333,7 @@ def run_audit_lab(
     fresh_process_samples: int = 3,
     subsystem_probes: bool = True,
 ) -> AuditLabResult:
+    initial_provenance = _repository_provenance()
     configurations = generate_configurations(seed, budget)
     generated_results: list[GeneratedCaseResult] = []
     cases: list[dict[str, object]] = []
@@ -432,7 +586,10 @@ def run_audit_lab(
         ),
         "status": "PASS" if detected_count == injected_count else "FAIL",
     }
-    provenance = _repository_provenance()
+    provenance = _execution_window_provenance(
+        initial_provenance,
+        _repository_provenance(),
+    )
     acceptance = _acceptance_record(
         seed,
         tuple(cases),
@@ -1192,6 +1349,7 @@ def _acceptance_record(
             for item in probes
         )
         or any(not item.preserved for item in minimized)
+        or provenance.get("status") != "PASS"
     )
     artifacts = {
         "cases": canonical_sha256(cases),
@@ -1206,6 +1364,10 @@ def _acceptance_record(
         "statistical_threshold_manifest": (
             STATISTICAL_THRESHOLD_MANIFEST_SHA256
         ),
+        "provenance_manifest": str(
+            provenance["provenance_manifest_sha256"]
+        ),
+        "dirty_state": str(provenance["dirty_state_sha256"]),
         "implementation": str(provenance["implementation_sha256"]),
     }
     identity = {
@@ -1258,6 +1420,7 @@ def _persist_result(
             [item.as_dict() for item in result.probes]
         )
         + "\n",
+        "provenance.json": canonical_json(result.provenance) + "\n",
         "replay_parity.json": canonical_json(result.replay_parity) + "\n",
         "statistics.json": canonical_json(
             [item.as_dict() for item in result.statistics]
@@ -1286,8 +1449,20 @@ def _persist_result(
                     },
                 }
             ) + "\n"
+    human = result.render().replace(
+        "RUNTIME_INVARIANTS",
+        "PACKET id=SEE_MANIFEST\nRUNTIME_INVARIANTS",
+    )
+    artifacts["report.txt"] = human + "\n"
+    result_artifact_digests = {
+        name: hashlib.sha256(content.encode("utf-8")).hexdigest()
+        for name, content in sorted(artifacts.items())
+    }
     identity = {
-        "acceptance_record_sha256": canonical_sha256(result.acceptance.as_dict()),
+        "acceptance_record_sha256": result_artifact_digests[
+            "acceptance_record.json"
+        ],
+        "result_artifact_digests": result_artifact_digests,
         "budget": result.budget,
         "case_result_sha256": canonical_sha256(result.cases),
         "determinism_sha256": canonical_sha256(result.determinism),
@@ -1295,7 +1470,9 @@ def _persist_result(
         "fault_observations_sha256": canonical_sha256(
             result.fault_observations
         ),
-        "provenance": result.provenance,
+        "provenance_manifest_sha256": result.provenance[
+            "provenance_manifest_sha256"
+        ],
         "minimized_failures_sha256": canonical_sha256(
             [item.as_dict() for item in result.minimized_failures]
         ),
@@ -1305,15 +1482,13 @@ def _persist_result(
         "save_failures": save_failures,
         "schema_version": AUDIT_LAB_SCHEMA_VERSION,
         "seed": result.seed,
+        "statistical_threshold_manifest_sha256": (
+            STATISTICAL_THRESHOLD_MANIFEST_SHA256
+        ),
         "statistics_sha256": canonical_sha256(
             [item.as_dict() for item in result.statistics]
         ),
     }
-    human = result.render().replace(
-        "RUNTIME_INVARIANTS",
-        "PACKET id=SEE_MANIFEST\nRUNTIME_INVARIANTS",
-    )
-    artifacts["report.txt"] = human + "\n"
     packet = store.record(identity, artifacts)
     store.record_acceptance(result.acceptance)
     ledger_verification = store.verify_ledgers()
@@ -1325,38 +1500,385 @@ def _persist_result(
     return packet
 
 
-def _repository_provenance() -> dict[str, object]:
-    repository = Path(__file__).resolve().parents[2]
-    implementation_paths = (
-        repository / "pyproject.toml",
-        repository / "kirby2" / "__main__.py",
-        repository / "kirby2" / "audit" / "model_risk_lab.py",
-        *sorted((repository / "kirby2" / "auditlab").glob("*.py")),
-        repository / "kirby2" / "auditlab" / "README.md",
-        repository / "kirby2" / "latency" / "diagnostics.py",
-        repository / "kirby2" / "multivenue" / "diagnostics.py",
+def _repository_provenance(repository: Path | None = None) -> dict[str, object]:
+    root = (
+        Path(__file__).resolve().parents[2]
+        if repository is None
+        else repository.resolve()
     )
-    implementation = {
-        str(path.relative_to(repository)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in implementation_paths
+    implementation, links, implementation_errors = _implementation_manifest(root)
+    dirty = _dirty_worktree_state(root)
+    commit_bytes, commit_error = _git_bytes(root, "rev-parse", "HEAD")
+    git_commit = (
+        os.fsdecode(commit_bytes).strip()
+        if commit_bytes is not None
+        else "UNAVAILABLE"
+    )
+    software_version, version_source, version_error = _software_version(root)
+    if dirty["status"] == "UNAVAILABLE" or commit_error is not None:
+        status = "UNAVAILABLE"
+    elif (
+        dirty["status"] != "PASS"
+        or implementation_errors
+        or version_error is not None
+    ):
+        status = "FAIL"
+    else:
+        status = "PASS"
+    payload = {
+        "dirty_entries": dirty["entries"],
+        "dirty_entry_count": dirty["entry_count"],
+        "dirty_state_sha256": dirty["sha256"],
+        "execution_window_stable": None,
+        "git_commit": git_commit,
+        "git_errors": [
+            item
+            for item in (dirty.get("error"), commit_error)
+            if isinstance(item, str) and item
+        ],
+        "git_porcelain_records": dirty["porcelain_records"],
+        "git_porcelain_sha256": dirty["porcelain_sha256"],
+        "implementation_errors": implementation_errors,
+        "implementation_file_count": len(implementation),
+        "implementation_links": links,
+        "implementation_manifest": implementation,
+        "implementation_sha256": canonical_sha256(implementation),
+        "package_roots": list(PROVENANCE_PACKAGE_ROOTS),
+        "repository": str(root),
+        "software_version": software_version,
+        "software_version_error": version_error,
+        "software_version_source": version_source,
+        "status": status,
+        "working_tree_dirty": (
+            "UNAVAILABLE"
+            if dirty["status"] == "UNAVAILABLE"
+            else bool(dirty["entry_count"])
+        ),
+    }
+    return _seal_provenance(payload)
+
+
+def _execution_window_provenance(
+    initial: dict[str, object],
+    final: dict[str, object],
+) -> dict[str, object]:
+    repository = Path(str(initial["repository"]))
+    loaded_module_paths = _loaded_repository_module_paths(repository)
+    implementation = initial.get("implementation_manifest")
+    implementation_paths = (
+        set(implementation) if isinstance(implementation, dict) else set()
+    )
+    unbound_loaded_modules = sorted(
+        set(loaded_module_paths).difference(implementation_paths)
+    )
+    stable = all(
+        initial.get(name) == final.get(name)
+        for name in (
+            "dirty_state_sha256",
+            "git_commit",
+            "implementation_sha256",
+            "software_version",
+            "software_version_source",
+        )
+    ) and not unbound_loaded_modules
+    payload = {
+        name: value
+        for name, value in initial.items()
+        if name != "provenance_manifest_sha256"
+    }
+    payload["execution_window_end_manifest_sha256"] = final[
+        "provenance_manifest_sha256"
+    ]
+    payload["execution_window_stable"] = stable
+    payload["loaded_repository_module_count"] = len(loaded_module_paths)
+    payload["loaded_repository_modules"] = loaded_module_paths
+    payload["unbound_loaded_repository_modules"] = unbound_loaded_modules
+    if initial.get("status") == "UNAVAILABLE" or final.get("status") == "UNAVAILABLE":
+        payload["status"] = "UNAVAILABLE"
+    elif initial.get("status") != "PASS" or final.get("status") != "PASS" or not stable:
+        payload["status"] = "FAIL"
+    else:
+        payload["status"] = "PASS"
+    return _seal_provenance(payload)
+
+
+def _loaded_repository_module_paths(repository: Path) -> list[str]:
+    paths: set[str] = set()
+    for module in tuple(sys.modules.values()):
+        raw_path = getattr(module, "__file__", None)
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        try:
+            path = Path(raw_path).resolve()
+            relative = path.relative_to(repository)
+        except (OSError, ValueError):
+            continue
+        if relative.parts and relative.parts[0] == "kirby2" and path.is_file():
+            paths.add(relative.as_posix())
+    return sorted(paths)
+
+
+def _seal_provenance(payload: Mapping[str, object]) -> dict[str, object]:
+    sealed = dict(payload)
+    sealed.pop("provenance_manifest_sha256", None)
+    sealed["provenance_manifest_sha256"] = canonical_sha256(sealed)
+    return sealed
+
+
+def _implementation_manifest(
+    repository: Path,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    candidates = {repository / name for name in _PROVENANCE_TOP_LEVEL_FILES}
+    errors: list[str] = []
+    for root_name in PROVENANCE_PACKAGE_ROOTS:
+        package_root = repository / "kirby2" / root_name
+        if not package_root.is_dir():
+            errors.append(f"missing package root: kirby2/{root_name}")
+            continue
+        for path in package_root.rglob("*"):
+            relative_parts = path.relative_to(repository).parts
+            if (
+                _PROVENANCE_IGNORED_PARTS.intersection(relative_parts)
+                or path.suffix in _PROVENANCE_IGNORED_SUFFIXES
+            ):
+                continue
+            if path.is_file():
+                candidates.add(path)
+
+    manifest: dict[str, str] = {}
+    links: dict[str, str] = {}
+    for path in sorted(candidates):
+        relative = path.relative_to(repository).as_posix()
+        try:
+            if path.is_symlink():
+                links[relative] = os.readlink(path)
+            data = path.read_bytes()
+        except OSError as error:
+            errors.append(f"unavailable implementation input {relative}: {error}")
+            continue
+        manifest[relative] = hashlib.sha256(data).hexdigest()
+    return dict(sorted(manifest.items())), dict(sorted(links.items())), errors
+
+
+def _dirty_worktree_state(repository: Path) -> dict[str, object]:
+    raw, error = _git_bytes(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "-z",
+    )
+    if raw is None:
+        unavailable = {
+            "entries": [],
+            "error": error,
+            "porcelain_records": "UNAVAILABLE",
+            "porcelain_sha256": "UNAVAILABLE",
+            "status": "UNAVAILABLE",
+        }
+        return {
+            **unavailable,
+            "entry_count": 0,
+            "sha256": canonical_sha256(unavailable),
+        }
+    try:
+        records = _parse_porcelain_v1_z(raw)
+    except ValueError as parse_error:
+        failed = {
+            "entries": [],
+            "error": str(parse_error),
+            "porcelain_records": [],
+            "porcelain_sha256": hashlib.sha256(raw).hexdigest(),
+            "status": "FAIL",
+        }
+        return {
+            **failed,
+            "entry_count": 0,
+            "sha256": canonical_sha256(failed),
+        }
+    entries: list[dict[str, object]] = []
+    state_failed = False
+    for record in records:
+        entry = {
+            **record,
+            "working_path": _working_path_state(repository, str(record["path"])),
+        }
+        original_path = record.get("original_path")
+        if isinstance(original_path, str):
+            entry["original_working_path"] = _working_path_state(
+                repository,
+                original_path,
+            )
+        working_states = [entry["working_path"]]
+        if "original_working_path" in entry:
+            working_states.append(entry["original_working_path"])
+        state_failed = state_failed or any(
+            isinstance(item, dict) and item.get("kind") == "UNAVAILABLE"
+            for item in working_states
+        )
+        entries.append(entry)
+    material = {
+        "entries": entries,
+        "porcelain_records": records,
+        "porcelain_sha256": hashlib.sha256(raw).hexdigest(),
+        "status": "FAIL" if state_failed else "PASS",
+    }
+    return {
+        **material,
+        "entry_count": len(entries),
+        "error": None,
+        "sha256": canonical_sha256(material),
     }
 
-    def git(*arguments: str) -> str:
+
+def _parse_porcelain_v1_z(raw: bytes) -> list[dict[str, str]]:
+    chunks = raw.split(b"\0")
+    if chunks and chunks[-1] == b"":
+        chunks.pop()
+    records: list[dict[str, str]] = []
+    index = 0
+    while index < len(chunks):
+        item = chunks[index]
+        if len(item) < 4 or item[2:3] != b" ":
+            raise ValueError("Git porcelain v1 record is malformed")
+        status = os.fsdecode(item[:2])
+        record = {
+            "path": os.fsdecode(item[3:]),
+            "status": status,
+        }
+        if "R" in status or "C" in status:
+            index += 1
+            if index >= len(chunks):
+                raise ValueError("Git porcelain rename record lacks its original path")
+            record["original_path"] = os.fsdecode(chunks[index])
+        records.append(record)
+        index += 1
+    return records
+
+
+def _working_path_state(repository: Path, relative_name: str) -> dict[str, object]:
+    relative = Path(relative_name)
+    if relative.is_absolute() or ".." in relative.parts:
+        return {
+            "error": "Git reported a path outside the repository",
+            "kind": "UNAVAILABLE",
+        }
+    path = repository.joinpath(*relative.parts)
+    try:
+        if path.is_symlink():
+            target = os.readlink(path)
+            return {
+                "kind": "SYMLINK",
+                "target": target,
+                "target_sha256": hashlib.sha256(
+                    os.fsencode(target)
+                ).hexdigest(),
+            }
+        if path.is_file():
+            data = path.read_bytes()
+            return {
+                "bytes": len(data),
+                "kind": "REGULAR_FILE",
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        if path.is_dir():
+            manifest = _directory_manifest(path)
+            return {
+                "entry_count": len(manifest),
+                "kind": "DIRECTORY",
+                "manifest": manifest,
+                "sha256": canonical_sha256(manifest),
+            }
+        if not path.exists():
+            return {"kind": "DELETION", "marker": "DELETED"}
+        return {"kind": "SPECIAL_FILE", "mode": path.lstat().st_mode}
+    except OSError as error:
+        return {"error": str(error), "kind": "UNAVAILABLE"}
+
+
+def _directory_manifest(path: Path) -> dict[str, dict[str, object]]:
+    manifest: dict[str, dict[str, object]] = {}
+    for current_root, directory_names, file_names in os.walk(
+        path,
+        followlinks=False,
+    ):
+        current = Path(current_root)
+        for directory_name in tuple(directory_names):
+            child = current / directory_name
+            if not child.is_symlink():
+                continue
+            directory_names.remove(directory_name)
+            relative = child.relative_to(path).as_posix()
+            target = os.readlink(child)
+            manifest[relative] = {"kind": "SYMLINK", "target": target}
+        for file_name in file_names:
+            child = current / file_name
+            relative = child.relative_to(path).as_posix()
+            if child.is_symlink():
+                manifest[relative] = {
+                    "kind": "SYMLINK",
+                    "target": os.readlink(child),
+                }
+            elif child.is_file():
+                data = child.read_bytes()
+                manifest[relative] = {
+                    "bytes": len(data),
+                    "kind": "REGULAR_FILE",
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            else:
+                manifest[relative] = {
+                    "kind": "SPECIAL_FILE",
+                    "mode": child.lstat().st_mode,
+                }
+    return dict(sorted(manifest.items()))
+
+
+def _software_version(repository: Path) -> tuple[str, str, str | None]:
+    metadata_error: str | None = None
+    try:
+        installed = metadata.version("kirby2")
+    except metadata.PackageNotFoundError:
+        installed = None
+    except Exception as error:  # metadata backends are external to this package
+        installed = None
+        metadata_error = f"installed metadata unavailable: {error}"
+    else:
+        metadata_error = None
+    if installed:
+        return installed, "importlib.metadata:kirby2", None
+    try:
+        payload = tomllib.loads(
+            (repository / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        project = payload["project"]
+        version = project["version"]
+        if not isinstance(version, str) or not version:
+            raise ValueError("project.version must be nonempty text")
+    except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError) as error:
+        detail = f"pyproject version fallback unavailable: {error}"
+        if metadata_error is not None:
+            detail = f"{metadata_error}; {detail}"
+        return "UNAVAILABLE", "UNAVAILABLE", detail
+    return version, "pyproject.toml:[project].version", None
+
+
+def _git_bytes(
+    repository: Path,
+    *arguments: str,
+) -> tuple[bytes | None, str | None]:
+    try:
         completed = subprocess.run(
             ["git", *arguments],
             cwd=repository,
-            text=True,
             capture_output=True,
             check=False,
         )
-        return completed.stdout.strip() if completed.returncode == 0 else "UNAVAILABLE"
-
-    status = git("status", "--porcelain=v1", "--untracked-files=all")
-    return {
-        "dirty_state_sha256": canonical_sha256(status.splitlines()),
-        "git_commit": git("rev-parse", "HEAD"),
-        "implementation_file_count": len(implementation),
-        "implementation_sha256": canonical_sha256(implementation),
-        "software_version": "0.1.0",
-        "working_tree_dirty": status not in {"", "UNAVAILABLE"},
-    }
+    except OSError as error:
+        return None, f"git {' '.join(arguments)} unavailable: {error}"
+    if completed.returncode != 0:
+        detail = os.fsdecode(completed.stderr).strip() or (
+            f"exit status {completed.returncode}"
+        )
+        return None, f"git {' '.join(arguments)} failed: {detail}"
+    return completed.stdout, None

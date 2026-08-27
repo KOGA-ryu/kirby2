@@ -69,6 +69,7 @@ class AuditLabStore:
     ) -> PacketRecord:
         identity_snapshot = _json_object_snapshot(identity, "packet identity")
         encoded_artifacts, references = _prepare_artifacts(artifacts)
+        _validate_declared_result_artifacts(identity_snapshot, references)
         packet_id = _v2_packet_id(identity_snapshot, references)
         manifest = {
             "artifacts": references,
@@ -368,6 +369,35 @@ def _prepare_artifacts(
             "sha256": hashlib.sha256(data).hexdigest(),
         }
     return encoded, references
+
+
+def _validate_declared_result_artifacts(
+    identity: dict[str, object],
+    references: dict[str, dict[str, object]],
+) -> None:
+    """Reject a lab identity whose declared artifact digests omit or misstate bytes."""
+
+    declared = identity.get("result_artifact_digests")
+    if declared is None:
+        return
+    expected = {
+        name: str(reference["sha256"])
+        for name, reference in sorted(references.items())
+    }
+    if not isinstance(declared, dict) or declared != expected:
+        raise ValueError(
+            "packet result artifact digests must match the complete byte inventory"
+        )
+    acceptance_digest = identity.get("acceptance_record_sha256")
+    if acceptance_digest != expected.get("acceptance_record.json"):
+        raise ValueError("packet acceptance-record digest does not match its bytes")
+    for name in (
+        "provenance_manifest_sha256",
+        "statistical_threshold_manifest_sha256",
+    ):
+        digest = identity.get(name)
+        if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+            raise ValueError(f"packet identity lacks a valid {name}")
 
 
 def _validate_artifact_name(name: object) -> str:

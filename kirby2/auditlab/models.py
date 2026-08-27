@@ -162,6 +162,160 @@ class AutomatedStatus(str, Enum):
     FAIL = "FAIL"
 
 
+class AuditGateStatus(str, Enum):
+    PASS = "PASS"
+    WARNING = "WARNING"
+    FAIL = "FAIL"
+    NOT_EXERCISED = "NOT_EXERCISED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class AuditAggregateStatus(str, Enum):
+    FAIL = "FAIL"
+    PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+    AUTOMATED_PASS_PENDING_HUMAN = "AUTOMATED_PASS_PENDING_HUMAN"
+
+
+@dataclass(frozen=True, slots=True)
+class AuditGateReport:
+    """Orthogonal automated gates plus the separately recorded human decision."""
+
+    structural_status: AuditGateStatus
+    coverage_status: AuditGateStatus
+    replay_status: AuditGateStatus
+    determinism_status: AuditGateStatus
+    fault_status: AuditGateStatus
+    statistical_status: AuditGateStatus
+    provenance_status: AuditGateStatus
+    manual_acceptance: str
+
+    def __post_init__(self) -> None:
+        ordinary = (
+            self.structural_status,
+            self.coverage_status,
+            self.replay_status,
+            self.determinism_status,
+            self.fault_status,
+        )
+        all_statuses = (
+            *ordinary,
+            self.statistical_status,
+            self.provenance_status,
+        )
+        if any(not isinstance(item, AuditGateStatus) for item in all_statuses):
+            raise TypeError("audit gate statuses must use AuditGateStatus")
+        if any(
+            item
+            not in {
+                AuditGateStatus.PASS,
+                AuditGateStatus.FAIL,
+                AuditGateStatus.NOT_EXERCISED,
+            }
+            for item in ordinary
+        ):
+            raise ValueError("runtime gate status is invalid")
+        if self.statistical_status not in {
+            AuditGateStatus.PASS,
+            AuditGateStatus.WARNING,
+            AuditGateStatus.FAIL,
+            AuditGateStatus.NOT_EXERCISED,
+        }:
+            raise ValueError("statistical gate status is invalid")
+        if self.provenance_status not in {
+            AuditGateStatus.PASS,
+            AuditGateStatus.FAIL,
+            AuditGateStatus.UNAVAILABLE,
+        }:
+            raise ValueError("provenance gate status is invalid")
+        if self.manual_acceptance not in {
+            "PENDING_HUMAN_REVIEW",
+            "REJECT_AUTOMATED_PRECHECK",
+        }:
+            raise ValueError("manual acceptance is invalid for an automated run")
+        automated_blocked = (
+            any(item is not AuditGateStatus.PASS for item in ordinary)
+            or self.provenance_status is not AuditGateStatus.PASS
+            or self.statistical_status
+            in {AuditGateStatus.FAIL, AuditGateStatus.NOT_EXERCISED}
+        )
+        expected_manual = (
+            "REJECT_AUTOMATED_PRECHECK"
+            if automated_blocked
+            else "PENDING_HUMAN_REVIEW"
+        )
+        if self.manual_acceptance != expected_manual:
+            raise ValueError("manual acceptance contradicts the automated gates")
+
+    @property
+    def aggregate_status(self) -> AuditAggregateStatus:
+        blocking = (
+            self.structural_status,
+            self.coverage_status,
+            self.replay_status,
+            self.determinism_status,
+            self.fault_status,
+            self.provenance_status,
+        )
+        if (
+            any(item is not AuditGateStatus.PASS for item in blocking)
+            or self.statistical_status
+            in {AuditGateStatus.FAIL, AuditGateStatus.NOT_EXERCISED}
+        ):
+            return AuditAggregateStatus.FAIL
+        if self.statistical_status is AuditGateStatus.WARNING:
+            return AuditAggregateStatus.PASS_WITH_WARNINGS
+        return AuditAggregateStatus.AUTOMATED_PASS_PENDING_HUMAN
+
+    @property
+    def automated_passed(self) -> bool:
+        return self.aggregate_status is not AuditAggregateStatus.FAIL
+
+    @property
+    def runtime_invariant_status(self) -> AuditGateStatus:
+        runtime = (
+            self.structural_status,
+            self.coverage_status,
+            self.replay_status,
+            self.determinism_status,
+            self.fault_status,
+        )
+        if AuditGateStatus.FAIL in runtime:
+            return AuditGateStatus.FAIL
+        if AuditGateStatus.NOT_EXERCISED in runtime:
+            return AuditGateStatus.NOT_EXERCISED
+        return AuditGateStatus.PASS
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "AGGREGATE_STATUS": self.aggregate_status.value,
+            "COVERAGE_STATUS": self.coverage_status.value,
+            "DETERMINISM_STATUS": self.determinism_status.value,
+            "FAULT_STATUS": self.fault_status.value,
+            "MANUAL_ACCEPTANCE": self.manual_acceptance,
+            "PROVENANCE_STATUS": self.provenance_status.value,
+            "REPLAY_STATUS": self.replay_status.value,
+            "RUNTIME_INVARIANTS": self.runtime_invariant_status.value,
+            "STATISTICAL_STATUS": self.statistical_status.value,
+            "STRUCTURAL_STATUS": self.structural_status.value,
+        }
+
+    def render_lines(self) -> tuple[str, ...]:
+        statuses = self.as_dict()
+        order = (
+            "STRUCTURAL_STATUS",
+            "COVERAGE_STATUS",
+            "REPLAY_STATUS",
+            "DETERMINISM_STATUS",
+            "FAULT_STATUS",
+            "STATISTICAL_STATUS",
+            "PROVENANCE_STATUS",
+            "MANUAL_ACCEPTANCE",
+            "AGGREGATE_STATUS",
+            "RUNTIME_INVARIANTS",
+        )
+        return tuple(f"{name} {statuses[name]}" for name in order)
+
+
 _GENERATED_CONFIGURATION_FIELDS = frozenset(
     {
         "agent_count",
