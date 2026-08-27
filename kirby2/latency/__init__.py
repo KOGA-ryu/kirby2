@@ -7,6 +7,11 @@ from .distributions import (
     LatencyDraw,
     LatencySampler,
 )
+from .diagnostics import (
+    LatencyDiagnostic,
+    acknowledgement_budget_diagnostic,
+    terminal_race_diagnostic,
+)
 from .engine import AsynchronousExecutionSession, LatencyTimelineInspector
 from .models import (
     LATENCY_RECORDING_SCHEMA_VERSION,
@@ -41,6 +46,7 @@ __all__ = [
     "LatencyComponent",
     "LatencyDistributionKind",
     "LatencyDistributionSpec",
+    "LatencyDiagnostic",
     "LatencyDraw",
     "LatencyEvent",
     "LatencyEventType",
@@ -53,6 +59,8 @@ __all__ = [
     "LatencySampler",
     "LatencyTimelineInspector",
     "get_latency_profile",
+    "acknowledgement_budget_diagnostic",
     "replay_latency_recording",
     "run_cancel_race",
+    "terminal_race_diagnostic",
 ]

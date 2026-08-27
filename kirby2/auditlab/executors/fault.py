@@ -1,10 +1,10 @@
-"""Typed generated-case wrapper for the current explicit fault adapters."""
+"""Typed wrapper for production-subsystem fault observations."""
 
 from __future__ import annotations
 
 from kirby2.immutable import thaw_json
 
-from ..faults import inject_and_detect
+from ..faults import inject_and_observe
 from ..models import (
     CaseRecording,
     CheckResult,
@@ -14,7 +14,7 @@ from ..models import (
     ExecutorLane,
     FailureKind,
     FailureObservation,
-    FaultEvidence,
+    FaultObservation,
     GeneratedCaseResult,
     GeneratedConfiguration,
     canonical_sha256,
@@ -22,11 +22,11 @@ from ..models import (
 
 
 FAULT_RECORDING_TYPE = "EXPLICIT_FAULT_OBSERVATION"
-_RECORDING_FIELDS = frozenset({"configuration", "fault_evidence"})
+_RECORDING_FIELDS = frozenset({"configuration", "fault_observation"})
 
 
 class FaultExecutor:
-    """Return typed evidence for one explicitly selected fault adapter."""
+    """Return raw evidence for one explicitly selected production fault."""
 
     lane = ExecutorLane.FAULT
 
@@ -35,18 +35,18 @@ class FaultExecutor:
         configuration: GeneratedConfiguration,
     ) -> GeneratedCaseResult:
         self._require_configuration(configuration)
-        evidence = inject_and_detect(configuration)
-        if evidence is None:
-            raise RuntimeError("fault executor produced no fault evidence")
+        observation = inject_and_observe(configuration)
+        if observation is None:
+            raise RuntimeError("fault executor produced no fault observation")
         recording = CaseRecording(
             lane=self.lane,
             recording_type=FAULT_RECORDING_TYPE,
             payload={
                 "configuration": configuration.as_dict(),
-                "fault_evidence": evidence.as_dict(),
+                "fault_observation": observation.as_dict(),
             },
         )
-        return _result(configuration, recording, evidence, replay_match=True)
+        return _result(configuration, recording, observation, replay_match=True)
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:
         if not isinstance(recording, CaseRecording):
@@ -63,11 +63,16 @@ class FaultExecutor:
             raise TypeError("fault recording configuration must be an object")
         configuration = GeneratedConfiguration.from_dict(raw_configuration)
         self._require_configuration(configuration)
-        evidence = inject_and_detect(configuration)
-        if evidence is None:
-            raise RuntimeError("fault replay produced no fault evidence")
-        replay_match = evidence.as_dict() == payload["fault_evidence"]
-        return _result(configuration, recording, evidence, replay_match=replay_match)
+        observation = inject_and_observe(configuration)
+        if observation is None:
+            raise RuntimeError("fault replay produced no fault observation")
+        replay_match = observation.as_dict() == payload["fault_observation"]
+        return _result(
+            configuration,
+            recording,
+            observation,
+            replay_match=replay_match,
+        )
 
     def _require_configuration(
         self,
@@ -84,37 +89,40 @@ class FaultExecutor:
 def _result(
     configuration: GeneratedConfiguration,
     recording: CaseRecording,
-    evidence: FaultEvidence,
+    observation: FaultObservation,
     *,
     replay_match: bool,
 ) -> GeneratedCaseResult:
-    repeated = inject_and_detect(configuration)
+    repeated = inject_and_observe(configuration)
     configuration_round_trip = (
         GeneratedConfiguration.from_dict(configuration.as_dict())
         == configuration
     )
     adapter_deterministic = (
-        repeated is not None and repeated.as_dict() == evidence.as_dict()
+        repeated is not None and repeated.as_dict() == observation.as_dict()
     )
-    raw_evidence_sha256 = canonical_sha256(evidence.as_dict())
+    raw_evidence_sha256 = canonical_sha256(observation.as_dict())
     checks = (
         _check(
             "fault_injected",
-            evidence.fault is configuration.injected_fault,
+            observation.fault is configuration.injected_fault,
             {
                 "configuration_sha256": configuration.sha256,
-                "fault": evidence.fault.value,
-                "injection_event": evidence.injection_event,
+                "fault": observation.fault.value,
+                "injection_event": observation.injection_event,
+                "injection_location": observation.injection_location,
             },
         ),
         _check(
-            "expected_fault_detected",
-            evidence.detected,
+            "production_detector_exercised",
+            bool(observation.raw_events or observation.raw_issues),
             {
-                "detected_code": evidence.detected_code,
-                "detector": evidence.detector,
-                "expected_code": evidence.expected_code,
+                "detector": observation.detector,
+                "observed_code": observation.observed_code,
                 "raw_evidence_sha256": raw_evidence_sha256,
+                "raw_event_count": len(observation.raw_events),
+                "raw_issue_count": len(observation.raw_issues),
+                "subsystem": observation.subsystem,
             },
         ),
         _check(
@@ -158,43 +166,44 @@ def _result(
         recording=recording,
         event_projection=(
             {
-                "data": evidence.as_dict(),
+                "data": observation.as_dict(),
                 "record_type": "fault_observation",
                 "sequence": 1,
             },
         ),
         final_state_projection={
             "configuration_sha256": configuration.sha256,
-            "fault_evidence": evidence.as_dict(),
+            "fault_observation": observation.as_dict(),
             "raw_evidence_sha256": raw_evidence_sha256,
         },
         metrics={
-            "detected_fault_count": int(evidence.detected),
             "injected_fault_count": 1,
+            "observed_code_count": int(observation.observed_code is not None),
             "raw_observation_count": 1,
         },
         exercises=(
             ExerciseRecord(
                 ExecutorLane.FAULT,
                 "injected_fault",
-                evidence.fault.value,
+                observation.fault.value,
                 ExerciseStatus.EXERCISED,
                 {
-                    "detector": evidence.detector,
+                    "detector": observation.detector,
                     "raw_evidence_sha256": raw_evidence_sha256,
                     "recording_sha256": recording.sha256,
+                    "subsystem": observation.subsystem,
                 },
             ),
         ),
         checks=checks,
         failures=tuple(failures),
         observable_projection={
-            "detected": evidence.detected,
-            "detected_code": evidence.detected_code,
-            "fault": evidence.fault.value,
-            "representation": "EXPLICIT_FAULT_AUDIT_OBSERVATION",
+            "fault": observation.fault.value,
+            "observed_code": observation.observed_code,
+            "representation": "PRODUCTION_FAULT_OBSERVATION",
+            "subsystem": observation.subsystem,
         },
-        expected_fault=evidence,
+        fault_observation=observation,
     )
 
 
@@ -208,9 +217,9 @@ def _check(
         status=CheckStatus.PASS if passed else CheckStatus.FAIL,
         required=True,
         detail=(
-            f"explicit fault-adapter check passed: {name}"
+            f"production fault-observation check passed: {name}"
             if passed
-            else f"explicit fault-adapter check failed: {name}"
+            else f"production fault-observation check failed: {name}"
         ),
         evidence={"source": "FaultExecutor", **evidence},
     )

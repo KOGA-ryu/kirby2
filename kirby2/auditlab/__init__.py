@@ -5,7 +5,7 @@ from .kernel import failure_signatures, run_generated_case
 from .models import (
     AUDIT_LAB_SCHEMA_VERSION,
     AcceptanceRecord,
-    FaultEvidence,
+    FaultObservation,
     FaultKind,
     GeneratedCaseResult,
     GeneratedConfiguration,
@@ -27,7 +27,7 @@ __all__ = [
     "AuditLabResult",
     "AuditLabStore",
     "DEFAULT_AUDIT_LAB_STORE",
-    "FaultEvidence",
+    "FaultObservation",
     "FaultKind",
     "GeneratedCaseResult",
     "GeneratedConfiguration",

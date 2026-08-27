@@ -1,6 +1,7 @@
 """Fragmented synthetic venues, consolidated feeds, and routing baselines."""
 
 from .coordinator import MarketCoordinator
+from .diagnostics import MultiVenueDiagnostic, pending_order_halt_diagnostic
 from .models import (
     MULTIVENUE_RECORDING_SCHEMA_VERSION,
     ConsolidatedFeed,
@@ -62,6 +63,7 @@ __all__ = [
     "LowestExpectedCostRouter",
     "MarketCoordinator",
     "MultiVenueCommand",
+    "MultiVenueDiagnostic",
     "MultiVenueRecording",
     "MultiVenueReplayReport",
     "MultiVenueScenarioResult",
@@ -87,6 +89,7 @@ __all__ = [
     "render_routing_timeline",
     "replay_multivenue_recording",
     "router_for_policy",
+    "pending_order_halt_diagnostic",
     "run_all_multivenue_scenarios",
     "run_multivenue_scenario",
 ]

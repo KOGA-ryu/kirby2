@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .generator import evidence_coverage_report, generate_configurations
+from .fault_oracle import FaultEvaluation, evaluate_fault_observation
 from .kernel import failure_signatures, run_generated_case
 from .minimizer import minimize_failure
 from .models import (
@@ -39,6 +40,7 @@ class AuditLabResult:
     determinism: dict[str, object]
     replay_parity: dict[str, object]
     fault_summary: dict[str, object]
+    fault_observations: tuple[dict[str, object], ...]
     provenance: dict[str, object]
     minimized_failures: tuple[MinimizedFailure, ...]
     statistics: tuple[StatisticalCheck, ...]
@@ -78,6 +80,9 @@ class AuditLabResult:
             ),
             "determinism": self.determinism,
             "fault_summary": self.fault_summary,
+            "fault_observation_sha256": canonical_sha256(
+                self.fault_observations
+            ),
             "provenance": self.provenance,
             "minimized_failure_count": len(self.minimized_failures),
             "packet": None if self.packet is None else self.packet.as_dict(),
@@ -158,6 +163,7 @@ def run_audit_lab(
     cases: list[dict[str, object]] = []
     unexpected: list[dict[str, object]] = []
     signature_sources: dict[str, GeneratedConfiguration] = {}
+    fault_observations: list[dict[str, object]] = []
     injected_count = 0
     detected_count = 0
     replay_failures = 0
@@ -170,19 +176,29 @@ def run_audit_lab(
         replay = run_generated_case(replay_configuration)
         replay_match = replay.result_sha256 == result.result_sha256
         replay_failures += not replay_match
-        signatures = failure_signatures(result)
-        if result.expected_fault is not None:
+        fault_evaluation: FaultEvaluation | None = None
+        if result.fault_observation is not None:
+            fault_evaluation = evaluate_fault_observation(
+                result.fault_observation
+            )
             injected_count += 1
-            detected_count += result.expected_fault.detected
+            detected_count += fault_evaluation.detected
+            fault_observations.append(
+                {
+                    "configuration_sha256": configuration.sha256,
+                    "evaluation": fault_evaluation.as_dict(),
+                    "observation": result.fault_observation.as_dict(),
+                }
+            )
+        signatures = failure_signatures(result)
         for signature in signatures:
             signature_sources.setdefault(signature, configuration)
-            if not signature.startswith("EXPECTED_FAULT:"):
-                unexpected.append(
-                    {
-                        "configuration_sha256": configuration.sha256,
-                        "signature": signature,
-                    }
-                )
+            unexpected.append(
+                {
+                    "configuration_sha256": configuration.sha256,
+                    "signature": signature,
+                }
+            )
         if not replay_match:
             signature = "REPLAY_DIGEST_MISMATCH"
             signature_sources.setdefault(signature, configuration)
@@ -192,7 +208,7 @@ def run_audit_lab(
                     "signature": signature,
                 }
             )
-        cases.append(_compact_case(result, replay_match))
+        cases.append(_compact_case(result, replay_match, fault_evaluation))
     coverage = evidence_coverage_report(tuple(generated_results))
     minimized = tuple(
         minimize_failure(configuration, signature)
@@ -224,8 +240,14 @@ def run_audit_lab(
     fault_summary = {
         "detected_count": detected_count,
         "injected_count": injected_count,
-        "signature_count": sum(
-            signature.startswith("EXPECTED_FAULT:") for signature in signature_sources
+        "miss_count": injected_count - detected_count,
+        "observation_count": len(fault_observations),
+        "signature_count": len(
+            {
+                item["evaluation"]["observed_code"]
+                for item in fault_observations
+                if item["evaluation"]["observed_code"] is not None
+            }
         ),
         "status": "PASS" if detected_count == injected_count else "FAIL",
     }
@@ -237,6 +259,7 @@ def run_audit_lab(
         determinism,
         replay_parity,
         fault_summary,
+        tuple(fault_observations),
         tuple(minimized),
         statistics,
         probes,
@@ -251,6 +274,7 @@ def run_audit_lab(
         determinism,
         replay_parity,
         fault_summary,
+        tuple(fault_observations),
         provenance,
         minimized,
         statistics,
@@ -271,6 +295,7 @@ def run_audit_lab(
         result.determinism,
         result.replay_parity,
         result.fault_summary,
+        result.fault_observations,
         result.provenance,
         result.minimized_failures,
         result.statistics,
@@ -284,6 +309,7 @@ def run_audit_lab(
 def _compact_case(
     result: GeneratedCaseResult,
     replay_match: bool,
+    fault_evaluation: FaultEvaluation | None,
 ) -> dict[str, object]:
     exercises = [
         {
@@ -307,10 +333,15 @@ def _compact_case(
         "configuration_sha256": result.configuration.sha256,
         "event_digest": result.event_sha256,
         "exercises": exercises,
-        "fault_evidence": (
+        "fault_evaluation": (
             None
-            if result.expected_fault is None
-            else result.expected_fault.as_dict()
+            if fault_evaluation is None
+            else fault_evaluation.as_dict()
+        ),
+        "fault_observation": (
+            None
+            if result.fault_observation is None
+            else result.fault_observation.as_dict()
         ),
         "failures": [item.as_dict() for item in result.failures],
         "invariant_checks": checks,
@@ -439,6 +470,7 @@ def _acceptance_record(
     determinism,
     replay_parity,
     fault_summary,
+    fault_observations,
     minimized,
     statistics,
     probes,
@@ -464,6 +496,7 @@ def _acceptance_record(
         "coverage": canonical_sha256(coverage),
         "determinism": canonical_sha256(determinism),
         "fault_summary": canonical_sha256(fault_summary),
+        "fault_observations": canonical_sha256(fault_observations),
         "minimized_failures": canonical_sha256([item.as_dict() for item in minimized]),
         "probes": canonical_sha256([item.as_dict() for item in probes]),
         "replay_parity": canonical_sha256(replay_parity),
@@ -503,20 +536,15 @@ def _persist_result(
     save_failures: bool,
 ) -> PacketRecord:
     cases_jsonl = "\n".join(canonical_json(item) for item in result.cases) + "\n"
-    fault_rows = [
-        {
-            "configuration_sha256": item["configuration_sha256"],
-            "fault_evidence": item["fault_evidence"],
-        }
-        for item in result.cases
-        if item["fault_evidence"] is not None
-    ]
     artifacts = {
         "acceptance_record.json": canonical_json(result.acceptance.as_dict()) + "\n",
         "cases.jsonl": cases_jsonl,
         "coverage.json": canonical_json(result.coverage) + "\n",
         "determinism.json": canonical_json(result.determinism) + "\n",
-        "faults.jsonl": "\n".join(canonical_json(item) for item in fault_rows) + "\n",
+        "faults.jsonl": "\n".join(
+            canonical_json(item) for item in result.fault_observations
+        )
+        + "\n",
         "minimized_failures.json": canonical_json(
             [item.as_dict() for item in result.minimized_failures]
         )
@@ -548,6 +576,9 @@ def _persist_result(
         "case_result_sha256": canonical_sha256(result.cases),
         "determinism_sha256": canonical_sha256(result.determinism),
         "fault_summary": result.fault_summary,
+        "fault_observations_sha256": canonical_sha256(
+            result.fault_observations
+        ),
         "provenance": result.provenance,
         "minimized_failures_sha256": canonical_sha256(
             [item.as_dict() for item in result.minimized_failures]
@@ -586,6 +617,8 @@ def _repository_provenance() -> dict[str, object]:
         repository / "kirby2" / "audit" / "model_risk_lab.py",
         *sorted((repository / "kirby2" / "auditlab").glob("*.py")),
         repository / "kirby2" / "auditlab" / "README.md",
+        repository / "kirby2" / "latency" / "diagnostics.py",
+        repository / "kirby2" / "multivenue" / "diagnostics.py",
     )
     implementation = {
         str(path.relative_to(repository)): hashlib.sha256(path.read_bytes()).hexdigest()

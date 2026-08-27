@@ -37,18 +37,21 @@ algorithms and local accumulators. Targeted subsystem probes also return typed
 verified parent ID and digest, exact fork-prefix equality, post-fork mutation,
 and immutable branch verification; generated lanes do not claim that check.
 
-The fault lane now has the same typed execution contract as the six scientific
-lanes. Its current explicit detector observations remain the input to the next
-repair stage, which separates production fault injection from an independent
-expected-code oracle. Typed wrapping alone is not evidence that those detector
-internals are already independent.
+The fault lane has the same typed execution contract as the six scientific
+lanes. Each adapter now injects into a production subsystem and returns only a
+raw `FaultObservation`: manifest, injection location, subsystem, source rows or
+commands, detector events/issues, and the observed code. `fault_oracle.py` owns
+the expected codes, and the runner consults it only after production execution.
+The runtime audit parses adapter source and refuses any oracle import
+or embedded expected-code literal.
 
-The ten injected faults are never hidden in random noise. Each has a manifest,
-injection point, detector, expected code, detected code, and evidence. Detected
-injected faults are expected adversarial observations; detector misses and
-structural invariant failures are unexpected violations.
+The ten injected faults are never hidden in random noise. Successful expected
+detections are recorded in `fault_observations` and do not enter unexpected
+failures or minimization. A missing or wrong production code is reported as a
+`FAULT_MISS` oracle outcome and fails the fault summary without pretending that
+the injected adversarial condition is a simulator defect.
 
-Each stable violation signature is reduced by rerunning candidates while
+Each unexpected stable violation signature is reduced by rerunning candidates while
 shrinking duration, event count, participant count, venue count, and remaining
 configuration complexity. A reduction is accepted only if the same signature
 survives.

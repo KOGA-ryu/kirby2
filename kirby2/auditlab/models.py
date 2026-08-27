@@ -21,6 +21,29 @@ _CELL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+class UnsupportedSchemaVersionError(ValueError):
+    """Stable production-loader refusal for an unsupported schema version."""
+
+    code = "UNSUPPORTED_SCHEMA_VERSION"
+
+    def __init__(self, *, artifact: str, expected: int, actual: object) -> None:
+        self.artifact = artifact
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"unsupported {artifact} schema version: expected {expected}, got {actual!r}"
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "actual_schema_version": self.actual,
+            "artifact": self.artifact,
+            "code": self.code,
+            "expected_schema_version": self.expected,
+            "message": str(self),
+        }
+
+
 def canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -275,7 +298,11 @@ class GeneratedConfiguration:
             _serialized_int(payload, "schema_version")
             != AUDIT_LAB_SCHEMA_VERSION
         ):
-            raise ValueError("unsupported audit-lab configuration schema")
+            raise UnsupportedSchemaVersionError(
+                artifact="audit-lab configuration",
+                expected=AUDIT_LAB_SCHEMA_VERSION,
+                actual=payload["schema_version"],
+            )
         raw_fault = payload.get("injected_fault")
         if raw_fault is not None and type(raw_fault) is not str:
             raise TypeError("serialized injected fault must be a string or null")
@@ -418,7 +445,11 @@ class CaseRecording:
         if type(self.recording_type) is not str or not self.recording_type:
             raise ValueError("recording type is required")
         if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("unsupported case-recording schema")
+            raise UnsupportedSchemaVersionError(
+                artifact="case recording",
+                expected=1,
+                actual=self.schema_version,
+            )
         frozen = _frozen_mapping(self.payload, "case recording payload")
         if not frozen:
             raise ValueError("case recording payload must not be empty")
@@ -441,33 +472,67 @@ class CaseRecording:
 
 
 @dataclass(frozen=True, slots=True)
-class FaultEvidence:
+class FaultObservation:
+    """Raw production evidence from one fault injection, without an oracle."""
+
     fault: FaultKind
+    subsystem: str
     detector: str
-    expected_code: str
-    detected_code: str | None
+    injection_location: str
+    observed_code: str | None
     injection_event: int
+    manifest: Mapping[str, object]
+    raw_events: tuple[Mapping[str, object], ...]
+    raw_issues: tuple[Mapping[str, object], ...]
     details: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        frozen = freeze_json(self.details)
-        if not isinstance(frozen, Mapping):
-            raise TypeError("fault details must be a JSON object")
-        object.__setattr__(self, "details", frozen)
-
-    @property
-    def detected(self) -> bool:
-        return self.detected_code == self.expected_code
+        if not isinstance(self.fault, FaultKind):
+            raise TypeError("fault observation must use FaultKind")
+        if any(
+            type(value) is not str or not value
+            for value in (self.subsystem, self.detector, self.injection_location)
+        ):
+            raise ValueError("fault observation source identity is incomplete")
+        if self.observed_code is not None and (
+            type(self.observed_code) is not str or not self.observed_code
+        ):
+            raise ValueError("fault observed code must be nonempty or absent")
+        if type(self.injection_event) is not int or self.injection_event <= 0:
+            raise ValueError("fault injection event must be positive")
+        frozen_manifest = _frozen_mapping(self.manifest, "fault manifest")
+        frozen_events = freeze_json(self.raw_events)
+        frozen_issues = freeze_json(self.raw_issues)
+        frozen_details = _frozen_mapping(self.details, "fault details")
+        if not frozen_manifest:
+            raise ValueError("fault manifest must not be empty")
+        if not isinstance(frozen_events, tuple) or any(
+            not isinstance(item, Mapping) for item in frozen_events
+        ):
+            raise TypeError("fault raw events must contain JSON objects")
+        if not isinstance(frozen_issues, tuple) or any(
+            not isinstance(item, Mapping) for item in frozen_issues
+        ):
+            raise TypeError("fault raw issues must contain JSON objects")
+        if not frozen_events and not frozen_issues:
+            raise ValueError("fault observation requires raw events or issues")
+        object.__setattr__(self, "manifest", frozen_manifest)
+        object.__setattr__(self, "raw_events", frozen_events)
+        object.__setattr__(self, "raw_issues", frozen_issues)
+        object.__setattr__(self, "details", frozen_details)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "details": thaw_json(self.details),
-            "detected": self.detected,
-            "detected_code": self.detected_code,
             "detector": self.detector,
-            "expected_code": self.expected_code,
             "fault": self.fault.value,
             "injection_event": self.injection_event,
+            "injection_location": self.injection_location,
+            "manifest": thaw_json(self.manifest),
+            "observed_code": self.observed_code,
+            "raw_events": thaw_json(self.raw_events),
+            "raw_issues": thaw_json(self.raw_issues),
+            "subsystem": self.subsystem,
         }
 
 
@@ -483,7 +548,7 @@ class GeneratedCaseResult:
     checks: tuple[CheckResult, ...]
     failures: tuple[FailureObservation, ...]
     observable_projection: Mapping[str, object]
-    expected_fault: FaultEvidence | None = None
+    fault_observation: FaultObservation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.configuration, GeneratedConfiguration):
@@ -533,11 +598,11 @@ class GeneratedCaseResult:
         check_names = tuple(item.name for item in self.checks)
         if len(check_names) != len(set(check_names)):
             raise ValueError("generated case check names must be unique")
-        if self.expected_fault is not None:
-            if not isinstance(self.expected_fault, FaultEvidence):
-                raise TypeError("expected fault evidence must use FaultEvidence")
-            if self.configuration.injected_fault is not self.expected_fault.fault:
-                raise ValueError("expected fault evidence differs from configuration")
+        if self.fault_observation is not None:
+            if not isinstance(self.fault_observation, FaultObservation):
+                raise TypeError("fault observation must use FaultObservation")
+            if self.configuration.injected_fault is not self.fault_observation.fault:
+                raise ValueError("fault observation differs from configuration")
 
     @property
     def automated_status(self) -> AutomatedStatus:
@@ -571,8 +636,10 @@ class GeneratedCaseResult:
             "configuration_sha256": self.configuration.sha256,
             "event_sha256": self.event_sha256,
             "exercises": [item.as_dict() for item in self.exercises],
-            "expected_fault": (
-                None if self.expected_fault is None else self.expected_fault.as_dict()
+            "fault_observation": (
+                None
+                if self.fault_observation is None
+                else self.fault_observation.as_dict()
             ),
             "failures": [item.as_dict() for item in self.failures],
             "lane": self.lane.value,

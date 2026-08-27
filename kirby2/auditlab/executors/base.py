@@ -109,7 +109,7 @@ CAPABILITY_MATRIX: Mapping[ExecutorLane, LaneCapabilitySpec] = MappingProxyType(
             ("injected_fault",),
             (
                 "fault_injected",
-                "expected_fault_detected",
+                "production_detector_exercised",
                 "unrelated_invariants_survive",
             ),
         ),

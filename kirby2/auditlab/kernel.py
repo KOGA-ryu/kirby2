@@ -36,14 +36,4 @@ def failure_signatures(result: GeneratedCaseResult) -> tuple[str, ...]:
         if check.status is CheckStatus.FAIL
         or (check.required and check.status is CheckStatus.NOT_EXERCISED)
     )
-    if result.expected_fault is not None:
-        if result.expected_fault.detected:
-            signatures.append(
-                f"EXPECTED_FAULT:{result.expected_fault.detected_code}"
-            )
-        else:
-            signatures.append(
-                f"FAULT_MISS:{result.expected_fault.fault.value}:"
-                f"{result.expected_fault.detected_code}"
-            )
     return tuple(dict.fromkeys(signatures))

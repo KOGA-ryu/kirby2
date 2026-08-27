@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 from collections import Counter
@@ -55,13 +56,15 @@ from kirby2.auditlab.models import (
     ExerciseStatus,
     FailureKind,
     FailureObservation,
-    FaultEvidence,
+    FaultObservation,
     GeneratedCaseResult,
     GeneratedConfiguration,
     StatisticalCheck,
     canonical_json,
     canonical_sha256,
 )
+import kirby2.auditlab.faults as production_fault_adapters
+from kirby2.auditlab.fault_oracle import expected_fault_codes
 from kirby2.counterfactual.models import (
     ActionMutation,
     BranchSnapshot,
@@ -2099,16 +2102,61 @@ def _fault_case(result) -> ModelRiskLabAuditCase:
         case for case in result.cases if case["lane"] == ExecutorLane.FAULT.value
     ]
     observed = {
-        case["fault_evidence"]["fault"]
+        case["fault_observation"]["fault"]
         for case in fault_cases
-        if case["fault_evidence"] is not None
+        if case["fault_observation"] is not None
     }
     expected = {item.value for item in FaultKind}
+    evaluations = tuple(result.fault_observations)
+    adapter_source = inspect.getsource(production_fault_adapters)
+    adapter_tree = ast.parse(adapter_source)
+    oracle_imports = sorted(
+        getattr(node, "module", None) or alias.name
+        for node in ast.walk(adapter_tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        if "fault_oracle" in (getattr(node, "module", None) or alias.name)
+    )
+    oracle_codes = {
+        code
+        for fault in FaultKind
+        for code in expected_fault_codes(fault)
+    }
+    adapter_string_literals = {
+        node.value
+        for node in ast.walk(adapter_tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    embedded_oracle_codes = sorted(
+        code
+        for code in oracle_codes
+        if any(code in literal for literal in adapter_string_literals)
+    )
+    raw_evidence_complete = all(
+        observation["observation"]["manifest"]
+        and (
+            observation["observation"]["raw_events"]
+            or observation["observation"]["raw_issues"]
+        )
+        and observation["observation"]["injection_location"]
+        and observation["observation"]["subsystem"]
+        for observation in evaluations
+    )
+    expected_detection_count = sum(
+        observation["evaluation"]["outcome"] == "EXPECTED_DETECTION"
+        for observation in evaluations
+    )
     failures = []
     if observed != expected:
         failures.append("not all explicit fault types were injected")
     if result.fault_summary["status"] != "PASS":
         failures.append("one or more explicit faults escaped detection")
+    if expected_detection_count != len(evaluations):
+        failures.append("one or more production observations differed from the oracle")
+    if not raw_evidence_complete:
+        failures.append("a fault observation omitted its production evidence")
+    if oracle_imports or embedded_oracle_codes:
+        failures.append("fault adapters contain oracle knowledge")
     if any(
         case["recording_type"] != FAULT_RECORDING_TYPE
         or {item["name"] for item in case["invariant_checks"]}
@@ -2119,10 +2167,22 @@ def _fault_case(result) -> ModelRiskLabAuditCase:
     return ModelRiskLabAuditCase(
         "all_faults_explicit_recorded_and_detected",
         {
+            "adapter_embedded_oracle_codes": embedded_oracle_codes,
+            "adapter_oracle_imports": oracle_imports,
             "fault_case_count": len(fault_cases),
             "fault_recording_type": FAULT_RECORDING_TYPE,
             "fault_summary": result.fault_summary,
+            "observation_count": len(evaluations),
+            "observation_subsystems": sorted(
+                {
+                    observation["observation"]["subsystem"]
+                    for observation in evaluations
+                }
+            ),
             "observed_faults": sorted(observed),
+            "production_evidence_complete": raw_evidence_complete,
+            "source_separation_proved": not oracle_imports
+            and not embedded_oracle_codes,
         },
         tuple(failures),
     )
@@ -2143,15 +2203,27 @@ def _determinism_case(result) -> ModelRiskLabAuditCase:
 
 def _minimization_case(result) -> ModelRiskLabAuditCase:
     failures = []
-    if len(result.minimized_failures) != len(FaultKind):
-        failures.append("one minimized reproducer per stable injected-fault signature is absent")
+    unexpected_signatures = {
+        item["signature"] for item in result.unexpected_violations
+    }
+    minimized_signatures = {
+        item.signature for item in result.minimized_failures
+    }
+    if minimized_signatures != unexpected_signatures:
+        failures.append("unexpected failure and minimized-signature inventories differ")
+    if any(
+        item.signature.startswith(("EXPECTED_FAULT:", "FAULT_MISS:"))
+        for item in result.minimized_failures
+    ):
+        failures.append("an expected fault observation entered minimization")
     if any(not item.preserved for item in result.minimized_failures):
         failures.append("a minimization lost its violation signature")
     return ModelRiskLabAuditCase(
-        "every_discovered_signature_has_a_preserving_minimal_reproducer",
+        "expected_faults_are_observations_not_minimization_sources",
         {
             "minimized": [item.as_dict() for item in result.minimized_failures],
             "signature_count": len(result.minimized_failures),
+            "unexpected_signatures": sorted(unexpected_signatures),
         },
         tuple(failures),
     )
@@ -2717,16 +2789,20 @@ def _subsystem_evidence_payload_ownership_case() -> ModelRiskLabAuditCase:
     )
 
     fault_details = nested_payload()
-    fault = FaultEvidence(
-        FaultKind.DUPLICATE_MESSAGE,
-        "payload_ownership_probe",
-        "DUPLICATE_MESSAGE",
-        "DUPLICATE_MESSAGE",
-        1,
-        fault_details,
+    fault = FaultObservation(
+        fault=FaultKind.DUPLICATE_MESSAGE,
+        subsystem="payload_ownership_probe",
+        detector="payload_ownership_probe",
+        injection_location="probe:1",
+        observed_code="DUPLICATE_RECORD",
+        injection_event=1,
+        manifest={"probe": "payload_ownership"},
+        raw_events=({"sequence": 1},),
+        raw_issues=(),
+        details=fault_details,
     )
     probe(
-        "fault_evidence.details",
+        "fault_observation.details",
         fault_details,
         fault.details,
         fault.as_dict,
