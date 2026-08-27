@@ -289,6 +289,27 @@ def _parser() -> argparse.ArgumentParser:
         default="all",
     )
 
+    from kirby2.agents import ADVERSARIAL_DRILL_IDS, POPULATION_IDS
+
+    agent_ecology = subcommands.add_parser(
+        "agent-ecology",
+        help="run a bounded deterministic participant population or recognition drill",
+    )
+    selection = agent_ecology.add_mutually_exclusive_group()
+    selection.add_argument("--population", choices=POPULATION_IDS)
+    selection.add_argument("--drill", choices=ADVERSARIAL_DRILL_IDS)
+    agent_ecology.add_argument("--seed", type=int, default=42)
+    agent_ecology.add_argument(
+        "--show-public-events",
+        action="store_true",
+        help="print the disclosure-safe player event stream",
+    )
+    agent_ecology.add_argument(
+        "--show-post-session-actors",
+        action="store_true",
+        help="print actor attribution only after the synthetic session completes",
+    )
+
     hidden_demo = subcommands.add_parser(
         "hidden-liquidity-demo",
         help="run deterministic hidden-liquidity and blind-feed scenarios",
@@ -628,6 +649,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-counterfactuals",
         help="audit causal forks, mutations, paired timelines, and immutable branches",
+    )
+    subcommands.add_parser(
+        "audit-agent-ecology",
+        help="audit bounded agents, disclosure boundaries, drills, emergence, and replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -1048,6 +1073,74 @@ def main() -> None:
             print("TIMELINE")
             print(MechanicsTimelineInspector(result.engine.events).render())
             print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "agent-ecology":
+        from kirby2.agents import (
+            EcologyRecording,
+            get_adversarial_drill,
+            get_population,
+            replay_agent_ecology,
+            run_agent_ecology,
+        )
+
+        population_id = args.drill or args.population or "liquidity_provision"
+        definition = (
+            get_adversarial_drill(population_id)
+            if args.drill is not None
+            else get_population(population_id)
+        )
+        result = run_agent_ecology(definition, seed=args.seed)
+        recording = EcologyRecording.capture(result)
+        replay = replay_agent_ecology(recording)
+        print("KIRBY2_SYNTHETIC_AGENT_ECOLOGY")
+        print(
+            f"POPULATION id={definition.population_id} agents={len(definition.agents)} "
+            f"recognition_drill={str(definition.recognition_drill).lower()} "
+            f"definition_sha256={definition.sha256()}"
+        )
+        print(
+            f"STARTING_BOOK sha256={result.summary.starting_book_sha256} "
+            f"initial_mid_ticks={definition.initial_mid_ticks}"
+        )
+        print(
+            "SUMMARY "
+            + json.dumps(
+                result.summary.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(
+            f"PLAYER_BOUNDARY events={len(result.public_events)} "
+            f"sha256={result.summary.public_event_sha256} "
+            "actor_identity=hidden intent=hidden"
+        )
+        print(
+            f"GROUND_TRUTH label=SIMULATOR_GROUND_TRUTH_POST_SESSION "
+            f"actions={len(result.truth_events)} "
+            f"sha256={result.summary.truth_event_sha256}"
+        )
+        print(
+            "REPLAY "
+            + json.dumps(replay.as_dict(), sort_keys=True, separators=(",", ":"))
+        )
+        print(f"POST_SESSION_EXPLANATION {definition.post_session_explanation}")
+        if args.show_public_events:
+            print("PUBLIC_EVENT_STREAM")
+            for event in result.public_events:
+                print(json.dumps(event.as_dict(), sort_keys=True, separators=(",", ":")))
+        if args.show_post_session_actors:
+            print("POST_SESSION_ACTOR_ATTRIBUTION")
+            for actor in result.post_session_analysis["actor_summaries"]:
+                print(json.dumps(actor, sort_keys=True, separators=(",", ":")))
+        print(f"RESULT_SHA256 {result.result_sha256}")
+        print(
+            f"AGENT_ECOLOGY {'PASS' if replay.passed else 'FAIL'} "
+            "runtime_invariants=PASS synthetic_only=true"
+        )
+        if not replay.passed:
+            raise SystemExit(1)
         return
 
     if args.command == "hidden-liquidity-demo":
@@ -2767,6 +2860,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"COUNTERFACTUAL_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-agent-ecology":
+        from kirby2.audit.agent_ecology import audit_agent_ecology
+
+        reports = audit_agent_ecology()
+        print("KIRBY2_AGENT_ECOLOGY_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"AGENT_ECOLOGY_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
