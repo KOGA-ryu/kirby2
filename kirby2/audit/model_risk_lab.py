@@ -288,6 +288,14 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
         item for item in schedule if item.lane is ExecutorLane.CORE_FLOW
     )
     capability = CAPABILITY_MATRIX[ExecutorLane.CORE_FLOW]
+    expected_core_dimensions = (
+        "seed",
+        "duration_us",
+        "flow_model",
+        "regime",
+        "volume",
+        "liquidity",
+    )
     refusal_checks = tuple(
         CheckResult(
             name=name,
@@ -421,6 +429,7 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
     passed = all(
         (
             schedule_wire == repeated_wire,
+            capability.credited_dimensions == expected_core_dimensions,
             len(schedule) == 420,
             len({item.seed for item in schedule}) == len(schedule),
             len(scientific_cells) == 60,
@@ -451,6 +460,9 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             "boolean_status_refusals": boolean_status_refusals,
             "complete_fault_cells": complete_fault_cells,
             "complete_scientific_cells": complete_scientific_cells,
+            "core_flow_credited_dimensions": list(
+                capability.credited_dimensions
+            ),
             "declared_without_evidence_status": unreported.automated_status.value,
             "deterministic_schedule_sha256": hashlib.sha256(
                 schedule_wire.encode("utf-8")

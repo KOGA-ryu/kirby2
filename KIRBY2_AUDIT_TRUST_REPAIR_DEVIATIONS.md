@@ -54,3 +54,52 @@ public score report remains JSON serializable.
 Commit: `Accept immutable replay mappings in scoring`
 
 Handoff: resume ATR-03 from the preserved interrupted-slice changes.
+
+## ATR-06A — Align the core-flow duration capability
+
+Discovered: 2026-08-27 during ATR-07 preflight at
+`609156a4d0d34d1408dba6a5284ac5eb6237c416`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.executors import CAPABILITY_MATRIX; from kirby2.auditlab.models import ExecutorLane; print(CAPABILITY_MATRIX[ExecutorLane.CORE_FLOW].credited_dimensions)"
+```
+
+The result contains seven credits, including `duration_events`. The fixed
+architecture names six CORE_FLOW dimensions, and ATR-07 prescribes execution
+through `RegimeOrderFlow.advance_to(configuration.duration_us)` while explicitly
+requiring only six credits. No ATR-07 operation consumes `duration_events`, so
+the seventh declaration cannot truthfully earn an `ExerciseRecord`.
+
+Root cause: ATR-06 translated the conceptual `duration` capability into both
+legacy minimization controls instead of the one simulation-time control used by
+the real executor.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/auditlab/executors/base.py`
+- `kirby2/audit/model_risk_lab.py`
+
+Repair:
+
+1. Credit `duration_us` as the sole CORE_FLOW duration dimension.
+2. Keep `duration_events` in generated-configuration schema v2 for legacy
+   compatibility and later predicate-aware minimization, without claiming that
+   the real core-flow executor exercises it.
+3. Make the runtime contract audit require the exact ordered six-dimension
+   tuple so the overclaim cannot recur silently.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.executors import CAPABILITY_MATRIX; from kirby2.auditlab.models import ExecutorLane; expected = ('seed', 'duration_us', 'flow_model', 'regime', 'volume', 'liquidity'); assert CAPABILITY_MATRIX[ExecutorLane.CORE_FLOW].credited_dimensions == expected; print('ATR_06A_CAPABILITY_MATRIX PASS dimensions=6')"
+git diff --check
+```
+
+Acceptance: CORE_FLOW exposes exactly the six roadmap-authorized credits and
+the complete model-risk runtime audit remains green.
+
+Commit: `Align core flow duration capability`

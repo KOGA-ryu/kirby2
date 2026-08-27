@@ -35,7 +35,6 @@ CAPABILITY_MATRIX: Mapping[ExecutorLane, LaneCapabilitySpec] = MappingProxyType(
             (
                 "seed",
                 "duration_us",
-                "duration_events",
                 "flow_model",
                 "regime",
                 "volume",
