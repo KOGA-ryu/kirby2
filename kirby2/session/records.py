@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+
+from kirby2.immutable import freeze_json, thaw_json
 
 
 class TimelineKind(str, Enum):
@@ -30,7 +32,7 @@ class InputRecord:
     simulation_time_us: int
     input_key: str
     resolved_command: str | None
-    order_parameters: dict[str, Any]
+    order_parameters: Mapping[str, object]
     market_state_id: str
     latency_reference_time_us: int
     action_latency_us: int
@@ -40,6 +42,16 @@ class InputRecord:
     resulting_order_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        frozen_parameters = freeze_json(self.order_parameters)
+        if not isinstance(frozen_parameters, Mapping):
+            raise TypeError("input order parameters must be a JSON object")
+        frozen_order_ids = freeze_json(self.resulting_order_ids)
+        if not isinstance(frozen_order_ids, tuple) or any(
+            type(value) is not str for value in frozen_order_ids
+        ):
+            raise TypeError("resulting order IDs must be a JSON string sequence")
+        object.__setattr__(self, "order_parameters", frozen_parameters)
+        object.__setattr__(self, "resulting_order_ids", frozen_order_ids)
         if self.sequence <= 0 or self.simulation_time_us < 0:
             raise ValueError("input record sequence and timestamp are invalid")
         if not self.input_key or self.action_latency_us < 0:
@@ -66,7 +78,7 @@ class InputRecord:
             "input_key": self.input_key,
             "latency_reference_timestamp": self.latency_reference_time_us,
             "market_state_id": self.market_state_id,
-            "order_parameters": self.order_parameters,
+            "order_parameters": thaw_json(self.order_parameters),
             "rejection_reason": self.rejection_reason,
             "resolved_command": self.resolved_command,
             "resulting_order_id": self.resulting_order_id,
@@ -76,10 +88,10 @@ class InputRecord:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> InputRecord:
+    def from_dict(cls, payload: Mapping[str, object]) -> InputRecord:
         parameters = payload.get("order_parameters", {})
         order_ids = payload.get("resulting_order_ids", [])
-        if not isinstance(parameters, dict) or not isinstance(order_ids, list):
+        if not isinstance(parameters, Mapping) or not isinstance(order_ids, list):
             raise ValueError("invalid input record parameters or order IDs")
         return cls(
             sequence=int(payload["sequence"]),
@@ -115,9 +127,13 @@ class MarketStateRecord:
     simulation_time_us: int
     observed_state_time_us: int
     exchange_event_sequence: int
-    snapshot: dict[str, Any]
+    snapshot: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        frozen = freeze_json(self.snapshot)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("market-state snapshot must be a JSON object")
+        object.__setattr__(self, "snapshot", frozen)
         if not self.state_id.startswith("MS-"):
             raise ValueError("invalid market-state identifier")
         if self.simulation_time_us < 0 or self.exchange_event_sequence < 0:
@@ -131,13 +147,13 @@ class MarketStateRecord:
             "market_state_id": self.state_id,
             "observed_state_timestamp": self.observed_state_time_us,
             "simulation_timestamp": self.simulation_time_us,
-            "snapshot": self.snapshot,
+            "snapshot": thaw_json(self.snapshot),
         }
 
     @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> MarketStateRecord:
+    def from_dict(cls, payload: Mapping[str, object]) -> MarketStateRecord:
         snapshot = payload.get("snapshot")
-        if not isinstance(snapshot, dict):
+        if not isinstance(snapshot, Mapping):
             raise ValueError("market-state snapshot must be an object")
         return cls(
             state_id=str(payload["market_state_id"]),
@@ -154,15 +170,19 @@ class TimelineRecord:
     simulation_time_us: int
     kind: TimelineKind
     message: str
-    data: dict[str, Any]
+    data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("timeline data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
         if self.sequence <= 0 or self.simulation_time_us < 0 or not self.message:
             raise ValueError("invalid timeline record")
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "data": self.data,
+            "data": thaw_json(self.data),
             "kind": self.kind.value,
             "message": self.message,
             "sequence": self.sequence,

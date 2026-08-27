@@ -14,6 +14,14 @@ from kirby2.auditlab.models import (
     canonical_json,
     canonical_sha256,
 )
+from kirby2.immutable import freeze_json
+from kirby2.session.events import EventJournal, EventType
+from kirby2.session.records import (
+    InputRecord,
+    MarketStateRecord,
+    TimelineKind,
+    TimelineRecord,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +87,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _minimization_case(result),
             _statistics_case(result),
             _probe_case(result),
+            _core_replay_payload_ownership_case(),
             _artifact_path_boundary_case(root / "artifact-path-boundary"),
             _packet_identity_scope_case(
                 root / "packet-identity-scope",
@@ -197,6 +206,171 @@ def _probe_case(result) -> ModelRiskLabAuditCase:
         "real_subsystem_probes_cover_non_kernel_semantics",
         {"probes": result.probes},
         () if not failed else (f"subsystem probes failed: {failed}",),
+    )
+
+
+def _core_replay_payload_ownership_case() -> ModelRiskLabAuditCase:
+    expected_payload = {
+        "nested": {
+            "queue": [
+                {
+                    "flags": [True, None],
+                    "quantity": 10,
+                }
+            ]
+        }
+    }
+    caller_payload = {
+        "nested": {
+            "queue": [
+                {
+                    "flags": [True, None],
+                    "quantity": 10,
+                }
+            ]
+        }
+    }
+    journal = EventJournal()
+    event = journal.emit(EventType.ORDER_SUBMITTED, payload=caller_payload)
+    input_record = InputRecord(
+        sequence=1,
+        simulation_time_us=10,
+        input_key="B",
+        resolved_command="BUY_BID",
+        order_parameters={"payload": caller_payload},
+        market_state_id="MS-payload-ownership",
+        latency_reference_time_us=9,
+        action_latency_us=1,
+        accepted=True,
+        rejection_reason=None,
+        resulting_order_id="PLAYER-O-000001",
+        resulting_order_ids=("PLAYER-O-000001",),
+    )
+    market_state = MarketStateRecord(
+        state_id="MS-payload-ownership",
+        simulation_time_us=10,
+        observed_state_time_us=9,
+        exchange_event_sequence=1,
+        snapshot={"payload": caller_payload},
+    )
+    timeline_record = TimelineRecord(
+        sequence=1,
+        simulation_time_us=10,
+        kind=TimelineKind.COMMAND,
+        message="immutable payload probe",
+        data={"payload": caller_payload},
+    )
+
+    def record_wire() -> str:
+        return canonical_json(
+            {
+                "event": event.as_dict(),
+                "input": input_record.as_dict(),
+                "market_state": market_state.as_dict(),
+                "timeline": timeline_record.as_dict(),
+            }
+        )
+
+    wire_before = record_wire()
+    journal_before = journal.canonical_json_lines()
+    expected_journal = canonical_json(
+        {
+            "data": {"payload": expected_payload},
+            "sequence": 1,
+            "type": EventType.ORDER_SUBMITTED.value,
+        }
+    )
+
+    caller_payload["nested"]["queue"][0]["quantity"] = 999
+    wire_after_caller_mutation = record_wire()
+    journal_after_caller_mutation = journal.canonical_json_lines()
+
+    frozen_roots = {
+        "input_record": input_record.order_parameters,
+        "market_state_record": market_state.snapshot,
+        "simulation_event": event.data,
+        "timeline_record": timeline_record.data,
+    }
+    direct_mutation_rejected: dict[str, bool] = {}
+    for name, root in frozen_roots.items():
+        try:
+            root["payload"]["nested"]["queue"][0]["quantity"] = 777  # type: ignore[index]
+        except TypeError:
+            direct_mutation_rejected[name] = True
+        else:
+            direct_mutation_rejected[name] = False
+
+    event_export = event.as_dict()
+    input_export = input_record.as_dict()
+    market_export = market_state.as_dict()
+    timeline_export = timeline_record.as_dict()
+    event_export["data"]["payload"]["nested"]["queue"][0]["quantity"] = 501  # type: ignore[index]
+    input_export["order_parameters"]["payload"]["nested"]["queue"][0]["quantity"] = 502  # type: ignore[index]
+    market_export["snapshot"]["payload"]["nested"]["queue"][0]["quantity"] = 503  # type: ignore[index]
+    timeline_export["data"]["payload"]["nested"]["queue"][0]["quantity"] = 504  # type: ignore[index]
+    wire_after_export_mutation = record_wire()
+    journal_after_export_mutation = journal.canonical_json_lines()
+
+    invalid_json_rejected: dict[str, bool] = {}
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    for name, value in {
+        "cyclic_sequence": cyclic,
+        "non_finite_float": float("nan"),
+        "non_string_key": {1: "invalid"},
+        "unsupported_object": object(),
+    }.items():
+        try:
+            freeze_json(value)
+        except (TypeError, ValueError):
+            invalid_json_rejected[name] = True
+        else:
+            invalid_json_rejected[name] = False
+    sorted_mapping = freeze_json({"z": 1, "a": 2})
+    sorted_mapping_keys = (
+        list(sorted_mapping)
+        if hasattr(sorted_mapping, "__iter__")
+        else []
+    )
+
+    passed = all(
+        (
+            journal_before == expected_journal,
+            journal_after_caller_mutation == journal_before,
+            journal_after_export_mutation == journal_before,
+            wire_after_caller_mutation == wire_before,
+            wire_after_export_mutation == wire_before,
+            all(direct_mutation_rejected.values()),
+            set(direct_mutation_rejected) == set(frozen_roots),
+            all(invalid_json_rejected.values()),
+            len(invalid_json_rejected) == 4,
+            sorted_mapping_keys == ["a", "z"],
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "core_replay_payloads_are_deeply_owned_and_detached",
+        {
+            "caller_mutation_preserved_journal": (
+                journal_after_caller_mutation == journal_before
+            ),
+            "direct_mutation_rejected": direct_mutation_rejected,
+            "export_mutation_preserved_journal": (
+                journal_after_export_mutation == journal_before
+            ),
+            "invalid_json_rejected": invalid_json_rejected,
+            "journal_sha256": hashlib.sha256(
+                journal_before.encode("utf-8")
+            ).hexdigest(),
+            "sorted_mapping_keys": sorted_mapping_keys,
+            "wire_sha256": hashlib.sha256(wire_before.encode("utf-8")).hexdigest(),
+            "wire_stable_after_caller_mutation": (
+                wire_after_caller_mutation == wire_before
+            ),
+            "wire_stable_after_export_mutation": (
+                wire_after_export_mutation == wire_before
+            ),
+        },
+        () if passed else ("core replay payload ownership boundary failed",),
     )
 
 

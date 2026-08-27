@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+
+from kirby2.immutable import freeze_json, thaw_json
 
 
 class EventType(str, Enum):
@@ -28,10 +30,20 @@ class EventType(str, Enum):
 class SimulationEvent:
     sequence: int
     event_type: EventType
-    data: dict[str, Any]
+    data: Mapping[str, object]
 
-    def as_dict(self) -> dict[str, Any]:
-        return {"data": self.data, "sequence": self.sequence, "type": self.event_type.value}
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.data)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("simulation event data must be a JSON object")
+        object.__setattr__(self, "data", frozen)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "data": thaw_json(self.data),
+            "sequence": self.sequence,
+            "type": self.event_type.value,
+        }
 
     def to_json(self) -> str:
         return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
@@ -46,7 +58,7 @@ class EventJournal:
     def events(self) -> tuple[SimulationEvent, ...]:
         return tuple(self._events)
 
-    def emit(self, event_type: EventType, **data: Any) -> SimulationEvent:
+    def emit(self, event_type: EventType, **data: object) -> SimulationEvent:
         event = SimulationEvent(self._next_sequence, event_type, data)
         self._events.append(event)
         self._next_sequence += 1
