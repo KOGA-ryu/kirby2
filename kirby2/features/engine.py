@@ -5,15 +5,41 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
-from typing import Iterable
+from typing import Iterable, Mapping, Protocol
 
-from kirby2.exchange import OrderBook, Side
+from kirby2.exchange import Side
 from kirby2.session.events import EventType, SimulationEvent
 
 from .models import FEATURE_CATALOG, FeatureFrame, FeatureKey
 
 
 MICROSECONDS_PER_SECOND = 1_000_000
+
+
+class DepthLevelView(Protocol):
+    total_quantity: int
+
+
+class MarketDepthView(Protocol):
+    """Minimum aggregate-depth surface accepted by observable features."""
+
+    @property
+    def best_bid(self) -> int | None: ...
+
+    @property
+    def best_ask(self) -> int | None: ...
+
+    @property
+    def bid_prices(self) -> list[int]: ...
+
+    @property
+    def ask_prices(self) -> list[int]: ...
+
+    @property
+    def bids(self) -> Mapping[int, DepthLevelView]: ...
+
+    @property
+    def asks(self) -> Mapping[int, DepthLevelView]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +88,7 @@ class MicrostructureFeatureEngine:
         self._last_time_us = 0
         self._initialized = False
 
-    def reset(self, simulation_time_us: int, book: OrderBook) -> FeatureFrame:
+    def reset(self, simulation_time_us: int, book: MarketDepthView) -> FeatureFrame:
         if type(simulation_time_us) is not int or simulation_time_us < 0:
             raise ValueError("feature reset time must be nonnegative microseconds")
         self._activities.clear()
@@ -76,7 +102,7 @@ class MicrostructureFeatureEngine:
         self,
         simulation_time_us: int,
         events: Iterable[SimulationEvent],
-        book: OrderBook,
+        book: MarketDepthView,
     ) -> FeatureFrame:
         if not self._initialized:
             self.reset(simulation_time_us, book)
@@ -90,7 +116,7 @@ class MicrostructureFeatureEngine:
         self._prune(simulation_time_us)
         return self.snapshot(simulation_time_us, book)
 
-    def advance_to(self, simulation_time_us: int, book: OrderBook) -> FeatureFrame:
+    def advance_to(self, simulation_time_us: int, book: MarketDepthView) -> FeatureFrame:
         """Advance rolling windows without inventing market activity."""
 
         if not self._initialized:
@@ -130,7 +156,7 @@ class MicrostructureFeatureEngine:
                     break
         return min(candidates) if candidates else None
 
-    def snapshot(self, simulation_time_us: int, book: OrderBook) -> FeatureFrame:
+    def snapshot(self, simulation_time_us: int, book: MarketDepthView) -> FeatureFrame:
         if not self._initialized:
             return self.reset(simulation_time_us, book)
         if simulation_time_us < self._last_time_us:
@@ -338,7 +364,7 @@ def _window_midpoints(
     return tuple(selected)
 
 
-def _best_size(book: OrderBook, side: Side) -> int:
+def _best_size(book: MarketDepthView, side: Side) -> int:
     price = book.best_bid if side is Side.BUY else book.best_ask
     if price is None:
         return 0
@@ -346,14 +372,14 @@ def _best_size(book: OrderBook, side: Side) -> int:
     return levels[price].total_quantity
 
 
-def _midpoint(book: OrderBook) -> Decimal | None:
+def _midpoint(book: MarketDepthView) -> Decimal | None:
     if book.best_bid is None or book.best_ask is None:
         return None
     return Decimal(book.best_bid + book.best_ask) / Decimal(2)
 
 
 def _microprice(
-    book: OrderBook,
+    book: MarketDepthView,
     best_bid_size: int,
     best_ask_size: int,
 ) -> Decimal | None:
@@ -371,7 +397,7 @@ def _imbalance(bid: int, ask: int) -> Decimal:
     return Decimal(bid - ask) / Decimal(total) if total else Decimal(0)
 
 
-def _weighted_depth(book: OrderBook, side: Side, levels: int) -> Decimal:
+def _weighted_depth(book: MarketDepthView, side: Side, levels: int) -> Decimal:
     prices = book.bid_prices if side is Side.BUY else book.ask_prices
     side_levels = book.bids if side is Side.BUY else book.asks
     return sum(

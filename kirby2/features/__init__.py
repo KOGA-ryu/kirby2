@@ -1,6 +1,6 @@
 """Canonical causal microstructure feature engine."""
 
-from .engine import MicrostructureFeatureEngine
+from .engine import MarketDepthView, MicrostructureFeatureEngine
 from .inspection import (
     FeatureStream,
     historical_feature_frame,
@@ -24,6 +24,7 @@ __all__ = [
     "FeatureKey",
     "FeatureStream",
     "MicrostructureFeatureEngine",
+    "MarketDepthView",
     "feature_catalog_as_dict",
     "feature_catalog_sha256",
     "feature_field_name",

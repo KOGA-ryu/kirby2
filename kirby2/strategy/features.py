@@ -6,8 +6,12 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable
 
-from kirby2.exchange import OrderBook
-from kirby2.features import FeatureFrame, FeatureKey, MicrostructureFeatureEngine
+from kirby2.features import (
+    FeatureFrame,
+    FeatureKey,
+    MarketDepthView,
+    MicrostructureFeatureEngine,
+)
 from kirby2.session.events import SimulationEvent
 
 from .language import FeatureName
@@ -42,14 +46,14 @@ class ObservableFeatureTracker:
             relative_volume=relative_volume,
         )
 
-    def reset(self, simulation_time_us: int, book: OrderBook) -> FeatureSnapshot:
+    def reset(self, simulation_time_us: int, book: MarketDepthView) -> FeatureSnapshot:
         return self._adapt(self.engine.reset(simulation_time_us, book))
 
     def observe(
         self,
         simulation_time_us: int,
         events: Iterable[SimulationEvent],
-        book: OrderBook,
+        book: MarketDepthView,
     ) -> FeatureSnapshot:
         captured = tuple(events)
         frame = (
@@ -59,14 +63,14 @@ class ObservableFeatureTracker:
         )
         return self._adapt(frame)
 
-    def advance_to(self, simulation_time_us: int, book: OrderBook) -> FeatureSnapshot:
+    def advance_to(self, simulation_time_us: int, book: MarketDepthView) -> FeatureSnapshot:
         return self._adapt(self.engine.advance_to(simulation_time_us, book))
 
     @property
     def next_expiry_time_us(self) -> int | None:
         return self.engine.next_expiry_time_us
 
-    def snapshot(self, simulation_time_us: int, book: OrderBook) -> FeatureSnapshot:
+    def snapshot(self, simulation_time_us: int, book: MarketDepthView) -> FeatureSnapshot:
         return self._adapt(self.engine.snapshot(simulation_time_us, book))
 
     def _adapt(self, frame: FeatureFrame) -> FeatureSnapshot:

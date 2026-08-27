@@ -17,6 +17,7 @@ include = ["kirby2*"]
 
 [tool.setuptools.package-data]
 "kirby2.exchange" = ["MECHANICS.md"]
+"kirby2.observability" = ["README.md"]
 "kirby2.scenarios" = ["accepted_scenarios.json"]
 "kirby2.historical" = ["FEATURES.md", "LESSONS.md", "fixtures/*.json", "lessons/*.json"]
 "kirby2.latency" = ["README.md"]

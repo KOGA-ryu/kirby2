@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable
 
-from kirby2.exchange import OrderBook
+from kirby2.features import MarketDepthView
 from kirby2.session.events import SimulationEvent
 
 from .features import FeatureSnapshot, ObservableFeatureTracker
@@ -80,7 +80,7 @@ class TrafficLightRuntime:
         )
         self.current: EvaluationResult | None = None
 
-    def reset(self, simulation_time_us: int, book: OrderBook) -> TrafficTransition:
+    def reset(self, simulation_time_us: int, book: MarketDepthView) -> TrafficTransition:
         features = self.tracker.reset(simulation_time_us, book)
         evaluation = self._evaluate(features)
         self.current = evaluation
@@ -94,7 +94,7 @@ class TrafficLightRuntime:
         self,
         simulation_time_us: int,
         events: Iterable[SimulationEvent],
-        book: OrderBook,
+        book: MarketDepthView,
     ) -> TrafficTransition | None:
         features = self.tracker.observe(simulation_time_us, events, book)
         evaluation = self._evaluate(features)

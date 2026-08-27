@@ -224,6 +224,24 @@ def _parser() -> argparse.ArgumentParser:
         default="all",
     )
 
+    hidden_demo = subcommands.add_parser(
+        "hidden-liquidity-demo",
+        help="run deterministic hidden-liquidity and blind-feed scenarios",
+    )
+    hidden_demo.add_argument(
+        "--scenario",
+        choices=(
+            "all",
+            "blind-paired",
+            "iceberg-absorption",
+            "hidden-midpoint-fill",
+            "repeated-displayed-refresh",
+            "apparent-wall",
+            "small-displayed-deep-hidden",
+        ),
+        default="all",
+    )
+
     defaults = EventRates()
     simulate = subcommands.add_parser("simulate", help="run seeded Poisson-style order flow")
     simulate.add_argument("--seed", type=int, default=42, help="explicit simulation RNG seed")
@@ -429,6 +447,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-market-mechanics",
         help="audit instructions, sessions, auctions, protections, and replay",
+    )
+    subcommands.add_parser(
+        "audit-hidden-liquidity",
+        help="audit hidden liquidity, observability, queue estimates, and replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -849,6 +871,83 @@ def main() -> None:
             print("TIMELINE")
             print(MechanicsTimelineInspector(result.engine.events).render())
             print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "hidden-liquidity-demo":
+        from kirby2.observability import (
+            HIDDEN_LIQUIDITY_SCENARIOS,
+            run_blind_hidden_liquidity_exercise,
+            run_hidden_liquidity_scenario,
+        )
+
+        print("KIRBY2_HIDDEN_LIQUIDITY_DEMO")
+        if args.scenario in {"all", "blind-paired"}:
+            blind = run_blind_hidden_liquidity_exercise()
+            print("BLIND_PAIRED")
+            print(f"INITIAL_OBSERVABLE sha256={blind.initial_observable_sha256}")
+            print(
+                f"FILLS shallow={blind.shallow_fill_quantity} "
+                f"deep={blind.deep_fill_quantity}"
+            )
+            print(
+                "SCORING shallow="
+                + json.dumps(
+                    blind.shallow_score.as_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print(
+                "SCORING deep="
+                + json.dumps(
+                    blind.deep_score.as_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print(
+                "REPLAY "
+                f"shallow={'PASS' if blind.shallow.replay.passed else 'FAIL'} "
+                f"deep={'PASS' if blind.deep.replay.passed else 'FAIL'}"
+            )
+            print("INFERENCE_REQUIRED fills,replenishment,tape")
+            print("RUNTIME_INVARIANTS PASS")
+        if args.scenario != "blind-paired":
+            names = (
+                HIDDEN_LIQUIDITY_SCENARIOS
+                if args.scenario == "all"
+                else (args.scenario,)
+            )
+            for name in names:
+                result = run_hidden_liquidity_scenario(name)
+                result.venue.assert_invariants()
+                print(f"SCENARIO {name}")
+                print(
+                    "SUMMARY "
+                    + json.dumps(
+                        result.summary,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                print(
+                    f"OBSERVABLE_EVENTS sha256="
+                    f"{result.venue.observable_event_sha256()}"
+                )
+                print(
+                    f"GROUND_TRUTH_EVENTS sha256="
+                    f"{result.venue.truth_event_sha256()}"
+                )
+                print(f"RECORDING sha256={result.recording.sha256()}")
+                print(
+                    f"REPLAY {'PASS' if result.replay.passed else 'FAIL'} "
+                    f"observable_match={str(result.replay.observable_match).lower()} "
+                    f"truth_match={str(result.replay.ground_truth_match).lower()} "
+                    f"state_match={str(result.replay.state_match).lower()}"
+                )
+                print("OBSERVABLE_TIMELINE")
+                print(result.timeline)
+                print("RUNTIME_INVARIANTS PASS")
         return
 
     if args.command == "strategy":
@@ -2150,6 +2249,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"MARKET_MECHANICS_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-hidden-liquidity":
+        from kirby2.audit.hidden_liquidity import audit_hidden_liquidity
+
+        reports = audit_hidden_liquidity()
+        print("KIRBY2_HIDDEN_LIQUIDITY_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"HIDDEN_LIQUIDITY_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
