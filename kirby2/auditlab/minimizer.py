@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from .kernel import run_kernel, violation_signatures
+from .kernel import failure_signatures, run_generated_case
 from .models import GeneratedConfiguration, MinimizedFailure
 
 
@@ -37,15 +37,15 @@ def minimize_failure(
         if candidate == current:
             continue
         attempts += 1
-        if signature in violation_signatures(run_kernel(candidate)):
+        if signature in failure_signatures(run_generated_case(candidate)):
             current = candidate
-    final_result = run_kernel(current)
+    final_result = run_generated_case(current)
     attempts += 1
     return MinimizedFailure(
         signature=signature,
         source_configuration_sha256=configuration.sha256,
         minimized_configuration=current,
         attempts=attempts,
-        preserved=signature in violation_signatures(final_result),
-        result_digest=final_result.result_digest,
+        preserved=signature in failure_signatures(final_result),
+        result_digest=final_result.result_sha256,
     )

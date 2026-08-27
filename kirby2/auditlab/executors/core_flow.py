@@ -5,10 +5,9 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
-from kirby2.exchange import OrderBook, OrderOwner, Side
+from kirby2.exchange import OrderBook, Side
 from kirby2.immutable import thaw_json
 from kirby2.scenarios import create_market_engine, get_scenario_definition
-from kirby2.session import EventType, SimulationEvent
 from kirby2.simulation import (
     FlowEvent,
     FlowEventFamily,
@@ -33,6 +32,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from ..projectors import EventLedgerProjector, FillLedgerProjector
 
 
 CORE_FLOW_RECORDING_TYPE = "CORE_FLOW_EVENT_TAPE"
@@ -275,7 +275,7 @@ def _result(
                 evidence={"mismatches": list(replay_mismatches)},
             )
         )
-    fill_ledger = _player_ledger_from_fills(engine.book)
+    fill_ledger = FillLedgerProjector.project(engine.book.fills).as_dict()
     trades = engine.book.trades[engine.initial_trade_count :]
     return GeneratedCaseResult(
         configuration=configuration,
@@ -514,8 +514,8 @@ def _checks(
         )
     )
 
-    fill_ledger = _player_ledger_from_fills(book)
-    event_ledger = _player_ledger_from_events(book.journal.events)
+    fill_ledger = FillLedgerProjector.project(book.fills).as_dict()
+    event_ledger = EventLedgerProjector.project(book.journal.events).as_dict()
     book_ledger = {
         "bought_shares": book.player_position.bought_quantity,
         "position_shares": book.player_position.position,
@@ -771,71 +771,6 @@ def _observations(engine: RegimeOrderFlow) -> list[dict[str, object]]:
         }
         for item in engine.observations
     ]
-
-
-def _player_ledger_from_fills(book: OrderBook) -> dict[str, int]:
-    bought_shares = 0
-    sold_shares = 0
-    position_shares = 0
-    cash_tick_shares = 0
-    for fill in book.fills:
-        if fill.owner is not OrderOwner.PLAYER:
-            continue
-        if fill.side is Side.BUY:
-            bought_shares += fill.quantity
-            position_shares += fill.quantity
-            cash_tick_shares -= fill.price_ticks * fill.quantity
-        else:
-            sold_shares += fill.quantity
-            position_shares -= fill.quantity
-            cash_tick_shares += fill.price_ticks * fill.quantity
-    return {
-        "bought_shares": bought_shares,
-        "cash_tick_shares": cash_tick_shares,
-        "position_shares": position_shares,
-        "sold_shares": sold_shares,
-    }
-
-
-def _player_ledger_from_events(
-    events: tuple[SimulationEvent, ...],
-) -> dict[str, int]:
-    player_sides: dict[str, Side] = {}
-    bought_shares = 0
-    sold_shares = 0
-    position_shares = 0
-    cash_tick_shares = 0
-    for event in events:
-        data = event.data
-        if (
-            event.event_type is EventType.ORDER_SUBMITTED
-            and data.get("owner") == OrderOwner.PLAYER.value
-            and data.get("side") is not None
-        ):
-            player_sides[str(data["order_id"])] = Side(str(data["side"]))
-            continue
-        if event.event_type not in {EventType.PARTIAL_FILL, EventType.FULL_FILL}:
-            continue
-        order_id = str(data["order_id"])
-        side = player_sides.get(order_id)
-        if side is None:
-            continue
-        quantity = int(data["fill_quantity"])
-        price_ticks = int(data["price_ticks"])
-        if side is Side.BUY:
-            bought_shares += quantity
-            position_shares += quantity
-            cash_tick_shares -= price_ticks * quantity
-        else:
-            sold_shares += quantity
-            position_shares -= quantity
-            cash_tick_shares += price_ticks * quantity
-    return {
-        "bought_shares": bought_shares,
-        "cash_tick_shares": cash_tick_shares,
-        "position_shares": position_shares,
-        "sold_shares": sold_shares,
-    }
 
 
 def _flow_model_identity(

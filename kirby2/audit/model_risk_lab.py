@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,13 +16,20 @@ from kirby2.algorithms import (
 )
 from kirby2.agents.models import PublicEcologyEvent
 from kirby2.agents.populations import BOUNDED_POPULATION_TEMPLATES
-from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
+from kirby2.auditlab import (
+    AuditLabStore,
+    EventLedgerProjector,
+    FaultKind,
+    FillLedgerProjector,
+    run_audit_lab,
+)
 from kirby2.auditlab.executors import (
     ALGORITHM_RECORDING_TYPE,
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
     ECOLOGY_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
+    FAULT_RECORDING_TYPE,
     FRAGMENTED_RECORDING_TYPE,
     LATENCY_RECORDING_TYPE,
     MECHANICS_RECORDING_TYPE,
@@ -50,7 +58,6 @@ from kirby2.auditlab.models import (
     FaultEvidence,
     GeneratedCaseResult,
     GeneratedConfiguration,
-    KernelResult,
     StatisticalCheck,
     canonical_json,
     canonical_sha256,
@@ -98,6 +105,7 @@ _IMPLEMENTED_EXECUTOR_LANES = (
     ExecutorLane.FRAGMENTED,
     ExecutorLane.ECOLOGY,
     ExecutorLane.ALGORITHM,
+    ExecutorLane.FAULT,
 )
 
 
@@ -194,16 +202,66 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
 
 
 def _coverage_case(result) -> ModelRiskLabAuditCase:
-    missing = [name for name, item in result.coverage.items() if item["status"] != "PASS"]
+    coverage = result.coverage
+    lanes = coverage["lanes"]
+    missing = sorted(
+        name for name, item in lanes.items() if item["status"] != "PASS"
+    )
+    case_contracts_exact = True
+    evidence_digests_present = True
+    generated_branch_claims: list[str] = []
+    for case in result.cases:
+        lane = ExecutorLane(str(case["lane"]))
+        capability = CAPABILITY_MATRIX[lane]
+        exercises = case["exercises"]
+        checks = case["invariant_checks"]
+        case_contracts_exact = case_contracts_exact and all(
+            (
+                {item["capability"] for item in exercises}
+                == set(capability.credited_dimensions),
+                {item["name"] for item in checks}
+                == set(capability.required_checks),
+                all(item["status"] == "EXERCISED" for item in exercises),
+                all(item["status"] == "PASS" for item in checks),
+            )
+        )
+        evidence_digests_present = evidence_digests_present and all(
+            len(str(item["evidence_sha256"])) == 64
+            for item in (*exercises, *checks)
+        )
+        generated_branch_claims.extend(
+            f"{lane.value}:{item['name']}"
+            for item in checks
+            if item["name"] == "branch_parent_consistency"
+        )
+    unsupported = coverage["unsupported_cross_lane_interactions"]
+    passed = all(
+        (
+            coverage["status"] == "PASS",
+            coverage["lane_count"] == len(ExecutorLane),
+            coverage["covered_lane_count"] == len(ExecutorLane),
+            coverage["missing_configured_value_count"] == 0,
+            coverage["unexercised_required_check_count"] == 0,
+            coverage["failed_required_check_count"] == 0,
+            unsupported["status"] == "ABSENT_BY_DESIGN",
+            unsupported["credited_pair_count"] == 0,
+            not unsupported["pairs"],
+            not missing,
+            case_contracts_exact,
+            evidence_digests_present,
+            not generated_branch_claims,
+        )
+    )
     return ModelRiskLabAuditCase(
-        "all_fourteen_configuration_dimensions_and_fault_families_vary",
+        "all_generated_coverage_is_backed_by_typed_lane_evidence",
         {
-            "required_axis_count": 14,
-            "extra_minimization_axis": "agent_count",
-            "coverage": result.coverage,
+            "case_contracts_exact": case_contracts_exact,
+            "evidence_digests_present": evidence_digests_present,
+            "generated_branch_parent_claims": generated_branch_claims,
+            "coverage": coverage,
             "generated_cases": result.budget,
         },
-        () if not missing else (f"partial generated coverage: {missing}",),
+        () if passed else (f"partial or unbacked generated coverage: {missing}",),
     )
 
 
@@ -1975,29 +2033,74 @@ def _real_algorithm_executor_case() -> ModelRiskLabAuditCase:
 def _structural_case(result) -> ModelRiskLabAuditCase:
     failed_checks = sorted(
         {
-            name
+            f"{case['lane']}:{check['name']}:{check['status']}"
             for case in result.cases
-            for name, passed in case["invariant_checks"].items()
-            if not passed
+            for check in case["invariant_checks"]
+            if check["status"] != "PASS"
         }
+    )
+    book = OrderBook()
+    book.process(Order.limit("PROJECTOR-ASK", Side.SELL, 100, 10_001))
+    book.process(
+        Order.market(
+            "PROJECTOR-PLAYER",
+            Side.BUY,
+            60,
+            OrderOwner.PLAYER,
+        )
+    )
+    fill_projection = FillLedgerProjector.project(book.fills).as_dict()
+    event_projection = EventLedgerProjector.project(
+        book.journal.events
+    ).as_dict()
+    fill_source = inspect.getsource(FillLedgerProjector.project)
+    event_source = inspect.getsource(EventLedgerProjector.project)
+    independent_projectors = all(
+        (
+            fill_projection == event_projection,
+            fill_projection["position_shares"] == 60,
+            fill_projection["cash_tick_shares"] == -600_060,
+            "EventLedgerProjector" not in fill_source,
+            "FillLedgerProjector" not in event_source,
+            "player_sides" not in fill_source,
+            "for fill in fills" in fill_source,
+            "for event in events" in event_source,
+        )
+    )
+    passed = all(
+        (
+            not failed_checks,
+            not result.unexpected_violations,
+            independent_projectors,
+        )
     )
     return ModelRiskLabAuditCase(
         "structural_invariants_enforced_on_every_generated_case",
         {
             "case_count": len(result.cases),
+            "event_ledger_projection": event_projection,
             "failed_check_names": failed_checks,
+            "fill_ledger_projection": fill_projection,
+            "independent_projectors": independent_projectors,
+            "projector_source_sha256": {
+                "event": canonical_sha256(event_source),
+                "fill": canonical_sha256(fill_source),
+            },
             "unexpected_violation_count": len(result.unexpected_violations),
         },
-        () if not failed_checks and not result.unexpected_violations else (
+        () if passed else (
             "one or more structural invariants failed",
         ),
     )
 
 
 def _fault_case(result) -> ModelRiskLabAuditCase:
+    fault_cases = [
+        case for case in result.cases if case["lane"] == ExecutorLane.FAULT.value
+    ]
     observed = {
         case["fault_evidence"]["fault"]
-        for case in result.cases
+        for case in fault_cases
         if case["fault_evidence"] is not None
     }
     expected = {item.value for item in FaultKind}
@@ -2006,9 +2109,21 @@ def _fault_case(result) -> ModelRiskLabAuditCase:
         failures.append("not all explicit fault types were injected")
     if result.fault_summary["status"] != "PASS":
         failures.append("one or more explicit faults escaped detection")
+    if any(
+        case["recording_type"] != FAULT_RECORDING_TYPE
+        or {item["name"] for item in case["invariant_checks"]}
+        != set(CAPABILITY_MATRIX[ExecutorLane.FAULT].required_checks)
+        for case in fault_cases
+    ):
+        failures.append("fault cases did not use the typed fault executor contract")
     return ModelRiskLabAuditCase(
         "all_faults_explicit_recorded_and_detected",
-        {"fault_summary": result.fault_summary, "observed_faults": sorted(observed)},
+        {
+            "fault_case_count": len(fault_cases),
+            "fault_recording_type": FAULT_RECORDING_TYPE,
+            "fault_summary": result.fault_summary,
+            "observed_faults": sorted(observed),
+        },
         tuple(failures),
     )
 
@@ -2052,11 +2167,37 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
 
 
 def _probe_case(result) -> ModelRiskLabAuditCase:
-    failed = [name for name, item in result.probes.items() if item["status"] != "PASS"]
+    failed = [
+        item.name
+        for item in result.probes
+        if item.required and item.status is not CheckStatus.PASS
+    ]
+    probes = [
+        {
+            **item.as_dict(),
+            "evidence_sha256": canonical_sha256(item.as_dict()["evidence"]),
+        }
+        for item in result.probes
+    ]
+    branch = next(
+        item for item in probes if item["name"] == "branch_parent_consistency"
+    )
+    branch_evidence = branch["evidence"]
+    branch_exact = all(
+        (
+            branch_evidence["parent_link_consistent"],
+            branch_evidence["exact_prefix_equality_through_fork"],
+            branch_evidence["mutation_only_after_fork"],
+            branch_evidence["immutable_branch_verified"],
+            len(branch_evidence["parent_result_digest"]) == 64,
+        )
+    )
     return ModelRiskLabAuditCase(
         "real_subsystem_probes_cover_non_kernel_semantics",
-        {"probes": result.probes},
-        () if not failed else (f"subsystem probes failed: {failed}",),
+        {"branch_parent_consistency_exact": branch_exact, "probes": probes},
+        () if not failed and branch_exact else (
+            f"subsystem probes failed: {failed}",
+        ),
     )
 
 
@@ -2616,39 +2757,45 @@ def _subsystem_evidence_payload_ownership_case() -> ModelRiskLabAuditCase:
         strategy="NONE",
         objective="PAYLOAD_OWNERSHIP",
     )
-    kernel_event = nested_payload()
-    kernel_state = nested_payload()
-    kernel_observable = nested_payload()
-    kernel = KernelResult(
+    generated_event = nested_payload()
+    generated_state = nested_payload()
+    generated_observable = nested_payload()
+    generated = GeneratedCaseResult(
         configuration=configuration,
-        event_stream=(kernel_event,),
-        venue_states=(kernel_state,),
-        observable_layer=kernel_observable,
+        lane=ExecutorLane.CORE_FLOW,
+        recording=CaseRecording(
+            ExecutorLane.CORE_FLOW,
+            "PAYLOAD_OWNERSHIP_PROBE",
+            {"configuration_sha256": configuration.sha256},
+        ),
+        event_projection=(generated_event,),
+        final_state_projection=generated_state,
         metrics={"event_count": 1},
-        invariant_checks={"payload_ownership": True},
-        violations=(),
-        fault_evidence=fault,
+        exercises=(),
+        checks=(),
+        failures=(),
+        observable_projection=generated_observable,
     )
     probe(
-        "kernel_result.event_stream",
-        kernel_event,
-        kernel.event_stream[0],
-        kernel.as_dict,
-        lambda payload: payload["event_stream"][0],
+        "generated_case_result.event_projection",
+        generated_event,
+        generated.event_projection[0],
+        generated.as_dict,
+        lambda payload: payload["event_projection"][0],
     )
     probe(
-        "kernel_result.venue_states",
-        kernel_state,
-        kernel.venue_states[0],
-        kernel.as_dict,
-        lambda payload: payload["venue_states"][0],
+        "generated_case_result.final_state_projection",
+        generated_state,
+        generated.final_state_projection,
+        generated.as_dict,
+        lambda payload: payload["final_state_projection"],
     )
     probe(
-        "kernel_result.observable_layer",
-        kernel_observable,
-        kernel.observable_layer,
-        kernel.as_dict,
-        lambda payload: payload["observable_layer"],
+        "generated_case_result.observable_projection",
+        generated_observable,
+        generated.observable_projection,
+        generated.as_dict,
+        lambda payload: payload["observable_projection"],
     )
 
     statistic_evidence = nested_payload()

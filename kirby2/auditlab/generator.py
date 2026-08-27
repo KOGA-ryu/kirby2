@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from itertools import combinations
 
 from kirby2.agents import POPULATION_IDS
 from kirby2.algorithms.models import AlgorithmName
@@ -146,43 +147,6 @@ def _axis_values(seed: int, cell_index: int) -> dict[str, object]:
     return values
 
 
-def coverage_report(configurations: tuple[GeneratedConfiguration, ...]) -> dict[str, object]:
-    """Legacy declaration coverage retained only until the ATR-13 cutover."""
-
-    report: dict[str, object] = {}
-    seeds = {config.seed for config in configurations}
-    report["seed"] = {
-        "expected": "more than one explicitly owned seed",
-        "observed_count": len(seeds),
-        "status": "PASS" if len(seeds) > 1 else "PARTIAL",
-    }
-    for name, options in AXES.items():
-        observed = {getattr(config, name) for config in configurations}
-        expected = set(options)
-        report[name] = {
-            "expected": sorted(str(value) for value in expected),
-            "observed": sorted(str(value) for value in observed),
-            "status": "PASS" if observed == expected else "PARTIAL",
-        }
-    observed_faults = {
-        config.injected_fault
-        for config in configurations
-        if config.injected_fault is not None
-    }
-    report["faults"] = {
-        "expected": sorted(item.value for item in FaultKind),
-        "observed": sorted(item.value for item in observed_faults),
-        "status": "PASS" if observed_faults == set(FaultKind) else "PARTIAL",
-    }
-    agent_counts = {config.agent_count for config in configurations}
-    report["agent_count_reduction_axis"] = {
-        "expected": list(range(1, 9)),
-        "observed": sorted(agent_counts),
-        "status": "PASS" if agent_counts == set(range(1, 9)) else "PARTIAL",
-    }
-    return report
-
-
 def evidence_coverage_report(
     results: tuple[GeneratedCaseResult, ...],
 ) -> dict[str, object]:
@@ -190,6 +154,9 @@ def evidence_coverage_report(
 
     lanes: dict[str, object] = {}
     overall_passed = True
+    missing_configured_value_count = 0
+    unexercised_required_check_count = 0
+    failed_required_check_count = 0
     for lane, capability in CAPABILITY_MATRIX.items():
         lane_results = tuple(result for result in results if result.lane is lane)
         dimensions: dict[str, object] = {}
@@ -197,10 +164,12 @@ def evidence_coverage_report(
             configured: dict[str, object] = {}
             exercised: set[str] = set()
             mismatched_records = 0
+            unexercised_case_count = 0
             for result in lane_results:
                 value = _configuration_dimension(result.configuration, dimension)
                 key = canonical_json(value)
                 configured[key] = value
+                exact_exercise = False
                 for record in result.exercises:
                     if (
                         record.capability != dimension
@@ -210,10 +179,20 @@ def evidence_coverage_report(
                     record_key = canonical_json(record.configured_value)
                     if record_key == key:
                         exercised.add(key)
+                        exact_exercise = True
                     else:
                         mismatched_records += 1
+                unexercised_case_count += not exact_exercise
             missing = sorted(set(configured).difference(exercised))
-            status = "PASS" if configured and not missing else "PARTIAL"
+            missing_configured_value_count += len(missing)
+            status = (
+                "PASS"
+                if configured
+                and not missing
+                and mismatched_records == 0
+                and unexercised_case_count == 0
+                else "PARTIAL"
+            )
             overall_passed = overall_passed and status == "PASS"
             dimensions[dimension] = {
                 "configured_values": [configured[key] for key in sorted(configured)],
@@ -221,6 +200,7 @@ def evidence_coverage_report(
                 "mismatched_record_count": mismatched_records,
                 "missing_values": [configured[key] for key in missing],
                 "status": status,
+                "unexercised_case_count": unexercised_case_count,
             }
 
         checks: dict[str, object] = {}
@@ -235,33 +215,98 @@ def evidence_coverage_report(
                 check.status is not CheckStatus.NOT_EXERCISED for check in reported
             )
             failed_count = sum(check.status is CheckStatus.FAIL for check in reported)
-            status = "PASS" if exercise_count else "PARTIAL"
+            not_exercised_count = sum(
+                check.status is CheckStatus.NOT_EXERCISED for check in reported
+            )
+            missing_case_count = len(lane_results) - len(reported)
+            unexercised_required_check_count += (
+                not_exercised_count + missing_case_count
+            )
+            failed_required_check_count += failed_count
+            status = (
+                "PASS"
+                if lane_results
+                and len(reported) == len(lane_results)
+                and exercise_count == len(lane_results)
+                and failed_count == 0
+                else "PARTIAL"
+            )
             overall_passed = overall_passed and status == "PASS"
             checks[name] = {
                 "exercise_count": exercise_count,
                 "failed_count": failed_count,
-                "not_exercised_count": sum(
-                    check.status is CheckStatus.NOT_EXERCISED for check in reported
-                ),
+                "missing_case_count": missing_case_count,
+                "not_exercised_count": not_exercised_count,
                 "reported_count": len(reported),
                 "status": status,
             }
+        supported_pairs: dict[str, object] = {}
+        for left, right in combinations(capability.credited_dimensions, 2):
+            configured_pairs: dict[str, tuple[object, object]] = {}
+            exercised_pairs: set[str] = set()
+            for result in lane_results:
+                pair = (
+                    _configuration_dimension(result.configuration, left),
+                    _configuration_dimension(result.configuration, right),
+                )
+                key = canonical_json(pair)
+                configured_pairs[key] = pair
+                successful = {
+                    record.capability: canonical_json(record.configured_value)
+                    for record in result.exercises
+                    if record.status is ExerciseStatus.EXERCISED
+                    and record.capability in {left, right}
+                }
+                if successful == {
+                    left: canonical_json(pair[0]),
+                    right: canonical_json(pair[1]),
+                }:
+                    exercised_pairs.add(key)
+            missing_pairs = sorted(
+                set(configured_pairs).difference(exercised_pairs)
+            )
+            pair_status = (
+                "PASS"
+                if configured_pairs and not missing_pairs
+                else "PARTIAL"
+            )
+            overall_passed = overall_passed and pair_status == "PASS"
+            supported_pairs[f"{left}__{right}"] = {
+                "configured_pair_count": len(configured_pairs),
+                "exercised_pair_count": len(exercised_pairs),
+                "missing_pairs": [
+                    list(configured_pairs[key]) for key in missing_pairs
+                ],
+                "status": pair_status,
+            }
         lane_passed = all(
             item["status"] == "PASS"
-            for group in (dimensions, checks)
+            for group in (dimensions, checks, supported_pairs)
             for item in group.values()
         )
         lanes[lane.value] = {
             "case_count": len(lane_results),
             "checks": checks,
             "dimensions": dimensions,
+            "supported_within_lane_pairs": supported_pairs,
             "status": "PASS" if lane_passed else "PARTIAL",
         }
     return {
+        "covered_lane_count": sum(
+            item["status"] == "PASS" for item in lanes.values()
+        ),
+        "failed_required_check_count": failed_required_check_count,
         "lane_count": len(lanes),
         "lanes": lanes,
+        "missing_configured_value_count": missing_configured_value_count,
         "result_count": len(results),
         "status": "PASS" if overall_passed else "PARTIAL",
+        "unexercised_required_check_count": unexercised_required_check_count,
+        "unsupported_cross_lane_interactions": {
+            "credited_pair_count": 0,
+            "pairs": [],
+            "status": "ABSENT_BY_DESIGN",
+        },
     }
 
 
@@ -271,14 +316,6 @@ def _configuration_dimension(
 ) -> object:
     value = getattr(configuration, dimension)
     return value.value if isinstance(value, Enum) else value
-
-
-def minimum_full_coverage_budget(seed: int, limit: int = 10_000) -> int | None:
-    for budget in range(1, limit + 1):
-        report = coverage_report(generate_configurations(seed, budget))
-        if all(item["status"] == "PASS" for item in report.values()):
-            return budget
-    return None
 
 
 def _mix(seed: int, lane: int) -> int:

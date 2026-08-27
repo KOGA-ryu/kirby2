@@ -1,16 +1,21 @@
 """Generative correctness, fault injection, minimization, and immutable evidence."""
 
-from .generator import AXES, coverage_report, generate_configurations
-from .kernel import run_kernel, violation_signatures
+from .generator import AXES, evidence_coverage_report, generate_configurations
+from .kernel import failure_signatures, run_generated_case
 from .models import (
     AUDIT_LAB_SCHEMA_VERSION,
     AcceptanceRecord,
     FaultEvidence,
     FaultKind,
+    GeneratedCaseResult,
     GeneratedConfiguration,
-    KernelResult,
     MinimizedFailure,
     StatisticalCheck,
+)
+from .projectors import (
+    EventLedgerProjector,
+    FillLedgerProjector,
+    PlayerLedgerProjection,
 )
 from .runner import AuditLabResult, run_audit_lab
 from .store import AuditLabStore, DEFAULT_AUDIT_LAB_STORE, PacketRecord
@@ -24,14 +29,17 @@ __all__ = [
     "DEFAULT_AUDIT_LAB_STORE",
     "FaultEvidence",
     "FaultKind",
+    "GeneratedCaseResult",
     "GeneratedConfiguration",
-    "KernelResult",
+    "EventLedgerProjector",
+    "FillLedgerProjector",
     "MinimizedFailure",
     "PacketRecord",
+    "PlayerLedgerProjection",
     "StatisticalCheck",
-    "coverage_report",
+    "evidence_coverage_report",
+    "failure_signatures",
     "generate_configurations",
     "run_audit_lab",
-    "run_kernel",
-    "violation_signatures",
+    "run_generated_case",
 ]

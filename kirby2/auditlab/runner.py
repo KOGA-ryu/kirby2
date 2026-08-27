@@ -10,12 +10,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .generator import coverage_report, generate_configurations
-from .kernel import run_kernel, violation_signatures
+from .generator import evidence_coverage_report, generate_configurations
+from .kernel import failure_signatures, run_generated_case
 from .minimizer import minimize_failure
 from .models import (
     AUDIT_LAB_SCHEMA_VERSION,
     AcceptanceRecord,
+    CheckResult,
+    CheckStatus,
+    GeneratedCaseResult,
     GeneratedConfiguration,
     MinimizedFailure,
     StatisticalCheck,
@@ -39,7 +42,7 @@ class AuditLabResult:
     provenance: dict[str, object]
     minimized_failures: tuple[MinimizedFailure, ...]
     statistics: tuple[StatisticalCheck, ...]
-    probes: dict[str, dict[str, object]]
+    probes: tuple[CheckResult, ...]
     acceptance: AcceptanceRecord
     unexpected_violations: tuple[dict[str, object], ...]
     packet: PacketRecord | None
@@ -49,13 +52,16 @@ class AuditLabResult:
         return all(
             (
                 not self.unexpected_violations,
-                all(item["status"] == "PASS" for item in self.coverage.values()),
+                self.coverage["status"] == "PASS",
                 self.determinism["status"] == "PASS",
                 self.replay_parity["status"] == "PASS",
                 self.fault_summary["status"] == "PASS",
                 all(item.preserved for item in self.minimized_failures),
                 all(item.status != "FAIL" for item in self.statistics),
-                all(item["status"] == "PASS" for item in self.probes.values()),
+                all(
+                    item.status is CheckStatus.PASS or not item.required
+                    for item in self.probes
+                ),
                 self.packet is None or self.packet.verification_status == "PASS",
             )
         )
@@ -67,7 +73,7 @@ class AuditLabResult:
             "case_result_sha256": canonical_sha256(self.cases),
             "coverage_status": (
                 "PASS"
-                if all(item["status"] == "PASS" for item in self.coverage.values())
+                if self.coverage["status"] == "PASS"
                 else "PARTIAL"
             ),
             "determinism": self.determinism,
@@ -76,7 +82,7 @@ class AuditLabResult:
             "minimized_failure_count": len(self.minimized_failures),
             "packet": None if self.packet is None else self.packet.as_dict(),
             "probe_status": {
-                name: item["status"] for name, item in self.probes.items()
+                item.name: item.status.value for item in self.probes
             },
             "replay_parity": self.replay_parity,
             "seed": self.seed,
@@ -120,7 +126,7 @@ class AuditLabResult:
                 f"{item.name}={item.status}" for item in self.statistics
             ),
             "PROBES " + " ".join(
-                f"{name}={item['status']}" for name, item in self.probes.items()
+                f"{item.name}={item.status.value}" for item in self.probes
             ),
             (
                 "MANUAL_ACCEPTANCE "
@@ -148,7 +154,7 @@ def run_audit_lab(
     subsystem_probes: bool = True,
 ) -> AuditLabResult:
     configurations = generate_configurations(seed, budget)
-    coverage = coverage_report(configurations)
+    generated_results: list[GeneratedCaseResult] = []
     cases: list[dict[str, object]] = []
     unexpected: list[dict[str, object]] = []
     signature_sources: dict[str, GeneratedConfiguration] = {}
@@ -156,17 +162,18 @@ def run_audit_lab(
     detected_count = 0
     replay_failures = 0
     for configuration in configurations:
-        result = run_kernel(configuration)
+        result = run_generated_case(configuration)
+        generated_results.append(result)
         replay_configuration = GeneratedConfiguration.from_dict(
             json.loads(canonical_json(configuration.as_dict()))
         )
-        replay = run_kernel(replay_configuration)
-        replay_match = replay.result_digest == result.result_digest
+        replay = run_generated_case(replay_configuration)
+        replay_match = replay.result_sha256 == result.result_sha256
         replay_failures += not replay_match
-        signatures = violation_signatures(result)
-        if result.fault_evidence is not None:
+        signatures = failure_signatures(result)
+        if result.expected_fault is not None:
             injected_count += 1
-            detected_count += result.fault_evidence.detected
+            detected_count += result.expected_fault.detected
         for signature in signatures:
             signature_sources.setdefault(signature, configuration)
             if not signature.startswith("EXPECTED_FAULT:"):
@@ -186,18 +193,25 @@ def run_audit_lab(
                 }
             )
         cases.append(_compact_case(result, replay_match))
+    coverage = evidence_coverage_report(tuple(generated_results))
     minimized = tuple(
         minimize_failure(configuration, signature)
         for signature, configuration in sorted(signature_sources.items())
     )
     statistics = statistical_checks(tuple(cases))
-    probes = run_subsystem_probes(seed) if subsystem_probes else {
-        "subsystem_probes": {
-            "evidence": {"reason": "explicitly disabled by caller"},
-            "evidence_sha256": canonical_sha256("disabled"),
-            "status": "PASS",
-        }
-    }
+    probes = (
+        run_subsystem_probes(seed)
+        if subsystem_probes
+        else (
+            CheckResult(
+                name="subsystem_probes",
+                status=CheckStatus.NOT_EXERCISED,
+                required=False,
+                detail="subsystem probes explicitly disabled by caller",
+                evidence={"source": "run_audit_lab", "reason": "caller_disabled"},
+            ),
+        )
+    )
     determinism = _fresh_process_determinism(
         configurations,
         max(1, fresh_process_samples),
@@ -219,7 +233,10 @@ def run_audit_lab(
     acceptance = _acceptance_record(
         seed,
         tuple(cases),
+        coverage,
         determinism,
+        replay_parity,
+        fault_summary,
         tuple(minimized),
         statistics,
         probes,
@@ -264,24 +281,98 @@ def run_audit_lab(
     )
 
 
-def _compact_case(result, replay_match: bool) -> dict[str, object]:
-    checks = dict(sorted(result.invariant_checks.items()))
-    checks["replay_digest_parity"] = replay_match
+def _compact_case(
+    result: GeneratedCaseResult,
+    replay_match: bool,
+) -> dict[str, object]:
+    exercises = [
+        {
+            **item.as_dict(),
+            "evidence_sha256": canonical_sha256(item.as_dict()["evidence"]),
+        }
+        for item in result.exercises
+    ]
+    checks = [
+        {
+            **item.as_dict(),
+            "evidence_sha256": canonical_sha256(item.as_dict()["evidence"]),
+        }
+        for item in result.checks
+    ]
+    typed_metrics = result.declared_outputs()["metrics"]
+    if not isinstance(typed_metrics, dict):
+        raise TypeError("generated case metrics must serialize as an object")
     return {
         "configuration": result.configuration.as_dict(),
         "configuration_sha256": result.configuration.sha256,
-        "event_digest": result.event_digest,
+        "event_digest": result.event_sha256,
+        "exercises": exercises,
         "fault_evidence": (
-            None if result.fault_evidence is None else result.fault_evidence.as_dict()
+            None
+            if result.expected_fault is None
+            else result.expected_fault.as_dict()
         ),
+        "failures": [item.as_dict() for item in result.failures],
         "invariant_checks": checks,
-        "metrics": dict(sorted(result.metrics.items())),
+        "lane": result.lane.value,
+        "metrics": _legacy_statistical_projection(result, typed_metrics),
+        "observable_projection_sha256": result.declared_outputs()[
+            "observable_projection_sha256"
+        ],
+        "recording_sha256": result.recording.sha256,
+        "recording_type": result.recording.recording_type,
         "replay_digest_parity": replay_match,
-        "result_digest": result.result_digest,
-        "state_digest": result.state_digest,
+        "result_digest": result.result_sha256,
+        "source_evidence_sha256": canonical_sha256(
+            {"checks": checks, "exercises": exercises}
+        ),
+        "state_digest": result.state_sha256,
         "status": "PASS" if result.passed and replay_match else "FAIL",
-        "violations": list(result.violations),
+        "typed_metrics": typed_metrics,
+        "violations": list(failure_signatures(result)),
     }
+
+
+def _legacy_statistical_projection(
+    result: GeneratedCaseResult,
+    typed_metrics: dict[str, object],
+) -> dict[str, object]:
+    """Preserve pre-ATR-17 screens without inventing subsystem behavior."""
+
+    metrics = dict(typed_metrics)
+    metrics.setdefault("event_count", len(result.event_projection))
+    metrics.setdefault(
+        "trade_count",
+        typed_metrics.get("core_trade_count", 0),
+    )
+    metrics.setdefault(
+        "traded_volume",
+        next(
+            (
+                typed_metrics[name]
+                for name in (
+                    "traded_volume_shares",
+                    "route_completed_quantity",
+                    "client_filled_quantity",
+                    "auction_matched_volume_shares",
+                )
+                if name in typed_metrics
+            ),
+            0,
+        ),
+    )
+    metrics.setdefault("price_displacement_ticks", 0)
+    ending_bid = typed_metrics.get("ending_best_bid_ticks")
+    ending_ask = typed_metrics.get("ending_best_ask_ticks")
+    metrics.setdefault(
+        "spread_ticks",
+        (
+            ending_ask - ending_bid
+            if type(ending_bid) is int and type(ending_ask) is int
+            else None
+        ),
+    )
+    return dict(sorted(metrics.items()))
 
 
 def _fresh_process_determinism(
@@ -301,7 +392,9 @@ def _fresh_process_determinism(
     environment["PYTHONHASHSEED"] = "0"
     for index in indices:
         configuration = configurations[index]
-        expected = canonical_json(run_kernel(configuration).declared_outputs())
+        expected = canonical_json(
+            run_generated_case(configuration).declared_outputs()
+        )
         outputs = []
         for _ in range(2):
             completed = subprocess.run(
@@ -342,7 +435,10 @@ def _fresh_process_determinism(
 def _acceptance_record(
     seed,
     cases,
+    coverage,
     determinism,
+    replay_parity,
+    fault_summary,
     minimized,
     statistics,
     probes,
@@ -352,16 +448,25 @@ def _acceptance_record(
     warning_names = tuple(item.name for item in statistics if item.status == "WARNING")
     failed = (
         bool(unexpected)
+        or coverage["status"] != "PASS"
         or determinism["status"] != "PASS"
+        or replay_parity["status"] != "PASS"
+        or fault_summary["status"] != "PASS"
         or any(item.status == "FAIL" for item in statistics)
-        or any(item["status"] != "PASS" for item in probes.values())
+        or any(
+            item.required and item.status is not CheckStatus.PASS
+            for item in probes
+        )
         or any(not item.preserved for item in minimized)
     )
     artifacts = {
         "cases": canonical_sha256(cases),
+        "coverage": canonical_sha256(coverage),
         "determinism": canonical_sha256(determinism),
+        "fault_summary": canonical_sha256(fault_summary),
         "minimized_failures": canonical_sha256([item.as_dict() for item in minimized]),
-        "probes": canonical_sha256(probes),
+        "probes": canonical_sha256([item.as_dict() for item in probes]),
+        "replay_parity": canonical_sha256(replay_parity),
         "statistics": canonical_sha256([item.as_dict() for item in statistics]),
         "implementation": str(provenance["implementation_sha256"]),
     }
@@ -416,7 +521,10 @@ def _persist_result(
             [item.as_dict() for item in result.minimized_failures]
         )
         + "\n",
-        "probes.json": canonical_json(result.probes) + "\n",
+        "probes.json": canonical_json(
+            [item.as_dict() for item in result.probes]
+        )
+        + "\n",
         "replay_parity.json": canonical_json(result.replay_parity) + "\n",
         "statistics.json": canonical_json(
             [item.as_dict() for item in result.statistics]
@@ -426,12 +534,12 @@ def _persist_result(
     }
     if save_failures:
         for minimized in result.minimized_failures:
-            reproducer = run_kernel(minimized.minimized_configuration)
+            reproducer = run_generated_case(minimized.minimized_configuration)
             name = canonical_sha256(minimized.signature)[:20]
             artifacts[f"failures/{name}.json"] = canonical_json(
                 {
                     "minimization": minimized.as_dict(),
-                    "reproducer": reproducer.as_dict(include_events=True),
+                    "reproducer": reproducer.as_dict(),
                 }
             ) + "\n"
     identity = {
@@ -444,7 +552,9 @@ def _persist_result(
         "minimized_failures_sha256": canonical_sha256(
             [item.as_dict() for item in result.minimized_failures]
         ),
-        "probe_sha256": canonical_sha256(result.probes),
+        "probe_sha256": canonical_sha256(
+            [item.as_dict() for item in result.probes]
+        ),
         "save_failures": save_failures,
         "schema_version": AUDIT_LAB_SCHEMA_VERSION,
         "seed": result.seed,

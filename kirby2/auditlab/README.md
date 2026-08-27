@@ -22,14 +22,26 @@ declared value only when the corresponding real executor returns an
 `EXERCISED` record for that exact value. An empty registry refuses execution;
 there is no placeholder executor.
 
-The original high-throughput kernel and its declaration-based coverage report
-remain explicitly legacy during the staged executor migration. They continue
-to support the pre-cutover audit packet while real lanes are added one by one.
-The generated runner will stop using them at the ATR-13 cutover. Until then,
-legacy kernel output must not be interpreted as evidence that the declared
-subsystem capabilities ran. Targeted runtime probes continue to exercise the
-actual auction, asynchronous latency, hidden-liquidity, multi-venue,
-agent-ecology, Hawkes, market-data, and causal-branch implementations.
+The generated runner dispatches every case through `run_generated_case()` and
+the lane-keyed executor registry. The former facsimile kernel and its
+declaration-based coverage report have been removed. Coverage is derived only
+from matching `EXERCISED` records and required typed checks. It reports missing
+configured values and supported pairs inside each lane; no cross-lane
+interaction receives implicit credit.
+
+Player cash and position in the core-flow lane are independently reconstructed
+by `FillLedgerProjector` from the immutable fill ledger and by
+`EventLedgerProjector` from submitted/fill events. The projectors have separate
+algorithms and local accumulators. Targeted subsystem probes also return typed
+`CheckResult` records. In particular, `branch_parent_consistency` records the
+verified parent ID and digest, exact fork-prefix equality, post-fork mutation,
+and immutable branch verification; generated lanes do not claim that check.
+
+The fault lane now has the same typed execution contract as the six scientific
+lanes. Its current explicit detector observations remain the input to the next
+repair stage, which separates production fault injection from an independent
+expected-code oracle. Typed wrapping alone is not evidence that those detector
+internals are already independent.
 
 The ten injected faults are never hidden in random noise. Each has a manifest,
 injection point, detector, expected code, detected code, and evidence. Detected
