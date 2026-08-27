@@ -29,6 +29,14 @@ from matching `EXERCISED` records and required typed checks. It reports missing
 configured values and supported pairs inside each lane; no cross-lane
 interaction receives implicit credit.
 
+Case-recording schema v2 contains the starting configuration, explicit command
+tape or native subsystem recording, and expected event, state, observable,
+metric, and declared-output digests. The runner canonicalizes the complete
+recording to JSON, verifies it with `CaseRecording.from_dict()`, and invokes the
+lane's distinct `replay()` path. Replay does not regenerate a case from its
+configuration. Fresh-process determinism is a separate worker predicate and
+samples every executor lane and all ten fault families.
+
 Player cash and position in the core-flow lane are independently reconstructed
 by `FillLedgerProjector` from the immutable fill ledger and by
 `EventLedgerProjector` from submitted/fill events. The projectors have separate
@@ -51,10 +59,24 @@ failures or minimization. A missing or wrong production code is reported as a
 `FAULT_MISS` oracle outcome and fails the fault summary without pretending that
 the injected adversarial condition is a simulator defect.
 
-Each unexpected stable violation signature is reduced by rerunning candidates while
-shrinking duration, event count, participant count, venue count, and remaining
-configuration complexity. A reduction is accepted only if the same signature
-survives.
+Only reproducible unexpected defects enter minimization. A typed
+`FailureIdentity` binds predicate class, failure kind, stable code, lane,
+check/field name, source configuration digest, source recording digest, and any
+predicate parameters. The five predicates are `STRUCTURAL_CHECK`,
+`REPLAY_MISMATCH`, `DETERMINISM_MISMATCH`, `FAULT_MISS`, and
+`SUBSYSTEM_PROBE`. Replay reproduction always captures, serializes, loads, and
+replays a recording; determinism reproduction always launches two distinct
+workers.
+
+Reducers change only lane-supported dimensions: simulated duration or command
+count, agent count, venue count, and the lane's own configuration complexity.
+They never change executor lane or required fault kind. Each attempted change
+is stored as accepted or rejected with its observation digest. The final
+reproducer stores its schema-v2 recording and is executed twice; both
+verification digests and both reproduction outcomes are retained. If the
+normal run has no unexpected reproducible failures, its minimized-defect count
+is zero. Expected detections of the ten adversarial fault cases never become
+minimized defects.
 
 Run the requested substantial audit:
 

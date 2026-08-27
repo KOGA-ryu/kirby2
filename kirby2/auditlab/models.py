@@ -149,6 +149,14 @@ class FailureKind(str, Enum):
     UNCLASSIFIED = "UNCLASSIFIED"
 
 
+class FailurePredicateKind(str, Enum):
+    STRUCTURAL_CHECK = "STRUCTURAL_CHECK"
+    REPLAY_MISMATCH = "REPLAY_MISMATCH"
+    DETERMINISM_MISMATCH = "DETERMINISM_MISMATCH"
+    FAULT_MISS = "FAULT_MISS"
+    SUBSYSTEM_PROBE = "SUBSYSTEM_PROBE"
+
+
 class AutomatedStatus(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
@@ -455,6 +463,93 @@ class FailureObservation:
             "kind": self.kind.value,
             "message": self.message,
         }
+
+    def identity(
+        self,
+        *,
+        predicate: FailurePredicateKind,
+        lane: ExecutorLane,
+        field_name: str,
+        source_configuration_sha256: str,
+        source_recording_sha256: str,
+        predicate_parameters: Mapping[str, object] | None = None,
+    ) -> FailureIdentity:
+        return FailureIdentity(
+            predicate=predicate,
+            kind=self.kind,
+            code=self.code,
+            lane=lane,
+            field_name=field_name,
+            source_configuration_sha256=source_configuration_sha256,
+            source_recording_sha256=source_recording_sha256,
+            predicate_parameters=(
+                {} if predicate_parameters is None else predicate_parameters
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FailureIdentity:
+    predicate: FailurePredicateKind
+    kind: FailureKind
+    code: str
+    lane: ExecutorLane
+    field_name: str
+    source_configuration_sha256: str
+    source_recording_sha256: str
+    predicate_parameters: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.predicate, FailurePredicateKind):
+            raise TypeError("failure identity predicate is invalid")
+        if not isinstance(self.kind, FailureKind):
+            raise TypeError("failure identity kind is invalid")
+        if not isinstance(self.lane, ExecutorLane):
+            raise TypeError("failure identity lane is invalid")
+        if any(
+            type(value) is not str or not value
+            for value in (self.code, self.field_name)
+        ):
+            raise ValueError("failure identity code and field are required")
+        if any(
+            type(value) is not str or not _SHA256.fullmatch(value)
+            for value in (
+                self.source_configuration_sha256,
+                self.source_recording_sha256,
+            )
+        ):
+            raise ValueError("failure identity source digests are invalid")
+        object.__setattr__(
+            self,
+            "predicate_parameters",
+            _frozen_mapping(
+                self.predicate_parameters,
+                "failure identity predicate parameters",
+            ),
+        )
+
+    def identity_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "field_name": self.field_name,
+            "kind": self.kind.value,
+            "lane": self.lane.value,
+            "predicate": self.predicate.value,
+            "predicate_parameters": thaw_json(self.predicate_parameters),
+            "source_configuration_sha256": self.source_configuration_sha256,
+            "source_recording_sha256": self.source_recording_sha256,
+        }
+
+    @property
+    def signature(self) -> str:
+        return (
+            f"{self.predicate.value}:{self.lane.value}:{self.kind.value}:"
+            f"{self.code}:{self.field_name}:"
+            f"{canonical_sha256(self.identity_dict())[:20]}"
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.identity_dict(), "signature": self.signature}
 
 
 @dataclass(frozen=True, slots=True)
@@ -827,22 +922,128 @@ def _without_recording_identity(value: object) -> object:
 
 
 @dataclass(frozen=True, slots=True)
-class MinimizedFailure:
-    signature: str
-    source_configuration_sha256: str
-    minimized_configuration: GeneratedConfiguration
-    attempts: int
-    preserved: bool
-    result_digest: str
+class MinimizationAttempt:
+    sequence: int
+    change: Mapping[str, object]
+    accepted: bool
+    reproduced: bool
+    command_count_before: int
+    command_count_after: int | None
+    observation_sha256: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("minimization attempt sequence must be positive")
+        object.__setattr__(
+            self,
+            "change",
+            _frozen_mapping(self.change, "minimization attempt change"),
+        )
+        if type(self.accepted) is not bool or type(self.reproduced) is not bool:
+            raise TypeError("minimization attempt outcomes must be boolean")
+        if self.accepted and not self.reproduced:
+            raise ValueError("accepted minimization must reproduce its predicate")
+        if type(self.command_count_before) is not int or self.command_count_before < 0:
+            raise ValueError("minimization command count before must be nonnegative")
+        if self.command_count_after is not None and (
+            type(self.command_count_after) is not int
+            or self.command_count_after < 0
+        ):
+            raise ValueError("minimization command count after must be nonnegative")
+        if not _SHA256.fullmatch(self.observation_sha256):
+            raise ValueError("minimization observation digest is invalid")
+        if type(self.detail) is not str or not self.detail:
+            raise ValueError("minimization attempt detail is required")
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "attempts": self.attempts,
+            "accepted": self.accepted,
+            "change": thaw_json(self.change),
+            "command_count_after": self.command_count_after,
+            "command_count_before": self.command_count_before,
+            "detail": self.detail,
+            "observation_sha256": self.observation_sha256,
+            "reproduced": self.reproduced,
+            "sequence": self.sequence,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinimizedFailure:
+    identity: FailureIdentity
+    minimized_configuration: GeneratedConfiguration
+    attempts: tuple[MinimizationAttempt, ...]
+    final_recording: CaseRecording
+    verification_digests: tuple[str, str]
+    verification_reproduced: tuple[bool, bool]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, FailureIdentity):
+            raise TypeError("minimized failure requires FailureIdentity")
+        if not isinstance(self.minimized_configuration, GeneratedConfiguration):
+            raise TypeError("minimized failure requires GeneratedConfiguration")
+        if self.minimized_configuration.lane is not self.identity.lane:
+            raise ValueError("minimized failure changed executor lane")
+        if any(not isinstance(item, MinimizationAttempt) for item in self.attempts):
+            raise TypeError("minimized failure attempts are invalid")
+        if tuple(item.sequence for item in self.attempts) != tuple(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise ValueError("minimized failure attempt sequence is incomplete")
+        if not isinstance(self.final_recording, CaseRecording):
+            raise TypeError("minimized failure requires a final recording")
+        if self.final_recording.lane is not self.identity.lane:
+            raise ValueError("minimized recording changed executor lane")
+        if not self.final_recording.expected_outputs:
+            raise ValueError("minimized final recording is not finalized")
+        final_payload = thaw_json(self.final_recording.payload)
+        if final_payload.get("configuration") != self.minimized_configuration.as_dict():
+            raise ValueError("minimized recording configuration does not reconcile")
+        if len(self.verification_digests) != 2:
+            raise ValueError("minimized failure requires two verification digests")
+        if any(not _SHA256.fullmatch(item) for item in self.verification_digests):
+            raise ValueError("minimized verification digests are invalid")
+        if len(self.verification_reproduced) != 2:
+            raise ValueError("minimized failure requires two verification outcomes")
+        if any(type(item) is not bool for item in self.verification_reproduced):
+            raise TypeError("minimized verification outcomes must be boolean")
+
+    @property
+    def signature(self) -> str:
+        return self.identity.signature
+
+    @property
+    def source_configuration_sha256(self) -> str:
+        return self.identity.source_configuration_sha256
+
+    @property
+    def preserved(self) -> bool:
+        return all(self.verification_reproduced)
+
+    @property
+    def result_digest(self) -> str:
+        return self.verification_digests[-1]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "accepted_reductions": [
+                item.as_dict() for item in self.attempts if item.accepted
+            ],
+            "attempt_count": len(self.attempts),
+            "attempts": [item.as_dict() for item in self.attempts],
+            "final_recording": self.final_recording.as_dict(),
+            "identity": self.identity.as_dict(),
             "minimized_configuration": self.minimized_configuration.as_dict(),
             "preserved": self.preserved,
+            "rejected_reductions": [
+                item.as_dict() for item in self.attempts if not item.accepted
+            ],
             "result_digest": self.result_digest,
             "signature": self.signature,
             "source_configuration_sha256": self.source_configuration_sha256,
+            "verification_digests": list(self.verification_digests),
+            "verification_reproduced": list(self.verification_reproduced),
         }
 
 

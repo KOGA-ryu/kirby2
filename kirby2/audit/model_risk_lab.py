@@ -44,6 +44,10 @@ from kirby2.auditlab.generator import (
     evidence_coverage_report,
     generate_configurations,
 )
+from kirby2.auditlab.minimizer import (
+    AuditPredicateInjection,
+    minimize_failure,
+)
 from kirby2.auditlab.models import (
     AUDIT_LAB_SCHEMA_VERSION,
     AUDIT_PACKET_SCHEMA_VERSION,
@@ -59,7 +63,9 @@ from kirby2.auditlab.models import (
     ExerciseRecord,
     ExerciseStatus,
     FailureKind,
+    FailureIdentity,
     FailureObservation,
+    FailurePredicateKind,
     FaultObservation,
     GeneratedCaseResult,
     GeneratedConfiguration,
@@ -2356,31 +2362,249 @@ def _serialized_replay_mutation_probe() -> dict[str, object]:
 
 
 def _minimization_case(result) -> ModelRiskLabAuditCase:
+    import kirby2.auditlab.minimizer as failure_minimizer
+
     failures = []
-    unexpected_signatures = {
-        item["signature"] for item in result.unexpected_violations
+    reproducible_unexpected_signatures = {
+        item["signature"]
+        for item in result.unexpected_violations
+        if item["reproducible"]
     }
     minimized_signatures = {
         item.signature for item in result.minimized_failures
     }
-    if minimized_signatures != unexpected_signatures:
-        failures.append("unexpected failure and minimized-signature inventories differ")
+    controlled = _controlled_minimization_probes()
+    minimizer_source = inspect.getsource(failure_minimizer)
+    predicate_inventory = {
+        predicate.value
+        for predicate in FailurePredicateKind
+        if f"FailurePredicateKind.{predicate.name}" in minimizer_source
+    }
+    predicate_implementation_complete = predicate_inventory == {
+        item.value for item in FailurePredicateKind
+    }
+    replay_loader_proved = all(
+        token in inspect.getsource(failure_minimizer._observe_replay)
+        for token in (
+            "CaseRecording.from_dict",
+            "EXECUTOR_REGISTRY.replay",
+        )
+    )
+    distinct_workers_proved = all(
+        token in inspect.getsource(failure_minimizer._observe_determinism)
+        for token in ("subprocess.run", "range(2)")
+    )
+    if minimized_signatures != reproducible_unexpected_signatures:
+        failures.append(
+            "reproducible unexpected and minimized identity inventories differ"
+        )
     if any(
-        item.signature.startswith(("EXPECTED_FAULT:", "FAULT_MISS:"))
+        item.identity.predicate is FailurePredicateKind.FAULT_MISS
         for item in result.minimized_failures
     ):
         failures.append("an expected fault observation entered minimization")
     if any(not item.preserved for item in result.minimized_failures):
-        failures.append("a minimization lost its violation signature")
+        failures.append("a minimization lost its typed failure identity")
+    if not controlled["passed"]:
+        failures.append("controlled structural or replay minimization failed")
+    if not predicate_implementation_complete:
+        failures.append("typed minimization predicate inventory is incomplete")
+    if not replay_loader_proved or not distinct_workers_proved:
+        failures.append("replay or determinism predicate bypasses its real path")
     return ModelRiskLabAuditCase(
-        "expected_faults_are_observations_not_minimization_sources",
+        "only_reproducible_typed_defects_are_minimized",
         {
+            "controlled_predicates": controlled,
+            "distinct_workers_proved": distinct_workers_proved,
             "minimized": [item.as_dict() for item in result.minimized_failures],
+            "minimizer_source_sha256": canonical_sha256(minimizer_source),
+            "predicate_implementation_complete": (
+                predicate_implementation_complete
+            ),
+            "predicate_inventory": sorted(predicate_inventory),
+            "replay_loader_proved": replay_loader_proved,
             "signature_count": len(result.minimized_failures),
-            "unexpected_signatures": sorted(unexpected_signatures),
+            "reproducible_unexpected_signatures": sorted(
+                reproducible_unexpected_signatures
+            ),
+            "unexpected": list(result.unexpected_violations),
         },
         tuple(failures),
     )
+
+
+def _controlled_minimization_probes() -> dict[str, object]:
+    configuration = replace(
+        next(
+            item
+            for item in generate_configurations(seed=771, budget=840)
+            if item.lane is ExecutorLane.CORE_FLOW
+        ),
+        duration_us=2_000_000,
+    )
+    source = EXECUTOR_REGISTRY.execute(configuration)
+    structural_failure = FailureObservation(
+        kind=FailureKind.INVARIANT_VIOLATION,
+        code="AUDIT_CONTROLLED_STRUCTURAL_CHECK",
+        message="controlled audit-only structural failure",
+        evidence={
+            "check": "controlled_structural_check",
+            "source": "model-risk-runtime-audit",
+        },
+    )
+    structural_identity = structural_failure.identity(
+        predicate=FailurePredicateKind.STRUCTURAL_CHECK,
+        lane=configuration.lane,
+        field_name="controlled_structural_check",
+        source_configuration_sha256=configuration.sha256,
+        source_recording_sha256=source.recording.sha256,
+    )
+
+    def inject_structural_case(
+        generated: GeneratedCaseResult,
+    ) -> GeneratedCaseResult:
+        check = CheckResult(
+            name="controlled_structural_check",
+            status=CheckStatus.FAIL,
+            required=True,
+            detail="controlled audit-only structural failure",
+            evidence={"source": "model-risk-runtime-audit"},
+        )
+        return replace(
+            generated,
+            checks=(*generated.checks, check),
+            failures=(*generated.failures, structural_failure),
+        )
+
+    structural = minimize_failure(
+        configuration,
+        structural_identity,
+        audit_injection=AuditPredicateInjection(
+            case_transform=inject_structural_case
+        ),
+    )
+    replay_identity = FailureIdentity(
+        predicate=FailurePredicateKind.REPLAY_MISMATCH,
+        kind=FailureKind.REPLAY_MISMATCH,
+        code="AUDIT_CONTROLLED_REPLAY_MISMATCH",
+        lane=configuration.lane,
+        field_name="event",
+        source_configuration_sha256=configuration.sha256,
+        source_recording_sha256=source.recording.sha256,
+        predicate_parameters={},
+    )
+
+    def mutate_recording(recording: CaseRecording) -> CaseRecording:
+        payload = thaw_json(recording.payload)
+        flow_event = next(
+            item
+            for item in payload["flow_events"]
+            if item["applied"]
+            and int(item["command"].get("quantity", 0)) > 1
+        )
+        quantity = int(flow_event["command"]["quantity"])
+        flow_event["command"]["quantity"] = max(1, quantity // 2)
+        return CaseRecording(
+            lane=recording.lane,
+            recording_type=recording.recording_type,
+            payload=payload,
+            expected_outputs=recording.expected_outputs,
+        )
+
+    replay = minimize_failure(
+        configuration,
+        replay_identity,
+        audit_injection=AuditPredicateInjection(
+            recording_transform=mutate_recording
+        ),
+    )
+    controlled_items = (structural, replay)
+    present = all(item is not None for item in controlled_items)
+    realized = tuple(item for item in controlled_items if item is not None)
+    classes = {item.identity.predicate.value for item in realized}
+    preserved = all(item.preserved for item in realized)
+    two_verifications = all(
+        len(item.verification_digests) == 2
+        and len(item.verification_reproduced) == 2
+        for item in realized
+    )
+    final_recordings = all(
+        item.final_recording.schema_version == CASE_RECORDING_SCHEMA_VERSION
+        and item.final_recording.expected_outputs
+        for item in realized
+    )
+    replay_attempt_inventory = (
+        replay is not None
+        and any(item.accepted for item in replay.attempts)
+        and any(not item.accepted for item in replay.attempts)
+    )
+    command_count_reduced = any(
+        attempt.accepted
+        and attempt.command_count_after is not None
+        and attempt.command_count_after < attempt.command_count_before
+        for item in realized
+        for attempt in item.attempts
+    )
+    lane_and_fault_preserved = all(
+        item.minimized_configuration.lane is configuration.lane
+        and item.minimized_configuration.injected_fault
+        is configuration.injected_fault
+        for item in realized
+    )
+    passed = all(
+        (
+            present,
+            len(realized) == 2,
+            classes
+            == {
+                FailurePredicateKind.STRUCTURAL_CHECK.value,
+                FailurePredicateKind.REPLAY_MISMATCH.value,
+            },
+            preserved,
+            two_verifications,
+            final_recordings,
+            replay_attempt_inventory,
+            command_count_reduced,
+            lane_and_fault_preserved,
+        )
+    )
+    return {
+        "classes": sorted(classes),
+        "items": [
+            {
+                "accepted_reduction_count": sum(
+                    attempt.accepted for attempt in item.attempts
+                ),
+                "attempt_count": len(item.attempts),
+                "command_count_changes": [
+                    {
+                        "accepted": attempt.accepted,
+                        "after": attempt.command_count_after,
+                        "before": attempt.command_count_before,
+                    }
+                    for attempt in item.attempts
+                ],
+                "final_recording_sha256": item.final_recording.sha256,
+                "identity": item.identity.as_dict(),
+                "minimized_configuration_sha256": (
+                    item.minimized_configuration.sha256
+                ),
+                "preserved": item.preserved,
+                "rejected_reduction_count": sum(
+                    not attempt.accepted for attempt in item.attempts
+                ),
+                "verification_digests": list(item.verification_digests),
+                "verification_reproduced": list(
+                    item.verification_reproduced
+                ),
+            }
+            for item in realized
+        ],
+        "lane_and_fault_preserved": lane_and_fault_preserved,
+        "passed": passed,
+        "command_count_reduced": command_count_reduced,
+        "replay_attempt_inventory": replay_attempt_inventory,
+    }
 
 
 def _statistics_case(result) -> ModelRiskLabAuditCase:

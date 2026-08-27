@@ -23,6 +23,9 @@ from .models import (
     CheckResult,
     CheckStatus,
     ExecutorLane,
+    FailureIdentity,
+    FailureKind,
+    FailurePredicateKind,
     FaultKind,
     GeneratedCaseResult,
     GeneratedConfiguration,
@@ -167,7 +170,10 @@ def run_audit_lab(
     generated_results: list[GeneratedCaseResult] = []
     cases: list[dict[str, object]] = []
     unexpected: list[dict[str, object]] = []
-    signature_sources: dict[str, GeneratedConfiguration] = {}
+    failure_sources: dict[
+        str,
+        tuple[GeneratedConfiguration, FailureIdentity],
+    ] = {}
     fault_observations: list[dict[str, object]] = []
     injected_count = 0
     detected_count = 0
@@ -210,30 +216,100 @@ def run_audit_lab(
                     "observation": result.fault_observation.as_dict(),
                 }
             )
-        signatures = failure_signatures(result)
-        for signature in signatures:
-            signature_sources.setdefault(signature, configuration)
-            unexpected.append(
-                {
-                    "configuration_sha256": configuration.sha256,
-                    "signature": signature,
-                }
+        represented_fields: set[str] = set()
+        for failure in result.failures:
+            predicate = (
+                FailurePredicateKind.REPLAY_MISMATCH
+                if failure.kind is FailureKind.REPLAY_MISMATCH
+                else FailurePredicateKind.DETERMINISM_MISMATCH
+                if failure.kind is FailureKind.DETERMINISM_MISMATCH
+                else FailurePredicateKind.STRUCTURAL_CHECK
+            )
+            field_name = _failure_field(failure.evidence, failure.code)
+            if field_name == failure.code and predicate in {
+                FailurePredicateKind.REPLAY_MISMATCH,
+                FailurePredicateKind.DETERMINISM_MISMATCH,
+            }:
+                field_name = "declared_outputs"
+            represented_fields.add(field_name)
+            identity = failure.identity(
+                predicate=predicate,
+                lane=result.lane,
+                field_name=field_name,
+                source_configuration_sha256=configuration.sha256,
+                source_recording_sha256=result.recording.sha256,
+            )
+            _register_unexpected(
+                failure_sources,
+                unexpected,
+                configuration,
+                identity,
+            )
+        for check in result.checks:
+            if (
+                check.name in represented_fields
+                or check.status is CheckStatus.PASS
+                or (
+                    check.status is CheckStatus.NOT_EXERCISED
+                    and not check.required
+                )
+            ):
+                continue
+            identity = FailureIdentity(
+                predicate=FailurePredicateKind.STRUCTURAL_CHECK,
+                kind=FailureKind.INVARIANT_VIOLATION,
+                code=f"{result.lane.value}_{check.name.upper()}",
+                lane=result.lane,
+                field_name=check.name,
+                source_configuration_sha256=configuration.sha256,
+                source_recording_sha256=result.recording.sha256,
+                predicate_parameters={},
+            )
+            _register_unexpected(
+                failure_sources,
+                unexpected,
+                configuration,
+                identity,
+            )
+        if fault_evaluation is not None and not fault_evaluation.detected:
+            fault = result.fault_observation
+            if fault is None:
+                raise RuntimeError("fault evaluation lost its observation")
+            identity = FailureIdentity(
+                predicate=FailurePredicateKind.FAULT_MISS,
+                kind=FailureKind.DATA_INTEGRITY,
+                code="FAULT_MISS",
+                lane=result.lane,
+                field_name=fault.fault.value,
+                source_configuration_sha256=configuration.sha256,
+                source_recording_sha256=result.recording.sha256,
+                predicate_parameters={"fault": fault.fault.value},
+            )
+            _register_unexpected(
+                failure_sources,
+                unexpected,
+                configuration,
+                identity,
             )
         if not replay_match:
-            signature = "REPLAY_DIGEST_MISMATCH"
-            signature_sources.setdefault(signature, configuration)
-            unexpected.append(
-                {
-                    "configuration_sha256": configuration.sha256,
-                    "signature": signature,
-                }
+            identity = FailureIdentity(
+                predicate=FailurePredicateKind.REPLAY_MISMATCH,
+                kind=FailureKind.REPLAY_MISMATCH,
+                code="REPLAY_DIGEST_MISMATCH",
+                lane=result.lane,
+                field_name=str(parity["first_differing_field"]),
+                source_configuration_sha256=configuration.sha256,
+                source_recording_sha256=result.recording.sha256,
+                predicate_parameters={},
+            )
+            _register_unexpected(
+                failure_sources,
+                unexpected,
+                configuration,
+                identity,
             )
         cases.append(_compact_case(result, parity, fault_evaluation))
     coverage = evidence_coverage_report(tuple(generated_results))
-    minimized = tuple(
-        minimize_failure(configuration, signature)
-        for signature, configuration in sorted(signature_sources.items())
-    )
     statistics = statistical_checks(tuple(cases))
     probes = (
         run_subsystem_probes(seed)
@@ -252,6 +328,74 @@ def run_audit_lab(
         configurations,
         max(1, fresh_process_samples),
     )
+    result_by_configuration = {
+        item.configuration.sha256: item for item in generated_results
+    }
+    configuration_by_sha256 = {
+        item.sha256: item for item in configurations
+    }
+    for evidence in determinism["evidence"]:
+        if evidence["matched"]:
+            continue
+        configuration = configuration_by_sha256[
+            str(evidence["configuration_sha256"])
+        ]
+        source = result_by_configuration[configuration.sha256]
+        identity = FailureIdentity(
+            predicate=FailurePredicateKind.DETERMINISM_MISMATCH,
+            kind=FailureKind.DETERMINISM_MISMATCH,
+            code="FRESH_PROCESS_DETERMINISM_MISMATCH",
+            lane=configuration.lane,
+            field_name="declared_outputs",
+            source_configuration_sha256=configuration.sha256,
+            source_recording_sha256=source.recording.sha256,
+            predicate_parameters={},
+        )
+        _register_unexpected(
+            failure_sources,
+            unexpected,
+            configuration,
+            identity,
+        )
+    representative_configuration = configurations[0]
+    representative_result = generated_results[0]
+    for probe in probes:
+        if not probe.required or probe.status is CheckStatus.PASS:
+            continue
+        identity = FailureIdentity(
+            predicate=FailurePredicateKind.SUBSYSTEM_PROBE,
+            kind=FailureKind.INVARIANT_VIOLATION,
+            code="SUBSYSTEM_PROBE_FAILURE",
+            lane=representative_configuration.lane,
+            field_name=probe.name,
+            source_configuration_sha256=representative_configuration.sha256,
+            source_recording_sha256=representative_result.recording.sha256,
+            predicate_parameters={"probe_seed": seed},
+        )
+        _register_unexpected(
+            failure_sources,
+            unexpected,
+            representative_configuration,
+            identity,
+        )
+    minimized_items: list[MinimizedFailure] = []
+    reproducible_signatures: set[str] = set()
+    for signature, (configuration, identity) in sorted(
+        failure_sources.items()
+    ):
+        minimized_item = minimize_failure(configuration, identity)
+        if minimized_item is None:
+            continue
+        minimized_items.append(minimized_item)
+        reproducible_signatures.add(signature)
+    minimized = tuple(minimized_items)
+    unexpected = [
+        {
+            **item,
+            "reproducible": item["signature"] in reproducible_signatures,
+        }
+        for item in unexpected
+    ]
     replay_parity = {
         "failed_count": len(replay_failures),
         "failures": replay_failures,
@@ -327,6 +471,34 @@ def run_audit_lab(
         result.unexpected_violations,
         packet,
     )
+
+
+def _register_unexpected(
+    sources: dict[str, tuple[GeneratedConfiguration, FailureIdentity]],
+    unexpected: list[dict[str, object]],
+    configuration: GeneratedConfiguration,
+    identity: FailureIdentity,
+) -> None:
+    signature = identity.signature
+    if signature in sources:
+        return
+    sources[signature] = (configuration, identity)
+    unexpected.append(
+        {
+            "configuration_sha256": configuration.sha256,
+            "identity": identity.as_dict(),
+            "reproducible": None,
+            "signature": signature,
+        }
+    )
+
+
+def _failure_field(evidence: Mapping[str, object], fallback: str) -> str:
+    for name in ("check", "field_name", "field", "capability"):
+        value = evidence.get(name)
+        if type(value) is str and value:
+            return value
+    return fallback
 
 
 def _compact_case(
@@ -677,12 +849,19 @@ def _persist_result(
     }
     if save_failures:
         for minimized in result.minimized_failures:
-            reproducer = run_generated_case(minimized.minimized_configuration)
             name = canonical_sha256(minimized.signature)[:20]
             artifacts[f"failures/{name}.json"] = canonical_json(
                 {
                     "minimization": minimized.as_dict(),
-                    "reproducer": reproducer.as_dict(),
+                    "stored_reproducer": {
+                        "final_recording": minimized.final_recording.as_dict(),
+                        "verification_digests": list(
+                            minimized.verification_digests
+                        ),
+                        "verification_reproduced": list(
+                            minimized.verification_reproduced
+                        ),
+                    },
                 }
             ) + "\n"
     identity = {
