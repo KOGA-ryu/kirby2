@@ -9,13 +9,23 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from .models import AcceptanceRecord, canonical_json, canonical_sha256
+from .models import (
+    AUDIT_PACKET_SCHEMA_VERSION,
+    LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
+    AcceptanceRecord,
+    canonical_json,
+    canonical_sha256,
+)
 
 
 DEFAULT_AUDIT_LAB_STORE = Path(".kirby2") / "research" / "audit_lab"
 _ACCEPTANCE_ID = re.compile(r"^acceptance-[A-Za-z0-9_-]{1,96}$")
 _PACKET_ID = re.compile(r"^audit-[0-9a-f]{24}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RESERVED_ARTIFACT_NAMES = frozenset({"manifest.json"})
+_IDENTITY_AND_ARTIFACTS = "IDENTITY_AND_ARTIFACTS"
+_IDENTITY_ONLY_LEGACY = "IDENTITY_ONLY_LEGACY"
+_UNSUPPORTED_IDENTITY_SCOPE = "UNSUPPORTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,14 +34,18 @@ class PacketRecord:
     directory: Path
     manifest_sha256: str
     artifact_count: int
+    schema_version: int
+    identity_scope: str
     verification_status: str
 
     def as_dict(self) -> dict[str, object]:
         return {
             "artifact_count": self.artifact_count,
             "directory": str(self.directory),
+            "identity_scope": self.identity_scope,
             "manifest_sha256": self.manifest_sha256,
             "packet_id": self.packet_id,
+            "schema_version": self.schema_version,
             "verification_status": self.verification_status,
         }
 
@@ -53,8 +67,16 @@ class AuditLabStore:
         identity: dict[str, object],
         artifacts: dict[str, str],
     ) -> PacketRecord:
-        artifact_names = _validated_artifact_names(artifacts)
-        packet_id = f"audit-{canonical_sha256(identity)[:24]}"
+        identity_snapshot = _json_object_snapshot(identity, "packet identity")
+        encoded_artifacts, references = _prepare_artifacts(artifacts)
+        packet_id = _v2_packet_id(identity_snapshot, references)
+        manifest = {
+            "artifacts": references,
+            "identity": identity_snapshot,
+            "packet_id": packet_id,
+            "record_type": "IMMUTABLE_KIRBY2_MODEL_RISK_PACKET",
+            "schema_version": AUDIT_PACKET_SCHEMA_VERSION,
+        }
         target = self.packets / packet_id
         if target.is_symlink():
             raise RuntimeError("immutable audit packet target must not be a symlink")
@@ -62,6 +84,11 @@ class AuditLabStore:
             record = self.verify(packet_id)
             if record.verification_status != "PASS":
                 raise RuntimeError("existing immutable audit packet failed verification")
+            existing_manifest = _read_manifest(target / "manifest.json")
+            if existing_manifest != manifest:
+                raise RuntimeError(
+                    "immutable audit packet ID collision with different manifest"
+                )
             return record
         with tempfile.TemporaryDirectory(
             dir=self.staging,
@@ -69,30 +96,18 @@ class AuditLabStore:
         ) as temporary:
             directory = Path(temporary) / packet_id
             directory.mkdir()
-            references: dict[str, dict[str, object]] = {}
-            for name in artifact_names:
+            for name, content in encoded_artifacts.items():
                 path = _contained_artifact_path(directory, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path = _contained_artifact_path(directory, name)
-                path.write_text(artifacts[name], encoding="utf-8")
-                references[name] = {
-                    "bytes": path.stat().st_size,
-                    "sha256": _file_sha256(path),
-                }
-            manifest = {
-                "artifacts": references,
-                "identity": identity,
-                "packet_id": packet_id,
-                "record_type": "IMMUTABLE_KIRBY2_MODEL_RISK_PACKET",
-                "schema_version": 1,
-            }
+                path.write_bytes(content)
             manifest_path = directory / "manifest.json"
             manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
             directory.replace(target)
         record = self.verify(packet_id)
         if record.verification_status != "PASS":
             raise RuntimeError("new audit packet failed immutable verification")
-        self._append_ledger(record, identity)
+        self._append_ledger(record, identity_snapshot)
         return record
 
     def verify(self, packet_id: str) -> PacketRecord:
@@ -103,28 +118,43 @@ class AuditLabStore:
         manifest_path = directory / "manifest.json"
         if manifest_path.is_symlink():
             raise RuntimeError("audit packet manifest must not be a symlink")
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError(f"audit packet manifest is unavailable: {error}") from error
+        manifest = _read_manifest(manifest_path)
         failures = []
         if manifest.get("packet_id") != packet_id:
             failures.append("packet identity mismatch")
-        if manifest.get("schema_version") != 1:
+        raw_schema_version = manifest.get("schema_version")
+        schema_version = (
+            raw_schema_version if type(raw_schema_version) is int else 0
+        )
+        if schema_version == AUDIT_PACKET_SCHEMA_VERSION:
+            identity_scope = _IDENTITY_AND_ARTIFACTS
+        elif schema_version == LEGACY_AUDIT_PACKET_SCHEMA_VERSION:
+            identity_scope = _IDENTITY_ONLY_LEGACY
+        else:
+            identity_scope = _UNSUPPORTED_IDENTITY_SCOPE
             failures.append("unsupported packet schema")
         identity = manifest.get("identity")
-        if not isinstance(identity, dict) or packet_id != f"audit-{canonical_sha256(identity)[:24]}":
-            failures.append("content-derived packet identity mismatch")
         references = manifest.get("artifacts")
         if not isinstance(references, dict):
             failures.append("artifact inventory is missing")
             references = {}
+        if not isinstance(identity, dict):
+            failures.append("content-derived packet identity mismatch")
+        elif schema_version == AUDIT_PACKET_SCHEMA_VERSION:
+            if packet_id != _v2_packet_id(identity, references):
+                failures.append("content-derived packet identity mismatch")
+        elif schema_version == LEGACY_AUDIT_PACKET_SCHEMA_VERSION:
+            if packet_id != _legacy_packet_id(identity):
+                failures.append("content-derived packet identity mismatch")
         validated_references: list[tuple[str, object]] = []
         for name, reference in references.items():
             try:
                 validated_name = _validate_artifact_name(name)
             except (TypeError, ValueError) as error:
                 failures.append(f"invalid artifact name {name!r}: {error}")
+                continue
+            if not _valid_artifact_reference(reference):
+                failures.append(f"invalid artifact reference {name!r}")
                 continue
             validated_references.append((validated_name, reference))
 
@@ -161,11 +191,15 @@ class AuditLabStore:
         if actual_artifacts != set(references):
             failures.append("packet file inventory differs from immutable manifest")
         return PacketRecord(
-            packet_id,
-            directory.resolve(),
-            _file_sha256(manifest_path),
-            len(references),
-            "PASS" if not failures else "FAIL: " + "; ".join(failures),
+            packet_id=packet_id,
+            directory=directory.resolve(),
+            manifest_sha256=_file_sha256(manifest_path),
+            artifact_count=len(references),
+            schema_version=schema_version,
+            identity_scope=identity_scope,
+            verification_status=(
+                "PASS" if not failures else "FAIL: " + "; ".join(failures)
+            ),
         )
 
     def record_acceptance(self, record: AcceptanceRecord) -> Path:
@@ -211,8 +245,22 @@ class AuditLabStore:
             except RuntimeError as error:
                 failures.append(str(error))
                 continue
+            if record.verification_status != "PASS":
+                failures.append(f"packet verification failed {packet_id}")
             if record.manifest_sha256 != entry.get("manifest_sha256"):
                 failures.append(f"packet ledger digest mismatch {packet_id}")
+            entry_schema = entry.get("packet_schema_version")
+            if entry_schema is None:
+                if record.schema_version != LEGACY_AUDIT_PACKET_SCHEMA_VERSION:
+                    failures.append(f"packet ledger schema missing {packet_id}")
+            elif entry_schema != record.schema_version:
+                failures.append(f"packet ledger schema mismatch {packet_id}")
+            entry_scope = entry.get("identity_scope")
+            if entry_scope is None:
+                if record.identity_scope != _IDENTITY_ONLY_LEGACY:
+                    failures.append(f"packet ledger identity scope missing {packet_id}")
+            elif entry_scope != record.identity_scope:
+                failures.append(f"packet ledger identity scope mismatch {packet_id}")
         directory_packet_ids = {
             path.name for path in self.packets.iterdir() if path.is_dir()
         }
@@ -276,8 +324,10 @@ class AuditLabStore:
         entry = canonical_json(
             {
                 "budget": identity["budget"],
+                "identity_scope": record.identity_scope,
                 "manifest_sha256": record.manifest_sha256,
                 "packet_id": record.packet_id,
+                "packet_schema_version": record.schema_version,
                 "seed": identity["seed"],
             }
         )
@@ -297,13 +347,27 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validated_artifact_names(artifacts: dict[str, str]) -> tuple[str, ...]:
-    """Validate the complete inventory before packet staging or artifact writes."""
+def _prepare_artifacts(
+    artifacts: dict[str, str],
+) -> tuple[dict[str, bytes], dict[str, dict[str, object]]]:
+    """Validate and encode the complete inventory before staging any writes."""
 
     names = tuple(_validate_artifact_name(name) for name in artifacts)
     if len(names) != len(set(names)):
         raise ValueError("artifact names must be unique after canonicalization")
-    return tuple(sorted(names))
+    encoded: dict[str, bytes] = {}
+    references: dict[str, dict[str, object]] = {}
+    for name in sorted(names):
+        content = artifacts[name]
+        if not isinstance(content, str):
+            raise TypeError(f"artifact content must be text: {name}")
+        data = content.encode("utf-8")
+        encoded[name] = data
+        references[name] = {
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    return encoded, references
 
 
 def _validate_artifact_name(name: object) -> str:
@@ -343,3 +407,50 @@ def _validate_packet_id(packet_id: object) -> str:
     if not isinstance(packet_id, str) or _PACKET_ID.fullmatch(packet_id) is None:
         raise ValueError("audit packet ID is invalid")
     return packet_id
+
+
+def _json_object_snapshot(value: object, label: str) -> dict[str, object]:
+    try:
+        snapshot = json.loads(canonical_json(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} must be canonical JSON: {error}") from error
+    if not isinstance(snapshot, dict):
+        raise TypeError(f"{label} must be an object")
+    return snapshot
+
+
+def _v2_packet_id(
+    identity: dict[str, object],
+    references: dict[str, object],
+) -> str:
+    material = {
+        "artifacts": references,
+        "identity": identity,
+        "schema_version": AUDIT_PACKET_SCHEMA_VERSION,
+    }
+    return f"audit-{canonical_sha256(material)[:24]}"
+
+
+def _legacy_packet_id(identity: dict[str, object]) -> str:
+    return f"audit-{canonical_sha256(identity)[:24]}"
+
+
+def _valid_artifact_reference(reference: object) -> bool:
+    return (
+        isinstance(reference, dict)
+        and set(reference) == {"bytes", "sha256"}
+        and type(reference.get("bytes")) is int
+        and int(reference["bytes"]) >= 0
+        and isinstance(reference.get("sha256"), str)
+        and _SHA256.fullmatch(str(reference["sha256"])) is not None
+    )
+
+
+def _read_manifest(path: Path) -> dict[str, object]:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"audit packet manifest is unavailable: {error}") from error
+    if not isinstance(manifest, dict):
+        raise RuntimeError("audit packet manifest root must be an object")
+    return manifest

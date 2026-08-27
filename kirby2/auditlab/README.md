@@ -30,11 +30,19 @@ python3 -m kirby2 audit-lab --budget 10000 --seed 771 --save-failures
 ```
 
 Packets are content-addressed beneath `.kirby2/research/audit_lab/packets` and
-indexed by an append-only ledger. Artifact names must be canonical,
-packet-relative POSIX paths. Absolute paths, parent/dot segments, Windows path
-forms, backslashes, the reserved manifest name, and symlinks are rejected. The
-complete name inventory is validated before staging writes, and verification
-rechecks both lexical names and resolved containment before reading artifacts.
+indexed by an append-only ledger. Schema-v2 packet identity binds the canonical
+run identity to the sorted byte count and SHA-256 inventory of every UTF-8
+artifact. Re-recording identical material is idempotent; changed artifact bytes
+produce a different packet ID. The human-readable report stores
+`PACKET id=SEE_MANIFEST` so the ID is never guessed before all artifacts exist.
+
+Artifact names must be canonical, packet-relative POSIX paths. Absolute paths,
+parent/dot segments, Windows path forms, backslashes, the reserved manifest
+name, and symlinks are rejected. The complete name inventory is validated before
+staging writes, and verification rechecks both lexical names and resolved
+containment before reading artifacts. Schema-v1 packets remain verifiable as
+`IDENTITY_ONLY_LEGACY`, but all new writes use schema v2 and
+`IDENTITY_AND_ARTIFACTS`; legacy packets are never rewritten during recording.
 
 Passing automated gates creates a separate immutable acceptance record whose
 decision remains `PENDING_HUMAN_REVIEW`. `AuditLabStore.record_acceptance` can

@@ -8,7 +8,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
-from kirby2.auditlab.models import canonical_json, canonical_sha256
+from kirby2.auditlab.models import (
+    AUDIT_PACKET_SCHEMA_VERSION,
+    LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
+    canonical_json,
+    canonical_sha256,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +80,10 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _statistics_case(result),
             _probe_case(result),
             _artifact_path_boundary_case(root / "artifact-path-boundary"),
+            _packet_identity_scope_case(
+                root / "packet-identity-scope",
+                packet,
+            ),
             _immutable_case(
                 packet.as_dict(),
                 initial_verification.verification_status,
@@ -331,6 +340,137 @@ def _artifact_path_boundary_case(root: Path) -> ModelRiskLabAuditCase:
             "traversal_verification": traversal_verification.verification_status,
         },
         () if passed else ("audit packet path containment boundary failed",),
+    )
+
+
+def _packet_identity_scope_case(
+    root: Path,
+    persisted_packet,
+) -> ModelRiskLabAuditCase:
+    v2_store = AuditLabStore(root / "v2")
+    v2_identity = {"budget": 1, "probe": "packet-v2", "seed": 771}
+    alpha_artifacts = {"result.txt": "alpha\n"}
+    alpha = v2_store.record(v2_identity, alpha_artifacts)
+    alpha_manifest_before = (alpha.directory / "manifest.json").read_bytes()
+    alpha_idempotent = v2_store.record(v2_identity, dict(alpha_artifacts))
+    alpha_manifest_after = (alpha.directory / "manifest.json").read_bytes()
+    beta = v2_store.record(v2_identity, {"result.txt": "beta\n"})
+    v2_store.acceptance_ledger.write_text("", encoding="utf-8")
+    v2_ledger = v2_store.verify_ledgers()
+
+    alpha_path = alpha.directory / "result.txt"
+    alpha_bytes = alpha_path.read_bytes()
+    alpha_path.write_bytes(alpha_bytes + b"tamper")
+    tampered = v2_store.verify(alpha.packet_id)
+    tampered_ledger = v2_store.verify_ledgers()
+    alpha_path.write_bytes(alpha_bytes)
+    restored = v2_store.verify(alpha.packet_id)
+    restored_ledger = v2_store.verify_ledgers()
+
+    legacy_store = AuditLabStore(root / "legacy")
+    legacy_identity = {"budget": 1, "probe": "packet-v1", "seed": 771}
+    legacy_name = "legacy.txt"
+    legacy_content = b"legacy identity-only packet\n"
+    legacy_packet_id = f"audit-{canonical_sha256(legacy_identity)[:24]}"
+    legacy_directory = legacy_store.packets / legacy_packet_id
+    legacy_directory.mkdir()
+    legacy_artifact = legacy_directory / legacy_name
+    legacy_artifact.write_bytes(legacy_content)
+    legacy_manifest = {
+        "artifacts": {
+            legacy_name: {
+                "bytes": len(legacy_content),
+                "sha256": hashlib.sha256(legacy_content).hexdigest(),
+            }
+        },
+        "identity": legacy_identity,
+        "packet_id": legacy_packet_id,
+        "record_type": "IMMUTABLE_KIRBY2_MODEL_RISK_PACKET",
+        "schema_version": LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
+    }
+    legacy_manifest_path = legacy_directory / "manifest.json"
+    legacy_manifest_path.write_text(
+        canonical_json(legacy_manifest) + "\n",
+        encoding="utf-8",
+    )
+    legacy_manifest_bytes = legacy_manifest_path.read_bytes()
+    legacy_artifact_bytes = legacy_artifact.read_bytes()
+    legacy_stats = (
+        legacy_manifest_path.stat().st_ino,
+        legacy_manifest_path.stat().st_mtime_ns,
+        legacy_artifact.stat().st_ino,
+        legacy_artifact.stat().st_mtime_ns,
+    )
+    legacy_verification = legacy_store.verify(legacy_packet_id)
+    promoted = legacy_store.record(
+        legacy_identity,
+        {legacy_name: legacy_content.decode("utf-8")},
+    )
+    legacy_restored_verification = legacy_store.verify(legacy_packet_id)
+    legacy_stats_after = (
+        legacy_manifest_path.stat().st_ino,
+        legacy_manifest_path.stat().st_mtime_ns,
+        legacy_artifact.stat().st_ino,
+        legacy_artifact.stat().st_mtime_ns,
+    )
+    legacy_unchanged = (
+        legacy_manifest_path.read_bytes() == legacy_manifest_bytes
+        and legacy_artifact.read_bytes() == legacy_artifact_bytes
+        and legacy_stats_after == legacy_stats
+    )
+
+    persisted_report = (persisted_packet.directory / "report.txt").read_text(
+        encoding="utf-8"
+    )
+    stored_report_uses_manifest = (
+        "PACKET id=SEE_MANIFEST" in persisted_report
+        and persisted_packet.packet_id not in persisted_report
+    )
+    passed = all(
+        (
+            alpha.packet_id == alpha_idempotent.packet_id,
+            alpha.packet_id != beta.packet_id,
+            alpha_manifest_before == alpha_manifest_after,
+            alpha.schema_version == AUDIT_PACKET_SCHEMA_VERSION,
+            alpha.identity_scope == "IDENTITY_AND_ARTIFACTS",
+            v2_ledger["status"] == "PASS",
+            tampered.verification_status.startswith("FAIL"),
+            tampered_ledger["status"] == "FAIL",
+            restored.verification_status == "PASS",
+            restored_ledger["status"] == "PASS",
+            legacy_verification.verification_status == "PASS",
+            legacy_verification.schema_version
+            == LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
+            legacy_verification.identity_scope == "IDENTITY_ONLY_LEGACY",
+            legacy_restored_verification.verification_status == "PASS",
+            legacy_unchanged,
+            promoted.packet_id != legacy_packet_id,
+            promoted.schema_version == AUDIT_PACKET_SCHEMA_VERSION,
+            stored_report_uses_manifest,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "packet_v2_identity_binds_artifacts_and_preserves_v1_read_only",
+        {
+            "different_bytes_have_different_ids": (
+                alpha.packet_id != beta.packet_id
+            ),
+            "idempotent_packet_id": alpha_idempotent.packet_id,
+            "legacy_packet_id": legacy_packet_id,
+            "legacy_promoted_v2_packet_id": promoted.packet_id,
+            "legacy_unchanged": legacy_unchanged,
+            "legacy_verification": legacy_verification.as_dict(),
+            "persisted_packet": persisted_packet.as_dict(),
+            "stored_report_uses_manifest": stored_report_uses_manifest,
+            "tampered_ledger": tampered_ledger,
+            "tampered_verification": tampered.verification_status,
+            "v2_alpha_packet": alpha.as_dict(),
+            "v2_beta_packet": beta.as_dict(),
+            "v2_ledger": v2_ledger,
+            "v2_restored_ledger": restored_ledger,
+            "v2_restored_verification": restored.verification_status,
+        },
+        () if passed else ("packet schema-v2 identity boundary failed",),
     )
 
 

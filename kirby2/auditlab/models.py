@@ -11,6 +11,8 @@ from typing import Any
 
 
 AUDIT_LAB_SCHEMA_VERSION = 1
+AUDIT_PACKET_SCHEMA_VERSION = 2
+LEGACY_AUDIT_PACKET_SCHEMA_VERSION = 1
 _ACCEPTANCE_ID = re.compile(r"^acceptance-[A-Za-z0-9_-]{1,96}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 

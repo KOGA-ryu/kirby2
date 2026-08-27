@@ -452,10 +452,9 @@ def _persist_result(
             [item.as_dict() for item in result.statistics]
         ),
     }
-    provisional_id = f"audit-{canonical_sha256(identity)[:24]}"
     human = result.render().replace(
         "RUNTIME_INVARIANTS",
-        f"PACKET id={provisional_id} verification=CONTENT_ADDRESSED\nRUNTIME_INVARIANTS",
+        "PACKET id=SEE_MANIFEST\nRUNTIME_INVARIANTS",
     )
     artifacts["report.txt"] = human + "\n"
     packet = store.record(identity, artifacts)
