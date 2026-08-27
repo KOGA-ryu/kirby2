@@ -155,6 +155,14 @@ class AsynchronousExecutionSession:
     def client_position(self) -> int:
         return self._client_position
 
+    @property
+    def pending_event_horizon_us(self) -> int | None:
+        """Return the latest queued simulation time without advancing state."""
+
+        if not self._messages:
+            return None
+        return max(message.time_us for message in self._messages)
+
     def advance_to(self, target_time_us: int) -> None:
         if type(target_time_us) is not int or target_time_us < self.clock.current_time_us:
             raise ValueError("asynchronous session time cannot move backward")

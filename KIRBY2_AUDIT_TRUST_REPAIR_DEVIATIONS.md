@@ -271,3 +271,74 @@ Commit: `Implement genuine GTC mechanics`
 
 Handoff: restore the preserved ATR-08 work, replace its false SESSION-to-GTC
 alias with the genuine instruction, and resume the real mechanics executor.
+
+## ATR-09A — Expose the asynchronous pending-event horizon
+
+Discovered: 2026-08-27 during ATR-09 preflight at
+`134c54fff53a2de21bbaab1dddebfd74388d1434`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.exchange import Side; from kirby2.latency import AsynchronousExecutionSession, get_latency_profile; session=AsynchronousExecutionSession(seed=3991301936962863233, profile=get_latency_profile('UNSTABLE')); session.advance_to(2_000); assert session.latest_display is None; session.request_limit(Side.BUY, 100, 99, order_id='ATR09-PROBE')"
+```
+
+Observed failure:
+
+```text
+RuntimeError: client cannot act before a market state is rendered
+```
+
+The generated `UNSTABLE` seed schedules the initial publication at 2,000 us,
+the downlink at 22,000 us, and the render at 26,000 us. `STRESSED` can likewise
+render after 2,000 us. The ATR-09 card's absolute 2,000 us player-command
+assumption therefore conflicts with the production observability guard. The
+session also exposes no read-only pending-message horizon, so a caller cannot
+truthfully advance through the remaining asynchronous chain without reading
+its private scheduler heap or guessing a fixed terminal time.
+
+Root cause: the fixed ATR-09 command times omitted the initial observable-state
+precondition while the asynchronous session intentionally applies the selected
+latency profile to that initial state. The session's scheduler owns the exact
+pending horizon but does not publish it.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/latency/engine.py`
+- `kirby2/audit/latency.py`
+
+Repair:
+
+1. Expose a read-only `pending_event_horizon_us` property equal to the maximum
+   currently queued simulation timestamp, or `None` when the queue is empty.
+2. Prove that reading the horizon does not mutate the queue, RNG, events, or
+   state, and that advancing to successive horizons drains chains which enqueue
+   later work.
+3. Preserve the production refusal to submit before an observable market state;
+   do not bootstrap a client quote from hidden venue state.
+4. In the resumed ATR-09 scenario, define `observable_ready_time_us` as the
+   simulation time when the first real `UI_RENDERED_MARKET_STATE` arrives. Keep
+   the mandated command offsets exactly 2,000, 6,000, and 8,000 or 10,000 us
+   from that epoch, and record both the epoch and absolute command timestamps in
+   native evidence.
+5. Complete the scenario by repeatedly advancing to the public pending horizon
+   until it is `None`, rather than guessing a wall-clock or fixed terminal time.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-latency
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.latency import AsynchronousExecutionSession, get_latency_profile; session=AsynchronousExecutionSession(seed=3991301936962863233, profile=get_latency_profile('UNSTABLE')); seen=[]; exec('while session.pending_event_horizon_us is not None:\n seen.append(session.pending_event_horizon_us)\n session.advance_to(session.pending_event_horizon_us)'); assert session.latest_display is not None and session.pending_event_horizon_us is None; print('ATR_09A_PENDING_HORIZON PASS steps=%d ready_us=%d' % (len(seen), session.latest_display.render_time_us))"
+git diff --check
+```
+
+Acceptance: every queued asynchronous chain can be advanced to true idleness
+through a read-only public horizon; the horizon is `None` only when no message
+remains; the initial quote still arrives through the configured profile; and
+the existing latency runtime audit remains green.
+
+Commit: `Expose latency pending event horizon`
+
+Handoff: resume ATR-09 from a clean worktree and use the observable-ready epoch
+for its exact relative command schedule.

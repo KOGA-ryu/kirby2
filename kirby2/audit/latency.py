@@ -48,6 +48,7 @@ def audit_latency() -> tuple[LatencyAuditCase, ...]:
     return (
         _distribution_case(),
         _profile_case(),
+        _pending_event_horizon_case(),
         _lifecycle_timestamp_case(fill_wins),
         _cancel_wins_case(cancel_wins),
         _fill_wins_case(fill_wins),
@@ -56,6 +57,60 @@ def audit_latency() -> tuple[LatencyAuditCase, ...]:
         _partial_fill_cancel_case(),
         _partial_market_expiration_case(),
         _venue_rejection_case(),
+    )
+
+
+def _pending_event_horizon_case() -> LatencyAuditCase:
+    session = AsynchronousExecutionSession(
+        seed=3_991_301_936_962_863_233,
+        profile=get_latency_profile(LatencyProfileName.UNSTABLE),
+    )
+    state_before_read = session.state_sha256()
+    first = session.pending_event_horizon_us
+    second = session.pending_event_horizon_us
+    read_preserved_state = (
+        first == second and session.state_sha256() == state_before_read
+    )
+    horizons: list[int] = []
+    clocks_before_advance: list[int] = []
+    while session.pending_event_horizon_us is not None:
+        horizon = session.pending_event_horizon_us
+        if horizon is None:  # pragma: no cover - loop condition narrows this
+            raise RuntimeError("pending latency horizon disappeared")
+        horizons.append(horizon)
+        clocks_before_advance.append(session.clock.current_time_us)
+        session.advance_to(horizon)
+    session.assert_invariants()
+    failures: list[str] = []
+    if not read_preserved_state:
+        failures.append("reading pending horizon mutated asynchronous state")
+    if not horizons or any(
+        horizon < clock
+        for horizon, clock in zip(horizons, clocks_before_advance, strict=True)
+    ):
+        failures.append("pending horizon preceded the owned simulation clock")
+    if session.pending_event_horizon_us is not None:
+        failures.append("idle asynchronous session retained a pending horizon")
+    if session.latest_display is None:
+        failures.append("pending horizons did not deliver initial observable state")
+    render_time_us = (
+        None
+        if session.latest_display is None
+        else session.latest_display.render_time_us
+    )
+    if render_time_us != session.clock.current_time_us:
+        failures.append("final pending horizon did not match initial render time")
+    return LatencyAuditCase(
+        "read_only_pending_event_horizon_drains_to_observable_idle_state",
+        {
+            "final_clock_time_us": session.clock.current_time_us,
+            "horizon_reads_preserved_state": read_preserved_state,
+            "horizons_us": horizons,
+            "initial_render_time_us": render_time_us,
+            "pending_horizon_after_drain": session.pending_event_horizon_us,
+            "profile": session.profile.name.value,
+        },
+        tuple(failures),
     )
 
 
