@@ -7,6 +7,8 @@ from dataclasses import dataclass, fields
 
 from kirby2.agents import (
     ADVERSARIAL_DRILL_IDS,
+    ECOLOGY_RECORDING_SCHEMA_VERSION,
+    LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION,
     POPULATION_IDS,
     AgentEcology,
     AgentFamily,
@@ -54,6 +56,7 @@ def audit_agent_ecology() -> tuple[AgentEcologyAuditCase, ...]:
         _bounds_case(ecologies),
         _composition_case(results),
         _determinism_and_replay_case(results),
+        _portable_composed_recording_case(results),
         _different_seed_case(results),
         _deceptive_safety_case(results),
         _information_case(ecologies),
@@ -225,6 +228,68 @@ def _determinism_and_replay_case(results) -> AgentEcologyAuditCase:
         "owned_seeded_rng_and_exact_population_replay",
         evidence,
         tuple(failures),
+    )
+
+
+def _portable_composed_recording_case(results) -> AgentEcologyAuditCase:
+    definition = compose_population(
+        "audit-portable-composed",
+        {
+            AgentFamily.NOISE_TRADER: 1,
+            AgentFamily.PASSIVE_MARKET_MAKER: 1,
+        },
+        duration_us=1_000_000,
+    )
+    result = AgentEcology(definition, 314_159).run()
+    recording = EcologyRecording.capture(result)
+    loaded = EcologyRecording.from_dict(recording.as_dict())
+    replay = replay_agent_ecology(loaded)
+
+    canonical = EcologyRecording.capture(results[POPULATION_IDS[0]])
+    legacy_payload = canonical.as_dict()
+    legacy_payload.pop("population_definition")
+    legacy_payload["schema_version"] = LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION
+    legacy_payload["record_label"] = "CANONICAL_SYNTHETIC_AGENT_ECOLOGY_RECORD"
+    legacy = EcologyRecording.from_dict(legacy_payload)
+    legacy_replay = replay_agent_ecology(legacy)
+
+    embedded_tamper = recording.as_dict()
+    raw_embedded = embedded_tamper["population_definition"]
+    if not isinstance(raw_embedded, dict):  # pragma: no cover - v2 validates
+        raise RuntimeError("portable ecology definition was not serialized")
+    raw_embedded["duration_us"] = int(raw_embedded["duration_us"]) + 1
+    tamper_refused = False
+    try:
+        EcologyRecording.from_dict(embedded_tamper)
+    except ValueError:
+        tamper_refused = True
+
+    passed = all(
+        (
+            recording.schema_version == ECOLOGY_RECORDING_SCHEMA_VERSION,
+            recording.population_definition == definition,
+            loaded.as_dict() == recording.as_dict(),
+            replay.passed,
+            legacy.schema_version
+            == LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION,
+            legacy.population_definition is None,
+            legacy_replay.passed,
+            tamper_refused,
+        )
+    )
+    return AgentEcologyAuditCase(
+        "portable_composed_population_recording_and_legacy_replay",
+        {
+            "agent_count": len(definition.agents),
+            "embedded_definition_sha256": definition.sha256(),
+            "embedded_tamper_refused": tamper_refused,
+            "legacy_replay_status": "PASS" if legacy_replay.passed else "FAIL",
+            "legacy_schema_version": legacy.schema_version,
+            "portable_replay_status": "PASS" if replay.passed else "FAIL",
+            "portable_schema_version": recording.schema_version,
+            "portable_wire_sha256": canonical_sha256(recording.as_dict()),
+        },
+        () if passed else ("portable composed ecology replay proof failed",),
     )
 
 

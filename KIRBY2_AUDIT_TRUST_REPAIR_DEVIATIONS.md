@@ -342,3 +342,71 @@ Commit: `Expose latency pending event horizon`
 
 Handoff: resume ATR-09 from a clean worktree and use the observable-ready epoch
 for its exact relative command schedule.
+
+## ATR-11A — Embed composed population definitions in ecology recordings
+
+Discovered: 2026-08-27 during ATR-11 preflight at
+`29672795911674705b6566efa7c8252f178c8199`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.agents import AgentEcology, AgentFamily, EcologyRecording, compose_population; definition=compose_population('liquidity_provision', {AgentFamily.NOISE_TRADER: 1}, duration_us=1000000); result=AgentEcology(definition, 42).run(); EcologyRecording.capture(result)"
+```
+
+Observed failure:
+
+```text
+ValueError: ecology recording population digest is stale or forged
+```
+
+ATR-11 requires `compose_population()` to create exactly one through eight
+agents for each generated case, followed by native `EcologyRecording` capture
+and exact replay. The recording stores only `population_id` and replay resolves
+that ID through `get_population()`, whose three canonical definitions have
+fixed compositions and a fixed four-second duration. A composed definition can
+therefore neither be captured under a canonical ID nor reconstructed under a
+new ID.
+
+Root cause: ecology recording schema v1 identifies a mutable code-defined
+fixture instead of carrying the exact immutable population definition that
+produced the recorded event stream.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/agents/models.py`
+- `kirby2/agents/replay.py`
+- `kirby2/agents/__init__.py`
+- `kirby2/audit/agent_ecology.py`
+
+Repair:
+
+1. Add exact `from_dict()` reconstruction for population definitions, agent
+   specifications, bounds, policy parameters, and session transitions.
+2. Introduce portable ecology recording schema v2, embedding the complete
+   definition and binding it to `population_definition_sha256`.
+3. Let `EcologyRecording.capture()` accept any validated safe population;
+   replay v2 from the embedded definition rather than process-global fixtures.
+4. Continue reading schema-v1 canonical recordings through `get_population()`
+   without changing their field inventory or interpretation.
+5. Prove a noncanonical composed definition round-trips and replays exactly,
+   an embedded-definition mutation is refused, and a reconstructed v1 record
+   still replays.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-agent-ecology
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.agents import AgentEcology, AgentFamily, EcologyRecording, compose_population, replay_agent_ecology; definition=compose_population('audit-portable', {AgentFamily.NOISE_TRADER: 1}, duration_us=1000000); recording=EcologyRecording.capture(AgentEcology(definition, 42).run()); loaded=EcologyRecording.from_dict(recording.as_dict()); assert loaded.definition == definition and replay_agent_ecology(loaded).passed; print('ATR_11A_PORTABLE_ECOLOGY_REPLAY PASS schema=%d' % recording.schema_version)"
+git diff --check
+```
+
+Acceptance: every safe composed population has a self-contained exact native
+recording; its embedded definition is digest-bound and schema-exact; legacy v1
+canonical recordings remain readable and replayable.
+
+Commit: `Embed ecology definitions in replay records`
+
+Handoff: resume ATR-11 from this clean prerequisite commit and capture each
+generated population through portable ecology recording schema v2.

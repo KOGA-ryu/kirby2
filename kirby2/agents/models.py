@@ -116,6 +116,44 @@ class AgentBounds:
             "quantity_budget": self.quantity_budget,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AgentBounds:
+        _require_fields(
+            payload,
+            {
+                "decision_interval_us",
+                "information_set",
+                "latency_us",
+                "lifetime_end_us",
+                "lifetime_start_us",
+                "max_abs_inventory",
+                "max_order_quantity",
+                "max_orders_per_second",
+                "max_price_distance_ticks",
+                "max_working_quantity",
+                "quantity_budget",
+            },
+            "agent bounds",
+        )
+        return cls(
+            quantity_budget=_wire_int(payload, "quantity_budget"),
+            max_abs_inventory=_wire_int(payload, "max_abs_inventory"),
+            max_working_quantity=_wire_int(payload, "max_working_quantity"),
+            max_orders_per_second=_wire_int(payload, "max_orders_per_second"),
+            max_order_quantity=_wire_int(payload, "max_order_quantity"),
+            max_price_distance_ticks=_wire_int(
+                payload,
+                "max_price_distance_ticks",
+            ),
+            latency_us=_wire_int(payload, "latency_us"),
+            lifetime_start_us=_wire_int(payload, "lifetime_start_us"),
+            lifetime_end_us=_wire_int(payload, "lifetime_end_us"),
+            decision_interval_us=_wire_int(payload, "decision_interval_us"),
+            information_set=AgentInformationSet(
+                _wire_str(payload, "information_set")
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AgentPolicyParameters:
@@ -164,6 +202,47 @@ class AgentPolicyParameters:
             "reserve_price_ticks": self.reserve_price_ticks,
             "withdrawal_time_us": self.withdrawal_time_us,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AgentPolicyParameters:
+        _require_fields(
+            payload,
+            {
+                "activation_time_us",
+                "auction_only",
+                "clip_quantity",
+                "latent_value_ticks",
+                "preferred_side",
+                "quote_offset_ticks",
+                "repeat_display",
+                "reserve_price_ticks",
+                "withdrawal_time_us",
+            },
+            "agent policy",
+        )
+        raw_side = payload["preferred_side"]
+        if raw_side is not None and type(raw_side) is not str:
+            raise TypeError("serialized preferred side must be a string or null")
+        return cls(
+            clip_quantity=_wire_int(payload, "clip_quantity"),
+            preferred_side=None if raw_side is None else Side(raw_side),
+            activation_time_us=_wire_int(payload, "activation_time_us"),
+            withdrawal_time_us=_wire_optional_int(
+                payload,
+                "withdrawal_time_us",
+            ),
+            latent_value_ticks=_wire_optional_int(
+                payload,
+                "latent_value_ticks",
+            ),
+            quote_offset_ticks=_wire_int(payload, "quote_offset_ticks"),
+            reserve_price_ticks=_wire_optional_int(
+                payload,
+                "reserve_price_ticks",
+            ),
+            auction_only=_wire_bool(payload, "auction_only"),
+            repeat_display=_wire_bool(payload, "repeat_display"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +302,30 @@ class AgentSpec:
             "venue_scope": SYNTHETIC_VENUE_ID,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AgentSpec:
+        _require_fields(
+            payload,
+            {"agent_id", "bounds", "family", "policy", "safety_class"},
+            "agent specification",
+        )
+        raw_bounds = payload["bounds"]
+        raw_policy = payload["policy"]
+        if not isinstance(raw_bounds, Mapping) or not isinstance(
+            raw_policy,
+            Mapping,
+        ):
+            raise TypeError("serialized agent bounds and policy must be objects")
+        return cls(
+            agent_id=_wire_str(payload, "agent_id"),
+            family=AgentFamily(_wire_str(payload, "family")),
+            bounds=AgentBounds.from_dict(raw_bounds),
+            policy=AgentPolicyParameters.from_dict(raw_policy),
+            safety_class=AgentSafetyClass(
+                _wire_str(payload, "safety_class")
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class EcologyTransition:
@@ -242,6 +345,19 @@ class EcologyTransition:
             "state": self.state.value,
             "uncross_before": self.uncross_before,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> EcologyTransition:
+        _require_fields(
+            payload,
+            {"simulation_time_us", "state", "uncross_before"},
+            "ecology transition",
+        )
+        return cls(
+            simulation_time_us=_wire_int(payload, "simulation_time_us"),
+            state=SessionState(_wire_str(payload, "state")),
+            uncross_before=_wire_bool(payload, "uncross_before"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +432,65 @@ class PopulationDefinition:
 
     def sha256(self) -> str:
         return canonical_sha256(self.identity_dict())
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PopulationDefinition:
+        _require_fields(
+            payload,
+            {
+                "agents",
+                "description",
+                "descriptive_regime_label",
+                "duration_us",
+                "initial_depth_levels",
+                "initial_level_quantity",
+                "initial_mid_ticks",
+                "population_id",
+                "post_session_explanation",
+                "recognition_drill",
+                "schema_version",
+                "start_state",
+                "transitions",
+            },
+            "population definition",
+        )
+        if _wire_int(payload, "schema_version") != AGENT_ECOLOGY_SCHEMA_VERSION:
+            raise ValueError("unsupported population-definition schema")
+        raw_agents = payload["agents"]
+        raw_transitions = payload["transitions"]
+        if not isinstance(raw_agents, list) or any(
+            not isinstance(item, Mapping) for item in raw_agents
+        ):
+            raise TypeError("serialized population agents must be objects")
+        if not isinstance(raw_transitions, list) or any(
+            not isinstance(item, Mapping) for item in raw_transitions
+        ):
+            raise TypeError("serialized population transitions must be objects")
+        return cls(
+            population_id=_wire_str(payload, "population_id"),
+            description=_wire_str(payload, "description"),
+            agents=tuple(AgentSpec.from_dict(item) for item in raw_agents),
+            duration_us=_wire_int(payload, "duration_us"),
+            initial_mid_ticks=_wire_int(payload, "initial_mid_ticks"),
+            initial_depth_levels=_wire_int(payload, "initial_depth_levels"),
+            initial_level_quantity=_wire_int(
+                payload,
+                "initial_level_quantity",
+            ),
+            descriptive_regime_label=_wire_str(
+                payload,
+                "descriptive_regime_label",
+            ),
+            recognition_drill=_wire_bool(payload, "recognition_drill"),
+            post_session_explanation=_wire_str(
+                payload,
+                "post_session_explanation",
+            ),
+            start_state=SessionState(_wire_str(payload, "start_state")),
+            transitions=tuple(
+                EcologyTransition.from_dict(item) for item in raw_transitions
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,3 +637,49 @@ class AgentTruthEvent:
             "sequence": self.sequence,
             "status": self.status.value,
         }
+
+
+def _require_fields(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    fields = set(payload)
+    missing = sorted(expected.difference(fields))
+    unknown = sorted(fields.difference(expected))
+    if missing or unknown:
+        raise ValueError(
+            f"serialized {label} fields are not exact: "
+            f"missing={missing} unknown={unknown}"
+        )
+
+
+def _wire_int(payload: Mapping[str, object], name: str) -> int:
+    value = payload[name]
+    if type(value) is not int:
+        raise TypeError(f"serialized {name} must be an integer")
+    return value
+
+
+def _wire_optional_int(
+    payload: Mapping[str, object],
+    name: str,
+) -> int | None:
+    value = payload[name]
+    if value is not None and type(value) is not int:
+        raise TypeError(f"serialized {name} must be an integer or null")
+    return value
+
+
+def _wire_str(payload: Mapping[str, object], name: str) -> str:
+    value = payload[name]
+    if type(value) is not str:
+        raise TypeError(f"serialized {name} must be a string")
+    return value
+
+
+def _wire_bool(payload: Mapping[str, object], name: str) -> bool:
+    value = payload[name]
+    if type(value) is not bool:
+        raise TypeError(f"serialized {name} must be a boolean")
+    return value

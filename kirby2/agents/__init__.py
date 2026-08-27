@@ -19,11 +19,19 @@ from .populations import (
     get_adversarial_drill,
     get_population,
 )
-from .replay import EcologyRecording, EcologyReplayReport, replay_agent_ecology
+from .replay import (
+    ECOLOGY_RECORDING_SCHEMA_VERSION,
+    LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION,
+    EcologyRecording,
+    EcologyReplayReport,
+    replay_agent_ecology,
+)
 
 __all__ = [
     "ADVERSARIAL_DRILL_IDS",
     "AGENT_ECOLOGY_SCHEMA_VERSION",
+    "ECOLOGY_RECORDING_SCHEMA_VERSION",
+    "LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION",
     "POPULATION_IDS",
     "SYNTHETIC_VENUE_ID",
     "AgentBounds",

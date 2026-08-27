@@ -5,8 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .ecology import EcologyRunResult, run_agent_ecology
-from .models import AGENT_ECOLOGY_SCHEMA_VERSION
+from .models import PopulationDefinition
 from .populations import ADVERSARIAL_DRILL_IDS, POPULATION_IDS, get_population
+
+
+ECOLOGY_RECORDING_SCHEMA_VERSION = 2
+LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION = 1
+_LEGACY_RECORD_LABEL = "CANONICAL_SYNTHETIC_AGENT_ECOLOGY_RECORD"
+_PORTABLE_RECORD_LABEL = "PORTABLE_SYNTHETIC_AGENT_ECOLOGY_RECORD"
+_COMMON_FIELDS = {
+    "expected_public_event_sha256",
+    "expected_result_sha256",
+    "expected_starting_book_sha256",
+    "expected_state_sha256",
+    "expected_summary",
+    "expected_truth_event_sha256",
+    "population_definition_sha256",
+    "population_id",
+    "record_label",
+    "schema_version",
+    "seed",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,17 +39,33 @@ class EcologyRecording:
     expected_truth_event_sha256: str
     expected_result_sha256: str
     expected_summary: dict[str, object]
-    schema_version: int = AGENT_ECOLOGY_SCHEMA_VERSION
-    record_label: str = "CANONICAL_SYNTHETIC_AGENT_ECOLOGY_RECORD"
+    population_definition: PopulationDefinition | None = None
+    schema_version: int = ECOLOGY_RECORDING_SCHEMA_VERSION
+    record_label: str = _PORTABLE_RECORD_LABEL
 
     def __post_init__(self) -> None:
-        if self.population_id not in {*POPULATION_IDS, *ADVERSARIAL_DRILL_IDS}:
-            raise ValueError("ecology recording requires a canonical built-in population")
-        if self.schema_version != AGENT_ECOLOGY_SCHEMA_VERSION:
+        if self.schema_version == LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION:
+            if self.population_definition is not None:
+                raise ValueError("legacy ecology recording cannot embed a definition")
+            if self.population_id not in {*POPULATION_IDS, *ADVERSARIAL_DRILL_IDS}:
+                raise ValueError(
+                    "legacy ecology recording requires a canonical population"
+                )
+            if self.record_label != _LEGACY_RECORD_LABEL:
+                raise ValueError("legacy ecology recording label is invalid")
+            definition = get_population(self.population_id)
+        elif self.schema_version == ECOLOGY_RECORDING_SCHEMA_VERSION:
+            if not isinstance(self.population_definition, PopulationDefinition):
+                raise TypeError("portable ecology recording requires its definition")
+            if self.record_label != _PORTABLE_RECORD_LABEL:
+                raise ValueError("portable ecology recording label is invalid")
+            definition = self.population_definition
+            if definition.population_id != self.population_id:
+                raise ValueError("embedded population identity does not match recording")
+        else:
             raise ValueError("unsupported agent ecology recording schema")
-        if self.seed < 0:
+        if type(self.seed) is not int or self.seed < 0:
             raise ValueError("ecology recording seed must be nonnegative")
-        definition = get_population(self.population_id)
         if definition.sha256() != self.population_definition_sha256:
             raise ValueError("ecology recording population digest is stale or forged")
         digests = (
@@ -45,25 +80,23 @@ class EcologyRecording:
 
     @classmethod
     def capture(cls, result: EcologyRunResult) -> EcologyRecording:
-        if result.definition.population_id not in {
-            *POPULATION_IDS,
-            *ADVERSARIAL_DRILL_IDS,
-        }:
-            raise ValueError("only canonical populations have portable exact replay records")
         return cls(
-            result.definition.population_id,
-            result.definition.sha256(),
-            result.seed,
-            result.summary.starting_book_sha256,
-            result.summary.state_sha256,
-            result.summary.public_event_sha256,
-            result.summary.truth_event_sha256,
-            result.result_sha256,
-            result.summary.as_dict(),
+            population_id=result.definition.population_id,
+            population_definition_sha256=result.definition.sha256(),
+            seed=result.seed,
+            expected_starting_book_sha256=(
+                result.summary.starting_book_sha256
+            ),
+            expected_state_sha256=result.summary.state_sha256,
+            expected_public_event_sha256=result.summary.public_event_sha256,
+            expected_truth_event_sha256=result.summary.truth_event_sha256,
+            expected_result_sha256=result.result_sha256,
+            expected_summary=result.summary.as_dict(),
+            population_definition=result.definition,
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "expected_public_event_sha256": self.expected_public_event_sha256,
             "expected_result_sha256": self.expected_result_sha256,
             "expected_starting_book_sha256": self.expected_starting_book_sha256,
@@ -76,24 +109,34 @@ class EcologyRecording:
             "schema_version": self.schema_version,
             "seed": self.seed,
         }
+        if self.schema_version == ECOLOGY_RECORDING_SCHEMA_VERSION:
+            if self.population_definition is None:  # pragma: no cover - validated
+                raise RuntimeError("portable ecology definition is absent")
+            payload["population_definition"] = (
+                self.population_definition.identity_dict()
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> EcologyRecording:
-        expected = {
-            "expected_public_event_sha256",
-            "expected_result_sha256",
-            "expected_starting_book_sha256",
-            "expected_state_sha256",
-            "expected_summary",
-            "expected_truth_event_sha256",
-            "population_definition_sha256",
-            "population_id",
-            "record_label",
-            "schema_version",
-            "seed",
-        }
-        if set(payload) != expected or not isinstance(payload["expected_summary"], dict):
+        raw_schema = payload.get("schema_version")
+        if type(raw_schema) is not int:
+            raise TypeError("ecology recording schema must be an integer")
+        expected = (
+            _COMMON_FIELDS
+            if raw_schema == LEGACY_ECOLOGY_RECORDING_SCHEMA_VERSION
+            else _COMMON_FIELDS | {"population_definition"}
+            if raw_schema == ECOLOGY_RECORDING_SCHEMA_VERSION
+            else set()
+        )
+        if set(payload) != expected or not isinstance(
+            payload.get("expected_summary"),
+            dict,
+        ):
             raise ValueError("ecology recording field inventory is invalid")
+        raw_definition = payload.get("population_definition")
+        if raw_definition is not None and not isinstance(raw_definition, dict):
+            raise TypeError("embedded population definition must be an object")
         return cls(
             population_id=str(payload["population_id"]),
             population_definition_sha256=str(payload["population_definition_sha256"]),
@@ -110,9 +153,20 @@ class EcologyRecording:
             ),
             expected_result_sha256=str(payload["expected_result_sha256"]),
             expected_summary=dict(payload["expected_summary"]),
-            schema_version=int(payload["schema_version"]),
+            population_definition=(
+                None
+                if raw_definition is None
+                else PopulationDefinition.from_dict(raw_definition)
+            ),
+            schema_version=raw_schema,
             record_label=str(payload["record_label"]),
         )
+
+    @property
+    def definition(self) -> PopulationDefinition:
+        if self.population_definition is not None:
+            return self.population_definition
+        return get_population(self.population_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,8 +205,7 @@ class EcologyReplayReport:
 
 
 def replay_agent_ecology(recording: EcologyRecording) -> EcologyReplayReport:
-    definition = get_population(recording.population_id)
-    result = run_agent_ecology(definition, seed=recording.seed)
+    result = run_agent_ecology(recording.definition, seed=recording.seed)
     return EcologyReplayReport(
         result,
         result.summary.starting_book_sha256
