@@ -230,6 +230,7 @@ class HiddenLiquidityVenue:
         *,
         owner: OrderOwner = OrderOwner.SIMULATED,
         account_id: str = "AGGRESSOR",
+        limit_price_ticks: int | None = None,
     ) -> int:
         self._require_open()
         if not order_id or not account_id:
@@ -240,6 +241,10 @@ class HiddenLiquidityVenue:
             raise TypeError("market side and owner must use canonical enums")
         if type(quantity) is not int or quantity <= 0:
             raise ValueError("market quantity must be a positive integer")
+        if limit_price_ticks is not None and (
+            type(limit_price_ticks) is not int or limit_price_ticks <= 0
+        ):
+            raise ValueError("marketable limit price must be positive integer ticks")
         self._emit_truth(
             TruthEventType.ORDER_ACCEPTED,
             account_id=account_id,
@@ -263,6 +268,16 @@ class HiddenLiquidityVenue:
         remaining = quantity
         while remaining > 0:
             candidates = self._market_candidates(side)
+            if limit_price_ticks is not None:
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if (
+                        candidate.price_x2 <= limit_price_ticks * 2
+                        if side is Side.BUY
+                        else candidate.price_x2 >= limit_price_ticks * 2
+                    )
+                ]
             if not candidates:
                 break
             candidate = candidates[0]

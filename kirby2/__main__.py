@@ -7,6 +7,7 @@ import json
 import math
 import secrets
 import sys
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -153,6 +154,37 @@ def _integer_tuple(value: str) -> tuple[int, ...]:
     return values
 
 
+def _benchmark_seeds(value: str) -> tuple[int, ...]:
+    if ":" in value:
+        raw_start, raw_end = value.split(":", 1)
+        try:
+            start, end = int(raw_start), int(raw_end)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("seed range must use START:END") from error
+        if end < start or end - start > 999:
+            raise argparse.ArgumentTypeError(
+                "seed range must be ascending and contain at most 1000 seeds"
+            )
+        return tuple(range(start, end + 1))
+    return _integer_tuple(value)
+
+
+def _benchmark_algorithms(value: str):
+    from kirby2.algorithms import AlgorithmName
+
+    try:
+        algorithms = tuple(
+            AlgorithmName.parse(item)
+            for item in value.split(",")
+            if item.strip()
+        )
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"unknown execution algorithm: {error}") from error
+    if not algorithms or len(algorithms) != len(set(algorithms)):
+        raise argparse.ArgumentTypeError("algorithm list must be nonempty and unique")
+    return algorithms
+
+
 def _calibration_stages(value: str) -> tuple[int, ...]:
     stages = _integer_tuple(value)
     if stages != tuple(range(1, max(stages) + 1)) or max(stages) > 4:
@@ -258,6 +290,49 @@ def _parser() -> argparse.ArgumentParser:
             "partial-multi-venue-completion",
         ),
         default="all",
+    )
+
+    benchmark_execution = subcommands.add_parser(
+        "benchmark-execution",
+        help="compare simulator-only execution algorithms over deterministic forks",
+    )
+    benchmark_execution.add_argument(
+        "--scenario",
+        action="append",
+        choices=("opening_momentum", "balanced_execution"),
+        dest="benchmark_scenarios",
+    )
+    benchmark_execution.add_argument(
+        "--algorithms",
+        type=_benchmark_algorithms,
+        default=_benchmark_algorithms("twap,pov,sweep,adaptive"),
+    )
+    benchmark_execution.add_argument(
+        "--seeds",
+        type=_benchmark_seeds,
+        default=(100, 101, 102),
+        help="comma-separated seeds or inclusive START:END",
+    )
+    benchmark_execution.add_argument("--quantity", type=_positive_int, default=500)
+    benchmark_execution.add_argument("--seconds", type=_positive_int, default=5)
+    benchmark_execution.add_argument(
+        "--decision-interval-ms",
+        type=_positive_int,
+        default=250,
+    )
+    benchmark_execution.add_argument("--side", choices=("buy", "sell"), default="buy")
+    benchmark_execution.add_argument(
+        "--manual-replay",
+        type=Path,
+        help=(
+            "verified Kirby2 player session recording to project into the "
+            "manual_replay policy slot"
+        ),
+    )
+    benchmark_execution.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research" / "algorithm_runs",
     )
 
     defaults = EventRates()
@@ -473,6 +548,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-multivenue",
         help="audit fragmented venues, routing evidence, scoring, and replay",
+    )
+    subcommands.add_parser(
+        "audit-execution-algorithms",
+        help="audit algorithm interfaces, forks, metrics, immutable runs, and replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -1016,6 +1095,103 @@ def main() -> None:
             print("ROUTING_TIMELINE")
             print(result.timeline)
             print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "benchmark-execution":
+        from kirby2.algorithms import (
+            AlgorithmName,
+            BenchmarkManifest,
+            RiskLimits,
+            default_algorithm_manifest,
+            manual_manifest_from_session_recording,
+            run_execution_benchmark,
+        )
+        from kirby2.exchange.models import Side
+        from kirby2.session.replay import SessionRecording
+
+        scenarios = tuple(args.benchmark_scenarios or ("opening_momentum",))
+        if len(scenarios) != len(set(scenarios)):
+            print("BENCHMARK_ERROR scenarios must be unique", file=sys.stderr)
+            raise SystemExit(2)
+        duration_us = args.seconds * 1_000_000
+        interval_us = args.decision_interval_ms * 1_000
+        try:
+            side = Side(args.side)
+            if (
+                args.manual_replay is not None
+                and AlgorithmName.MANUAL_REPLAY not in args.algorithms
+            ):
+                raise ValueError(
+                    "--manual-replay requires manual_replay in --algorithms"
+                )
+            manual_manifest = None
+            if args.manual_replay is not None:
+                manual_manifest = manual_manifest_from_session_recording(
+                    SessionRecording.load(args.manual_replay),
+                    objective_side=side,
+                    benchmark_duration_us=duration_us,
+                    decision_interval_us=interval_us,
+                )
+            manifest = BenchmarkManifest(
+                experiment_id="execution-benchmark-v1",
+                scenario_names=scenarios,
+                algorithm_manifests=tuple(
+                    (
+                        manual_manifest
+                        if name is AlgorithmName.MANUAL_REPLAY
+                        and manual_manifest is not None
+                        else default_algorithm_manifest(name)
+                    )
+                    for name in args.algorithms
+                ),
+                seeds=args.seeds,
+                quantity=args.quantity,
+                duration_us=duration_us,
+                decision_interval_us=interval_us,
+                side=side,
+                risk_limits=RiskLimits(
+                    maximum_child_quantity=args.quantity,
+                    maximum_working_quantity=args.quantity,
+                    maximum_position=args.quantity,
+                    maximum_spread_ticks=10,
+                ),
+            )
+            result = run_execution_benchmark(manifest, store_root=args.store)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"BENCHMARK_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_EXECUTION_ALGORITHM_BENCHMARK")
+        print(
+            f"MANIFEST sha256={manifest.sha256()} scenarios={len(scenarios)} "
+            f"seeds={len(manifest.seeds)} algorithms={len(manifest.algorithm_manifests)}"
+        )
+        if manual_manifest is not None:
+            provenance = manual_manifest.parameters["replay_provenance"]
+            if not isinstance(provenance, Mapping):
+                raise RuntimeError("manual replay provenance is not an object")
+            print(
+                "MANUAL_REPLAY_SOURCE "
+                f"sha256={provenance['source_sha256']} "
+                f"verification={provenance['source_verification']} "
+                f"traffic_light_guided={str(provenance['traffic_light_guided']).lower()}"
+            )
+        for run in result.runs:
+            print(
+                "PER_SEED "
+                + json.dumps(run.as_dict(), sort_keys=True, separators=(",", ":"))
+            )
+        for aggregate in result.aggregate_by_algorithm:
+            print(
+                "AGGREGATE "
+                + json.dumps(aggregate, sort_keys=True, separators=(",", ":"))
+            )
+        print(f"IMMUTABLE_RUNS count={len(result.runs)} root={result.immutable_store_root}")
+        print(
+            "WINNER none "
+            + str(result.winner_declaration["reason"])
+        )
+        print(f"RESULT_SHA256 {result.result_sha256}")
+        print("BENCHMARK_EXECUTION PASS")
         return
 
     if args.command == "strategy":
@@ -2349,6 +2525,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"MULTIVENUE_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-execution-algorithms":
+        from kirby2.audit.execution_algorithms import audit_execution_algorithms
+
+        reports = audit_execution_algorithms()
+        print("KIRBY2_EXECUTION_ALGORITHM_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"EXECUTION_ALGORITHM_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

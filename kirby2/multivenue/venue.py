@@ -36,6 +36,7 @@ class Venue:
         self.session_state = config.session_state
         self.latency_sampler = LatencySampler(seed)
         self._player_order_ids: set[str] = set()
+        self._closed_player_order_ids: set[str] = set()
 
     @property
     def venue_id(self) -> str:
@@ -125,6 +126,7 @@ class Venue:
         order_id: str,
         side: Side,
         quantity: int,
+        limit_price_ticks: int | None = None,
     ) -> VenueResponse:
         rejection = self._market_rejection()
         if rejection is not None:
@@ -141,6 +143,7 @@ class Venue:
             quantity,
             owner=OrderOwner.PLAYER,
             account_id="PLAYER",
+            limit_price_ticks=limit_price_ticks,
         )
         status = (
             VenueOrderStatus.FILLED
@@ -197,12 +200,14 @@ class Venue:
         try:
             quantity = self.engine.cancel(order_id)
         except ValueError:
+            self._closed_player_order_ids.add(order_id)
             return VenueResponse(
                 self.venue_id,
                 order_id,
                 VenueOrderStatus.ALREADY_CLOSED,
                 0,
             )
+        self._closed_player_order_ids.add(order_id)
         return VenueResponse(
             self.venue_id,
             order_id,
@@ -212,13 +217,22 @@ class Venue:
 
     @property
     def player_order_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(self._player_order_ids))
+        return tuple(sorted(self._player_order_ids - self._closed_player_order_ids))
 
     def complete_session(self) -> None:
         self.engine.complete_session()
 
     def assert_invariants(self) -> None:
         self.engine.assert_invariants()
+        if not self._closed_player_order_ids <= self._player_order_ids:
+            raise RuntimeError("venue closed-order routing state references an unknown order")
+
+    def routing_state(self) -> dict[str, object]:
+        return {
+            "closed_player_order_ids": sorted(self._closed_player_order_ids),
+            "player_order_ids": sorted(self._player_order_ids),
+            "session_state": self.session_state.value,
+        }
 
     def _market_rejection(self) -> str | None:
         if self.session_state is not SessionState.CONTINUOUS:

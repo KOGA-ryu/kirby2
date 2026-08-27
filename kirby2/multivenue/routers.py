@@ -218,9 +218,12 @@ def _leg(
     quantity: int,
     rationale: str,
 ) -> RouteLegPlan:
-    price = request.limit_price_ticks
-    if price is None:
-        price = quote.displayed_price(request.side, request.style)
+    price = (
+        request.limit_price_ticks
+        if request.style is RouteStyle.PASSIVE
+        and request.limit_price_ticks is not None
+        else quote.displayed_price(request.side, request.style)
+    )
     return RouteLegPlan(
         quote.venue_id,
         quantity,

@@ -511,7 +511,7 @@ class MarketCoordinator:
                         "config": venue.config.as_dict(),
                         "engine_state_sha256": venue.engine.state_sha256(),
                         "latency_draws": [draw.as_dict() for draw in venue.latency_sampler.draws],
-                        "session_state": venue.session_state.value,
+                        "routing_state": venue.routing_state(),
                     }
                     for venue_id, venue in sorted(self.venues.items())
                 },
@@ -565,6 +565,7 @@ class MarketCoordinator:
                 pending.order_id,
                 state.request.side,
                 leg.quantity,
+                state.request.limit_price_ticks,
             )
         else:
             if leg.reference_price_ticks is None:
