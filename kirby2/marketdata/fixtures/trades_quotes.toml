@@ -1,0 +1,7 @@
+schema_version = 1
+capability = "TRADES_AND_QUOTES"
+tick_size = "0.01"
+source_timezone = "UTC"
+source_name = "Kirby2 local trades and quotes fixture"
+license_note = "Part of the Kirby2 project fixture set."
+real_market_data = false

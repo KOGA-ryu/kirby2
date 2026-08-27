@@ -39,7 +39,7 @@ from .tables import (
     read_parquet_table,
     write_parquet_tables,
 )
-from .toml_codec import canonical_digest, file_sha256, load_toml
+from .toml_codec import canonical_digest, canonical_toml, file_sha256, load_toml
 
 
 DEFAULT_RESEARCH_STORE = Path(".kirby2") / "research"
@@ -441,6 +441,14 @@ class RunStore:
             (RunManifest.from_dict(load_toml(path)), file_sha256(path))
             for path in sorted(self.runs_directory.glob("run-*/manifest.toml"))
         ]
+        from kirby2.marketdata.models import DatasetManifest
+
+        dataset_manifests = [
+            (DatasetManifest.from_dict(load_toml(path)), file_sha256(path))
+            for path in sorted(
+                (self.root / "datasets").glob("dataset-*/dataset_manifest.toml")
+            )
+        ]
         with tempfile.TemporaryDirectory(
             dir=self.staging_directory,
             prefix="catalog-",
@@ -506,6 +514,61 @@ class RunStore:
                             for item, manifest_sha256 in manifests
                         ],
                     )
+                connection.execute("DROP TABLE IF EXISTS dataset_registry")
+                connection.execute(
+                    """
+                    CREATE TABLE dataset_registry (
+                        dataset_id VARCHAR PRIMARY KEY,
+                        adapter VARCHAR NOT NULL,
+                        source_locator VARCHAR NOT NULL,
+                        source_name VARCHAR NOT NULL,
+                        license_note VARCHAR NOT NULL,
+                        real_market_data BOOLEAN NOT NULL,
+                        capability VARCHAR NOT NULL,
+                        tick_size VARCHAR NOT NULL,
+                        source_digest VARCHAR NOT NULL,
+                        records_digest VARCHAR NOT NULL,
+                        quality_digest VARCHAR NOT NULL,
+                        replay_mode VARCHAR NOT NULL,
+                        exact_replay_allowed BOOLEAN NOT NULL,
+                        time_start_ns BIGINT,
+                        time_end_ns BIGINT,
+                        symbols_toml VARCHAR NOT NULL,
+                        session_count BIGINT NOT NULL,
+                        creation_timestamp_utc VARCHAR NOT NULL,
+                        manifest_sha256 VARCHAR NOT NULL
+                    )
+                    """
+                )
+                if dataset_manifests:
+                    connection.executemany(
+                        "INSERT INTO dataset_registry VALUES "
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (
+                                item.dataset_id,
+                                item.adapter,
+                                item.source_locator,
+                                item.source_name,
+                                item.license_note,
+                                item.real_market_data,
+                                item.capability.value,
+                                item.tick_size,
+                                item.source_digest,
+                                item.records_digest,
+                                item.quality_digest,
+                                item.replay_mode.value,
+                                item.exact_replay_allowed,
+                                item.time_start_ns,
+                                item.time_end_ns,
+                                canonical_toml({"symbols": list(item.symbols)}),
+                                item.session_count,
+                                item.creation_timestamp_utc,
+                                manifest_sha256,
+                            )
+                            for item, manifest_sha256 in dataset_manifests
+                        ],
+                    )
                 _create_fact_views(connection, self.runs_directory, bool(manifests))
                 _create_summary_views(connection)
             finally:
@@ -526,6 +589,12 @@ class RunStore:
             path.parent.name: file_sha256(path)
             for path in self.runs_directory.glob("run-*/manifest.toml")
         }
+        expected_datasets = {
+            path.parent.name: file_sha256(path)
+            for path in (self.root / "datasets").glob(
+                "dataset-*/dataset_manifest.toml"
+            )
+        }
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -536,11 +605,17 @@ class RunStore:
                         "SELECT run_id, manifest_sha256 FROM run_registry"
                     ).fetchall()
                 }
+                actual_datasets = {
+                    str(row[0]): str(row[1])
+                    for row in connection.execute(
+                        "SELECT dataset_id, manifest_sha256 FROM dataset_registry"
+                    ).fetchall()
+                }
             finally:
                 connection.close()
         except Exception:
             return False
-        return actual == expected
+        return actual == expected and actual_datasets == expected_datasets
 
     @contextmanager
     def _catalog_lock(self):
@@ -625,6 +700,7 @@ def _duckdb():
 
 
 _CATALOG_VIEWS = (
+    "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
     "historical_lesson_summary",
@@ -663,6 +739,17 @@ def _create_fact_views(connection, runs_directory: Path, has_runs: bool) -> None
 
 
 def _create_summary_views(connection) -> None:
+    connection.execute(
+        """
+        CREATE VIEW dataset_provenance AS
+        SELECT dataset_id, adapter, source_locator, source_name, license_note,
+               real_market_data, capability, tick_size,
+               source_digest, records_digest, quality_digest, replay_mode,
+               exact_replay_allowed, time_start_ns, time_end_ns,
+               symbols_toml, session_count, creation_timestamp_utc
+        FROM dataset_registry
+        """
+    )
     connection.execute(
         """
         CREATE VIEW run_summary AS

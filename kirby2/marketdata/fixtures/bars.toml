@@ -1,0 +1,7 @@
+schema_version = 1
+capability = "BARS_ONLY"
+tick_size = "0.01"
+source_timezone = "America/New_York"
+source_name = "Kirby2 local bar fixture"
+license_note = "Part of the Kirby2 project fixture set."
+real_market_data = false

@@ -388,6 +388,59 @@ def _parser() -> argparse.ArgumentParser:
         "audit-run-store",
         help="audit immutable identities, Parquet facts, DuckDB views, and replay",
     )
+    subcommands.add_parser(
+        "audit-market-data",
+        help="audit adapters, quality detection, provenance, and replay refusal",
+    )
+
+    ingest_market_data = subcommands.add_parser(
+        "ingest-market-data",
+        help="normalize and persist a capability-declared local market-data source",
+    )
+    ingest_market_data.add_argument(
+        "--adapter",
+        choices=("csv", "parquet", "kirby-mbo"),
+        required=True,
+    )
+    ingest_market_data.add_argument("source", type=Path)
+    ingest_market_data.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+
+    inspect_dataset = subcommands.add_parser(
+        "inspect-dataset",
+        help="show immutable provenance and data-quality evidence for one dataset",
+    )
+    inspect_dataset.add_argument("dataset_id")
+    inspect_dataset.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+
+    validate_dataset = subcommands.add_parser(
+        "validate-dataset",
+        help="verify normalized dataset schemas, rows, and immutable digests",
+    )
+    validate_dataset.add_argument("dataset_id")
+    validate_dataset.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+
+    replay_capability = subcommands.add_parser(
+        "replay-capability",
+        help="report whether source evidence supports exact replay",
+    )
+    replay_capability.add_argument("dataset_id")
+    replay_capability.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
 
     record_run = subcommands.add_parser(
         "record-run",
@@ -725,6 +778,91 @@ def main() -> None:
             )
         print(f"LESSON_COUNT {len(lessons)}")
         print("LESSON_CATALOG PASS provenance_validated=true")
+        return
+
+    if args.command == "ingest-market-data":
+        from kirby2.marketdata import MarketDataStore
+        from kirby2.research.toml_codec import load_toml
+
+        try:
+            store = MarketDataStore(args.store)
+            manifest = store.ingest(args.adapter, args.source)
+            verification = store.verify_dataset(manifest.dataset_id)
+            quality = load_toml(
+                store.dataset_directory(manifest.dataset_id) / "quality_report.toml"
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"INGEST_MARKET_DATA_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_INGEST_MARKET_DATA")
+        print(f"DATASET_ID {manifest.dataset_id}")
+        print(f"ADAPTER {manifest.adapter}")
+        print(f"CAPABILITY {manifest.capability.value}")
+        print(f"REAL_MARKET_DATA {str(manifest.real_market_data).lower()}")
+        print(f"SOURCE_DIGEST {manifest.source_digest}")
+        print(
+            f"ROWS input={quality['input_rows']} accepted={quality['accepted_rows']} "
+            f"rejected={quality['rejected_rows']}"
+        )
+        print(
+            f"QUALITY warnings={len(quality['warnings'])} "
+            f"gaps={len(quality['gaps'])} repairs={len(quality['repairs'])}"
+        )
+        print(
+            f"REPLAY mode={manifest.replay_mode.value} "
+            f"exact={str(manifest.exact_replay_allowed).lower()}"
+        )
+        print(
+            f"INGEST_MARKET_DATA {'PASS' if verification.passed else 'FAIL'}"
+        )
+        if not verification.passed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "inspect-dataset":
+        from kirby2.marketdata import MarketDataStore
+        from kirby2.research.toml_codec import canonical_toml
+
+        try:
+            payload = MarketDataStore(args.store).inspect_dataset(args.dataset_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"INSPECT_DATASET_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_INSPECT_DATASET")
+        print(canonical_toml({"inspection": payload}), end="")
+        return
+
+    if args.command == "validate-dataset":
+        from kirby2.marketdata import MarketDataStore
+
+        try:
+            report = MarketDataStore(args.store).verify_dataset(args.dataset_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"VALIDATE_DATASET_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print(report.render())
+        if not report.passed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "replay-capability":
+        from kirby2.marketdata import MarketDataStore
+
+        try:
+            decision = MarketDataStore(args.store).replay_decision(args.dataset_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"REPLAY_CAPABILITY_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_REPLAY_CAPABILITY")
+        print(f"DATASET_ID {args.dataset_id}")
+        print(f"MODE {decision.mode.value}")
+        print(f"EXACT_REPLAY_ALLOWED {str(decision.exact_replay_allowed).lower()}")
+        for reason in decision.reasons:
+            print(f"REASON {reason}")
+        print(
+            "REPLAY_CAPABILITY "
+            + ("EXACT_SUPPORTED" if decision.exact_replay_allowed else "EXACT_REFUSED")
+        )
         return
 
     if args.command == "record-run":
@@ -1842,6 +1980,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"RUN_STORE_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-market-data":
+        from kirby2.audit.market_data import audit_market_data
+
+        reports = audit_market_data()
+        print("KIRBY2_MARKET_DATA_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"MARKET_DATA_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

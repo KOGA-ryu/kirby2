@@ -1,0 +1,5 @@
+record_type,source_timestamp,timestamp_precision,source_sequence,symbol,session_id,instrument_type,currency,venue,session_open_ns,session_close_ns,open_ticks,high_ticks,low_ticks,close_ticks,volume,interval_ns
+SYMBOL_METADATA,2024-01-02T09:30:00,SECOND,,K2BAR,2024-01-02,STOCK,USD,XK2,,,,,,,,
+SESSION_METADATA,2024-01-02T09:30:00,SECOND,,K2BAR,2024-01-02,,,XK2,1704205800000000000,1704229200000000000,,,,,,
+BAR,2024-01-02T09:30:00,SECOND,1,K2BAR,2024-01-02,,,,,,10000,10005,9998,10003,12500,60000000000
+BAR,2024-01-02T09:31:00,SECOND,2,K2BAR,2024-01-02,,,,,,10003,10008,10001,10006,9800,60000000000
