@@ -194,6 +194,17 @@ def _parser() -> argparse.ArgumentParser:
     demo = subcommands.add_parser("demo", help="run the deterministic exchange demonstration")
     demo.add_argument("--seed", type=int, default=42, help="explicit simulation RNG seed")
 
+    latency_demo = subcommands.add_parser(
+        "latency-demo",
+        help="run and exactly replay one deterministic cancel race",
+    )
+    latency_demo.add_argument(
+        "--race",
+        choices=("cancel-wins", "fill-wins"),
+        default="cancel-wins",
+    )
+    latency_demo.add_argument("--seed", type=int, default=42)
+
     defaults = EventRates()
     simulate = subcommands.add_parser("simulate", help="run seeded Poisson-style order flow")
     simulate.add_argument("--seed", type=int, default=42, help="explicit simulation RNG seed")
@@ -391,6 +402,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-market-data",
         help="audit adapters, quality detection, provenance, and replay refusal",
+    )
+    subcommands.add_parser(
+        "audit-latency",
+        help="audit asynchronous lifecycles, races, metrics, and exact replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -727,6 +742,50 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "demo":
         print(run_demo(args.seed))
+        return
+
+    if args.command == "latency-demo":
+        from kirby2.latency import LatencyTimelineInspector, run_cancel_race
+
+        result = run_cancel_race(args.race, seed=args.seed)
+        result.session.assert_invariants()
+        print("KIRBY2_LATENCY_DEMO")
+        print("PROFILE NORMAL simulator_only=true")
+        print(f"RACE {result.race.value}")
+        print(
+            f"ORDER id={result.order.order_id} state={result.order.state.value} "
+            f"filled={result.order.filled_quantity}/{result.order.quantity} "
+            f"outcome={result.order.cancel_race_outcome}"
+        )
+        print(
+            f"POSITION exchange={result.session.player_position} "
+            f"client={result.session.client_position}"
+        )
+        print(
+            "METRICS "
+            + json.dumps(
+                result.metrics.as_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(
+            f"EVENTS count={len(result.session.events)} "
+            f"sha256={result.session.event_stream_sha256()}"
+        )
+        print(f"RECORDING sha256={result.recording.sha256()}")
+        print(
+            f"REPLAY {'PASS' if result.replay.passed else 'FAIL'} "
+            f"event_stream_match={str(result.replay.event_stream_match).lower()} "
+            f"state_match={str(result.replay.state_match).lower()}"
+        )
+        print("TIMELINE")
+        print(
+            LatencyTimelineInspector(result.session.events).render(
+                result.order.order_id
+            )
+        )
+        print("RUNTIME_INVARIANTS PASS")
         return
 
     if args.command == "strategy":
@@ -1996,6 +2055,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"MARKET_DATA_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-latency":
+        from kirby2.audit.latency import audit_latency
+
+        reports = audit_latency()
+        print("KIRBY2_LATENCY_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"LATENCY_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
