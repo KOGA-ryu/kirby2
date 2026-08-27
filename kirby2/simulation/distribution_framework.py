@@ -21,6 +21,63 @@ class DistributionPurpose(str, Enum):
     INTER_EVENT_TIMING_MODIFIER = "inter_event_timing_modifier"
     SPREAD_STATE_DURATION = "spread_state_duration"
 
+    @property
+    def unit(self) -> str:
+        return _PURPOSE_UNITS[self]
+
+
+INTER_EVENT_TIMING_SCALE = 1_000
+"""Per-mille scale for timing modifiers; 1,000 means an unchanged interval."""
+
+
+_PURPOSE_UNITS = {
+    DistributionPurpose.ORDER_SIZE: "shares",
+    DistributionPurpose.TRADE_SIZE: "shares",
+    DistributionPurpose.CANCEL_SIZE: "shares",
+    DistributionPurpose.QUEUE_DEPTH: "shares",
+    DistributionPurpose.LIMIT_PLACEMENT_DEPTH: "ticks_behind_best",
+    DistributionPurpose.INTER_EVENT_TIMING_MODIFIER: "per_mille_1000_equals_1x",
+    DistributionPurpose.SPREAD_STATE_DURATION: "simulation_microseconds",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class DistributionDrawRecord:
+    sequence: int
+    profile_id: str
+    purpose: DistributionPurpose
+    sampled_value: int
+    simulation_time_us: int
+    consumer: str
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("distribution draw sequence must be positive")
+        if not self.profile_id:
+            raise ValueError("distribution draw profile ID must not be empty")
+        if type(self.sampled_value) is not int:
+            raise TypeError("distribution sampled value must be an integer")
+        if self.purpose is DistributionPurpose.LIMIT_PLACEMENT_DEPTH:
+            if self.sampled_value < 0:
+                raise ValueError("placement-depth draw must be nonnegative")
+        elif self.sampled_value <= 0:
+            raise ValueError(f"{self.purpose.value} draw must be positive")
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("distribution draw simulation time must be nonnegative")
+        if not self.consumer:
+            raise ValueError("distribution draw consumer must not be empty")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "consumer": self.consumer,
+            "draw_sequence": self.sequence,
+            "profile_id": self.profile_id,
+            "purpose": self.purpose.value,
+            "sampled_value": self.sampled_value,
+            "simulation_time_us": self.simulation_time_us,
+            "unit": self.purpose.unit,
+        }
+
 
 @runtime_checkable
 class IntegerSampleDistribution(Protocol):
@@ -230,6 +287,8 @@ class DistributionProfile:
     distributions: dict[DistributionPurpose, IntegerSampleDistribution]
 
     def __post_init__(self) -> None:
+        if any(type(purpose) is not DistributionPurpose for purpose in self.distributions):
+            raise ValueError("distribution profile contains an unsupported purpose")
         if not self.profile_id or set(self.distributions) != set(DistributionPurpose):
             raise ValueError("distribution profile must identify and cover every purpose")
         if any(not isinstance(value, IntegerSampleDistribution) for value in self.distributions.values()):
@@ -247,10 +306,14 @@ class DistributionProfile:
     def as_dict(self) -> dict[str, object]:
         return {
             "distributions": {
-                purpose.value: self.distributions[purpose].as_dict()
+                purpose.value: {
+                    **self.distributions[purpose].as_dict(),
+                    "unit": purpose.unit,
+                }
                 for purpose in DistributionPurpose
             },
             "profile_id": self.profile_id,
+            "timing_modifier_scale": INTER_EVENT_TIMING_SCALE,
         }
 
 

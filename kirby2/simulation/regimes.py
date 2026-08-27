@@ -7,18 +7,20 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from kirby2.exchange import OrderBook, Side
+from kirby2.exchange import OrderBook, OrderOwner, OrderType, Side
 
 from .clock import MICROSECONDS_PER_SECOND
 from .config import SimulationConfig
 from .distributions import WeightedDiscreteDistribution
 from .distribution_framework import (
+    INTER_EVENT_TIMING_SCALE,
+    DistributionDrawRecord,
     DistributionProfile,
     DistributionPurpose,
     IntegerSampleDistribution,
 )
 from .flow import FlowEvent, FlowEventFamily, SimulationResult, SyntheticOrderFlow
-from .flow_models import FlowModel, SimpleFlowModel
+from .flow_models import FlowModel, ScheduledFlowArrival, SimpleFlowModel
 from .intraday import (
     IntradayClock,
     IntradayModifiers,
@@ -43,6 +45,11 @@ class Regime(str, Enum):
     MEAN_REVERSION = "MEAN_REVERSION"
     HIGH_CANCELLATION = "HIGH_CANCELLATION"
     PANIC = "PANIC"
+
+
+class SpreadPlacementState(str, Enum):
+    TOUCH_FAVORING = "TOUCH_FAVORING"
+    DEPTH_FAVORING = "DEPTH_FAVORING"
 
 
 _FAMILIES = tuple(FlowEventFamily)
@@ -445,15 +452,29 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._initial_trade_count = 0
         self._pending_arrival_time_us: int | None = None
         self._pending_family: FlowEventFamily | None = None
+        self._scheduled_flow_time_us: int | None = None
+        self._scheduled_flow_family: FlowEventFamily | None = None
         self._pending_is_intraday_transition = False
+        self._pending_is_spread_transition = False
+        self._spread_placement_state: SpreadPlacementState | None = None
+        self._spread_state_expiry_us: int | None = None
+        self._distribution_draws: list[DistributionDrawRecord] = []
 
     @property
     def flow_events(self) -> tuple[FlowEvent, ...]:
         return tuple(self._flow_events)
 
     @property
+    def distribution_draws(self) -> tuple[DistributionDrawRecord, ...]:
+        return tuple(self._distribution_draws)
+
+    @property
+    def spread_placement_state(self) -> SpreadPlacementState | None:
+        return self._spread_placement_state
+
+    @property
     def next_scheduled_time_us(self) -> int | None:
-        """Next flow arrival or intraday transition owned by simulation time."""
+        """Next flow, intraday, or latent spread-state simulation boundary."""
 
         return self._pending_arrival_time_us
 
@@ -473,6 +494,9 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         self._initial_trade_count = len(self.book.trades)
         if self.intensity_modifier is not None:
             self.intensity_modifier.initialize(self.book, self.clock.current_time_us)
+        if self.distribution_profile is not None:
+            self._spread_placement_state = SpreadPlacementState.TOUCH_FAVORING
+            self._schedule_spread_state_expiry()
         self._started = True
         self._schedule_next_arrival()
 
@@ -507,11 +531,21 @@ class RegimeOrderFlow(SyntheticOrderFlow):
                 self._pending_is_intraday_transition = False
                 self._schedule_next_arrival()
                 continue
+            if self._pending_is_spread_transition:
+                self.clock.advance_to(arrival_time_us)
+                if self.intraday_clock is not None:
+                    self.intraday_clock.advance_to(arrival_time_us)
+                self._advance_spread_placement_state()
+                self._pending_is_spread_transition = False
+                self._schedule_next_arrival(preserve_flow=True)
+                continue
             if family is None:
                 raise RuntimeError("scheduled regime arrival lacks an event family")
             self.clock.advance_to(arrival_time_us)
             if self.intraday_clock is not None:
                 self.intraday_clock.advance_to(arrival_time_us)
+            self._scheduled_flow_time_us = None
+            self._scheduled_flow_family = None
             event = self._apply_arrival(len(self._flow_events) + 1, family)
             self._flow_events.append(event)
             if self.intensity_modifier is not None:
@@ -560,46 +594,98 @@ class RegimeOrderFlow(SyntheticOrderFlow):
                 else self.distribution_profile.as_dict()
             ),
             intraday_profile_config=self._intraday_replay_config(),
+            distribution_draws=self.distribution_draws,
         )
 
-    def _schedule_next_arrival(self) -> None:
-        rates = self.policy.rates(self.book)
-        if self.intensity_modifier is not None:
-            self.last_intensity_inspection = self.intensity_modifier.inspect(
-                rates,
-                self.book,
+    def _schedule_next_arrival(self, *, preserve_flow: bool = False) -> None:
+        if not preserve_flow:
+            rates = self.policy.rates(self.book)
+            if self.intensity_modifier is not None:
+                self.last_intensity_inspection = self.intensity_modifier.inspect(
+                    rates,
+                    self.book,
+                    self.clock.current_time_us,
+                )
+                rates = self.last_intensity_inspection.final_intensities
+            arrival = self.flow_model.schedule_next(
                 self.clock.current_time_us,
+                rates,
+                self.rng,
             )
-            rates = self.last_intensity_inspection.final_intensities
-        arrival = self.flow_model.schedule_next(
-            self.clock.current_time_us,
-            rates,
-            self.rng,
-        )
+            if arrival is not None and self.distribution_profile is not None:
+                base_interval_us = (
+                    arrival.simulation_time_us - self.clock.current_time_us
+                )
+                if base_interval_us <= 0:
+                    raise ValueError("flow model must schedule a future arrival")
+                timing_modifier = self._draw_distribution(
+                    DistributionPurpose.INTER_EVENT_TIMING_MODIFIER,
+                    "flow_interarrival_duration",
+                )
+                adjusted_interval_us = max(
+                    1,
+                    (
+                        base_interval_us * timing_modifier
+                        + INTER_EVENT_TIMING_SCALE // 2
+                    )
+                    // INTER_EVENT_TIMING_SCALE,
+                )
+                arrival = ScheduledFlowArrival(
+                    self.clock.current_time_us + adjusted_interval_us,
+                    arrival.family,
+                )
+            self._scheduled_flow_time_us = (
+                None if arrival is None else arrival.simulation_time_us
+            )
+            self._scheduled_flow_family = None if arrival is None else arrival.family
         transition_time_us = (
             None
             if self.intraday_clock is None
             else self.intraday_clock.next_transition_time_us
         )
-        if transition_time_us is not None and (
-            arrival is None or arrival.simulation_time_us >= transition_time_us
-        ):
-            self._pending_arrival_time_us = transition_time_us
-            self._pending_family = None
-            self._pending_is_intraday_transition = True
-            return
-        if arrival is None:
+        candidates: list[tuple[int, int, str, FlowEventFamily | None]] = []
+        if transition_time_us is not None:
+            candidates.append((transition_time_us, 0, "intraday", None))
+        if self._spread_state_expiry_us is not None:
+            candidates.append((self._spread_state_expiry_us, 1, "spread", None))
+        if self._scheduled_flow_time_us is not None:
+            candidates.append(
+                (
+                    self._scheduled_flow_time_us,
+                    2,
+                    "flow",
+                    self._scheduled_flow_family,
+                )
+            )
+        if not candidates:
             self._pending_arrival_time_us = None
             self._pending_family = None
             self._pending_is_intraday_transition = False
+            self._pending_is_spread_transition = False
             return
-        self._pending_arrival_time_us = arrival.simulation_time_us
-        self._pending_family = arrival.family
-        self._pending_is_intraday_transition = False
+        pending_time, _, pending_kind, pending_family = min(candidates)
+        self._pending_arrival_time_us = pending_time
+        self._pending_family = pending_family
+        self._pending_is_intraday_transition = pending_kind == "intraday"
+        self._pending_is_spread_transition = pending_kind == "spread"
+        if pending_kind == "intraday":
+            self._pending_family = None
+            return
+        if pending_kind == "spread":
+            self._pending_family = None
+            return
 
     def _draw_order_size(self, family: FlowEventFamily) -> int:
-        distribution = self.policy.size_distribution(family)
-        size = distribution.draw(self.rng)
+        purpose = (
+            DistributionPurpose.TRADE_SIZE
+            if family in {FlowEventFamily.MARKET_BUY, FlowEventFamily.MARKET_SELL}
+            else DistributionPurpose.ORDER_SIZE
+        )
+        size = (
+            self._draw_distribution(purpose, f"{family.value}_quantity")
+            if self.distribution_profile is not None
+            else self.policy.size_distribution(family).draw(self.rng)
+        )
         scale = float(self.policy.parameter_overrides.get("order_size_scale", 1.0))
         scale *= self.dimensions.order_size_scale(family)
         family_scale_key = (
@@ -620,7 +706,14 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         return max(1, round(size * scale))
 
     def _draw_depth(self, family: FlowEventFamily) -> int:
-        depth = self.policy.depth_distribution(family).draw(self.rng)
+        depth = (
+            self._draw_distribution(
+                DistributionPurpose.LIMIT_PLACEMENT_DEPTH,
+                f"{family.value}_placement",
+            )
+            if self.distribution_profile is not None
+            else self.policy.depth_distribution(family).draw(self.rng)
+        )
         modifiers = self.policy.intraday_modifiers
         spread_scale = 1.0 if modifiers is None else modifiers.spread_tendency
         placement_scale = float(
@@ -631,17 +724,152 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         )
         if not math.isfinite(placement_scale) or placement_scale < 0:
             raise ValueError("placement_depth_scale must be finite and nonnegative")
-        return max(
+        adjusted_depth = max(
             0,
             round((depth + 1) * spread_scale * placement_scale)
             - 1
             + placement_offset,
         )
+        if self._spread_placement_state is SpreadPlacementState.TOUCH_FAVORING:
+            return max(0, adjusted_depth - 1)
+        if self._spread_placement_state is SpreadPlacementState.DEPTH_FAVORING:
+            return adjusted_depth + 1
+        return adjusted_depth
 
     def _draw_initial_queue_size(self) -> int:
-        size = super()._draw_initial_queue_size()
+        size = (
+            self._draw_distribution(
+                DistributionPurpose.QUEUE_DEPTH,
+                "initial_resting_queue_quantity",
+            )
+            if self.distribution_profile is not None
+            else super()._draw_initial_queue_size()
+        )
         modifiers = self.policy.intraday_modifiers
         return size if modifiers is None else max(1, round(size * modifiers.depth))
+
+    def _submit_cancel(
+        self,
+        sequence: int,
+        side: Side,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if self.distribution_profile is None:
+            return super()._submit_cancel(sequence, side)
+        budget = self._draw_distribution(
+            DistributionPurpose.CANCEL_SIZE,
+            f"cancel_{side.value}_volume_budget",
+        )
+        candidates = sorted(
+            (
+                order
+                for order in self.book.active_orders.values()
+                if order.side is side
+                and order.order_type is OrderType.LIMIT
+                and order.owner is OrderOwner.SIMULATED
+            ),
+            key=lambda order: (order.resting_sequence, order.order_id),
+        )
+        if not candidates:
+            command_id = self._command_id(
+                sequence,
+                "CB-BUDGET" if side is Side.BUY else "CA-BUDGET",
+            )
+            return {
+                "affected_order_ids": [],
+                "affected_orders": [],
+                "actual_cancelled_quantity": 0,
+                "cancelled_quantity": 0,
+                "command_id": command_id,
+                "command_ids": [],
+                "order_type": OrderType.CANCEL.value,
+                "overshoot_quantity": 0,
+                "price_ticks": None,
+                "requested_cancel_quantity": budget,
+                "side": side.value,
+                "target_order_id": None,
+                "unfulfilled_quantity": budget,
+            }, "no_active_liquidity"
+        start = self.rng.index(len(candidates))
+        ordered_candidates = candidates[start:] + candidates[:start]
+        affected_orders: list[dict[str, Any]] = []
+        actual_quantity = 0
+        suffix = "CB" if side is Side.BUY else "CA"
+        for target in ordered_candidates:
+            if actual_quantity >= budget:
+                break
+            quantity = target.remaining_quantity
+            command_id = self._command_id(
+                sequence,
+                f"{suffix}-{len(affected_orders) + 1:03d}",
+            )
+            affected_orders.append(
+                {
+                    "cancelled_quantity": quantity,
+                    "command_id": command_id,
+                    "price_ticks": target.price_ticks,
+                    "target_order_id": target.order_id,
+                }
+            )
+            self.book.cancel(target.order_id, command_id)
+            actual_quantity += quantity
+        first = affected_orders[0]
+        return {
+            "affected_order_ids": [
+                item["target_order_id"] for item in affected_orders
+            ],
+            "affected_orders": affected_orders,
+            "actual_cancelled_quantity": actual_quantity,
+            "cancelled_quantity": actual_quantity,
+            "command_id": first["command_id"],
+            "command_ids": [item["command_id"] for item in affected_orders],
+            "order_type": OrderType.CANCEL.value,
+            "overshoot_quantity": max(0, actual_quantity - budget),
+            "price_ticks": first["price_ticks"],
+            "requested_cancel_quantity": budget,
+            "side": side.value,
+            "target_order_id": first["target_order_id"],
+            "unfulfilled_quantity": max(0, budget - actual_quantity),
+        }, None
+
+    def _draw_distribution(
+        self,
+        purpose: DistributionPurpose,
+        consumer: str,
+    ) -> int:
+        if self.distribution_profile is None:
+            raise RuntimeError("distribution draw requires an active profile")
+        value = self.distribution_profile.distribution(purpose).draw(self.rng)
+        self._distribution_draws.append(
+            DistributionDrawRecord(
+                sequence=len(self._distribution_draws) + 1,
+                profile_id=self.distribution_profile.profile_id,
+                purpose=purpose,
+                sampled_value=value,
+                simulation_time_us=self.clock.current_time_us,
+                consumer=consumer,
+            )
+        )
+        return value
+
+    def _schedule_spread_state_expiry(self) -> None:
+        if self._spread_placement_state is None:
+            raise RuntimeError("spread state duration requires an active state")
+        duration_us = self._draw_distribution(
+            DistributionPurpose.SPREAD_STATE_DURATION,
+            f"spread_state:{self._spread_placement_state.value.lower()}",
+        )
+        self._spread_state_expiry_us = self.clock.current_time_us + duration_us
+
+    def _advance_spread_placement_state(self) -> None:
+        if self._spread_state_expiry_us != self.clock.current_time_us:
+            raise RuntimeError("spread state advanced outside its scheduled boundary")
+        if self._spread_placement_state is SpreadPlacementState.TOUCH_FAVORING:
+            self._spread_placement_state = SpreadPlacementState.DEPTH_FAVORING
+        elif self._spread_placement_state is SpreadPlacementState.DEPTH_FAVORING:
+            self._spread_placement_state = SpreadPlacementState.TOUCH_FAVORING
+        else:
+            raise RuntimeError("spread transition lacks an active state")
+        self._schedule_spread_state_expiry()
 
     def _intraday_replay_config(self) -> dict[str, object] | None:
         if self.intraday_clock is None:

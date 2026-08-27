@@ -15,6 +15,7 @@ from kirby2.session import EventType
 
 from .clock import MICROSECONDS_PER_SECOND, SimulationClock
 from .config import SimulationConfig
+from .distribution_framework import DistributionDrawRecord
 from .rng import SeededRng
 
 
@@ -47,9 +48,10 @@ class FlowEvent:
     reason: str | None
     exchange_event_start: int | None
     exchange_event_end: int | None
+    diagnostic: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "applied": self.applied,
             "command": self.command,
             "exchange_event_end": self.exchange_event_end,
@@ -59,6 +61,9 @@ class FlowEvent:
             "reason": self.reason,
             "simulation_time_us": self.simulation_time_us,
         }
+        if self.diagnostic is not None:
+            result["diagnostic"] = self.diagnostic
+        return result
 
 
 @dataclass(slots=True)
@@ -75,6 +80,7 @@ class SimulationResult:
     intensity_modifier_config: dict[str, object] | None = None
     distribution_profile_config: dict[str, object] | None = None
     intraday_profile_config: dict[str, object] | None = None
+    distribution_draws: tuple[DistributionDrawRecord, ...] = ()
 
     def replay_json_lines(self) -> str:
         header = {
@@ -92,6 +98,14 @@ class SimulationResult:
         if self.intraday_profile_config is not None:
             header["intraday_profile"] = self.intraday_profile_config
         lines = [json.dumps(header, sort_keys=True, separators=(",", ":"))]
+        for draw in self.distribution_draws:
+            lines.append(
+                json.dumps(
+                    {"record_type": "distribution_draw", **draw.as_dict()},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         exchange_events = {event.sequence: event for event in self.book.journal.events}
 
         for sequence in range(1, self.initial_exchange_event_count + 1):
@@ -163,6 +177,7 @@ class SimulationResult:
             summary["intensity_modifier"] = self.intensity_modifier_config
         if self.distribution_profile_config is not None:
             summary["distribution_profile"] = self.distribution_profile_config
+            summary["distribution_draw_count"] = len(self.distribution_draws)
         if self.intraday_profile_config is not None:
             summary["intraday_profile"] = self.intraday_profile_config
         return summary
@@ -285,7 +300,11 @@ class SyntheticOrderFlow:
         else:
             command, reason = self._submit_cancel(sequence, Side.SELL)
 
-        applied = command is not None
+        exchange_changed = len(self.book.journal.events) >= exchange_start
+        diagnostic = command if command is not None and not exchange_changed else None
+        if diagnostic is not None:
+            command = None
+        applied = command is not None and exchange_changed
         exchange_end = len(self.book.journal.events) if applied else None
         event = FlowEvent(
             sequence=sequence,
@@ -296,6 +315,7 @@ class SyntheticOrderFlow:
             reason=reason,
             exchange_event_start=exchange_start if applied else None,
             exchange_event_end=exchange_end,
+            diagnostic=diagnostic,
         )
         self._after_flow_event(event)
         return event

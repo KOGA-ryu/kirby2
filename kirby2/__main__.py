@@ -359,6 +359,10 @@ def _parser() -> argparse.ArgumentParser:
         "audit-strategy-time",
         help="audit simulation-time strategy deadlines, ordering, and replay",
     )
+    subcommands.add_parser(
+        "audit-distribution-truth",
+        help="audit distribution units, runtime consumers, seeded traces, and replay",
+    )
 
     matrix = subcommands.add_parser(
         "matrix",
@@ -948,7 +952,10 @@ def main() -> None:
         print(
             "CONFIG "
             + json.dumps(
-                profile.distribution(purpose).as_dict(),
+                {
+                    **profile.distribution(purpose).as_dict(),
+                    "unit": purpose.unit,
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -1512,6 +1519,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"STRATEGY_TIME_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-distribution-truth":
+        from kirby2.audit.distribution_truth import audit_distribution_truth
+
+        reports = audit_distribution_truth()
+        print("KIRBY2_DISTRIBUTION_TRUTH_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"DISTRIBUTION_TRUTH_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
