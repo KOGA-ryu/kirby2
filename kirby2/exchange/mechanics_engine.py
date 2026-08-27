@@ -848,10 +848,17 @@ class MarketMechanicsEngine:
             core = all_orders.get(managed.request.order_id)
             if core is None:
                 continue
+            classified_expired = managed.expired_quantity
+            if classified_expired > core.cancelled_quantity:
+                raise RuntimeError(
+                    "managed expired quantity exceeds core closed quantity"
+                )
             managed.filled_quantity = core.filled_quantity
             managed.resting_sequence = core.resting_sequence
-            managed.cancelled_quantity = core.cancelled_quantity
-            managed.expired_quantity = 0
+            managed.cancelled_quantity = (
+                core.cancelled_quantity - classified_expired
+            )
+            managed.expired_quantity = classified_expired
             managed.status = {
                 OrderStatus.NEW: "PENDING",
                 OrderStatus.ACTIVE: "WORKING",
@@ -863,6 +870,8 @@ class MarketMechanicsEngine:
             if core.status is OrderStatus.EXPIRED:
                 managed.expired_quantity = core.cancelled_quantity
                 managed.cancelled_quantity = 0
+            elif managed.expired_quantity:
+                managed.status = "EXPIRED"
 
     def _expire_continuous(self, managed: ManagedOrder, reason: str) -> None:
         remaining = managed.remaining_quantity

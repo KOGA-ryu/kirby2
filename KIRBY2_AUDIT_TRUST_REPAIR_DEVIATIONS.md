@@ -154,3 +154,62 @@ Acceptance: no executor lane can receive declaration credit for an axis value
 that its deterministic scheduler can never emit.
 
 Commit: `Cycle audit axes within executor lanes`
+
+## ATR-08A — Preserve managed-order expiration classification
+
+Discovered: 2026-08-27 while executing real lifecycle reconstruction for
+ATR-08 at `1621964f1ca02f0ee7c5b951ea5fff937fcdea78`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.audit.market_mechanics import audit_market_mechanics; cases=audit_market_mechanics(); case=next(item for item in cases if item.name == 'expiration_classification_survives_later_synchronization'); assert case.passed, case.as_dict(); print('ATR_08A_EXPIRATION_CLASSIFICATION PASS')"
+```
+
+Before repair, an IOC order partially fills and correctly becomes `EXPIRED`
+with 30 expired shares. Submitting a later continuous order calls
+`_sync_continuous_orders()`, which changes the first order to `CANCELLED`, moves
+the 30 shares from `expired_quantity` to `cancelled_quantity`, and destroys the
+real lifecycle classification. DAY, SESSION, GOOD_UNTIL_TIME, and market-order
+remainder expiration use the same synchronization path.
+
+Root cause: the core FIFO ledger represents both cancellation and policy expiry
+in `cancelled_quantity`, while `ManagedOrder` deliberately separates
+`cancelled_quantity` and `expired_quantity`. Every synchronization discarded the
+managed classification and recopied the undifferentiated core value.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/exchange/mechanics_engine.py`
+- `kirby2/audit/market_mechanics.py`
+
+Repair:
+
+1. Preserve the already classified managed expired quantity during subsequent
+   core-ledger synchronization and derive only the residual cancelled quantity.
+2. Keep an expired managed order terminally `EXPIRED` after later submissions,
+   cancellations, replacements, session transitions, and replay.
+3. Add runtime probes for IOC, SESSION, GOOD_UNTIL_TIME, and DAY expiration,
+   each followed by a later synchronization-triggering command.
+4. Reconcile the separated managed quantities back to the core ledger total and
+   reject an impossible over-classification.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-market-mechanics
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.audit.market_mechanics import audit_market_mechanics; cases=audit_market_mechanics(); case=next(item for item in cases if item.name == 'expiration_classification_survives_later_synchronization'); assert case.passed, case.as_dict(); print('ATR_08A_EXPIRATION_CLASSIFICATION PASS')"
+git diff --check
+```
+
+Acceptance: every probed policy expiry remains event-backed `EXPIRED` with its
+expired quantity unchanged after a later synchronization; cancelled plus
+expired quantity still equals the core cancelled quantity; native mechanics
+replay and the complete model-risk audit remain green.
+
+Commit: `Preserve mechanics expiry classification`
+
+Handoff: restore the preserved ATR-08 work and resume the real mechanics
+executor from this clean prerequisite commit.

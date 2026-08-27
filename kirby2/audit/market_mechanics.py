@@ -56,6 +56,7 @@ def audit_market_mechanics() -> tuple[MarketMechanicsAuditCase, ...]:
         _replace_priority_case(),
         _cancel_replace_replay_case(),
         _time_in_force_case(),
+        _expiration_classification_persistence_case(),
         _immediate_instruction_case(),
         _self_trade_prevention_case(),
         _generic_protection_case(),
@@ -462,6 +463,172 @@ def _time_in_force_case() -> MarketMechanicsAuditCase:
     return MarketMechanicsAuditCase(
         "day_session_and_good_until_time_expiration",
         evidence,
+        tuple(failures),
+    )
+
+
+def _expiration_classification_persistence_case() -> MarketMechanicsAuditCase:
+    engines: dict[str, tuple[MarketMechanicsEngine, str, int, int]] = {}
+
+    ioc = _continuous_engine()
+    ioc.submit(_limit("PERSIST-IOC-ASK", Side.SELL, 50, 101, "IOC-ASK"))
+    ioc.submit(
+        _limit(
+            "PERSIST-IOC",
+            Side.BUY,
+            80,
+            101,
+            "IOC-BUY",
+            time_in_force=OrderInstruction.IOC,
+        )
+    )
+    ioc.submit(_limit("PERSIST-IOC-LATER", Side.BUY, 10, 99, "IOC-LATER"))
+    engines["IOC"] = (ioc, "PERSIST-IOC", 30, 0)
+
+    session = _continuous_engine()
+    session.submit(
+        _limit(
+            "PERSIST-SESSION",
+            Side.BUY,
+            40,
+            99,
+            "SESSION",
+            time_in_force=OrderInstruction.SESSION,
+        )
+    )
+    session.transition_session(SessionState.HALTED, reason="PERSIST_SESSION_END")
+    session.transition_session(
+        SessionState.REOPENING_AUCTION,
+        reason="PERSIST_SESSION_REOPEN",
+    )
+    session.transition_session(
+        SessionState.CONTINUOUS,
+        reason="PERSIST_SESSION_REOPEN",
+    )
+    session.submit(
+        _limit("PERSIST-SESSION-LATER", Side.BUY, 10, 98, "SESSION-LATER")
+    )
+    engines["SESSION"] = (session, "PERSIST-SESSION", 40, 0)
+
+    good_until = _continuous_engine()
+    good_until.submit(
+        AdvancedOrderRequest(
+            "PERSIST-GTD",
+            Side.BUY,
+            35,
+            OrderInstruction.LIMIT,
+            OrderOwner.SIMULATED,
+            "GTD",
+            99,
+            OrderInstruction.GOOD_UNTIL_TIME,
+            good_until_time_us=100,
+        )
+    )
+    good_until.advance_to(100)
+    good_until.submit(
+        _limit("PERSIST-GTD-LATER", Side.BUY, 10, 98, "GTD-LATER")
+    )
+    engines["GOOD_UNTIL_TIME"] = (good_until, "PERSIST-GTD", 35, 0)
+
+    day = _continuous_engine()
+    day.submit(_limit("PERSIST-DAY", Side.BUY, 45, 99, "DAY"))
+    day.transition_session(SessionState.CLOSING_AUCTION, reason="PERSIST_DAY_CALL")
+    day.transition_session(SessionState.POSTCLOSE, reason="PERSIST_DAY_END")
+    day.transition_session(SessionState.PREOPEN, reason="PERSIST_NEXT_DAY")
+    day.transition_session(SessionState.OPENING_AUCTION, reason="PERSIST_NEXT_DAY")
+    day.transition_session(SessionState.CONTINUOUS, reason="PERSIST_NEXT_DAY")
+    day.submit(_limit("PERSIST-DAY-LATER", Side.BUY, 10, 98, "DAY-LATER"))
+    engines["DAY"] = (day, "PERSIST-DAY", 45, 0)
+
+    reduced_day = _continuous_engine()
+    reduced_day.submit(
+        _limit("PERSIST-REDUCED-DAY", Side.BUY, 100, 99, "REDUCED-DAY")
+    )
+    reduced_day.replace_order(
+        "PERSIST-REDUCED-DAY",
+        new_order_id="PERSIST-REDUCTION-REQUEST",
+        new_quantity=60,
+    )
+    reduced_day.transition_session(
+        SessionState.CLOSING_AUCTION,
+        reason="PERSIST_REDUCED_DAY_CALL",
+    )
+    reduced_day.transition_session(
+        SessionState.POSTCLOSE,
+        reason="PERSIST_REDUCED_DAY_END",
+    )
+    reduced_day.transition_session(SessionState.PREOPEN, reason="PERSIST_NEXT_DAY")
+    reduced_day.transition_session(
+        SessionState.OPENING_AUCTION,
+        reason="PERSIST_NEXT_DAY",
+    )
+    reduced_day.transition_session(
+        SessionState.CONTINUOUS,
+        reason="PERSIST_NEXT_DAY",
+    )
+    reduced_day.submit(
+        _limit(
+            "PERSIST-REDUCED-DAY-LATER",
+            Side.BUY,
+            10,
+            98,
+            "REDUCED-DAY-LATER",
+        )
+    )
+    engines["REDUCED_DAY"] = (
+        reduced_day,
+        "PERSIST-REDUCED-DAY",
+        60,
+        40,
+    )
+
+    outcomes: dict[str, dict[str, object]] = {}
+    failures: list[str] = []
+    for name, (
+        engine,
+        order_id,
+        expected_expired,
+        expected_cancelled,
+    ) in engines.items():
+        engine.assert_invariants()
+        managed = engine.get_order(order_id)
+        core = engine.book.all_orders[order_id]
+        expiry_events = [
+            event
+            for event in engine.events
+            if event.event_type is MechanicsEventType.ORDER_EXPIRED
+            and event.data.get("order_id") == order_id
+        ]
+        reconciled = (
+            managed.cancelled_quantity + managed.expired_quantity
+            == core.cancelled_quantity
+        )
+        passed = all(
+            (
+                managed.status == "EXPIRED",
+                managed.expired_quantity == expected_expired,
+                managed.cancelled_quantity == expected_cancelled,
+                reconciled,
+                len(expiry_events) == 1,
+                int(expiry_events[0].data["expired_quantity"])
+                == expected_expired
+                if expiry_events
+                else False,
+            )
+        )
+        if not passed:
+            failures.append(f"{name} expiration classification did not persist")
+        outcomes[name] = {
+            "cancelled_quantity": managed.cancelled_quantity,
+            "core_closed_quantity": core.cancelled_quantity,
+            "event_sequences": [event.sequence for event in expiry_events],
+            "expired_quantity": managed.expired_quantity,
+            "reconciled_to_core": reconciled,
+            "status": managed.status,
+        }
+    return MarketMechanicsAuditCase(
+        "expiration_classification_survives_later_synchronization",
+        {"outcomes": outcomes},
         tuple(failures),
     )
 
