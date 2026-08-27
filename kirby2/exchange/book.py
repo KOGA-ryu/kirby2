@@ -118,6 +118,50 @@ class OrderBook:
             assert_order_book_invariants(self)
         return self.journal.events[event_start:]
 
+    def reduce_order(
+        self,
+        target_order_id: str,
+        new_total_quantity: int,
+        command_id: str,
+    ) -> tuple[SimulationEvent, ...]:
+        """Reduce live quantity in place while preserving FIFO position.
+
+        The submitted quantity remains the conservation basis; the reduction is
+        recorded as cancelled quantity. Increasing quantity or reducing to the
+        already-filled amount is not an in-place operation.
+        """
+
+        target = self._active_orders.get(target_order_id)
+        if target is None:
+            raise ValueError(f"order is not active: {target_order_id}")
+        if type(new_total_quantity) is not int:
+            raise TypeError("replacement quantity must be an integer")
+        current_total = target.filled_quantity + target.remaining_quantity
+        if not target.filled_quantity < new_total_quantity < current_total:
+            raise ValueError(
+                "priority-preserving reduction must remain above filled quantity"
+            )
+        event_start = len(self.journal.events)
+        command = Order.cancel(command_id, target_order_id)
+        self._register(command)
+        self._emit_submitted(command)
+        reduction = current_total - new_total_quantity
+        target.remaining_quantity -= reduction
+        target.cancelled_quantity += reduction
+        command.status = OrderStatus.APPLIED
+        self.journal.emit(
+            EventType.ORDER_REDUCED,
+            cancelled_quantity=reduction,
+            command_id=command_id,
+            new_total_quantity=new_total_quantity,
+            order_id=target_order_id,
+            priority_preserved=True,
+            remaining_quantity=target.remaining_quantity,
+            resting_sequence=target.resting_sequence,
+        )
+        assert_order_book_invariants(self)
+        return self.journal.events[event_start:]
+
     def assert_invariants(self) -> None:
         assert_order_book_invariants(self)
 

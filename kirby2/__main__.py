@@ -205,6 +205,25 @@ def _parser() -> argparse.ArgumentParser:
     )
     latency_demo.add_argument("--seed", type=int, default=42)
 
+    mechanics_demo = subcommands.add_parser(
+        "mechanics-demo",
+        help="run deterministic advanced exchange/session scenarios",
+    )
+    mechanics_demo.add_argument(
+        "--scenario",
+        choices=(
+            "all",
+            "opening-auction",
+            "closing-auction",
+            "halt-during-momentum",
+            "reopening-gap",
+            "ioc-partial-fill",
+            "fok-rejection",
+            "post-only-rejection",
+        ),
+        default="all",
+    )
+
     defaults = EventRates()
     simulate = subcommands.add_parser("simulate", help="run seeded Poisson-style order flow")
     simulate.add_argument("--seed", type=int, default=42, help="explicit simulation RNG seed")
@@ -406,6 +425,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-latency",
         help="audit asynchronous lifecycles, races, metrics, and exact replay",
+    )
+    subcommands.add_parser(
+        "audit-market-mechanics",
+        help="audit instructions, sessions, auctions, protections, and replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -786,6 +809,46 @@ def main() -> None:
             )
         )
         print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "mechanics-demo":
+        from kirby2.exchange import (
+            MECHANICS_SCENARIOS,
+            MechanicsTimelineInspector,
+            run_mechanics_scenario,
+        )
+
+        names = (
+            MECHANICS_SCENARIOS
+            if args.scenario == "all"
+            else (args.scenario,)
+        )
+        print("KIRBY2_MARKET_MECHANICS_DEMO")
+        for name in names:
+            result = run_mechanics_scenario(name)
+            result.engine.assert_invariants()
+            print(f"SCENARIO {name}")
+            print(
+                "SUMMARY "
+                + json.dumps(
+                    result.summary,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print(
+                f"EVENTS count={len(result.engine.events)} "
+                f"sha256={result.engine.event_stream_sha256()}"
+            )
+            print(f"RECORDING sha256={result.recording.sha256()}")
+            print(
+                f"REPLAY {'PASS' if result.replay.passed else 'FAIL'} "
+                f"event_stream_match={str(result.replay.event_stream_match).lower()} "
+                f"state_match={str(result.replay.state_match).lower()}"
+            )
+            print("TIMELINE")
+            print(MechanicsTimelineInspector(result.engine.events).render())
+            print("RUNTIME_INVARIANTS PASS")
         return
 
     if args.command == "strategy":
@@ -2071,6 +2134,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"LATENCY_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-market-mechanics":
+        from kirby2.audit.market_mechanics import audit_market_mechanics
+
+        reports = audit_market_mechanics()
+        print("KIRBY2_MARKET_MECHANICS_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"MARKET_MECHANICS_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

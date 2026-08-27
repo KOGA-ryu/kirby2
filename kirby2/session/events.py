@@ -15,6 +15,7 @@ class EventType(str, Enum):
     CANCEL_REJECTED = "CANCEL_REJECTED"
     ORDER_EXPIRED = "ORDER_EXPIRED"
     ORDER_REPLACED = "ORDER_REPLACED"
+    ORDER_REDUCED = "ORDER_REDUCED"
     TRADE = "TRADE"
     PARTIAL_FILL = "PARTIAL_FILL"
     FULL_FILL = "FULL_FILL"
@@ -53,4 +54,3 @@ class EventJournal:
 
     def canonical_json_lines(self) -> str:
         return "\n".join(event.to_json() for event in self._events)
-
