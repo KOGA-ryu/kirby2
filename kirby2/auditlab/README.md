@@ -5,13 +5,31 @@ replay, generated scenario coverage, explicit fault injection, deterministic
 failure reduction, statistical holdouts, and immutable evidence. It is not a
 conventional unit-test framework.
 
-Every configuration declares fourteen axes: seed, flow model, regime, volume,
-liquidity, latency, session phase, order type family, hidden-liquidity mode,
-venue count, auction state, participant population, strategy, and objective.
-The fast kernel executes every case against ordinary `OrderBook` instances.
-Targeted probes additionally exercise the actual auction, asynchronous latency,
-hidden-liquidity, multi-venue, agent-ecology, Hawkes, market-data, and causal
-branch implementations.
+Generated-configuration schema v2 schedules seven independent executor lanes:
+core flow, market mechanics, asynchronous latency, fragmented venues, agent
+ecology, execution algorithms, and explicit faults. Each scientific cell has
+six otherwise identical replicates. Replicates zero through two are `TRAIN`;
+replicates three through five are `HOLDOUT`. Fault cells rotate all ten fault
+kinds. Lane assignment, cell identity, partition, and case seed depend only on
+the master seed and integer scheduler indices.
+
+Executors return immutable typed records for exercised configuration values,
+checks, unexpected failures, native recordings, event/state projections, and
+observable output. Status is an enum, not a Boolean: unsupported work is
+`NOT_EXERCISED`. A required `NOT_EXERCISED` check fails its case. The sole
+capability matrix lives in `executors/base.py`, and evidence coverage credits a
+declared value only when the corresponding real executor returns an
+`EXERCISED` record for that exact value. An empty registry refuses execution;
+there is no placeholder executor.
+
+The original high-throughput kernel and its declaration-based coverage report
+remain explicitly legacy during the staged executor migration. They continue
+to support the pre-cutover audit packet while real lanes are added one by one.
+The generated runner will stop using them at the ATR-13 cutover. Until then,
+legacy kernel output must not be interpreted as evidence that the declared
+subsystem capabilities ran. Targeted runtime probes continue to exercise the
+actual auction, asynchronous latency, hidden-liquidity, multi-venue,
+agent-ecology, Hawkes, market-data, and causal-branch implementations.
 
 The ten injected faults are never hidden in random noise. Each has a manifest,
 injection point, detector, expected code, detected code, and evidence. Detected

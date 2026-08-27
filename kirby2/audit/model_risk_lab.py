@@ -9,11 +9,32 @@ from tempfile import TemporaryDirectory
 
 from kirby2.agents.models import PublicEcologyEvent
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
+from kirby2.auditlab.executors import (
+    CAPABILITY_MATRIX,
+    EXECUTOR_REGISTRY,
+    ExecutorRegistry,
+)
+from kirby2.auditlab.generator import (
+    evidence_coverage_report,
+    generate_configurations,
+)
 from kirby2.auditlab.models import (
+    AUDIT_LAB_SCHEMA_VERSION,
     AUDIT_PACKET_SCHEMA_VERSION,
     LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
     AcceptanceRecord,
+    AutomatedStatus,
+    CaseRecording,
+    CheckResult,
+    CheckStatus,
+    ExecutorLane,
+    ExperimentPartition,
+    ExerciseRecord,
+    ExerciseStatus,
+    FailureKind,
+    FailureObservation,
     FaultEvidence,
+    GeneratedCaseResult,
     GeneratedConfiguration,
     KernelResult,
     StatisticalCheck,
@@ -112,6 +133,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
         restored_verification = store.verify(packet.packet_id)
         cases = (
             _coverage_case(result),
+            _truthful_execution_contract_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -151,6 +173,308 @@ def _coverage_case(result) -> ModelRiskLabAuditCase:
             "generated_cases": result.budget,
         },
         () if not missing else (f"partial generated coverage: {missing}",),
+    )
+
+
+def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
+    schedule = generate_configurations(seed=771, budget=420)
+    repeated_schedule = generate_configurations(seed=771, budget=420)
+    schedule_wire = canonical_json([item.as_dict() for item in schedule])
+    repeated_wire = canonical_json(
+        [item.as_dict() for item in repeated_schedule]
+    )
+
+    scientific_cells: dict[
+        tuple[ExecutorLane, str], list[GeneratedConfiguration]
+    ] = {}
+    fault_cells: dict[str, list[GeneratedConfiguration]] = {}
+    for configuration in schedule:
+        if configuration.lane is ExecutorLane.FAULT:
+            fault_cells.setdefault(configuration.cell_id, []).append(configuration)
+        else:
+            scientific_cells.setdefault(
+                (configuration.lane, configuration.cell_id), []
+            ).append(configuration)
+
+    nonseed_fields = {
+        "partition",
+        "replicate_index",
+        "seed",
+        "sequence",
+    }
+
+    def nonseed_wire(configuration: GeneratedConfiguration) -> str:
+        payload = configuration.as_dict()
+        for name in nonseed_fields:
+            payload.pop(name)
+        return canonical_json(payload)
+
+    complete_scientific_cells = sum(
+        all(
+            (
+                len(configurations) == 6,
+                {item.replicate_index for item in configurations} == set(range(6)),
+                {
+                    item.replicate_index
+                    for item in configurations
+                    if item.partition is ExperimentPartition.TRAIN
+                }
+                == {0, 1, 2},
+                {
+                    item.replicate_index
+                    for item in configurations
+                    if item.partition is ExperimentPartition.HOLDOUT
+                }
+                == {3, 4, 5},
+                len({nonseed_wire(item) for item in configurations}) == 1,
+            )
+        )
+        for configurations in scientific_cells.values()
+    )
+    complete_fault_cells = sum(
+        all(
+            (
+                len(configurations) == len(FaultKind),
+                {item.replicate_index for item in configurations}
+                == set(range(len(FaultKind))),
+                {item.partition for item in configurations}
+                == {ExperimentPartition.FAULT},
+                {item.injected_fault for item in configurations} == set(FaultKind),
+            )
+        )
+        for configurations in fault_cells.values()
+    )
+    train_seeds = {
+        item.seed
+        for item in schedule
+        if item.partition is ExperimentPartition.TRAIN
+    }
+    holdout_seeds = {
+        item.seed
+        for item in schedule
+        if item.partition is ExperimentPartition.HOLDOUT
+    }
+
+    round_trip = all(
+        GeneratedConfiguration.from_dict(item.as_dict()) == item
+        for item in schedule
+    )
+    schema_refusals: dict[str, bool] = {}
+    schema_mutations: dict[str, dict[str, object]] = {}
+    missing_field = schedule[0].as_dict()
+    missing_field.pop("lane")
+    schema_mutations["missing_field"] = missing_field
+    unknown_field = schedule[0].as_dict()
+    unknown_field["undeclared"] = "forbidden"
+    schema_mutations["unknown_field"] = unknown_field
+    old_schema = schedule[0].as_dict()
+    old_schema["schema_version"] = AUDIT_LAB_SCHEMA_VERSION - 1
+    schema_mutations["old_schema"] = old_schema
+    noninteger_schema = schedule[0].as_dict()
+    noninteger_schema["schema_version"] = float(AUDIT_LAB_SCHEMA_VERSION)
+    schema_mutations["noninteger_schema"] = noninteger_schema
+    unknown_lane = schedule[0].as_dict()
+    unknown_lane["lane"] = "PLACEHOLDER"
+    schema_mutations["unknown_lane"] = unknown_lane
+    for name, payload in schema_mutations.items():
+        try:
+            GeneratedConfiguration.from_dict(payload)
+        except (TypeError, ValueError):
+            schema_refusals[name] = True
+        else:
+            schema_refusals[name] = False
+
+    core_configuration = next(
+        item for item in schedule if item.lane is ExecutorLane.CORE_FLOW
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.CORE_FLOW]
+    refusal_checks = tuple(
+        CheckResult(
+            name=name,
+            status=CheckStatus.NOT_EXERCISED,
+            required=True,
+            detail="no real executor reported this required check",
+            evidence={"source": "truthful-contract-runtime-audit"},
+        )
+        for name in capability.required_checks
+    )
+    unreported = GeneratedCaseResult(
+        configuration=core_configuration,
+        lane=core_configuration.lane,
+        recording=CaseRecording(
+            lane=core_configuration.lane,
+            recording_type="CONTRACT_PROBE",
+            payload={"configuration_sha256": core_configuration.sha256},
+        ),
+        event_projection=(),
+        final_state_projection={"status": "NOT_EXERCISED"},
+        metrics={},
+        exercises=(),
+        checks=refusal_checks,
+        failures=(),
+        observable_projection={"status": "NOT_EXERCISED"},
+    )
+    unreported_coverage = evidence_coverage_report((unreported,))
+    unreported_core = unreported_coverage["lanes"][ExecutorLane.CORE_FLOW.value]
+    no_declared_dimension_credit = all(
+        not item["exercised_values"] and item["status"] == "PARTIAL"
+        for item in unreported_core["dimensions"].values()
+    )
+    no_unexercised_check_credit = all(
+        item["exercise_count"] == 0 and item["status"] == "PARTIAL"
+        for item in unreported_core["checks"].values()
+    )
+
+    evidence_source = {
+        "source": "truthful-contract-runtime-audit",
+        "detail": {"event_count": 0},
+    }
+    exercised_flow = ExerciseRecord(
+        lane=core_configuration.lane,
+        capability="flow_model",
+        configured_value=core_configuration.flow_model,
+        status=ExerciseStatus.EXERCISED,
+        evidence=evidence_source,
+    )
+    exercise_wire = canonical_json(exercised_flow.as_dict())
+    evidence_source["detail"]["event_count"] = 999
+    caller_mutation_preserved = (
+        canonical_json(exercised_flow.as_dict()) == exercise_wire
+    )
+    direct_mutation_rejected = False
+    try:
+        exercised_flow.evidence["detail"]["event_count"] = 999  # type: ignore[index]
+    except TypeError:
+        direct_mutation_rejected = True
+    exercise_export = exercised_flow.as_dict()
+    exercise_export["evidence"]["detail"]["event_count"] = 777  # type: ignore[index]
+    export_mutation_preserved = (
+        canonical_json(exercised_flow.as_dict()) == exercise_wire
+    )
+
+    reported = replace(unreported, exercises=(exercised_flow,))
+    reported_coverage = evidence_coverage_report((reported,))
+    reported_dimensions = reported_coverage["lanes"][
+        ExecutorLane.CORE_FLOW.value
+    ]["dimensions"]
+    only_reported_dimension_credited = all(
+        item["status"] == ("PASS" if name == "flow_model" else "PARTIAL")
+        for name, item in reported_dimensions.items()
+    )
+
+    boolean_status_refusals: dict[str, bool] = {}
+    for name, constructor in {
+        "check": lambda: CheckResult(
+            name="boolean_status",
+            status=True,  # type: ignore[arg-type]
+            required=True,
+            detail="Boolean status must be rejected",
+            evidence={"source": "truthful-contract-runtime-audit"},
+        ),
+        "exercise": lambda: ExerciseRecord(
+            lane=ExecutorLane.CORE_FLOW,
+            capability="boolean_status",
+            configured_value="simple",
+            status=True,  # type: ignore[arg-type]
+            evidence={"source": "truthful-contract-runtime-audit"},
+        ),
+    }.items():
+        try:
+            constructor()
+        except TypeError:
+            boolean_status_refusals[name] = True
+        else:
+            boolean_status_refusals[name] = False
+
+    failed_check_result = replace(
+        reported,
+        checks=(
+            CheckResult(
+                name="explicit_failure",
+                status=CheckStatus.FAIL,
+                required=False,
+                detail="runtime contract failure probe",
+                evidence={"source": "truthful-contract-runtime-audit"},
+            ),
+        ),
+    )
+    failure_observation_result = replace(
+        reported,
+        checks=(),
+        failures=(
+            FailureObservation(
+                kind=FailureKind.INVARIANT_VIOLATION,
+                code="CONTRACT_PROBE",
+                message="runtime contract failure probe",
+                evidence={"source": "truthful-contract-runtime-audit"},
+            ),
+        ),
+    )
+
+    empty_registry = ExecutorRegistry()
+    empty_registry_refused = False
+    try:
+        empty_registry.execute(core_configuration)
+    except LookupError:
+        empty_registry_refused = True
+
+    passed = all(
+        (
+            schedule_wire == repeated_wire,
+            len(schedule) == 420,
+            len({item.seed for item in schedule}) == len(schedule),
+            len(scientific_cells) == 60,
+            complete_scientific_cells == len(scientific_cells),
+            len(fault_cells) == 6,
+            complete_fault_cells == len(fault_cells),
+            train_seeds.isdisjoint(holdout_seeds),
+            round_trip,
+            all(schema_refusals.values()),
+            len(schema_refusals) == len(schema_mutations),
+            unreported.automated_status is AutomatedStatus.FAIL,
+            no_declared_dimension_credit,
+            no_unexercised_check_credit,
+            only_reported_dimension_credited,
+            all(boolean_status_refusals.values()),
+            failed_check_result.automated_status is AutomatedStatus.FAIL,
+            failure_observation_result.automated_status is AutomatedStatus.FAIL,
+            caller_mutation_preserved,
+            direct_mutation_rejected,
+            export_mutation_preserved,
+            empty_registry_refused,
+            not EXECUTOR_REGISTRY.registered_lanes,
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "truthful_typed_execution_contracts_and_independent_lane_schedule",
+        {
+            "boolean_status_refusals": boolean_status_refusals,
+            "complete_fault_cells": complete_fault_cells,
+            "complete_scientific_cells": complete_scientific_cells,
+            "declared_without_evidence_status": unreported.automated_status.value,
+            "deterministic_schedule_sha256": hashlib.sha256(
+                schedule_wire.encode("utf-8")
+            ).hexdigest(),
+            "empty_registry_refused_execution": empty_registry_refused,
+            "fault_cell_count": len(fault_cells),
+            "immutable_contract_payload": {
+                "caller_mutation_preserved": caller_mutation_preserved,
+                "direct_mutation_rejected": direct_mutation_rejected,
+                "export_mutation_preserved": export_mutation_preserved,
+            },
+            "no_declared_dimension_credit": no_declared_dimension_credit,
+            "no_unexercised_check_credit": no_unexercised_check_credit,
+            "only_reported_dimension_credited": only_reported_dimension_credited,
+            "registered_executor_lanes": [
+                item.value for item in EXECUTOR_REGISTRY.registered_lanes
+            ],
+            "round_trip_schema_v2": round_trip,
+            "schema_refusals": schema_refusals,
+            "scientific_cell_count": len(scientific_cells),
+            "train_holdout_seed_overlap": len(train_seeds.intersection(holdout_seeds)),
+            "unique_seed_count": len({item.seed for item in schedule}),
+        },
+        () if passed else ("truthful execution contract proof failed",),
     )
 
 
@@ -776,6 +1100,10 @@ def _subsystem_evidence_payload_ownership_case() -> ModelRiskLabAuditCase:
 
     configuration = GeneratedConfiguration(
         sequence=1,
+        lane=ExecutorLane.CORE_FLOW,
+        cell_id="core_flow-payload-ownership",
+        replicate_index=0,
+        partition=ExperimentPartition.TRAIN,
         seed=771,
         duration_us=1_000,
         duration_events=1,

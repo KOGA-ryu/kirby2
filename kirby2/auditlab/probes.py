@@ -23,7 +23,11 @@ from kirby2.scenarios import get_scenario_definition
 from kirby2.simulation import compare_flow_models, load_accepted_hawkes_configs
 
 from .generator import generate_configurations
-from .models import GeneratedConfiguration, canonical_sha256
+from .models import (
+    AUDIT_LAB_SCHEMA_VERSION,
+    GeneratedConfiguration,
+    canonical_sha256,
+)
 
 
 def run_subsystem_probes(seed: int) -> dict[str, dict[str, object]]:
@@ -160,7 +164,7 @@ def _fault_semantics_probe() -> dict[str, object]:
         for name, reports in suites.items()
     }
     invalid = generate_configurations(1, 1)[0].as_dict()
-    invalid["schema_version"] = 2
+    invalid["schema_version"] = AUDIT_LAB_SCHEMA_VERSION + 1
     schema_rejected = False
     try:
         GeneratedConfiguration.from_dict(invalid)

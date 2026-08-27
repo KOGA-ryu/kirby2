@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from enum import Enum
 
 from kirby2.agents import POPULATION_IDS
 from kirby2.exchange import SessionState
@@ -10,7 +11,17 @@ from kirby2.latency import LatencyProfileName
 from kirby2.session.objectives import ObjectiveType
 from kirby2.simulation import LiquidityPreset, Regime, VolumePreset
 
-from .models import FaultKind, GeneratedConfiguration
+from .executors.base import CAPABILITY_MATRIX
+from .models import (
+    CheckStatus,
+    ExecutorLane,
+    ExperimentPartition,
+    ExerciseStatus,
+    FaultKind,
+    GeneratedCaseResult,
+    GeneratedConfiguration,
+    canonical_json,
+)
 
 
 AXES: dict[str, tuple[object, ...]] = {
@@ -34,33 +45,73 @@ AXES: dict[str, tuple[object, ...]] = {
     "objective": tuple(item.value for item in ObjectiveType),
 }
 
+_LANES = tuple(ExecutorLane)
+_SCIENTIFIC_LANES = tuple(
+    lane for lane in ExecutorLane if lane is not ExecutorLane.FAULT
+)
+_PRIMES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41)
 
-def generate_configurations(seed: int, budget: int) -> tuple[GeneratedConfiguration, ...]:
+
+def generate_configurations(
+    seed: int,
+    budget: int,
+) -> tuple[GeneratedConfiguration, ...]:
     if type(seed) is not int or seed < 0:
         raise ValueError("audit-lab seed must be a nonnegative integer")
     if type(budget) is not int or budget <= 0:
         raise ValueError("audit-lab budget must be positive")
-    primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41)
     configs: list[GeneratedConfiguration] = []
+    lane_indices = {lane: 0 for lane in _LANES}
+    seed_base = (_mix(seed, 9_001) & 0x7FFF_FFFF) << 32
     for index in range(budget):
-        values = {}
-        for axis_index, (name, options) in enumerate(AXES.items()):
-            offset = _mix(seed, axis_index) % len(options)
-            step = 1
-            if len(options) > 1:
-                step = 1 + primes[axis_index] % (len(options) - 1)
-                while math.gcd(step, len(options)) != 1:
-                    step = 1 + (step % (len(options) - 1))
-            values[name] = options[(offset + index * step) % len(options)]
-        fault_options: tuple[FaultKind | None, ...] = (None, *tuple(FaultKind))
-        fault = fault_options[(_mix(seed, 31) + index) % len(fault_options)]
+        lane = _LANES[index % len(_LANES)]
+        lane_index = lane_indices[lane]
+        lane_indices[lane] += 1
+        lane_ordinal = _LANES.index(lane)
+        if lane is ExecutorLane.FAULT:
+            cell_index = lane_index // len(FaultKind)
+            replicate_index = lane_index % len(FaultKind)
+            partition = ExperimentPartition.FAULT
+            fault = tuple(FaultKind)[replicate_index]
+            coverage_index = cell_index * len(_LANES) + lane_ordinal
+        else:
+            cell_index = lane_index // 6
+            replicate_index = lane_index % 6
+            partition = (
+                ExperimentPartition.TRAIN
+                if replicate_index < 3
+                else ExperimentPartition.HOLDOUT
+            )
+            fault = None
+            scientific_ordinal = _SCIENTIFIC_LANES.index(lane)
+            coverage_index = (
+                cell_index * len(_SCIENTIFIC_LANES) + scientific_ordinal
+            )
+        values = _axis_values(seed, coverage_index)
+        cell_token = _mix(seed, 1_000 + lane_ordinal) & 0xFFFF_FFFF
         configs.append(
             GeneratedConfiguration(
                 sequence=index + 1,
-                seed=_mix(seed, index + 101) & 0x7FFF_FFFF,
-                duration_us=8_000 + ((_mix(seed, index + 181) + index) % 25) * 1_000,
-                duration_events=4 + ((_mix(seed, index + 211) + index) % 9),
-                agent_count=1 + ((_mix(seed, index + 241) + index) % 8),
+                lane=lane,
+                cell_id=(
+                    f"{lane.value.lower()}-{cell_index:08d}-{cell_token:08x}"
+                ),
+                replicate_index=replicate_index,
+                partition=partition,
+                seed=seed_base + index + 1,
+                duration_us=(
+                    8_000
+                    + (
+                        (_mix(seed, coverage_index + 181) + coverage_index) % 25
+                    )
+                    * 1_000
+                ),
+                duration_events=(
+                    4 + ((_mix(seed, coverage_index + 211) + coverage_index) % 9)
+                ),
+                agent_count=(
+                    1 + ((_mix(seed, coverage_index + 241) + coverage_index) % 8)
+                ),
                 flow_model=str(values["flow_model"]),
                 regime=str(values["regime"]),
                 volume=str(values["volume"]),
@@ -80,7 +131,22 @@ def generate_configurations(seed: int, budget: int) -> tuple[GeneratedConfigurat
     return tuple(configs)
 
 
+def _axis_values(seed: int, cell_index: int) -> dict[str, object]:
+    values: dict[str, object] = {}
+    for axis_index, (name, options) in enumerate(AXES.items()):
+        offset = _mix(seed, axis_index) % len(options)
+        step = 1
+        if len(options) > 1:
+            step = 1 + _PRIMES[axis_index] % (len(options) - 1)
+            while math.gcd(step, len(options)) != 1:
+                step = 1 + (step % (len(options) - 1))
+        values[name] = options[(offset + cell_index * step) % len(options)]
+    return values
+
+
 def coverage_report(configurations: tuple[GeneratedConfiguration, ...]) -> dict[str, object]:
+    """Legacy declaration coverage retained only until the ATR-13 cutover."""
+
     report: dict[str, object] = {}
     seeds = {config.seed for config in configurations}
     report["seed"] = {
@@ -97,7 +163,9 @@ def coverage_report(configurations: tuple[GeneratedConfiguration, ...]) -> dict[
             "status": "PASS" if observed == expected else "PARTIAL",
         }
     observed_faults = {
-        config.injected_fault for config in configurations if config.injected_fault is not None
+        config.injected_fault
+        for config in configurations
+        if config.injected_fault is not None
     }
     report["faults"] = {
         "expected": sorted(item.value for item in FaultKind),
@@ -111,6 +179,96 @@ def coverage_report(configurations: tuple[GeneratedConfiguration, ...]) -> dict[
         "status": "PASS" if agent_counts == set(range(1, 9)) else "PARTIAL",
     }
     return report
+
+
+def evidence_coverage_report(
+    results: tuple[GeneratedCaseResult, ...],
+) -> dict[str, object]:
+    """Credit configured values only when a real executor reports exercise."""
+
+    lanes: dict[str, object] = {}
+    overall_passed = True
+    for lane, capability in CAPABILITY_MATRIX.items():
+        lane_results = tuple(result for result in results if result.lane is lane)
+        dimensions: dict[str, object] = {}
+        for dimension in capability.credited_dimensions:
+            configured: dict[str, object] = {}
+            exercised: set[str] = set()
+            mismatched_records = 0
+            for result in lane_results:
+                value = _configuration_dimension(result.configuration, dimension)
+                key = canonical_json(value)
+                configured[key] = value
+                for record in result.exercises:
+                    if (
+                        record.capability != dimension
+                        or record.status is not ExerciseStatus.EXERCISED
+                    ):
+                        continue
+                    record_key = canonical_json(record.configured_value)
+                    if record_key == key:
+                        exercised.add(key)
+                    else:
+                        mismatched_records += 1
+            missing = sorted(set(configured).difference(exercised))
+            status = "PASS" if configured and not missing else "PARTIAL"
+            overall_passed = overall_passed and status == "PASS"
+            dimensions[dimension] = {
+                "configured_values": [configured[key] for key in sorted(configured)],
+                "exercised_values": [configured[key] for key in sorted(exercised)],
+                "mismatched_record_count": mismatched_records,
+                "missing_values": [configured[key] for key in missing],
+                "status": status,
+            }
+
+        checks: dict[str, object] = {}
+        for name in capability.required_checks:
+            reported = [
+                check
+                for result in lane_results
+                for check in result.checks
+                if check.name == name
+            ]
+            exercise_count = sum(
+                check.status is not CheckStatus.NOT_EXERCISED for check in reported
+            )
+            failed_count = sum(check.status is CheckStatus.FAIL for check in reported)
+            status = "PASS" if exercise_count else "PARTIAL"
+            overall_passed = overall_passed and status == "PASS"
+            checks[name] = {
+                "exercise_count": exercise_count,
+                "failed_count": failed_count,
+                "not_exercised_count": sum(
+                    check.status is CheckStatus.NOT_EXERCISED for check in reported
+                ),
+                "reported_count": len(reported),
+                "status": status,
+            }
+        lane_passed = all(
+            item["status"] == "PASS"
+            for group in (dimensions, checks)
+            for item in group.values()
+        )
+        lanes[lane.value] = {
+            "case_count": len(lane_results),
+            "checks": checks,
+            "dimensions": dimensions,
+            "status": "PASS" if lane_passed else "PARTIAL",
+        }
+    return {
+        "lane_count": len(lanes),
+        "lanes": lanes,
+        "result_count": len(results),
+        "status": "PASS" if overall_passed else "PARTIAL",
+    }
+
+
+def _configuration_dimension(
+    configuration: GeneratedConfiguration,
+    dimension: str,
+) -> object:
+    value = getattr(configuration, dimension)
+    return value.value if isinstance(value, Enum) else value
 
 
 def minimum_full_coverage_budget(seed: int, limit: int = 10_000) -> int | None:
