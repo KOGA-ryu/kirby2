@@ -29,8 +29,10 @@ from .flow_models import (
     FlowModel,
     HawkesConfig,
     HawkesFlowModel,
+    HawkesStabilityCertification,
     ScheduledFlowArrival,
     SimpleFlowModel,
+    certify_hawkes_stability,
     load_accepted_hawkes_configs,
 )
 from .intraday import (
@@ -84,6 +86,7 @@ __all__ = [
     "FlowModelComparison",
     "HawkesConfig",
     "HawkesFlowModel",
+    "HawkesStabilityCertification",
     "IntegerDistribution",
     "IntradayClock",
     "IntradayModifiers",
@@ -127,6 +130,7 @@ __all__ = [
     "run_simulation",
     "accepted_hawkes_profile_for_regime",
     "compare_flow_models",
+    "certify_hawkes_stability",
     "default_queue_reactive_config",
     "imbalance_probe_state",
     "load_accepted_hawkes_configs",

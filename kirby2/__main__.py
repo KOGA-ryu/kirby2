@@ -351,6 +351,10 @@ def _parser() -> argparse.ArgumentParser:
         "audit-scenarios",
         help="rerun accepted regime seeds, digests, invariants, and behavioral envelopes",
     )
+    subcommands.add_parser(
+        "audit-hawkes-stability",
+        help="run adversarial Hawkes branching-stability certification cases",
+    )
 
     matrix = subcommands.add_parser(
         "matrix",
@@ -1473,6 +1477,22 @@ def main() -> None:
         print(
             f"SCENARIO_AUDIT {'FAIL' if failed else 'PASS'} "
             f"accepted={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-hawkes-stability":
+        from kirby2.audit.hawkes import audit_hawkes_stability
+
+        reports = audit_hawkes_stability()
+        print("KIRBY2_HAWKES_STABILITY_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"HAWKES_STABILITY_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
             raise SystemExit(1)

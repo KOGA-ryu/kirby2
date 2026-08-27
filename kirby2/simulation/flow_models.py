@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Mapping, Protocol, runtime_checkable
 
@@ -14,6 +15,10 @@ from .rng import SeededRng
 
 FLOW_CHANNELS = tuple(FlowEventFamily)
 ACCEPTED_HAWKES_PATH = Path(__file__).with_name("accepted_hawkes.json")
+HAWKES_STABILITY_METHOD = "SCC_SHIFTED_COLLATZ_WIELANDT"
+HAWKES_STABILITY_ACCEPTANCE_MARGIN = 1e-9
+HAWKES_STABILITY_TOLERANCE = 1e-12
+HAWKES_STABILITY_MAX_ITERATIONS = 4_096
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +101,50 @@ class SimpleFlowModel:
 
 
 @dataclass(frozen=True, slots=True)
+class HawkesStabilityCertification:
+    """Deterministic lower/upper stability evidence for a branching matrix."""
+
+    method: str
+    lower_bound: float
+    upper_bound: float
+    iterations: int
+    component_count: int
+    converged: bool
+    acceptance_margin: float
+    warning_threshold: float
+    classification: str
+
+    @property
+    def accepted(self) -> bool:
+        return self.classification in {
+            "PASS_SUBCRITICAL",
+            "WARNING_NEAR_CRITICAL",
+        }
+
+    @property
+    def spectral_radius(self) -> float:
+        return (self.lower_bound + self.upper_bound) / 2.0
+
+    @property
+    def safety_margin(self) -> float:
+        return 1.0 - self.upper_bound
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "acceptance_margin": self.acceptance_margin,
+            "classification": self.classification,
+            "component_count": self.component_count,
+            "converged": self.converged,
+            "iterations": self.iterations,
+            "lower_bound": _diagnostic_number(self.lower_bound),
+            "method": self.method,
+            "safety_margin": _diagnostic_number(self.safety_margin),
+            "upper_bound": _diagnostic_number(self.upper_bound),
+            "warning_threshold": self.warning_threshold,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class HawkesConfig:
     profile_id: str
     baseline_mu: tuple[float, ...]
@@ -103,6 +152,11 @@ class HawkesConfig:
     beta: tuple[tuple[float, ...], ...]
     max_total_intensity: float = 120.0
     stability_warning_threshold: float = 0.80
+    _stability_certification: HawkesStabilityCertification = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         channel_count = len(FLOW_CHANNELS)
@@ -135,10 +189,30 @@ class HawkesConfig:
             raise ValueError("Hawkes baseline exceeds the configured intensity cap")
         if not 0 < self.stability_warning_threshold < 1:
             raise ValueError("Hawkes warning threshold must lie strictly between zero and one")
-        if self.spectral_radius >= 1.0:
+        certification = certify_hawkes_stability(
+            self.branching_matrix,
+            warning_threshold=self.stability_warning_threshold,
+        )
+        object.__setattr__(self, "_stability_certification", certification)
+        if certification.classification == "REJECT_SUPERCRITICAL":
             raise ValueError(
                 "supercritical Hawkes configuration rejected: "
-                f"branching spectral radius={self.spectral_radius:.6f}"
+                f"branching spectral radius lower bound="
+                f"{certification.lower_bound:.12f}"
+            )
+        if certification.classification == "REJECT_AMBIGUOUS":
+            raise ValueError(
+                "near-critical Hawkes configuration rejected: stability bounds "
+                f"[{certification.lower_bound:.12f}, "
+                f"{certification.upper_bound:.12f}] do not preserve the "
+                f"{certification.acceptance_margin:.1e} acceptance margin"
+            )
+        if certification.classification == "REJECT_UNVERIFIED":
+            raise ValueError(
+                "Hawkes configuration rejected: stability could not be verified "
+                f"after {certification.iterations} deterministic iterations; "
+                f"bounds=[{certification.lower_bound:.12f}, "
+                f"{certification.upper_bound:.12f}]"
             )
 
     @property
@@ -153,13 +227,15 @@ class HawkesConfig:
 
     @property
     def spectral_radius(self) -> float:
-        return _spectral_radius_nonnegative(self.branching_matrix)
+        return self._stability_certification.spectral_radius
+
+    @property
+    def stability_certification(self) -> HawkesStabilityCertification:
+        return self._stability_certification
 
     @property
     def stability_status(self) -> str:
-        if self.spectral_radius >= self.stability_warning_threshold:
-            return "WARNING_NEAR_CRITICAL"
-        return "PASS_SUBCRITICAL"
+        return self._stability_certification.classification
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -270,6 +346,7 @@ class HawkesFlowModel:
             "observed_events": self._observed_events,
             "profile_id": self.config.profile_id,
             "stability": self.config.stability_status,
+            "stability_certification": self.config.stability_certification.as_dict(),
             "thinning_rejections": self._thinning_rejections,
         }
 
@@ -424,20 +501,251 @@ def _matrix_dict(matrix: tuple[tuple[float, ...], ...]) -> dict[str, object]:
     }
 
 
-def _spectral_radius_nonnegative(matrix: tuple[tuple[float, ...], ...]) -> float:
+def certify_hawkes_stability(
+    matrix: tuple[tuple[float, ...], ...],
+    *,
+    warning_threshold: float = 0.80,
+    acceptance_margin: float = HAWKES_STABILITY_ACCEPTANCE_MARGIN,
+    tolerance: float = HAWKES_STABILITY_TOLERANCE,
+    max_iterations: int = HAWKES_STABILITY_MAX_ITERATIONS,
+) -> HawkesStabilityCertification:
+    """Bound the Perron root without assuming an aperiodic full matrix.
+
+    A reducible nonnegative matrix is permutation-similar to block triangular form,
+    and its spectral radius is the maximum radius of its strongly connected diagonal
+    blocks. Each nontrivial irreducible block is shifted by the identity, making it
+    primitive, before deterministic Collatz-Wielandt iteration. The lower and upper
+    ratios from every iteration remain valid bounds; a configuration is accepted only
+    when those bounds converge and preserve the critical safety margin.
+    """
+
+    normalized = _validated_nonnegative_matrix(matrix)
+    if not math.isfinite(warning_threshold) or not 0 < warning_threshold < 1:
+        raise ValueError("Hawkes warning threshold must lie strictly between zero and one")
+    if not math.isfinite(acceptance_margin) or not 0 < acceptance_margin < 1:
+        raise ValueError("Hawkes acceptance margin must lie strictly between zero and one")
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("Hawkes stability tolerance must be finite and positive")
+    if type(max_iterations) is not int or max_iterations <= 0:
+        raise ValueError("Hawkes stability iteration limit must be a positive integer")
+
+    components = _strongly_connected_components(normalized)
+    lower_bound = 0.0
+    upper_bound = 0.0
+    iterations = 0
+    converged = True
+    for component in components:
+        block = tuple(
+            tuple(normalized[row][column] for column in component)
+            for row in component
+        )
+        block_lower, block_upper, block_iterations, block_converged = (
+            _shifted_collatz_wielandt_bounds(
+                block,
+                tolerance=tolerance,
+                max_iterations=max_iterations,
+            )
+        )
+        lower_bound = max(lower_bound, block_lower)
+        upper_bound = max(upper_bound, block_upper)
+        iterations += block_iterations
+        converged = converged and block_converged
+
+    if lower_bound >= 1.0:
+        classification = "REJECT_SUPERCRITICAL"
+    elif not converged:
+        classification = "REJECT_UNVERIFIED"
+    elif upper_bound >= 1.0 - acceptance_margin:
+        classification = "REJECT_AMBIGUOUS"
+    elif upper_bound >= warning_threshold:
+        classification = "WARNING_NEAR_CRITICAL"
+    else:
+        classification = "PASS_SUBCRITICAL"
+    return HawkesStabilityCertification(
+        method=HAWKES_STABILITY_METHOD,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        iterations=iterations,
+        component_count=len(components),
+        converged=converged,
+        acceptance_margin=acceptance_margin,
+        warning_threshold=warning_threshold,
+        classification=classification,
+    )
+
+
+def _validated_nonnegative_matrix(
+    matrix: tuple[tuple[float, ...], ...],
+) -> tuple[tuple[float, ...], ...]:
+    if not matrix:
+        raise ValueError("Hawkes branching matrix must not be empty")
     size = len(matrix)
+    if any(len(row) != size for row in matrix):
+        raise ValueError("Hawkes branching matrix must be square")
+    try:
+        normalized = tuple(tuple(float(value) for value in row) for row in matrix)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError("Hawkes branching values must be finite numbers") from error
+    if any(
+        not math.isfinite(value) or value < 0
+        for row in normalized
+        for value in row
+    ):
+        raise ValueError("Hawkes branching values must be finite and nonnegative")
+    return normalized
+
+
+def _strongly_connected_components(
+    matrix: tuple[tuple[float, ...], ...],
+) -> tuple[tuple[int, ...], ...]:
+    size = len(matrix)
+    adjacency = tuple(
+        tuple(target for target in range(size) if matrix[target][source] > 0)
+        for source in range(size)
+    )
+    next_index = 0
+    indices = [-1 for _ in range(size)]
+    low_links = [0 for _ in range(size)]
+    stack: list[int] = []
+    on_stack = [False for _ in range(size)]
+    components: list[tuple[int, ...]] = []
+
+    def visit(node: int) -> None:
+        nonlocal next_index
+        indices[node] = next_index
+        low_links[node] = next_index
+        next_index += 1
+        stack.append(node)
+        on_stack[node] = True
+        for neighbor in adjacency[node]:
+            if indices[neighbor] == -1:
+                visit(neighbor)
+                low_links[node] = min(low_links[node], low_links[neighbor])
+            elif on_stack[neighbor]:
+                low_links[node] = min(low_links[node], indices[neighbor])
+        if low_links[node] != indices[node]:
+            return
+        component: list[int] = []
+        while True:
+            member = stack.pop()
+            on_stack[member] = False
+            component.append(member)
+            if member == node:
+                break
+        components.append(tuple(sorted(component)))
+
+    for node in range(size):
+        if indices[node] == -1:
+            visit(node)
+    return tuple(sorted(components, key=lambda component: component[0]))
+
+
+def _shifted_collatz_wielandt_bounds(
+    block: tuple[tuple[float, ...], ...],
+    *,
+    tolerance: float,
+    max_iterations: int,
+) -> tuple[float, float, int, bool]:
+    size = len(block)
+    if size == 1:
+        radius = block[0][0]
+        return radius, radius, 0, True
+
+    shifted = tuple(
+        tuple(
+            value + (1.0 if row == column else 0.0)
+            for column, value in enumerate(values)
+        )
+        for row, values in enumerate(block)
+    )
     vector = [1.0 / size for _ in range(size)]
-    estimate = 0.0
-    for _ in range(256):
-        multiplied = [
-            sum(matrix[row][column] * vector[column] for column in range(size))
-            for row in range(size)
-        ]
-        norm = max(multiplied)
-        if norm == 0:
-            return 0.0
-        vector = [value / norm for value in multiplied]
-        if abs(norm - estimate) < 1e-12:
-            return norm
-        estimate = norm
-    return estimate
+    best_lower = 0.0
+    best_upper = math.inf
+    for iteration in range(1, max_iterations + 1):
+        iteration_lower, iteration_upper = _exact_collatz_ratio_bounds(block, vector)
+        best_lower = max(best_lower, iteration_lower)
+        best_upper = min(best_upper, iteration_upper)
+        if best_lower == math.inf:
+            return math.inf, math.inf, iteration, True
+        if best_lower > best_upper:
+            return (
+                max(0.0, best_upper - 1.0),
+                max(0.0, best_lower - 1.0),
+                iteration,
+                False,
+            )
+        width = best_upper - best_lower
+        if width <= tolerance * max(1.0, abs(best_upper)):
+            return (
+                max(0.0, best_lower - 1.0),
+                max(0.0, best_upper - 1.0),
+                iteration,
+                True,
+            )
+        try:
+            multiplied = [
+                math.fsum(
+                    shifted[row][column] * vector[column]
+                    for column in range(size)
+                )
+                for row in range(size)
+            ]
+        except OverflowError:
+            return max(0.0, best_lower - 1.0), math.inf, iteration, False
+        if any(not math.isfinite(value) or value <= 0 for value in multiplied):
+            return max(0.0, best_lower - 1.0), math.inf, iteration, False
+        scale = max(multiplied)
+        vector = [value / scale for value in multiplied]
+    return (
+        max(0.0, best_lower - 1.0),
+        max(0.0, best_upper - 1.0),
+        max_iterations,
+        False,
+    )
+
+
+def _exact_collatz_ratio_bounds(
+    block: tuple[tuple[float, ...], ...],
+    vector: list[float],
+) -> tuple[float, float]:
+    """Return outward-rounded ratios for the exact binary-float inputs."""
+
+    exact_vector = tuple(Fraction.from_float(value) for value in vector)
+    ratios: list[Fraction] = []
+    for row, values in enumerate(block):
+        numerator = Fraction(0)
+        for column, value in enumerate(values):
+            coefficient = Fraction.from_float(value)
+            if row == column:
+                coefficient += 1
+            numerator += coefficient * exact_vector[column]
+        ratios.append(numerator / exact_vector[row])
+    return _fraction_lower_float(min(ratios)), _fraction_upper_float(max(ratios))
+
+
+def _fraction_lower_float(value: Fraction) -> float:
+    try:
+        result = float(value)
+    except OverflowError:
+        return math.inf
+    if math.isfinite(result) and Fraction.from_float(result) > value:
+        return math.nextafter(result, -math.inf)
+    return result
+
+
+def _fraction_upper_float(value: Fraction) -> float:
+    try:
+        result = float(value)
+    except OverflowError:
+        return math.inf
+    if math.isfinite(result) and Fraction.from_float(result) < value:
+        return math.nextafter(result, math.inf)
+    return result
+
+
+def _diagnostic_number(value: float) -> float | str:
+    if math.isinf(value):
+        return "INFINITY" if value > 0 else "-INFINITY"
+    if math.isnan(value):
+        return "NAN"
+    return round(value, 12)
