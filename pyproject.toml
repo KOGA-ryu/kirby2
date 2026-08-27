@@ -7,12 +7,17 @@ name = "kirby2"
 version = "0.1.0"
 description = "Deterministic market-execution training sandbox"
 requires-python = ">=3.11"
+dependencies = ["duckdb>=1.5,<2"]
 
 [project.scripts]
 kirby2 = "kirby2.__main__:main"
 
+[tool.setuptools.packages.find]
+include = ["kirby2*"]
+
 [tool.setuptools.package-data]
 "kirby2.scenarios" = ["accepted_scenarios.json"]
 "kirby2.historical" = ["FEATURES.md", "LESSONS.md", "fixtures/*.json", "lessons/*.json"]
+"kirby2.research" = ["README.md"]
 "kirby2.simulation" = ["DISTRIBUTIONS.md", "accepted_hawkes.json", "empirical/*.json"]
 "kirby2.calibration" = ["normalized_event_schema.json"]

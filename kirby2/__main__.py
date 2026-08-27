@@ -117,6 +117,19 @@ def _binding_assignment(value: str) -> tuple[str, str]:
     return _binding_key(raw_key), command
 
 
+def _timed_input(value: str) -> tuple[int, str]:
+    if ":" not in value:
+        raise argparse.ArgumentTypeError("player action must use TIME_US:KEY")
+    raw_time, raw_key = value.split(":", 1)
+    try:
+        simulation_time_us = int(raw_time)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("player action time must be an integer") from error
+    if simulation_time_us < 0:
+        raise argparse.ArgumentTypeError("player action time must be nonnegative")
+    return simulation_time_us, _binding_key(raw_key)
+
+
 def _flow_model_names(value: str) -> tuple[str, ...]:
     allowed = {"simple", "hawkes"}
     models = tuple(item.strip().lower() for item in value.split(",") if item.strip())
@@ -370,6 +383,69 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-historical-lessons",
         help="audit blind lesson phases, capability gates, overlays, and replay",
+    )
+    subcommands.add_parser(
+        "audit-run-store",
+        help="audit immutable identities, Parquet facts, DuckDB views, and replay",
+    )
+
+    record_run = subcommands.add_parser(
+        "record-run",
+        help="run and persist one deterministic synthetic training session",
+    )
+    record_run.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+    record_run.add_argument(
+        "--scenario",
+        choices=sorted(load_scenario_definitions()),
+        default="balanced",
+    )
+    record_run.add_argument("--seed", type=int, default=42)
+    record_run.add_argument("--seconds", type=_positive_int, default=5)
+    record_run.add_argument("--quantity", type=_positive_int, default=100)
+    record_run.add_argument(
+        "--player-action",
+        type=_timed_input,
+        action="append",
+        default=[],
+        metavar="TIME_US:KEY",
+        help="replayable input at simulation microseconds; default is a midpoint market buy",
+    )
+
+    inspect_run = subcommands.add_parser(
+        "inspect-run",
+        help="show one immutable run manifest, summary, and verification state",
+    )
+    inspect_run.add_argument("run_id")
+    inspect_run.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+
+    query_runs = subcommands.add_parser(
+        "query-runs",
+        help="query the DuckDB run-summary view",
+    )
+    query_runs.add_argument("--scenario")
+    query_runs.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
+    )
+
+    verify_run = subcommands.add_parser(
+        "verify-run",
+        help="verify immutable artifacts, schemas, event sequence, and deterministic replay",
+    )
+    verify_run.add_argument("run_id")
+    verify_run.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research",
     )
 
     matrix = subcommands.add_parser(
@@ -649,6 +725,137 @@ def main() -> None:
             )
         print(f"LESSON_COUNT {len(lessons)}")
         print("LESSON_CATALOG PASS provenance_validated=true")
+        return
+
+    if args.command == "record-run":
+        from kirby2.research import RunStore
+        from kirby2.session.layouts import HotkeyLayout
+        from kirby2.session.live import LiveMarketSession
+        from kirby2.session.objectives import ObjectiveType, SessionObjective
+        from kirby2.session.replay import SessionRecording
+
+        duration_us = args.seconds * 1_000_000
+        actions = tuple(args.player_action) or ((duration_us // 2, "d"),)
+        if tuple(time_us for time_us, _key in actions) != tuple(
+            sorted(time_us for time_us, _key in actions)
+        ):
+            print("RECORD_RUN_ERROR player actions must be time-ordered", file=sys.stderr)
+            raise SystemExit(2)
+        if any(time_us > duration_us for time_us, _key in actions):
+            print("RECORD_RUN_ERROR player action exceeds session duration", file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            layout = HotkeyLayout.default()
+            objective = SessionObjective(
+                ObjectiveType.ACQUIRE,
+                target_quantity=args.quantity,
+                time_limit_us=duration_us,
+                preferred_slippage_ticks=2,
+            )
+            session = LiveMarketSession(
+                get_scenario_definition(args.scenario),
+                seed=args.seed,
+                duration_seconds=args.seconds,
+                initial_quantity=args.quantity,
+                quantity_options=tuple(
+                    sorted(
+                        {
+                            25,
+                            50,
+                            100,
+                            200,
+                            500,
+                            1_000,
+                            2_000,
+                            args.quantity,
+                        }
+                    )
+                ),
+                objective=objective,
+            )
+            session.start()
+            for simulation_time_us, input_key in actions:
+                delta_us = simulation_time_us - session.simulation_time_us
+                if delta_us:
+                    if not session.running:
+                        raise ValueError("player action sequence paused before its next timestamp")
+                    session.advance_by(delta_us)
+                session.handle_input(input_key, layout.bindings)
+            final_delta_us = duration_us - session.simulation_time_us
+            if final_delta_us:
+                if not session.running:
+                    raise ValueError("player action sequence paused before session completion")
+                session.advance_by(final_delta_us)
+            recording = SessionRecording.capture(session, layout, auto_start=True)
+            store = RunStore(args.store)
+            manifest = store.record_session(recording, session)
+            verification = store.verify_run(manifest.run_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"RECORD_RUN_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_RECORD_RUN")
+        print(f"RUN_ID {manifest.run_id}")
+        print(f"RUN_DIRECTORY {store.run_directory(manifest.run_id).resolve()}")
+        print(f"CONFIGURATION_DIGEST {manifest.configuration_digest}")
+        print(f"EVIDENCE_DIGEST {manifest.evidence_digest}")
+        print(f"RESULT_DIGEST {manifest.result_digest}")
+        table_artifacts = tuple(
+            item for item in manifest.artifacts if item.row_count is not None
+        )
+        print(
+            f"TABLES {len(table_artifacts)} "
+            f"ROWS {sum(item.row_count or 0 for item in table_artifacts)}"
+        )
+        print(
+            f"RECORD_RUN {'PASS' if verification.passed else 'FAIL'} "
+            f"replay={str(verification.replay_passed).lower()}"
+        )
+        if not verification.passed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "inspect-run":
+        from kirby2.research import RunStore
+        from kirby2.research.toml_codec import canonical_toml
+
+        try:
+            payload = RunStore(args.store).inspect_run(args.run_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"INSPECT_RUN_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_INSPECT_RUN")
+        print(canonical_toml({"inspection": payload}), end="")
+        return
+
+    if args.command == "query-runs":
+        from kirby2.research import RunStore
+
+        try:
+            rows = RunStore(args.store).query_runs(args.scenario)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"QUERY_RUNS_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print("KIRBY2_QUERY_RUNS")
+        for row in rows:
+            print(
+                f"RUN {row['run_id']} scenario={row['scenario_id']} seed={row['seed']} "
+                f"events={row['event_count']} trades={row['trade_count']} "
+                f"actions={row['player_action_count']} result={row['result_digest']}"
+            )
+        print(f"RUN_COUNT {len(rows)}")
+        return
+
+    if args.command == "verify-run":
+        from kirby2.research import RunStore
+
+        try:
+            report = RunStore(args.store).verify_run(args.run_id)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            print(f"VERIFY_RUN_ERROR {error}", file=sys.stderr)
+            raise SystemExit(2) from error
+        print(report.render())
+        if not report.passed:
+            raise SystemExit(1)
         return
 
     if args.command == "lesson-run":
@@ -1619,6 +1826,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"HISTORICAL_LESSON_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-run-store":
+        from kirby2.audit.run_store import audit_run_store
+
+        reports = audit_run_store()
+        print("KIRBY2_RUN_STORE_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"RUN_STORE_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
