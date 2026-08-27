@@ -95,14 +95,25 @@ sensitivity reports each cell's median, range, and median absolute deviation,
 then deterministic cross-cell quantiles.
 
 Pathology screens retain their native units. Hawkes status comes from the
-accepted production stability certifications. Event explosion divides
-recorded event counts by simulated time and compares only capped core-flow
-cells to their configured events-per-second caps. No-trade rate excludes
-non-continuous mechanics and observe-only algorithm cells. Price displacement
-is measured from each lane's recorded initial reference. Fragmented-market
-crosses use the recorded episode timeline and become permanent only when one
-continuous episode exceeds `max(100000 us, 4 * maximum configured market-data
-latency)`; an ending quote is not duration evidence.
+accepted production stability certifications. A Hawkes
+`max_total_intensity` is a ceiling on instantaneous conditional intensity, not
+a deterministic ceiling on a finite-window arrival count. Event explosion
+therefore compares each complete capped core-flow cell's integer count to the
+one-sided tail of a homogeneous Poisson process at the aggregate cap exposure.
+For the audit core-flow path, the recorded absence of post-model interval
+compression establishes that this process conservatively dominates arrivals
+whose conditional intensity never exceeds the configured cap. A production
+path that compresses sampled inter-arrival intervals is ineligible
+until it supplies a derived effective bound. The immutable threshold uses a
+Bonferroni correction across measured cells and a family-wise false-positive
+probability of one part per million. Realized events per simulated second and
+their ratio to the cap remain descriptive evidence; crossing the expected rate
+alone is not a failure. No-trade rate excludes non-continuous mechanics and
+observe-only algorithm cells. Price displacement is measured from each lane's
+recorded initial reference. Fragmented-market crosses use the recorded episode
+timeline and become permanent only when one continuous episode exceeds
+`max(100000 us, 4 * maximum configured market-data latency)`; an ending quote
+is not duration evidence.
 
 Every predeclared threshold and unit lives in one recursively immutable
 manifest in `statistics.py`. Its digest is included in every statistical check

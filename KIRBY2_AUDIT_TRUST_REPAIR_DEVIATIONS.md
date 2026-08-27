@@ -3,6 +3,107 @@
 This file records prerequisite repairs discovered while executing the canonical
 sequence in `KIRBY2_AUDIT_TRUST_REPAIR_ROADMAP.md`.
 
+## ATR-19A — Correct capped-arrival statistical inference
+
+Discovered: 2026-08-27 during the first ATR-19 10,000-case persisted run at
+`570875ac10ef9d9771e4ef309d10992792f00a13`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-lab --budget 10000 --seed 771 --save-failures
+```
+
+Observed failure:
+
+```text
+RUN seed=771 budget=10000 status=FAIL
+STATISTIC unrealistic_event_explosion status=FAIL
+STATISTICAL_STATUS FAIL
+AGGREGATE_STATUS FAIL
+PACKET id=audit-2fe994077b7bf5c9818750ee verification=PASS
+```
+
+The rejected packet and its `acceptance-20d989f2c7cd8c0b8d15` automated
+precheck rejection remain immutable. The failing cell
+`core_flow-00000012-cb082d3e` contains six Hawkes arrivals across six 8 ms
+replicates. Its realized rate is 125 events per second, while the accepted
+profile declares `max_total_intensity=120.0` events per simulated second.
+
+Root cause: `HawkesConfig.max_total_intensity` is an instantaneous conditional-
+intensity ceiling enforced at every thinning proposal. It is not a deterministic
+ceiling on a realized finite-window count. Under the conservative homogeneous
+Poisson dominating process, the cell has cap exposure `120 * 0.048 = 5.76`
+events and `P[N >= 6]` is approximately `0.5150434175`; the observation is
+not anomalous under the conservative cap-only envelope. One constituent 8 ms
+replicate contains two arrivals, which also
+proves that summing `ceil(cap * replicate_duration)` would invent a count rule
+the production generator does not have. ATR-17 compared the random ratio
+`sum(count) / sum(duration)` directly to the conditional-intensity cap and
+therefore made a normal stochastic exceedance a hard failure.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/auditlab/executors/core_flow.py`
+- `kirby2/auditlab/runner.py`
+- `kirby2/auditlab/statistics.py`
+- `kirby2/audit/model_risk_lab.py`
+- `kirby2/auditlab/README.md`
+
+Repair:
+
+1. Keep realized events per simulated second and its ratio to the configured
+   cap as descriptive evidence, never as a deterministic count invariant.
+2. For each complete capped core-flow cell, aggregate cap exposure as
+   `sum(cap_events_per_second * duration_seconds)` and compute the one-sided
+   upper-tail probability of its realized count under the homogeneous Poisson
+   process that dominates a counting process whose conditional intensity never
+   exceeds that cap.
+3. Predeclare a family-wise false-positive probability of one part per million
+   in the immutable threshold manifest. Apply a Bonferroni correction across
+   every valid capped cell and fail only when the corrected upper-tail
+   probability is below that threshold.
+4. Bump the threshold-manifest schema and name the Poisson-dominating,
+   Bonferroni-corrected integer-count method because the decision semantics
+   changed.
+5. Record whether the core-flow executor applied an inter-arrival timing
+   transform. The `C * T` envelope is eligible only for Hawkes cells with a
+   path that has no post-model interval compression; production distribution
+   profiles may compress sampled intervals and need a separately derived
+   effective bound.
+6. Require exact flow-model/cap pairing: Hawkes cells require a numeric cap and
+   simple-flow cells must be uncapped. Treat mismatched, inconsistent, or
+   malformed cap/count/duration/timing evidence as a failed statistical claim
+   rather than silently discarding the cell. Reconcile projected caps and
+   timing paths to the unique required source invariant, durations to both the
+   generated configuration and typed metrics, and counts to typed metrics.
+7. Add runtime-audit probes proving the original six-event observation passes,
+   the corrected boundary is deterministic, and a controlled implausible count
+   fails. Preserve the old failed packet; only a new post-repair run may
+   supersede its evidence.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.statistics import classify_capped_event_count; ordinary=classify_capped_event_count(event_count=6, simulated_duration_us=48000, configured_intensity_cap_eps=120.0, comparison_count=119); boundary=classify_capped_event_count(event_count=24, simulated_duration_us=48000, configured_intensity_cap_eps=120.0, comparison_count=119); implausible=classify_capped_event_count(event_count=25, simulated_duration_us=48000, configured_intensity_cap_eps=120.0, comparison_count=119); assert ordinary['classification']=='PASS' and boundary['classification']=='PASS' and implausible['classification']=='FAIL'; print('ATR_19A_CAPPED_ARRIVAL_INFERENCE PASS')"
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-hawkes-stability
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab import run_audit_lab; result=run_audit_lab(budget=512, seed=771, persist=False, fresh_process_samples=2); check=next(item for item in result.statistics if item.name == 'unrealistic_event_explosion'); assert check.status == 'PASS', check.as_dict(); assert result.passed, result.render(); assert result.packet is None; print('ATR_19A_512_CASE_GATE PASS')"
+git diff --check
+```
+
+Acceptance: the preserved reproducer is explained without relabeling or editing
+it; ordinary stochastic count variation does not fail an intensity cap; a
+predeclared family-wise upper-tail breach does fail; raw count-rate evidence
+remains visible; the cap-only claim requires an unmodified Hawkes timing path;
+model/cap mismatches and malformed capped-cell evidence cannot earn a pass; and
+all runtime invariants survive.
+
+Commit: `Correct capped event count statistics`
+
+Handoff: return to a clean amendment commit and repeat ATR-19 from step 1.
+
 ## ATR-13A — Refuse the facsimile-era event-expansion statistic
 
 Discovered: 2026-08-27 during the ATR-13 real-executor runner cutover at

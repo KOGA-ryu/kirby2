@@ -22,7 +22,7 @@ from .models import ExecutorLane, StatisticalCheck, canonical_json, canonical_sh
 
 
 _THRESHOLD_MANIFEST_SOURCE = {
-    "schema_version": 1,
+    "schema_version": 2,
     "matched_cell_design": {
         "holdout_replicates": 3,
         "required_replicates": 6,
@@ -83,11 +83,14 @@ _THRESHOLD_MANIFEST_SOURCE = {
         },
         "unrealistic_event_explosion": {
             "description": (
-                "matched-cell observed events per simulated second <= 10000 "
-                "basis points of the configured production cap"
+                "capped core-flow counts do not breach the one-sided Poisson-"
+                "dominating envelope at Bonferroni-corrected family-wise "
+                "alpha 1e-6"
             ),
-            "fail_above_configured_cap_bps": 10_000,
-            "unit": "basis_points_of_configured_events_per_second_cap",
+            "comparison_correction": "BONFERRONI",
+            "family_wise_alpha_parts_per_billion": 1_000,
+            "method": "POISSON_DOMINATING_INTEGER_COUNT_UPPER_TAIL",
+            "unit": "bonferroni_adjusted_one_sided_probability",
         },
         "degenerate_no_trade": {
             "description": (
@@ -241,6 +244,69 @@ def classify_cross_episode(
             maximum_configured_market_data_latency_us
         ),
         "threshold_us": threshold_us,
+    }
+
+
+def classify_capped_event_count(
+    *,
+    event_count: int,
+    simulated_duration_us: int,
+    configured_intensity_cap_eps: float,
+    comparison_count: int,
+) -> dict[str, object]:
+    """Classify a realized count against a capped-intensity envelope."""
+
+    if type(event_count) is not int or event_count < 0:
+        raise ValueError("capped event count must be a nonnegative integer")
+    if type(simulated_duration_us) is not int or simulated_duration_us <= 0:
+        raise ValueError("capped event duration must be positive microseconds")
+    if (
+        type(configured_intensity_cap_eps) not in {int, float}
+        or not math.isfinite(float(configured_intensity_cap_eps))
+        or float(configured_intensity_cap_eps) <= 0
+    ):
+        raise ValueError("configured intensity cap must be finite and positive")
+    if type(comparison_count) is not int or comparison_count <= 0:
+        raise ValueError("capped event comparison count must be positive")
+
+    spec = _check_spec("unrealistic_event_explosion")
+    alpha_ppb = spec["family_wise_alpha_parts_per_billion"]
+    if type(alpha_ppb) is not int or not 0 < alpha_ppb < 1_000_000_000:
+        raise RuntimeError("event-count family-wise alpha is invalid")
+    if spec["comparison_correction"] != "BONFERRONI":
+        raise RuntimeError("unsupported event-count comparison correction")
+    if spec["method"] != "POISSON_DOMINATING_INTEGER_COUNT_UPPER_TAIL":
+        raise RuntimeError("unsupported capped event-count method")
+
+    cap = float(configured_intensity_cap_eps)
+    duration_seconds = simulated_duration_us / 1_000_000
+    dominating_mean = cap * duration_seconds
+    tail_probability = _poisson_upper_tail_probability(
+        event_count,
+        dominating_mean,
+    )
+    family_wise_alpha = alpha_ppb / 1_000_000_000
+    per_comparison_alpha = family_wise_alpha / comparison_count
+    adjusted_probability = min(1.0, tail_probability * comparison_count)
+    realized_eps = event_count / duration_seconds
+    observed_to_cap_bps = round(realized_eps * 10_000 / cap)
+    failed = tail_probability < per_comparison_alpha
+    return {
+        "bonferroni_adjusted_upper_tail_probability": adjusted_probability,
+        "poisson_dominating_mean_events": round(dominating_mean, 12),
+        "classification": "FAIL" if failed else "PASS",
+        "comparison_count": comparison_count,
+        "configured_intensity_cap_events_per_second": cap,
+        "event_count": event_count,
+        "events_per_simulated_second": round(realized_eps, 9),
+        "exceeds_poisson_dominating_mean": event_count > dominating_mean,
+        "family_wise_alpha": family_wise_alpha,
+        "family_wise_alpha_parts_per_billion": alpha_ppb,
+        "method": str(spec["method"]),
+        "observed_to_cap_bps": observed_to_cap_bps,
+        "per_comparison_alpha": per_comparison_alpha,
+        "poisson_dominating_upper_tail_probability": tail_probability,
+        "simulated_duration_us": simulated_duration_us,
     }
 
 
@@ -750,63 +816,309 @@ def _hawkes_stability() -> StatisticalCheck:
 
 
 def _event_explosion(cells: tuple[_MatchedCell, ...]) -> StatisticalCheck:
-    measured: list[dict[str, object]] = []
+    candidates: list[
+        tuple[
+            _MatchedCell,
+            float,
+            int,
+            int,
+            tuple[dict[str, object], ...],
+            str,
+        ]
+    ] = []
     uncapped: list[str] = []
+    invalid: list[dict[str, object]] = []
     for cell in cells:
         if cell.lane is not ExecutorLane.CORE_FLOW:
             continue
-        rows = tuple(_statistical_evidence(item) for item in cell.rows)
-        caps = {item.get("configured_event_rate_cap_eps") for item in rows}
-        if caps == {None}:
-            uncapped.append(cell.cell_id)
+        try:
+            rows = tuple(_statistical_evidence(item) for item in cell.rows)
+            cap_sources = tuple(
+                _event_rate_cap_source(item) for item in cell.rows
+            )
+        except (TypeError, ValueError) as error:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "detail": str(error),
+                    "reason": "missing or malformed statistical evidence",
+                }
+            )
             continue
-        if len(caps) != 1:
+        flow_model = cell.match_parameters.get("flow_model")
+        if flow_model not in {"hawkes", "simple"}:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "unknown core-flow model for cap inference",
+                    "value": repr(flow_model),
+                }
+            )
             continue
-        cap = next(iter(caps))
-        if type(cap) not in {int, float} or float(cap) <= 0:
+        raw_caps = [item.get("configured_event_rate_cap_eps") for item in rows]
+        source_caps = [
+            item.get("configured_cap_events_per_second") for item in cap_sources
+        ]
+        raw_timing_transforms = [
+            item.get("core_flow_arrival_timing_transform") for item in rows
+        ]
+        source_timing_transforms = [
+            item.get("arrival_timing_transform") for item in cap_sources
+        ]
+        if raw_caps != source_caps:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "projected_values": [repr(item) for item in raw_caps],
+                    "reason": "projected intensity cap does not match source check",
+                    "source_values": [repr(item) for item in source_caps],
+                }
+            )
             continue
+        if raw_timing_transforms != source_timing_transforms:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "projected_values": [
+                        repr(item) for item in raw_timing_transforms
+                    ],
+                    "reason": "projected timing path does not match source check",
+                    "source_values": [
+                        repr(item) for item in source_timing_transforms
+                    ],
+                }
+            )
+            continue
+        if all(item is None for item in raw_caps):
+            if flow_model == "simple":
+                uncapped.append(cell.cell_id)
+            else:
+                invalid.append(
+                    {
+                        **cell.design_evidence(),
+                        "reason": "Hawkes cell omitted its configured intensity cap",
+                    }
+                )
+            continue
+        if flow_model != "hawkes":
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "uncapped simple-flow cell declared an intensity cap",
+                    "values": [repr(item) for item in raw_caps],
+                }
+            )
+            continue
+        if any(item is None for item in raw_caps):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "inconsistent configured intensity caps",
+                    "values": [repr(item) for item in raw_caps],
+                }
+            )
+            continue
+        if any(type(item) not in {int, float} for item in raw_caps):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "invalid configured intensity cap",
+                    "values": [repr(item) for item in raw_caps],
+                }
+            )
+            continue
+        numeric_caps = [float(item) for item in raw_caps]
+        if any(not math.isfinite(item) or item <= 0 for item in numeric_caps):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "invalid configured intensity cap",
+                    "values": [repr(item) for item in raw_caps],
+                }
+            )
+            continue
+        if len(set(numeric_caps)) != 1:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "inconsistent configured intensity caps",
+                    "values": [repr(item) for item in raw_caps],
+                }
+            )
+            continue
+        if not all(
+            item == "NO_POST_MODEL_INTERVAL_COMPRESSION"
+            for item in raw_timing_transforms
+        ):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "capped count lacks an eligible identity timing path",
+                    "values": [repr(item) for item in raw_timing_transforms],
+                }
+            )
+            continue
+        timing_transform = "NO_POST_MODEL_INTERVAL_COMPRESSION"
+        cap = numeric_caps[0]
         durations = [item.get("simulation_duration_us") for item in rows]
         counts = [item.get("core_flow_event_count") for item in rows]
         if any(type(item) is not int or item <= 0 for item in durations):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "invalid simulation duration evidence",
+                    "values": [repr(item) for item in durations],
+                }
+            )
             continue
         if any(type(item) is not int or item < 0 for item in counts):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "invalid core-flow count evidence",
+                    "values": [repr(item) for item in counts],
+                }
+            )
+            continue
+        try:
+            configurations = tuple(_configuration(item) for item in cell.rows)
+            typed_metrics = tuple(_typed_metrics(item) for item in cell.rows)
+        except (TypeError, ValueError) as error:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "detail": str(error),
+                    "reason": "missing or malformed source evidence",
+                }
+            )
+            continue
+        configured_durations = [
+            item.get("duration_us") for item in configurations
+        ]
+        typed_durations = [
+            item.get("simulation_duration_us") for item in typed_metrics
+        ]
+        typed_counts = [item.get("flow_event_count") for item in typed_metrics]
+        if any(
+            type(item) is not int or item <= 0
+            for item in (*configured_durations, *typed_durations)
+        ) or any(type(item) is not int or item < 0 for item in typed_counts):
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "configured_durations": [
+                        repr(item) for item in configured_durations
+                    ],
+                    "reason": "invalid configuration or typed-metric source evidence",
+                    "typed_counts": [repr(item) for item in typed_counts],
+                    "typed_durations": [repr(item) for item in typed_durations],
+                }
+            )
+            continue
+        if durations != configured_durations or durations != typed_durations:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "configured_durations": configured_durations,
+                    "reason": "simulation duration evidence does not reconcile",
+                    "statistical_durations": durations,
+                    "typed_durations": typed_durations,
+                }
+            )
+            continue
+        if counts != typed_counts:
+            invalid.append(
+                {
+                    **cell.design_evidence(),
+                    "reason": "core-flow count evidence does not reconcile",
+                    "statistical_counts": counts,
+                    "typed_counts": typed_counts,
+                }
+            )
             continue
         duration_us = sum(int(item) for item in durations)
         event_count = sum(int(item) for item in counts)
-        events_per_second = event_count * 1_000_000 / duration_us
-        cap_ratio_bps = round(events_per_second * 10_000 / float(cap))
-        measured.append(
-            {
-                **cell.design_evidence(),
-                "configured_cap_events_per_second": float(cap),
-                "event_count": event_count,
-                "events_per_simulated_second": round(events_per_second, 9),
-                "observed_to_cap_bps": cap_ratio_bps,
-                "simulated_duration_us": duration_us,
-            }
+        candidates.append(
+            (
+                cell,
+                cap,
+                duration_us,
+                event_count,
+                rows,
+                timing_transform,
+            )
         )
-    if not measured:
+
+    if not candidates:
         return _make_check(
             "unrealistic_event_explosion",
-            "NOT_EXERCISED",
+            "FAIL" if invalid else "NOT_EXERCISED",
             {
-                "reason": "no complete core-flow cell had a configured event cap",
+                "invalid_cells": invalid,
+                "reason": (
+                    "malformed capped core-flow evidence"
+                    if invalid
+                    else "no complete core-flow cell had a configured intensity cap"
+                ),
                 "uncapped_cell_ids": sorted(uncapped),
             },
         )
-    maximum = max(int(item["observed_to_cap_bps"]) for item in measured)
-    fail_above = int(
-        _check_spec("unrealistic_event_explosion")[
-            "fail_above_configured_cap_bps"
-        ]
+
+    comparison_count = len(candidates)
+    measured: list[dict[str, object]] = []
+    for cell, cap, duration_us, event_count, rows, timing_transform in candidates:
+        classification = classify_capped_event_count(
+            event_count=event_count,
+            simulated_duration_us=duration_us,
+            configured_intensity_cap_eps=cap,
+            comparison_count=comparison_count,
+        )
+        measured.append(
+            {
+                **cell.design_evidence(),
+                **classification,
+                "arrival_timing_transform": timing_transform,
+                "replicates": [
+                    {
+                        "event_count": int(
+                            row.get("core_flow_event_count", 0)
+                        ),
+                        "replicate_index": int(
+                            _configuration(source)["replicate_index"]
+                        ),
+                        "seed": int(_configuration(source)["seed"]),
+                        "simulation_duration_us": int(
+                            row.get("simulation_duration_us", 0)
+                        ),
+                    }
+                    for source, row in zip(cell.rows, rows, strict=True)
+                ],
+            }
+        )
+    failed_cell_ids = sorted(
+        str(item["cell_id"])
+        for item in measured
+        if item["classification"] == "FAIL"
     )
     return _make_check(
         "unrealistic_event_explosion",
-        "FAIL" if maximum > fail_above else "PASS",
+        "FAIL" if failed_cell_ids or invalid else "PASS",
         {
             "cells": measured,
-            "design": "aggregate_events_divided_by_aggregate_simulated_seconds",
-            "maximum_observed_to_cap_bps": maximum,
+            "comparison_count": comparison_count,
+            "design": (
+                "one_sided_poisson_dominating_count_tail_with_bonferroni_"
+                "family_wise_control"
+            ),
+            "failed_cell_ids": failed_cell_ids,
+            "invalid_cells": invalid,
+            "maximum_observed_to_cap_bps": max(
+                int(item["observed_to_cap_bps"]) for item in measured
+            ),
+            "minimum_bonferroni_adjusted_upper_tail_probability": min(
+                float(item["bonferroni_adjusted_upper_tail_probability"])
+                for item in measured
+            ),
             "uncapped_cell_ids": sorted(uncapped),
         },
     )
@@ -1003,6 +1315,44 @@ def _permanent_cross(cells: tuple[_MatchedCell, ...]) -> StatisticalCheck:
     )
 
 
+def _poisson_upper_tail_probability(
+    event_count: int,
+    mean: float,
+) -> float:
+    """Return P[Poisson(mean) >= event_count] without upper-tail cancellation."""
+
+    if event_count <= 0:
+        return 1.0
+    if mean <= 0:
+        return 0.0
+    if event_count <= mean:
+        term = math.exp(-mean)
+        lower_cumulative = term
+        for index in range(1, event_count):
+            term *= mean / index
+            lower_cumulative += term
+        return min(1.0, max(0.0, 1.0 - lower_cumulative))
+
+    log_term = (
+        -mean
+        + event_count * math.log(mean)
+        - math.lgamma(event_count + 1)
+    )
+    term = math.exp(log_term)
+    upper_tail = term
+    index = event_count
+    for _ in range(100_000):
+        index += 1
+        term *= mean / index
+        updated = upper_tail + term
+        if updated == upper_tail:
+            break
+        upper_tail = updated
+    else:
+        raise RuntimeError("Poisson upper-tail calculation did not converge")
+    return min(1.0, max(0.0, upper_tail))
+
+
 def _configuration(case: Mapping[str, object]) -> dict[str, object]:
     value = case.get("configuration")
     if not isinstance(value, Mapping):
@@ -1015,6 +1365,33 @@ def _statistical_evidence(case: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError("case statistical evidence is missing")
     return dict(value)
+
+
+def _typed_metrics(case: Mapping[str, object]) -> dict[str, object]:
+    value = case.get("typed_metrics")
+    if not isinstance(value, Mapping):
+        raise TypeError("case typed metrics are missing")
+    return dict(value)
+
+
+def _event_rate_cap_source(case: Mapping[str, object]) -> dict[str, object]:
+    raw_checks = case.get("invariant_checks")
+    if not isinstance(raw_checks, (list, tuple)):
+        raise TypeError("case invariant checks are missing")
+    matches = [
+        item
+        for item in raw_checks
+        if isinstance(item, Mapping) and item.get("name") == "event_rate_cap"
+    ]
+    if len(matches) != 1:
+        raise ValueError("case must have exactly one event-rate-cap source check")
+    check = matches[0]
+    if check.get("required") is not True or check.get("status") != "PASS":
+        raise ValueError("event-rate-cap source check is not a required pass")
+    evidence = check.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise TypeError("event-rate-cap source evidence is missing")
+    return dict(evidence)
 
 
 def _summed_histogram(

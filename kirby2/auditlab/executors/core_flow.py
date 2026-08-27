@@ -656,6 +656,11 @@ def _checks(
             "event_rate_cap",
             intensity_ok,
             {
+                "arrival_timing_transform": (
+                    "NO_POST_MODEL_INTERVAL_COMPRESSION"
+                    if engine.distribution_profile is None
+                    else "DISTRIBUTION_PROFILE"
+                ),
                 "configured_cap_events_per_second": configured_cap,
                 "ending_intensities_events_per_second": {
                     family.value: round(value, 9)

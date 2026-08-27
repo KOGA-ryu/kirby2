@@ -2683,6 +2683,194 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
         for item in changed_cells
     )
 
+    ordinary_count = risk_statistics.classify_capped_event_count(
+        event_count=6,
+        simulated_duration_us=48_000,
+        configured_intensity_cap_eps=120.0,
+        comparison_count=119,
+    )
+    boundary_count = risk_statistics.classify_capped_event_count(
+        event_count=24,
+        simulated_duration_us=48_000,
+        configured_intensity_cap_eps=120.0,
+        comparison_count=119,
+    )
+    implausible_count = risk_statistics.classify_capped_event_count(
+        event_count=25,
+        simulated_duration_us=48_000,
+        configured_intensity_cap_eps=120.0,
+        comparison_count=119,
+    )
+    capped_count_inference_exact = all(
+        (
+            ordinary_count["classification"] == "PASS",
+            ordinary_count["event_count"] == 6,
+            ordinary_count["observed_to_cap_bps"] == 10_417,
+            ordinary_count["exceeds_poisson_dominating_mean"] is True,
+            ordinary_count["poisson_dominating_mean_events"] == 5.76,
+            boundary_count["classification"] == "PASS",
+            implausible_count["classification"] == "FAIL",
+            float(boundary_count["bonferroni_adjusted_upper_tail_probability"])
+            > float(boundary_count["family_wise_alpha"]),
+            float(
+                implausible_count[
+                    "bonferroni_adjusted_upper_tail_probability"
+                ]
+            )
+            < float(implausible_count["family_wise_alpha"]),
+        )
+    )
+    event_explosion = by_name["unrealistic_event_explosion"].as_dict()[
+        "evidence"
+    ]
+    integrated_capped_count_evidence = all(
+        (
+            event_explosion["design"]
+            == (
+                "one_sided_poisson_dominating_count_tail_with_bonferroni_"
+                "family_wise_control"
+            ),
+            event_explosion["comparison_count"] >= 1,
+            event_explosion["invalid_cells"] == [],
+            event_explosion["failed_cell_ids"] == [],
+            all(
+                cell["method"]
+                == "POISSON_DOMINATING_INTEGER_COUNT_UPPER_TAIL"
+                and cell["arrival_timing_transform"]
+                == "NO_POST_MODEL_INTERVAL_COMPRESSION"
+                and len(cell["replicates"]) == 6
+                for cell in event_explosion["cells"]
+            ),
+        )
+    )
+
+    match_source = object()
+
+    def controlled_capped_cell(
+        cell_id: str,
+        *,
+        flow_model: str = "hawkes",
+        projected_cap: object = 120.0,
+        source_cap: object = match_source,
+        projected_timing: object = "NO_POST_MODEL_INTERVAL_COMPRESSION",
+        source_timing: object = match_source,
+        statistical_duration_us: object = 8_000,
+        typed_duration_us: object = 8_000,
+        statistical_count: object = 1,
+        typed_count: object = 1,
+        omit_statistical_evidence: bool = False,
+    ):
+        actual_source_cap = (
+            projected_cap if source_cap is match_source else source_cap
+        )
+        actual_source_timing = (
+            projected_timing if source_timing is match_source else source_timing
+        )
+        rows: list[dict[str, object]] = []
+        for replicate_index in range(6):
+            row: dict[str, object] = {
+                "configuration": {
+                    "cell_id": cell_id,
+                    "duration_us": 8_000,
+                    "flow_model": flow_model,
+                    "lane": ExecutorLane.CORE_FLOW.value,
+                    "partition": (
+                        ExperimentPartition.TRAIN.value
+                        if replicate_index < 3
+                        else ExperimentPartition.HOLDOUT.value
+                    ),
+                    "replicate_index": replicate_index,
+                    "seed": 90_000 + replicate_index,
+                },
+                "invariant_checks": [
+                    {
+                        "detail": "controlled capped-count source check",
+                        "evidence": {
+                            "arrival_timing_transform": actual_source_timing,
+                            "configured_cap_events_per_second": (
+                                actual_source_cap
+                            ),
+                        },
+                        "name": "event_rate_cap",
+                        "required": True,
+                        "status": "PASS",
+                    }
+                ],
+                "statistical_evidence": {
+                    "configured_event_rate_cap_eps": projected_cap,
+                    "core_flow_arrival_timing_transform": projected_timing,
+                    "core_flow_event_count": statistical_count,
+                    "simulation_duration_us": statistical_duration_us,
+                },
+                "typed_metrics": {
+                    "flow_event_count": typed_count,
+                    "simulation_duration_us": typed_duration_us,
+                },
+            }
+            if omit_statistical_evidence and replicate_index == 0:
+                del row["statistical_evidence"]
+            rows.append(row)
+        return risk_statistics._MatchedCell(
+            ExecutorLane.CORE_FLOW,
+            cell_id,
+            {
+                "duration_us": 8_000,
+                "flow_model": flow_model,
+                "lane": ExecutorLane.CORE_FLOW.value,
+                "liquidity": "NORMAL",
+                "regime": "BALANCED",
+                "volume": "1.00x",
+            },
+            tuple(rows),
+        )
+
+    malformed_cells = {
+        "compressed_timing": controlled_capped_cell(
+            "controlled-compressed-timing",
+            projected_timing="DISTRIBUTION_PROFILE",
+        ),
+        "count_projection_mismatch": controlled_capped_cell(
+            "controlled-count-mismatch",
+            statistical_count=25,
+        ),
+        "duration_projection_mismatch": controlled_capped_cell(
+            "controlled-duration-mismatch",
+            statistical_duration_us=8_000_000,
+        ),
+        "invented_simple_cap": controlled_capped_cell(
+            "controlled-simple-cap",
+            flow_model="simple",
+        ),
+        "missing_hawkes_cap": controlled_capped_cell(
+            "controlled-missing-hawkes-cap",
+            projected_cap=None,
+        ),
+        "missing_statistical_evidence": controlled_capped_cell(
+            "controlled-missing-statistical-evidence",
+            omit_statistical_evidence=True,
+        ),
+        "source_cap_mismatch": controlled_capped_cell(
+            "controlled-source-cap-mismatch",
+            source_cap=140.0,
+        ),
+        "unhashable_cap": controlled_capped_cell(
+            "controlled-unhashable-cap",
+            projected_cap=[],
+        ),
+    }
+    malformed_capped_count_results: dict[str, dict[str, object]] = {}
+    for name, cell in malformed_cells.items():
+        check = risk_statistics._event_explosion((cell,))
+        check_evidence = check.as_dict()["evidence"]
+        malformed_capped_count_results[name] = {
+            "invalid_cell_count": len(check_evidence["invalid_cells"]),
+            "status": check.status,
+        }
+    malformed_capped_counts_fail_closed = all(
+        item["status"] == "FAIL" and item["invalid_cell_count"] == 1
+        for item in malformed_capped_count_results.values()
+    )
+
     short_cross = risk_statistics.classify_cross_episode(99_999, 0)
     threshold_cross = risk_statistics.classify_cross_episode(100_000, 0)
     long_cross = risk_statistics.classify_cross_episode(100_001, 0)
@@ -2792,6 +2980,8 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
             "implementation_shortfall_x2_tick_shares",
             "load_accepted_hawkes_configs()",
             "events_per_simulated_second",
+            "classify_capped_event_count(",
+            "POISSON_DOMINATING_INTEGER_COUNT_UPPER_TAIL",
             "classify_cross_episode(",
         )
     )
@@ -2802,6 +2992,9 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
             calibration_disjoint,
             comparisons_one_cell,
             seed_only_change_proved,
+            capped_count_inference_exact,
+            integrated_capped_count_evidence,
+            malformed_capped_counts_fail_closed,
             cross_duration_exact,
             manifest_complete,
             direct_manifest_mutation_rejected,
@@ -2831,6 +3024,12 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
             ],
             "compared_cell_record_count": len(compared_cells),
             "comparisons_use_one_cell_id": comparisons_one_cell,
+            "controlled_capped_count_inference": {
+                "boundary": boundary_count,
+                "implausible": implausible_count,
+                "ordinary_reproducer": ordinary_count,
+            },
+            "capped_count_inference_exact": capped_count_inference_exact,
             "controlled_cross_classification": {
                 "long": long_cross,
                 "short": short_cross,
@@ -2843,6 +3042,15 @@ def _statistics_case(result) -> ModelRiskLabAuditCase:
                 direct_manifest_mutation_rejected
             ),
             "invalid_status_rejected": invalid_status_rejected,
+            "integrated_capped_count_evidence": (
+                integrated_capped_count_evidence
+            ),
+            "malformed_capped_count_results": (
+                malformed_capped_count_results
+            ),
+            "malformed_capped_counts_fail_closed": (
+                malformed_capped_counts_fail_closed
+            ),
             "manifest_complete": manifest_complete,
             "not_exercised_blocks_substantial": (
                 not_exercised_blocks_substantial

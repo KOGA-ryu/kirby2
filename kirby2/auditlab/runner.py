@@ -902,15 +902,22 @@ def _statistical_evidence_projection(
                     quantity = raw_quantity
             volume_histogram[volume_histogram_label(quantity)] += 1
         configured_cap: object = None
+        arrival_timing_transform: object = None
         for check in result.checks:
             if check.name == "event_rate_cap":
                 configured_cap = check.evidence.get(
                     "configured_cap_events_per_second"
                 )
+                arrival_timing_transform = check.evidence.get(
+                    "arrival_timing_transform"
+                )
                 break
         raw_flow_count = metrics.get("flow_event_count")
         evidence.update(
             {
+                "core_flow_arrival_timing_transform": (
+                    arrival_timing_transform
+                ),
                 "configured_event_rate_cap_eps": configured_cap,
                 "core_flow_event_count": (
                     raw_flow_count if type(raw_flow_count) is int else None
