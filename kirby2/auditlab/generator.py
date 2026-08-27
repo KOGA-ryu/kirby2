@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from enum import Enum
 from itertools import combinations
 
@@ -132,6 +133,54 @@ def generate_configurations(
             )
         )
     return tuple(configs)
+
+
+def derive_calibration_seeds(master_seed: int) -> dict[str, object]:
+    """Derive disjoint calibration roles from one explicitly owned seed."""
+
+    if type(master_seed) is not int or master_seed < 0:
+        raise ValueError("calibration master seed must be nonnegative")
+    candidates: list[int] = []
+    used: set[int] = set()
+    for ordinal in range(6):
+        candidate = _mix(master_seed, 50_000 + ordinal) & 0x7FFF_FFFF
+        while candidate in used:
+            candidate = (candidate + 1) & 0x7FFF_FFFF
+        used.add(candidate)
+        candidates.append(candidate)
+    return {
+        "fitting_seeds": candidates[:2],
+        "heldout_seeds": candidates[2:4],
+        "reference_seed": candidates[4],
+        "search_seed": candidates[5],
+    }
+
+
+def scientific_match_parameters(
+    configuration: Mapping[str, object],
+) -> dict[str, object]:
+    """Return exactly the non-seed parameters exercised by a scientific lane."""
+
+    raw_lane = configuration.get("lane")
+    if type(raw_lane) is not str:
+        raise TypeError("statistical configuration lane must be a string")
+    lane = ExecutorLane(raw_lane)
+    if lane is ExecutorLane.FAULT:
+        raise ValueError("fault configurations do not form scientific cells")
+    dimensions = tuple(
+        name
+        for name in CAPABILITY_MATRIX[lane].credited_dimensions
+        if name != "seed"
+    )
+    missing = [name for name in dimensions if name not in configuration]
+    if missing:
+        raise ValueError(
+            f"statistical configuration is missing exercised fields: {missing}"
+        )
+    return {
+        "lane": lane.value,
+        **{name: configuration[name] for name in dimensions},
+    }
 
 
 def _axis_values(seed: int, cell_index: int) -> dict[str, object]:

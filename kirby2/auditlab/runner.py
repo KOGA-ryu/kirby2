@@ -7,9 +7,12 @@ import json
 import os
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from kirby2.immutable import thaw_json
 
 from .generator import evidence_coverage_report, generate_configurations
 from .fault_oracle import FaultEvaluation, evaluate_fault_observation
@@ -35,7 +38,12 @@ from .models import (
     canonical_sha256,
 )
 from .probes import run_subsystem_probes
-from .statistics import statistical_checks
+from .statistics import (
+    STATISTICAL_THRESHOLD_MANIFEST_SHA256,
+    statistical_checks,
+    statistical_threshold_manifest,
+    volume_histogram_label,
+)
 from .store import DEFAULT_AUDIT_LAB_STORE, AuditLabStore, PacketRecord
 
 
@@ -67,7 +75,10 @@ class AuditLabResult:
                 self.replay_parity["status"] == "PASS",
                 self.fault_summary["status"] == "PASS",
                 all(item.preserved for item in self.minimized_failures),
-                all(item.status != "FAIL" for item in self.statistics),
+                all(
+                    item.status in {"PASS", "WARNING"}
+                    for item in self.statistics
+                ),
                 all(
                     item.status is CheckStatus.PASS or not item.required
                     for item in self.probes
@@ -102,6 +113,9 @@ class AuditLabResult:
             "statistical_status": {
                 item.name: item.status for item in self.statistics
             },
+            "statistical_threshold_manifest_sha256": (
+                STATISTICAL_THRESHOLD_MANIFEST_SHA256
+            ),
             "status": "PASS" if self.passed else "FAIL",
             "unexpected_violation_count": len(self.unexpected_violations),
         }
@@ -310,7 +324,7 @@ def run_audit_lab(
             )
         cases.append(_compact_case(result, parity, fault_evaluation))
     coverage = evidence_coverage_report(tuple(generated_results))
-    statistics = statistical_checks(tuple(cases))
+    statistics = statistical_checks(tuple(cases), seed)
     probes = (
         run_subsystem_probes(seed)
         if subsystem_probes
@@ -524,6 +538,7 @@ def _compact_case(
     typed_metrics = result.declared_outputs()["metrics"]
     if not isinstance(typed_metrics, dict):
         raise TypeError("generated case metrics must serialize as an object")
+    legacy_metrics = _legacy_statistical_projection(result, typed_metrics)
     return {
         "configuration": result.configuration.as_dict(),
         "configuration_sha256": result.configuration.sha256,
@@ -542,7 +557,7 @@ def _compact_case(
         "failures": [item.as_dict() for item in result.failures],
         "invariant_checks": checks,
         "lane": result.lane.value,
-        "metrics": _legacy_statistical_projection(result, typed_metrics),
+        "metrics": legacy_metrics,
         "observable_projection_sha256": result.declared_outputs()[
             "observable_projection_sha256"
         ],
@@ -556,6 +571,10 @@ def _compact_case(
             {"checks": checks, "exercises": exercises}
         ),
         "state_digest": result.state_sha256,
+        "statistical_evidence": _statistical_evidence_projection(
+            result,
+            legacy_metrics,
+        ),
         "status": "PASS" if result.passed and replay_match else "FAIL",
         "typed_metrics": typed_metrics,
         "violations": list(failure_signatures(result)),
@@ -655,6 +674,399 @@ def _legacy_statistical_projection(
         ),
     )
     return dict(sorted(metrics.items()))
+
+
+def _statistical_evidence_projection(
+    result: GeneratedCaseResult,
+    metrics: dict[str, object],
+) -> dict[str, object]:
+    payload = _thawed_object(result.recording.payload, "recording payload")
+    final_state = _thawed_object(
+        result.final_state_projection,
+        "final state projection",
+    )
+    observable = _thawed_object(
+        result.observable_projection,
+        "observable projection",
+    )
+    events = tuple(
+        _thawed_object(item, "event projection")
+        for item in result.event_projection
+    )
+    reference = _recorded_price_evidence(
+        result.lane,
+        payload,
+        final_state,
+        observable,
+        events,
+    )
+    duration = metrics.get("simulation_duration_us")
+    if type(duration) is not int:
+        per_leg = metrics.get("simulation_duration_us_per_leg")
+        leg_count = metrics.get("leg_count")
+        duration = (
+            per_leg * leg_count
+            if type(per_leg) is int and type(leg_count) is int
+            else None
+        )
+    trade_count = metrics.get("trade_count")
+    if result.lane is ExecutorLane.ALGORITHM:
+        raw_legs = payload.get("legs")
+        if isinstance(raw_legs, list):
+            trade_count = sum(
+                len(leg.get("client_fills", []))
+                for leg in raw_legs
+                if isinstance(leg, dict)
+            )
+    if type(trade_count) is not int:
+        trade_count = 0
+    evidence: dict[str, object] = {
+        **reference,
+        "continuous_trade_eligible": _continuous_trade_eligible(result),
+        "sensitivity_event_count": len(events),
+        "simulation_duration_us": duration,
+        "trade_count": trade_count,
+    }
+
+    if result.lane is ExecutorLane.CORE_FLOW:
+        family_histogram: Counter[str] = Counter()
+        volume_histogram: Counter[str] = Counter()
+        for event in events:
+            if event.get("record_type") != "flow_event" or event.get("applied") is not True:
+                continue
+            family = event.get("family")
+            if type(family) is str:
+                family_histogram[family] += 1
+            raw_command = event.get("command")
+            quantity = 0
+            if isinstance(raw_command, dict):
+                raw_quantity = raw_command.get("quantity", 0)
+                if type(raw_quantity) is int and raw_quantity >= 0:
+                    quantity = raw_quantity
+            volume_histogram[volume_histogram_label(quantity)] += 1
+        configured_cap: object = None
+        for check in result.checks:
+            if check.name == "event_rate_cap":
+                configured_cap = check.evidence.get(
+                    "configured_cap_events_per_second"
+                )
+                break
+        raw_flow_count = metrics.get("flow_event_count")
+        evidence.update(
+            {
+                "configured_event_rate_cap_eps": configured_cap,
+                "core_flow_event_count": (
+                    raw_flow_count if type(raw_flow_count) is int else None
+                ),
+                "core_flow_event_family_histogram": dict(
+                    sorted(family_histogram.items())
+                ),
+                "core_flow_volume_histogram": dict(
+                    sorted(volume_histogram.items())
+                ),
+            }
+        )
+
+    if result.lane is ExecutorLane.FRAGMENTED:
+        raw_intervals = payload.get("observable_crossed_intervals")
+        evidence.update(
+            {
+                "crossed_composite_intervals": (
+                    raw_intervals if isinstance(raw_intervals, list) else []
+                ),
+                "maximum_configured_market_data_latency_us": (
+                    _maximum_market_data_latency_us(payload)
+                ),
+            }
+        )
+
+    if result.lane is ExecutorLane.ALGORITHM:
+        mapping = payload.get("execution_mapping")
+        raw_legs = payload.get("legs")
+        numerator = 0
+        denominator = 0
+        if isinstance(raw_legs, list):
+            for leg in raw_legs:
+                if not isinstance(leg, dict):
+                    continue
+                raw_metrics = leg.get("metrics")
+                if not isinstance(raw_metrics, dict):
+                    continue
+                raw_cost = raw_metrics.get(
+                    "implementation_shortfall_x2_tick_shares"
+                )
+                raw_target = raw_metrics.get("target_quantity")
+                if type(raw_cost) is int and type(raw_target) is int:
+                    numerator += raw_cost
+                    denominator += raw_target
+        if isinstance(mapping, dict):
+            evidence.update(
+                {
+                    "algorithm_cost_denominator_shares": denominator,
+                    "algorithm_cost_numerator_x2_ticks": numerator,
+                    "algorithm_objective": mapping.get("configured_objective"),
+                    "algorithm_scenario": mapping.get("scenario_name"),
+                    "algorithm_strategy": mapping.get("strategy"),
+                }
+            )
+    return dict(sorted(evidence.items()))
+
+
+def _continuous_trade_eligible(result: GeneratedCaseResult) -> bool:
+    configuration = result.configuration
+    if result.lane in {
+        ExecutorLane.CORE_FLOW,
+        ExecutorLane.LATENCY,
+        ExecutorLane.FRAGMENTED,
+        ExecutorLane.ECOLOGY,
+    }:
+        return True
+    if result.lane is ExecutorLane.MECHANICS:
+        return configuration.session_phase == "CONTINUOUS"
+    if result.lane is ExecutorLane.ALGORITHM:
+        return configuration.objective != "OBSERVE_ONLY"
+    return False
+
+
+def _recorded_price_evidence(
+    lane: ExecutorLane,
+    payload: dict[str, object],
+    final_state: dict[str, object],
+    observable: dict[str, object],
+    events: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    initial: int | None = None
+    source: str | None = None
+    samples: list[int] = []
+    if lane is ExecutorLane.CORE_FLOW:
+        raw_initial_count = final_state.get("initial_exchange_event_count")
+        bid: int | None = None
+        ask: int | None = None
+        for event in events:
+            if event.get("record_type") != "exchange_event":
+                continue
+            raw_sequence = event.get("sequence")
+            event_type = event.get("type")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                continue
+            new_price = data.get("new_price_ticks")
+            if event_type == "BEST_BID_CHANGED":
+                bid = new_price if type(new_price) is int else None
+            elif event_type == "BEST_ASK_CHANGED":
+                ask = new_price if type(new_price) is int else None
+            elif event_type == "TRADE" and type(data.get("price_ticks")) is int:
+                samples.append(int(data["price_ticks"]) * 2)
+            if bid is not None and ask is not None:
+                samples.append(bid + ask)
+            if (
+                initial is None
+                and type(raw_initial_count) is int
+                and type(raw_sequence) is int
+                and raw_sequence == raw_initial_count
+                and bid is not None
+                and ask is not None
+            ):
+                initial = bid + ask
+        if initial is None and bid is not None and ask is not None:
+            initial = bid + ask
+        source = "recorded_initial_exchange_event_prefix"
+    elif lane is ExecutorLane.MECHANICS:
+        native = payload.get("native_recording")
+        commands = native.get("commands") if isinstance(native, dict) else None
+        if isinstance(commands, list):
+            for command in commands:
+                if not isinstance(command, dict):
+                    continue
+                parameters = command.get("parameters")
+                request = (
+                    parameters.get("request")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                price = request.get("price_ticks") if isinstance(request, dict) else None
+                if type(price) is int:
+                    initial = price * 2
+                    break
+        for event in events:
+            if event.get("event_type") not in {"TRADE", "AUCTION_FILL"}:
+                continue
+            data = event.get("data")
+            price = data.get("price_ticks") if isinstance(data, dict) else None
+            if type(price) is int:
+                samples.append(price * 2)
+        source = "native_mechanics_first_price_bearing_order"
+    elif lane is ExecutorLane.LATENCY:
+        native = payload.get("native_recording")
+        if isinstance(native, dict):
+            bid = native.get("initial_bid_ticks")
+            ask = native.get("initial_ask_ticks")
+            if type(bid) is int and type(ask) is int:
+                initial = bid + ask
+        samples.extend(_book_trade_prices_x2(final_state.get("book")))
+        source = "native_latency_initial_bid_ask"
+    elif lane is ExecutorLane.FRAGMENTED:
+        initial = _fragmented_initial_reference_x2(payload)
+        for event in events:
+            if event.get("record_type") != "venue_truth_event" or event.get(
+                "event_type"
+            ) != "TRADE":
+                continue
+            data = event.get("data")
+            price = data.get("price_x2") if isinstance(data, dict) else None
+            if type(price) is int:
+                samples.append(price)
+        feed = observable.get("consolidated_feed")
+        if isinstance(feed, dict):
+            bid = feed.get("best_bid_ticks")
+            ask = feed.get("best_ask_ticks")
+            if type(bid) is int and type(ask) is int:
+                samples.append(bid + ask)
+        source = "native_fragmented_time_zero_composite"
+    elif lane is ExecutorLane.ECOLOGY:
+        native = payload.get("native_recording")
+        population = (
+            native.get("population_definition")
+            if isinstance(native, dict)
+            else None
+        )
+        summary = native.get("expected_summary") if isinstance(native, dict) else None
+        if isinstance(population, dict) and type(population.get("initial_mid_ticks")) is int:
+            initial = int(population["initial_mid_ticks"]) * 2
+        if isinstance(summary, dict):
+            for name in (
+                "low_trade_price_ticks",
+                "high_trade_price_ticks",
+                "last_trade_price_ticks",
+            ):
+                price = summary.get(name)
+                if type(price) is int:
+                    samples.append(price * 2)
+            bid = summary.get("ending_best_bid_ticks")
+            ask = summary.get("ending_best_ask_ticks")
+            if type(bid) is int and type(ask) is int:
+                samples.append(bid + ask)
+        source = "native_ecology_population_initial_mid"
+    elif lane is ExecutorLane.ALGORITHM:
+        raw_legs = payload.get("legs")
+        if isinstance(raw_legs, list):
+            for leg in raw_legs:
+                if not isinstance(leg, dict):
+                    continue
+                objective = leg.get("objective")
+                reference = (
+                    objective.get("arrival_midpoint_x2")
+                    if isinstance(objective, dict)
+                    else None
+                )
+                if initial is None and type(reference) is int:
+                    initial = reference
+                fills = leg.get("client_fills")
+                if isinstance(fills, list):
+                    for fill in fills:
+                        price = fill.get("price_x2") if isinstance(fill, dict) else None
+                        if type(price) is int:
+                            samples.append(price)
+                decisions = leg.get("decisions")
+                if isinstance(decisions, list):
+                    for decision in decisions:
+                        observation = (
+                            decision.get("observation")
+                            if isinstance(decision, dict)
+                            else None
+                        )
+                        features = (
+                            observation.get("observable_market_features")
+                            if isinstance(observation, dict)
+                            else None
+                        )
+                        midpoint = (
+                            features.get("midpoint_x2")
+                            if isinstance(features, dict)
+                            else None
+                        )
+                        if type(midpoint) is int:
+                            samples.append(midpoint)
+        source = "native_algorithm_objective_arrival_midpoint"
+    if initial is not None:
+        samples.append(initial)
+    displacement = (
+        None
+        if initial is None
+        else max((abs(item - initial) for item in samples), default=0)
+    )
+    return {
+        "initial_reference_source": source,
+        "initial_reference_x2_ticks": initial,
+        "maximum_reference_displacement_x2_ticks": displacement,
+    }
+
+
+def _fragmented_initial_reference_x2(payload: dict[str, object]) -> int | None:
+    native = payload.get("native_recording")
+    commands = native.get("commands") if isinstance(native, dict) else None
+    if not isinstance(commands, list):
+        return None
+    bids: list[int] = []
+    asks: list[int] = []
+    for command in commands:
+        if not isinstance(command, dict) or command.get("simulation_time_us") != 0:
+            continue
+        if command.get("command_type") != "ADD":
+            continue
+        parameters = command.get("parameters")
+        request = parameters.get("request") if isinstance(parameters, dict) else None
+        if not isinstance(request, dict):
+            continue
+        price = request.get("price_ticks")
+        side = request.get("side")
+        if type(price) is not int:
+            continue
+        if side == "buy":
+            bids.append(price)
+        elif side == "sell":
+            asks.append(price)
+    return max(bids) + min(asks) if bids and asks else None
+
+
+def _maximum_market_data_latency_us(payload: dict[str, object]) -> int:
+    native = payload.get("native_recording")
+    venue_configs = native.get("venue_configs") if isinstance(native, dict) else None
+    maximum = 0
+    if not isinstance(venue_configs, list):
+        return maximum
+    for venue in venue_configs:
+        profile = venue.get("latency_profile") if isinstance(venue, dict) else None
+        components = profile.get("components") if isinstance(profile, dict) else None
+        distribution = (
+            components.get("market_data_publication_latency")
+            if isinstance(components, dict)
+            else None
+        )
+        upper = distribution.get("upper_us") if isinstance(distribution, dict) else None
+        if type(upper) is int:
+            maximum = max(maximum, upper)
+    return maximum
+
+
+def _book_trade_prices_x2(value: object) -> list[int]:
+    if not isinstance(value, dict):
+        return []
+    trades = value.get("trades")
+    if not isinstance(trades, list):
+        return []
+    return [
+        int(item["price_ticks"]) * 2
+        for item in trades
+        if isinstance(item, dict) and type(item.get("price_ticks")) is int
+    ]
+
+
+def _thawed_object(value: object, name: str) -> dict[str, object]:
+    thawed = thaw_json(value)
+    if not isinstance(thawed, dict):
+        raise TypeError(f"{name} must be an object")
+    return thawed
 
 
 def _fresh_process_determinism(
@@ -771,7 +1183,10 @@ def _acceptance_record(
         or determinism["status"] != "PASS"
         or replay_parity["status"] != "PASS"
         or fault_summary["status"] != "PASS"
-        or any(item.status == "FAIL" for item in statistics)
+        or any(
+            item.status in {"FAIL", "NOT_EXERCISED"}
+            for item in statistics
+        )
         or any(
             item.required and item.status is not CheckStatus.PASS
             for item in probes
@@ -788,6 +1203,9 @@ def _acceptance_record(
         "probes": canonical_sha256([item.as_dict() for item in probes]),
         "replay_parity": canonical_sha256(replay_parity),
         "statistics": canonical_sha256([item.as_dict() for item in statistics]),
+        "statistical_threshold_manifest": (
+            STATISTICAL_THRESHOLD_MANIFEST_SHA256
+        ),
         "implementation": str(provenance["implementation_sha256"]),
     }
     identity = {
@@ -843,6 +1261,10 @@ def _persist_result(
         "replay_parity.json": canonical_json(result.replay_parity) + "\n",
         "statistics.json": canonical_json(
             [item.as_dict() for item in result.statistics]
+        )
+        + "\n",
+        "statistical_thresholds.json": canonical_json(
+            statistical_threshold_manifest()
         )
         + "\n",
         "unexpected_violations.json": canonical_json(result.unexpected_violations) + "\n",

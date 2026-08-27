@@ -74,6 +74,7 @@ from kirby2.auditlab.models import (
     canonical_sha256,
 )
 import kirby2.auditlab.faults as production_fault_adapters
+import kirby2.auditlab.statistics as risk_statistics
 from kirby2.auditlab.fault_oracle import expected_fault_codes
 from kirby2.counterfactual.models import (
     ActionMutation,
@@ -2608,11 +2609,238 @@ def _controlled_minimization_probes() -> dict[str, object]:
 
 
 def _statistics_case(result) -> ModelRiskLabAuditCase:
-    failed = [item.name for item in result.statistics if item.status == "FAIL"]
+    by_name = {item.name: item for item in result.statistics}
+    expected_names = {
+        "calibration_train_vs_holdout",
+        "distribution_drift",
+        "scenario_overfitting",
+        "seed_sensitivity",
+        "unstable_hawkes",
+        "unrealistic_event_explosion",
+        "degenerate_no_trade",
+        "price_runaway",
+        "permanent_crossed_composite_quote",
+    }
+    complete_inventory = set(by_name) == expected_names
+    blocking = sorted(
+        item.name
+        for item in result.statistics
+        if item.status in {"FAIL", "NOT_EXERCISED"}
+    )
+    calibration = by_name["calibration_train_vs_holdout"].as_dict()[
+        "evidence"
+    ]
+    fitting_seeds = set(calibration["fitting_seeds"])
+    heldout_seeds = set(calibration["heldout_seeds"])
+    calibration_disjoint = (
+        bool(calibration["seed_sets_disjoint"])
+        and fitting_seeds.isdisjoint(heldout_seeds)
+        and len(fitting_seeds) == 2
+        and len(heldout_seeds) == 2
+    )
+
+    compared_cells: list[dict[str, object]] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            if "cell_ids" in value:
+                compared_cells.append(value)
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    for item in result.statistics:
+        collect(item.as_dict()["evidence"])
+    comparisons_one_cell = bool(compared_cells) and all(
+        isinstance(item["cell_ids"], list)
+        and len(item["cell_ids"]) == 1
+        and item.get("cell_id") == item["cell_ids"][0]
+        and item.get("non_seed_exercised_parameters_match") is True
+        and item.get("seed_sets_disjoint") is True
+        for item in compared_cells
+    )
+
+    sensitivity = by_name["seed_sensitivity"].as_dict()["evidence"]
+    sensitivity_cells = sensitivity["cells"]
+    changed_cells = [
+        item for item in sensitivity_cells if item["changed_with_seed"]
+    ]
+    seed_only_change_proved = bool(changed_cells) and all(
+        item["non_seed_exercised_parameters_match"]
+        and len({row["seed"] for row in item["values_by_replicate"]}) == 6
+        and len({row["value"] for row in item["values_by_replicate"]}) > 1
+        for item in changed_cells
+    )
+
+    short_cross = risk_statistics.classify_cross_episode(99_999, 0)
+    threshold_cross = risk_statistics.classify_cross_episode(100_000, 0)
+    long_cross = risk_statistics.classify_cross_episode(100_001, 0)
+    cross_duration_exact = all(
+        (
+            short_cross["classification"] == "SHORT_EPISODE",
+            threshold_cross["classification"] == "SHORT_EPISODE",
+            long_cross["classification"] == "PERMANENT",
+            short_cross["threshold_us"] == 100_000,
+            long_cross["exceeds_threshold"] is True,
+        )
+    )
+
+    manifest = risk_statistics.statistical_threshold_manifest()
+    manifest_digest = canonical_sha256(manifest)
+    manifest_checks = manifest["checks"]
+    manifest_complete = (
+        manifest_digest
+        == risk_statistics.STATISTICAL_THRESHOLD_MANIFEST_SHA256
+        and set(manifest_checks) == expected_names
+        and all(
+            isinstance(spec["unit"], str)
+            and bool(spec["unit"])
+            and isinstance(spec["description"], str)
+            and bool(spec["description"])
+            for spec in manifest_checks.values()
+        )
+        and all(
+            item.as_dict()["evidence"]["threshold_manifest_sha256"]
+            == manifest_digest
+            for item in result.statistics
+        )
+    )
+    direct_manifest_mutation_rejected = False
+    try:
+        risk_statistics.STATISTICAL_THRESHOLD_MANIFEST["schema_version"] = 2  # type: ignore[index]
+    except TypeError:
+        direct_manifest_mutation_rejected = True
+    detached_manifest = risk_statistics.statistical_threshold_manifest()
+    detached_manifest["schema_version"] = 999
+    detached_mutation_preserved_source = (
+        canonical_sha256(risk_statistics.statistical_threshold_manifest())
+        == manifest_digest
+    )
+    packet = result.packet
+    threshold_artifact_exact = False
+    if packet is not None:
+        threshold_path = packet.directory / "statistical_thresholds.json"
+        threshold_artifact_exact = (
+            threshold_path.is_file()
+            and json.loads(threshold_path.read_text(encoding="utf-8"))
+            == manifest
+            and result.acceptance.artifact_digests.get(
+                "statistical_threshold_manifest"
+            )
+            == manifest_digest
+        )
+
+    not_exercised_probe = StatisticalCheck(
+        "insufficient_cell_probe",
+        "NOT_EXERCISED",
+        {"reason": "controlled incomplete-cell proof"},
+        "requires one complete six-replicate cell",
+    )
+    not_exercised_blocks_substantial = not replace(
+        result,
+        statistics=(not_exercised_probe,),
+    ).passed
+    invalid_status_rejected = False
+    try:
+        StatisticalCheck(
+            "invalid_status_probe",
+            "SKIPPED",
+            {},
+            "invalid status must be rejected",
+        )
+    except ValueError:
+        invalid_status_rejected = True
+
+    scenario = by_name["scenario_overfitting"].as_dict()["evidence"]
+    scenario_design_exact = all(
+        (
+            scenario["universal_winner_declared"] is False,
+            scenario["cost_definition"]
+            == "implementation_shortfall_x2_tick_shares / target_quantity",
+            scenario["context_count"] >= 1,
+            all(
+                len(context["train_ranking"]) >= 2
+                and set(context["train_ranking"])
+                == set(context["holdout_ranking"])
+                for context in scenario["contexts"]
+            ),
+        )
+    )
+    source = inspect.getsource(risk_statistics)
+    production_methods_present = all(
+        token in source
+        for token in (
+            "calibrate_market(",
+            "scientific_match_parameters(",
+            "_total_variation_bps(",
+            "implementation_shortfall_x2_tick_shares",
+            "load_accepted_hawkes_configs()",
+            "events_per_simulated_second",
+            "classify_cross_episode(",
+        )
+    )
+    passed = all(
+        (
+            complete_inventory,
+            not blocking,
+            calibration_disjoint,
+            comparisons_one_cell,
+            seed_only_change_proved,
+            cross_duration_exact,
+            manifest_complete,
+            direct_manifest_mutation_rejected,
+            detached_mutation_preserved_source,
+            threshold_artifact_exact,
+            not_exercised_blocks_substantial,
+            invalid_status_rejected,
+            scenario_design_exact,
+            production_methods_present,
+        )
+    )
     return ModelRiskLabAuditCase(
         "train_holdout_drift_overfit_seed_and_pathology_screens",
-        {"checks": [item.as_dict() for item in result.statistics]},
-        () if not failed else (f"statistical risk gates failed: {failed}",),
+        {
+            "blocking_statistics": blocking,
+            "calibration_seed_sets_disjoint": calibration_disjoint,
+            "check_summaries": [
+                {
+                    "evidence_sha256": canonical_sha256(
+                        item.as_dict()["evidence"]
+                    ),
+                    "name": item.name,
+                    "status": item.status,
+                    "threshold": item.threshold,
+                }
+                for item in result.statistics
+            ],
+            "compared_cell_record_count": len(compared_cells),
+            "comparisons_use_one_cell_id": comparisons_one_cell,
+            "controlled_cross_classification": {
+                "long": long_cross,
+                "short": short_cross,
+                "threshold": threshold_cross,
+            },
+            "detached_manifest_mutation_preserved_source": (
+                detached_mutation_preserved_source
+            ),
+            "direct_manifest_mutation_rejected": (
+                direct_manifest_mutation_rejected
+            ),
+            "invalid_status_rejected": invalid_status_rejected,
+            "manifest_complete": manifest_complete,
+            "not_exercised_blocks_substantial": (
+                not_exercised_blocks_substantial
+            ),
+            "production_methods_present": production_methods_present,
+            "scenario_design_exact": scenario_design_exact,
+            "seed_changed_cell_count": len(changed_cells),
+            "seed_only_change_proved": seed_only_change_proved,
+            "threshold_artifact_exact": threshold_artifact_exact,
+            "threshold_manifest_sha256": manifest_digest,
+        },
+        () if passed else ("controlled statistical risk proof failed",),
     )
 
 

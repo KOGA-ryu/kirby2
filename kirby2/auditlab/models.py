@@ -1055,6 +1055,17 @@ class StatisticalCheck:
     threshold: str
 
     def __post_init__(self) -> None:
+        if type(self.name) is not str or not _CAPABILITY_NAME.fullmatch(self.name):
+            raise ValueError("statistical check name is invalid")
+        if type(self.status) is not str or self.status not in {
+            "PASS",
+            "WARNING",
+            "FAIL",
+            "NOT_EXERCISED",
+        }:
+            raise ValueError("statistical status is invalid")
+        if type(self.threshold) is not str or not self.threshold:
+            raise ValueError("statistical threshold description is required")
         frozen = freeze_json(self.evidence)
         if not isinstance(frozen, Mapping):
             raise TypeError("statistical evidence must be a JSON object")

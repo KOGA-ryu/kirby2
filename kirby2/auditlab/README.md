@@ -78,6 +78,39 @@ normal run has no unexpected reproducible failures, its minimized-defect count
 is zero. Expected detections of the ten adversarial fault cases never become
 minimized defects.
 
+Statistical risk checks use only complete six-replicate scientific cells.
+Within each cell, replicates zero through two are the training partition and
+three through five are the holdout partition; the lane and every non-seed
+parameter actually exercised by that lane must match. Incomplete cells and
+fault cells receive no statistical credit. A required comparison without
+enough complete cells is `NOT_EXERCISED`, which blocks a substantial audit.
+
+Calibration is a real `calibrate_market()` run with deterministic, disjoint
+fitting and heldout seeds derived from the audit master seed. Core-flow drift
+uses train/holdout event-family and command-volume histograms inside each cell
+and reports total variation in basis points. Algorithm overfit evidence ranks
+objective-normalized implementation shortfall only among strategies sharing
+the same scenario and objective; it never declares a universal winner. Seed
+sensitivity reports each cell's median, range, and median absolute deviation,
+then deterministic cross-cell quantiles.
+
+Pathology screens retain their native units. Hawkes status comes from the
+accepted production stability certifications. Event explosion divides
+recorded event counts by simulated time and compares only capped core-flow
+cells to their configured events-per-second caps. No-trade rate excludes
+non-continuous mechanics and observe-only algorithm cells. Price displacement
+is measured from each lane's recorded initial reference. Fragmented-market
+crosses use the recorded episode timeline and become permanent only when one
+continuous episode exceeds `max(100000 us, 4 * maximum configured market-data
+latency)`; an ending quote is not duration evidence.
+
+Every predeclared threshold and unit lives in one recursively immutable
+manifest in `statistics.py`. Its digest is included in every statistical check
+and the acceptance identity, and its canonical bytes are persisted as
+`statistical_thresholds.json` in each packet. Statistical statuses are exactly
+`PASS`, `WARNING`, `FAIL`, or `NOT_EXERCISED`; warnings remain visible and are
+not silently promoted.
+
 Run the requested substantial audit:
 
 ```text
