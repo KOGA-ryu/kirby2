@@ -8,10 +8,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from kirby2.algorithms import (
+    AlgorithmActionType,
+    AlgorithmName,
+    default_algorithm_manifest,
+)
 from kirby2.agents.models import PublicEcologyEvent
 from kirby2.agents.populations import BOUNDED_POPULATION_TEMPLATES
 from kirby2.auditlab import AuditLabStore, FaultKind, run_audit_lab
 from kirby2.auditlab.executors import (
+    ALGORITHM_RECORDING_TYPE,
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
     ECOLOGY_RECORDING_TYPE,
@@ -75,6 +81,7 @@ from kirby2.observability.models import (
 )
 from kirby2.observability.venue import _PendingObservable
 from kirby2.session.events import EventJournal, EventType
+from kirby2.session.objectives import ObjectiveType
 from kirby2.session.records import (
     InputRecord,
     MarketStateRecord,
@@ -90,6 +97,7 @@ _IMPLEMENTED_EXECUTOR_LANES = (
     ExecutorLane.LATENCY,
     ExecutorLane.FRAGMENTED,
     ExecutorLane.ECOLOGY,
+    ExecutorLane.ALGORITHM,
 )
 
 
@@ -156,6 +164,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _real_latency_executor_case(),
             _real_fragmented_executor_case(),
             _real_ecology_executor_case(),
+            _real_algorithm_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -1650,6 +1659,316 @@ def _real_ecology_executor_case() -> ModelRiskLabAuditCase:
             "tapes": tapes,
         },
         () if passed else ("real agent-ecology executor proof failed",),
+    )
+
+
+def _real_algorithm_executor_case() -> ModelRiskLabAuditCase:
+    expected_strategies = {
+        item.value
+        for item in AlgorithmName
+        if item is not AlgorithmName.MANUAL_REPLAY
+    }
+    expected_objectives = {item.value for item in ObjectiveType}
+    expected_pairs = {
+        (strategy, objective)
+        for strategy in expected_strategies
+        for objective in expected_objectives
+    }
+    selected: dict[tuple[str, str], GeneratedConfiguration] = {}
+    for configuration in generate_configurations(seed=771, budget=4_200):
+        pair = (configuration.strategy, configuration.objective)
+        if (
+            configuration.lane is ExecutorLane.ALGORITHM
+            and configuration.replicate_index == 0
+            and pair in expected_pairs
+        ):
+            selected.setdefault(pair, configuration)
+    configurations = tuple(
+        selected[pair] for pair in sorted(expected_pairs) if pair in selected
+    )
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.ALGORITHM]
+    coverage = evidence_coverage_report(results)
+    algorithm_coverage = coverage["lanes"][ExecutorLane.ALGORITHM.value]
+
+    observed_pairs: set[tuple[str, str]] = set()
+    observed_action_types: set[str] = set()
+    event_record_types: set[str] = set()
+    observation_representations: set[str] = set()
+    native_recording_digests: set[str] = set()
+    public_boundary_clean = True
+    mapping_exact = True
+    event_backed_exercises = True
+    observe_only_zero_action = True
+    trading_route_backed = True
+    round_trip_preserved = True
+    no_winner_declared = True
+    native_recording_count = 0
+    result_evidence: dict[str, object] = {}
+    tapes: dict[str, object] = {}
+    for result, repeat, replay in zip(results, repeated, replayed):
+        configuration = result.configuration
+        observed_pairs.add((configuration.strategy, configuration.objective))
+        payload = thaw_json(result.recording.payload)
+        mapping = payload["execution_mapping"]
+        legs = payload["legs"]
+        winner = payload["winner_declaration"]
+        expected_manifest = default_algorithm_manifest(
+            AlgorithmName(configuration.strategy)
+        )
+        expected_leg_sides = {
+            ObjectiveType.ACQUIRE: ["buy"],
+            ObjectiveType.LIQUIDATE: ["sell"],
+            ObjectiveType.ROUND_TRIP: ["buy", "sell"],
+            ObjectiveType.OBSERVE_ONLY: ["buy"],
+        }[ObjectiveType(configuration.objective)]
+        mapping_exact = mapping_exact and all(
+            (
+                mapping["strategy"] == configuration.strategy,
+                mapping["configured_objective"] == configuration.objective,
+                mapping["algorithm_manifest"] == expected_manifest.as_dict(),
+                mapping["algorithm_manifest_sha256"]
+                == expected_manifest.sha256(),
+                mapping["duration_us"] == 1_000_000,
+                mapping["decision_interval_us"] == 250_000,
+                mapping["leg_sides"] == expected_leg_sides,
+                mapping["seed"] == configuration.seed,
+                len(legs) == len(expected_leg_sides),
+            )
+        )
+        route_count = 0
+        client_fill_quantity = 0
+        leg_backgrounds: set[str] = set()
+        leg_forks: set[str] = set()
+        decision_count = 0
+        for leg in legs:
+            native = leg["native_recording"]
+            native_digest = canonical_sha256(native)
+            native_recording_digests.add(native_digest)
+            native_recording_count += 1
+            route_count += len(native["route_ids"])
+            client_fill_quantity += sum(
+                int(fill["quantity"]) for fill in leg["client_fills"]
+            )
+            leg_backgrounds.add(str(leg["background_path_sha256"]))
+            leg_forks.add(str(leg["fork_state_sha256"]))
+            decision_count += len(leg["decisions"])
+            for decision in leg["decisions"]:
+                observed_action_types.add(
+                    str(decision["action"]["action_type"])
+                )
+                observation_representations.add(
+                    str(decision["observation"]["representation"])
+                )
+        event_record_types.update(
+            str(item["record_type"]) for item in result.event_projection
+        )
+        exercises = {
+            exercise.capability: thaw_json(exercise.evidence)
+            for exercise in result.exercises
+        }
+        event_backed_exercises = event_backed_exercises and all(
+            (
+                exercises["strategy"]["decision_count"] == decision_count,
+                exercises["objective"]["native_route_count"] == route_count,
+                exercises["objective"]["leg_count"] == len(legs),
+            )
+        )
+        if configuration.objective == ObjectiveType.OBSERVE_ONLY.value:
+            observe_only_zero_action = observe_only_zero_action and all(
+                (
+                    route_count == 0,
+                    client_fill_quantity == 0,
+                    exercises["strategy"]["observe_only_zero_action_proof"],
+                    all(
+                        decision["action"]["action_type"] == "WAIT"
+                        for leg in legs
+                        for decision in leg["decisions"]
+                    ),
+                )
+            )
+        else:
+            trading_route_backed = trading_route_backed and route_count > 0
+        if configuration.objective == ObjectiveType.ROUND_TRIP.value:
+            round_trip_preserved = round_trip_preserved and all(
+                (
+                    len(legs) == 2,
+                    [leg["objective"]["side"] for leg in legs]
+                    == ["buy", "sell"],
+                    len(leg_backgrounds) == 1,
+                    len(leg_forks) == 1,
+                    len(
+                        {
+                            leg["objective"]["target_quantity"]
+                            for leg in legs
+                        }
+                    )
+                    == 1,
+                )
+            )
+        no_winner_declared = no_winner_declared and all(
+            (
+                winner["status"] == "NOT_DECLARED",
+                winner["winner"] is None,
+            )
+        )
+        boundary = next(
+            check
+            for check in result.checks
+            if check.name == "observation_boundary"
+        )
+        boundary_evidence = thaw_json(boundary.evidence)
+        public_boundary_clean = public_boundary_clean and all(
+            (
+                not boundary_evidence["forbidden_fields_found"],
+                not boundary_evidence[
+                    "observable_projection_forbidden_fields"
+                ],
+            )
+        )
+        tapes[configuration.cell_id] = {
+            "background_path_sha256": sorted(leg_backgrounds),
+            "decision_trace_sha256": canonical_sha256(
+                [
+                    decision
+                    for leg in legs
+                    for decision in leg["decisions"]
+                ]
+            ),
+            "fork_state_sha256": sorted(leg_forks),
+            "native_recording_sha256": [
+                canonical_sha256(leg["native_recording"]) for leg in legs
+            ],
+            "recording_sha256": result.recording.sha256,
+        }
+        result_evidence[configuration.cell_id] = {
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "client_fill_quantity": client_fill_quantity,
+            "decision_count": decision_count,
+            "event_sha256": result.event_sha256,
+            "objective": configuration.objective,
+            "repeated_result_match": (
+                result.result_sha256 == repeat.result_sha256
+            ),
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": (
+                result.result_sha256 == replay.result_sha256
+            ),
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+            "route_count": route_count,
+            "strategy": configuration.strategy,
+        }
+
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    algorithm_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            algorithm_coverage["dimensions"],
+            algorithm_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes == _IMPLEMENTED_EXECUTOR_LANES,
+            len(configurations) == len(expected_pairs),
+            observed_pairs == expected_pairs,
+            exact_exercises,
+            event_backed_exercises,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            algorithm_coverage_passed,
+            public_boundary_clean,
+            mapping_exact,
+            observe_only_zero_action,
+            trading_route_backed,
+            round_trip_preserved,
+            no_winner_declared,
+            native_recording_count == 45,
+            len(native_recording_digests) == native_recording_count,
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == ALGORITHM_RECORDING_TYPE
+                for item in results
+            ),
+            observation_representations == {"ALGORITHM_CLIENT_OBSERVATION"},
+            {"algorithm_decision", "coordinator_event"}
+            <= event_record_types,
+            observed_action_types
+            <= {item.value for item in AlgorithmActionType},
+            bool(observed_action_types),
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_execution_algorithms_and_objectives_replay_natively",
+        {
+            "algorithm_coverage": algorithm_coverage,
+            "event_backed_exercises": event_backed_exercises,
+            "event_record_types": sorted(event_record_types),
+            "mapping_exact": mapping_exact,
+            "native_recording_count": native_recording_count,
+            "native_recording_digest_count": len(native_recording_digests),
+            "no_winner_declared": no_winner_declared,
+            "observed_action_types": sorted(observed_action_types),
+            "observed_axis_pairs": [
+                [strategy, objective]
+                for strategy, objective in sorted(observed_pairs)
+            ],
+            "observation_representations": sorted(
+                observation_representations
+            ),
+            "observe_only_zero_action": observe_only_zero_action,
+            "public_boundary_clean": public_boundary_clean,
+            "results": result_evidence,
+            "round_trip_preserved": round_trip_preserved,
+            "tapes": tapes,
+            "trading_route_backed": trading_route_backed,
+        },
+        () if passed else ("real execution-algorithm executor proof failed",),
     )
 
 

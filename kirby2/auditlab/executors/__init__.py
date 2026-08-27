@@ -6,6 +6,7 @@ from .base import (
     ExecutorRegistry,
     LaneCapabilitySpec,
 )
+from .algorithms import ALGORITHM_RECORDING_TYPE, AlgorithmExecutor
 from .core_flow import CORE_FLOW_RECORDING_TYPE, CoreFlowExecutor
 from .ecology import ECOLOGY_RECORDING_TYPE, EcologyExecutor
 from .fragmented import FRAGMENTED_RECORDING_TYPE, FragmentedExecutor
@@ -19,10 +20,12 @@ EXECUTOR_REGISTRY.register(MechanicsExecutor())
 EXECUTOR_REGISTRY.register(LatencyExecutor())
 EXECUTOR_REGISTRY.register(FragmentedExecutor())
 EXECUTOR_REGISTRY.register(EcologyExecutor())
+EXECUTOR_REGISTRY.register(AlgorithmExecutor())
 
 
 __all__ = [
     "CAPABILITY_MATRIX",
+    "ALGORITHM_RECORDING_TYPE",
     "CORE_FLOW_RECORDING_TYPE",
     "ECOLOGY_RECORDING_TYPE",
     "EXECUTOR_REGISTRY",
@@ -30,6 +33,7 @@ __all__ = [
     "LATENCY_RECORDING_TYPE",
     "MECHANICS_RECORDING_TYPE",
     "AuditCaseExecutor",
+    "AlgorithmExecutor",
     "CoreFlowExecutor",
     "EcologyExecutor",
     "ExecutorRegistry",

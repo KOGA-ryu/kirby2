@@ -38,6 +38,7 @@ from .models import (
     ExecutionBenchmarkResult,
     ExecutionObjective,
     ObservableMarketFeatures,
+    RiskLimits,
 )
 from .policies import create_algorithm
 from .scenarios import BackgroundMarketEvent, get_benchmark_scenario
@@ -45,13 +46,49 @@ from .store import AlgorithmRunArtifacts, AlgorithmRunStore
 
 
 @dataclass(frozen=True, slots=True)
-class _CompletedRun:
+class ExecutionCellResult:
+    """One non-persisted algorithm run on a deterministic benchmark cell."""
+
+    scenario_name: str
+    seed: int
     manifest: AlgorithmParameterManifest
+    objective: ExecutionObjective
     fork_state_sha256: str
     background_path_sha256: str
+    control_final_state_sha256: str
     decisions: tuple[AlgorithmDecision, ...]
+    client_fills: tuple[ClientFill, ...]
     recording: MultiVenueRecording
     metrics: ExecutionBenchmarkMetrics
+    observe_only: bool
+
+    @property
+    def final_signed_position(self) -> int:
+        return sum(fill.side.sign * fill.quantity for fill in self.client_fills)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "background_path_sha256": self.background_path_sha256,
+            "client_fills": [item.as_dict() for item in self.client_fills],
+            "control_final_state_sha256": self.control_final_state_sha256,
+            "decisions": [item.as_dict() for item in self.decisions],
+            "final_signed_position": self.final_signed_position,
+            "fork_state_sha256": self.fork_state_sha256,
+            "manifest": self.manifest.as_dict(),
+            "metrics": self.metrics.as_dict(),
+            "native_recording": self.recording.as_dict(),
+            "objective": self.objective.as_dict(),
+            "observe_only": self.observe_only,
+            "scenario_name": self.scenario_name,
+            "seed": self.seed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _BackgroundControl:
+    final_midpoint_x2: int
+    fork_state_sha256: str
+    final_state_sha256: str
 
 
 class _RecordedCoordinator:
@@ -138,8 +175,11 @@ class _ClientTracker:
         self._order_sides: dict[str, Side] = {}
         self._order_decision_midpoints_x2: dict[str, int | None] = {}
         self._route_send_time: dict[str, int] = {}
+        self._route_quantities: dict[str, int] = {}
         self._route_decision_midpoints_x2: dict[str, int | None] = {}
         self._route_ids: list[str] = []
+        self._route_order_allocations: dict[str, dict[str, int]] = {}
+        self._route_order_fills: dict[str, dict[str, int]] = {}
         self._last_observation_time_us = -1
         self._last_midpoint_x2: int | None = None
         self._sequence = 0
@@ -149,10 +189,23 @@ class _ClientTracker:
         route_id: str,
         time_us: int,
         observed_midpoint_x2: int | None,
+        quantity: int,
     ) -> None:
         self._route_ids.append(route_id)
         self._route_send_time[route_id] = time_us
+        self._route_quantities[route_id] = quantity
         self._route_decision_midpoints_x2[route_id] = observed_midpoint_x2
+
+    @property
+    def pending_route_quantity(self) -> int:
+        return sum(
+            max(
+                0,
+                self._route_quantities[route_id]
+                - self._observed_route_quantity(route_id),
+            )
+            for route_id in self._route_ids
+        )
 
     def observation(
         self,
@@ -163,13 +216,14 @@ class _ClientTracker:
     ) -> AlgorithmObservation:
         feed = coordinator.consolidated_feed()
         midpoint_x2 = _midpoint_x2(feed)
-        self._refresh_orders_and_fills(coordinator)
+        self._refresh_orders_and_fills(coordinator, objective)
         working = self._working_orders(coordinator)
         filled = sum(item.quantity for item in self.fills if item.side is objective.side)
         pending = [
             route_id
             for route_id in self._route_ids
-            if not coordinator.route_result(route_id).complete
+            if self._observed_route_quantity(route_id)
+            < self._route_quantities[route_id]
         ]
         current_time = coordinator.clock.current_time_us
         interval_volume = sum(
@@ -248,24 +302,30 @@ class _ClientTracker:
         self._last_midpoint_x2 = midpoint_x2
         return observation
 
-    def refresh_after_completion(self, coordinator: MarketCoordinator) -> None:
-        self._refresh_orders_and_fills(coordinator)
+    def refresh_after_completion(
+        self,
+        coordinator: MarketCoordinator,
+        objective: ExecutionObjective,
+    ) -> None:
+        self._refresh_orders_and_fills(coordinator, objective)
 
     def _refresh_orders_and_fills(
         self,
         coordinator: MarketCoordinator,
+        objective: ExecutionObjective,
     ) -> None:
-        for route_id in self._route_ids:
-            result = coordinator.route_result(route_id)
-            for execution in result.executions:
-                self._order_sides[execution.order_id] = result.request.side
-                self._order_decision_midpoints_x2[execution.order_id] = (
-                    self._route_decision_midpoints_x2[route_id]
-                )
         for venue_id, venue in sorted(coordinator.venues.items()):
             feed = venue.observable_feed()
             for own in feed.own_orders:
                 self._order_sides[own.order_id] = own.side
+                route_id = self._route_id_for_order(own.order_id)
+                if route_id is not None:
+                    self._route_order_allocations.setdefault(route_id, {})[
+                        own.order_id
+                    ] = own.original_quantity
+                    self._order_decision_midpoints_x2[own.order_id] = (
+                        self._route_decision_midpoints_x2[route_id]
+                    )
             for event in feed.events:
                 key = (venue_id, event.sequence)
                 if key in self._seen_events or event.event_type is not ObservableEventType.OWN_ORDER_FILL:
@@ -274,12 +334,21 @@ class _ClientTracker:
                 raw_own = event.data.get("own_order")
                 own_order_id = (
                     str(raw_own["order_id"])
-                    if isinstance(raw_own, dict)
+                    if isinstance(raw_own, Mapping)
                     else str(event.data["order_id"])
                 )
-                side = self._order_sides.get(own_order_id)
-                if side is None:
-                    raise RuntimeError("observable own fill lacks a known order side")
+                route_id = self._route_id_for_order(own_order_id)
+                if route_id is not None:
+                    route_fills = self._route_order_fills.setdefault(route_id, {})
+                    route_fills[own_order_id] = (
+                        route_fills.get(own_order_id, 0)
+                        + int(event.data["fill_quantity"])
+                    )
+                    self._order_decision_midpoints_x2[own_order_id] = (
+                        self._route_decision_midpoints_x2[route_id]
+                    )
+                side = self._order_sides.get(own_order_id, objective.side)
+                self._order_sides[own_order_id] = side
                 self.fills.append(
                     ClientFill(
                         venue_id,
@@ -299,6 +368,24 @@ class _ClientTracker:
                 item.trade_id,
                 item.order_id,
             )
+        )
+
+    def _route_id_for_order(self, order_id: str) -> str | None:
+        return next(
+            (
+                route_id
+                for route_id in self._route_ids
+                if f"-{route_id}-" in order_id
+            ),
+            None,
+        )
+
+    def _observed_route_quantity(self, route_id: str) -> int:
+        allocations = self._route_order_allocations.get(route_id, {})
+        fills = self._route_order_fills.get(route_id, {})
+        return sum(
+            max(allocations.get(order_id, 0), fills.get(order_id, 0))
+            for order_id in allocations.keys() | fills.keys()
         )
 
     def _working_orders(self, coordinator: MarketCoordinator) -> tuple[ClientWorkingOrder, ...]:
@@ -333,26 +420,20 @@ def run_execution_benchmark(
     store = AlgorithmRunStore(store_root)
     run_results: list[BenchmarkRunResult] = []
     for scenario_name in manifest.scenario_names:
-        scenario = get_benchmark_scenario(
-            scenario_name,
-            duration_us=manifest.duration_us,
-            decision_interval_us=manifest.decision_interval_us,
-        )
-        _assert_timing_supports_synchronous_cancels(manifest, scenario)
         for seed in manifest.seeds:
-            control_midpoint, control_fork = _run_background_control(scenario, seed)
             cell_forks: set[str] = set()
             for algorithm_manifest in manifest.algorithm_manifests:
-                completed = _run_algorithm(
-                    manifest,
-                    scenario,
-                    seed,
-                    algorithm_manifest,
-                    control_midpoint,
+                completed = run_execution_cell(
+                    scenario_name=scenario_name,
+                    seed=seed,
+                    algorithm_manifest=algorithm_manifest,
+                    side=manifest.side,
+                    target_quantity=manifest.quantity,
+                    duration_us=manifest.duration_us,
+                    decision_interval_us=manifest.decision_interval_us,
+                    risk_limits=manifest.risk_limits,
                 )
                 cell_forks.add(completed.fork_state_sha256)
-                if completed.fork_state_sha256 != control_fork:
-                    raise RuntimeError("algorithm did not start from the control fork state")
                 immutable = store.record(
                     AlgorithmRunArtifacts(
                         manifest.experiment_id,
@@ -407,7 +488,63 @@ def run_execution_benchmark(
     )
 
 
-def _run_background_control(scenario, seed: int) -> tuple[int, str]:
+def run_execution_cell(
+    *,
+    scenario_name: str,
+    seed: int,
+    algorithm_manifest: AlgorithmParameterManifest,
+    side: Side,
+    target_quantity: int,
+    duration_us: int,
+    decision_interval_us: int,
+    risk_limits: RiskLimits,
+    observe_only: bool = False,
+) -> ExecutionCellResult:
+    """Run one production benchmark cell without writing immutable artifacts."""
+
+    if type(seed) is not int or seed < 0:
+        raise ValueError("execution-cell seed must be a nonnegative integer")
+    if not isinstance(algorithm_manifest, AlgorithmParameterManifest):
+        raise TypeError("execution cell requires an algorithm manifest")
+    if not isinstance(side, Side):
+        raise TypeError("execution-cell side must use Side")
+    if type(target_quantity) is not int or target_quantity <= 0:
+        raise ValueError("execution-cell target quantity must be positive")
+    if type(observe_only) is not bool:
+        raise TypeError("execution-cell observe-only flag must be boolean")
+    if not isinstance(risk_limits, RiskLimits):
+        raise TypeError("execution cell requires canonical risk limits")
+    scenario = get_benchmark_scenario(
+        scenario_name,
+        duration_us=duration_us,
+        decision_interval_us=decision_interval_us,
+    )
+    _assert_timing_supports_synchronous_cancels(
+        decision_interval_us,
+        (algorithm_manifest,),
+        scenario,
+    )
+    control = _run_background_control(scenario, seed)
+    completed = _run_algorithm(
+        scenario,
+        seed,
+        algorithm_manifest,
+        side=side,
+        target_quantity=target_quantity,
+        risk_limits=risk_limits,
+        control=control,
+        observe_only=observe_only,
+    )
+    if completed.fork_state_sha256 != control.fork_state_sha256:
+        raise RuntimeError("algorithm did not start from the control fork state")
+    if observe_only and (
+        completed.recording.expected_state_sha256 != control.final_state_sha256
+    ):
+        raise RuntimeError("observe-only cell diverged from its background control")
+    return completed
+
+
+def _run_background_control(scenario, seed: int) -> _BackgroundControl:
     recorder = _RecordedCoordinator(scenario, seed)
     recorder.advance(scenario.start_time_us)
     fork = recorder.coordinator.state_sha256()
@@ -415,14 +552,25 @@ def _run_background_control(scenario, seed: int) -> tuple[int, str]:
         recorder.background(event)
     if recorder.coordinator.clock.current_time_us < scenario.deadline_us:
         recorder.advance(scenario.deadline_us)
-    recorder.complete()
+    recording = recorder.complete()
+    replay = replay_multivenue_recording(recording)
+    if not replay.passed:
+        raise RuntimeError("background control recording failed exact replay")
     midpoint = _midpoint_x2(recorder.coordinator.consolidated_feed())
     if midpoint is None:
         raise RuntimeError("background control ended without a two-sided market")
-    return midpoint, fork
+    return _BackgroundControl(
+        midpoint,
+        fork,
+        recorder.coordinator.state_sha256(),
+    )
 
 
-def _assert_timing_supports_synchronous_cancels(manifest, scenario) -> None:
+def _assert_timing_supports_synchronous_cancels(
+    decision_interval_us: int,
+    algorithm_manifests: tuple[AlgorithmParameterManifest, ...],
+    scenario,
+) -> None:
     cancel_capable = {
         AlgorithmName.IMPLEMENTATION_SHORTFALL_ADAPTIVE,
         AlgorithmName.IMPROVE_ONE_TICK,
@@ -435,7 +583,7 @@ def _assert_timing_supports_synchronous_cancels(manifest, scenario) -> None:
             item.algorithm is AlgorithmName.MANUAL_REPLAY
             and _manual_manifest_can_cancel(item)
         )
-        for item in manifest.algorithm_manifests
+        for item in algorithm_manifests
     )
     if not requires_cancel:
         return
@@ -452,10 +600,10 @@ def _assert_timing_supports_synchronous_cancels(manifest, scenario) -> None:
         )
         for config in scenario.venue_configs
     )
-    if manifest.decision_interval_us < worst_case_us:
+    if decision_interval_us < worst_case_us:
         raise ValueError(
             "decision interval is shorter than the bounded synchronous cancel-all "
-            f"latency ({manifest.decision_interval_us} < {worst_case_us} microseconds)"
+            f"latency ({decision_interval_us} < {worst_case_us} microseconds)"
         )
 
 
@@ -469,12 +617,16 @@ def _manual_manifest_can_cancel(manifest: AlgorithmParameterManifest) -> bool:
 
 
 def _run_algorithm(
-    benchmark: BenchmarkManifest,
     scenario,
     seed: int,
     algorithm_manifest: AlgorithmParameterManifest,
-    control_midpoint_x2: int,
-) -> _CompletedRun:
+    *,
+    side: Side,
+    target_quantity: int,
+    risk_limits: RiskLimits,
+    control: _BackgroundControl,
+    observe_only: bool,
+) -> ExecutionCellResult:
     recorder = _RecordedCoordinator(scenario, seed)
     recorder.advance(scenario.start_time_us)
     fork_state = recorder.coordinator.state_sha256()
@@ -483,14 +635,15 @@ def _run_algorithm(
     if arrival_midpoint is None:
         raise RuntimeError("execution benchmark fork lacks a two-sided market")
     objective = ExecutionObjective(
-        benchmark.side,
-        benchmark.quantity,
+        side,
+        target_quantity,
         scenario.start_time_us,
         scenario.deadline_us,
         arrival_midpoint,
     )
-    algorithm = create_algorithm(algorithm_manifest)
-    algorithm.reset(objective)
+    algorithm = None if observe_only else create_algorithm(algorithm_manifest)
+    if algorithm is not None:
+        algorithm.reset(objective)
     tracker = _ClientTracker()
     decisions: list[AlgorithmDecision] = []
     events_by_time: dict[int, list[BackgroundMarketEvent]] = {}
@@ -510,9 +663,15 @@ def _run_algorithm(
             recorder.coordinator,
             objective,
             scenario.volume_profile_bps,
-            benchmark.risk_limits,
+            risk_limits,
         )
-        action = _finish_action() if finished else algorithm.decide(observation)
+        action = (
+            _finish_action()
+            if finished
+            else _observe_only_action()
+            if algorithm is None
+            else algorithm.decide(observation)
+        )
         accepted, rejection, route_id = _apply_action(
             recorder,
             tracker,
@@ -538,21 +697,27 @@ def _run_algorithm(
     replay = replay_multivenue_recording(recording)
     if not replay.passed:
         raise RuntimeError("algorithm coordinator recording failed exact replay")
-    tracker.refresh_after_completion(recorder.coordinator)
+    tracker.refresh_after_completion(recorder.coordinator, objective)
     metrics = _metrics(
         objective,
         tracker.fills,
         recorder,
         tuple(decisions),
-        control_midpoint_x2,
+        control.final_midpoint_x2,
     )
-    return _CompletedRun(
-        algorithm_manifest,
-        fork_state,
-        scenario.background_sha256(seed),
-        tuple(decisions),
-        recording,
-        metrics,
+    return ExecutionCellResult(
+        scenario_name=scenario.name,
+        seed=seed,
+        manifest=algorithm_manifest,
+        objective=objective,
+        fork_state_sha256=fork_state,
+        background_path_sha256=scenario.background_sha256(seed),
+        control_final_state_sha256=control.final_state_sha256,
+        decisions=tuple(decisions),
+        client_fills=tuple(tracker.fills),
+        recording=recording,
+        metrics=metrics,
+        observe_only=observe_only,
     )
 
 
@@ -565,11 +730,53 @@ def _apply_action(
     rejection = _risk_rejection(observation, action)
     if rejection is not None:
         return False, rejection, None
+    if action.action_type in {
+        AlgorithmActionType.SUBMIT,
+        AlgorithmActionType.REPLACE,
+    }:
+        client_available = (
+            observation.remaining_quantity
+            if action.action_type is AlgorithmActionType.REPLACE
+            else observation.available_to_submit
+        )
+        client_available = max(
+            0,
+            client_available - tracker.pending_route_quantity,
+        )
+        if action.quantity > client_available:
+            return False, "QUANTITY_EXCEEDS_CLIENT_KNOWN_CAPACITY", None
     if action.action_type in {AlgorithmActionType.WAIT, AlgorithmActionType.FINISH}:
         return True, None, None
     try:
         if action.action_type in {AlgorithmActionType.CANCEL, AlgorithmActionType.REPLACE}:
             recorder.cancel_all()
+        if action.action_type is AlgorithmActionType.REPLACE:
+            tracker.refresh_after_completion(
+                recorder.coordinator,
+                observation.objective,
+            )
+            refreshed_filled = sum(
+                fill.quantity
+                for fill in tracker.fills
+                if fill.side is observation.objective.side
+            )
+            refreshed_working = sum(
+                order.remaining_quantity
+                for order in tracker._working_orders(recorder.coordinator)
+                if order.side is observation.objective.side
+            )
+            refreshed_available = max(
+                0,
+                observation.objective.target_quantity
+                - refreshed_filled
+                - refreshed_working,
+            )
+            if action.quantity > refreshed_available:
+                return (
+                    False,
+                    "REPLACE_QUANTITY_EXCEEDS_REFRESHED_OBJECTIVE",
+                    None,
+                )
         if action.action_type in {AlgorithmActionType.SUBMIT, AlgorithmActionType.REPLACE}:
             effective_limit = action.limit_price_ticks
             if (
@@ -592,6 +799,7 @@ def _apply_action(
                 route_id,
                 recorder.coordinator.clock.current_time_us,
                 observation.observable_market_features.midpoint_x2,
+                action.quantity,
             )
             return True, None, route_id
     except (TypeError, ValueError, RuntimeError) as error:
@@ -792,3 +1000,10 @@ def _midpoint_x2(feed) -> int | None:
 
 def _finish_action() -> AlgorithmAction:
     return AlgorithmAction(AlgorithmActionType.FINISH, "algorithm already finished")
+
+
+def _observe_only_action() -> AlgorithmAction:
+    return AlgorithmAction(
+        AlgorithmActionType.WAIT,
+        "observe-only control emits no child order",
+    )

@@ -1,6 +1,10 @@
 """Observable-only execution algorithms and deterministic benchmark bench."""
 
-from .benchmark import run_execution_benchmark
+from .benchmark import (
+    ExecutionCellResult,
+    run_execution_benchmark,
+    run_execution_cell,
+)
 from .manual import (
     MANUAL_REPLAY_TRANSLATION_VERSION,
     manual_manifest_from_session_recording,
@@ -70,6 +74,7 @@ __all__ = [
     "ExecutionAlgorithm",
     "ExecutionBenchmarkMetrics",
     "ExecutionBenchmarkResult",
+    "ExecutionCellResult",
     "ExecutionBenchmarkScenario",
     "ExecutionObjective",
     "ImmutableAlgorithmRunManifest",
@@ -80,4 +85,5 @@ __all__ = [
     "get_benchmark_scenario",
     "manual_manifest_from_session_recording",
     "run_execution_benchmark",
+    "run_execution_cell",
 ]
