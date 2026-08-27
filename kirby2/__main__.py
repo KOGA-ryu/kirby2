@@ -242,6 +242,24 @@ def _parser() -> argparse.ArgumentParser:
         default="all",
     )
 
+    multivenue_demo = subcommands.add_parser(
+        "multivenue-demo",
+        help="run deterministic fragmented-market routing drills",
+    )
+    multivenue_demo.add_argument(
+        "--scenario",
+        choices=(
+            "all",
+            "better-price-poor-fill-probability",
+            "deep-slow-versus-shallow-fast",
+            "sweep-during-momentum",
+            "passive-routing-two-venues",
+            "stale-composite-quote",
+            "partial-multi-venue-completion",
+        ),
+        default="all",
+    )
+
     defaults = EventRates()
     simulate = subcommands.add_parser("simulate", help="run seeded Poisson-style order flow")
     simulate.add_argument("--seed", type=int, default=42, help="explicit simulation RNG seed")
@@ -451,6 +469,10 @@ def _parser() -> argparse.ArgumentParser:
     subcommands.add_parser(
         "audit-hidden-liquidity",
         help="audit hidden liquidity, observability, queue estimates, and replay",
+    )
+    subcommands.add_parser(
+        "audit-multivenue",
+        help="audit fragmented venues, routing evidence, scoring, and replay",
     )
 
     ingest_market_data = subcommands.add_parser(
@@ -948,6 +970,52 @@ def main() -> None:
                 print("OBSERVABLE_TIMELINE")
                 print(result.timeline)
                 print("RUNTIME_INVARIANTS PASS")
+        return
+
+    if args.command == "multivenue-demo":
+        from kirby2.multivenue import (
+            MULTIVENUE_SCENARIOS,
+            run_multivenue_scenario,
+        )
+
+        names = MULTIVENUE_SCENARIOS if args.scenario == "all" else (args.scenario,)
+        print("KIRBY2_FRAGMENTED_MULTIVENUE_DEMO")
+        for name in names:
+            result = run_multivenue_scenario(name)
+            result.coordinator.assert_invariants()
+            print(f"SCENARIO {name}")
+            print(
+                "SUMMARY "
+                + json.dumps(result.summary, sort_keys=True, separators=(",", ":"))
+            )
+            print(
+                f"EVENTS count={len(result.coordinator.events)} "
+                f"sha256={result.coordinator.event_stream_sha256()}"
+            )
+            for route_id in result.route_ids:
+                route = result.coordinator.route_result(route_id)
+                score = result.coordinator.score_route(route_id)
+                print(
+                    f"ROUTE {route_id} policy={route.decision.policy.value} "
+                    f"evidence_sha256={route.decision.observable_feed_sha256}"
+                )
+                print(f"EXPLANATION {route.decision.explanation}")
+                print(
+                    "SCORE "
+                    + json.dumps(score.as_dict(), sort_keys=True, separators=(",", ":"))
+                )
+            print(f"RECORDING sha256={result.recording.sha256()}")
+            print(
+                f"REPLAY {'PASS' if result.replay.passed else 'FAIL'} "
+                f"events={str(result.replay.events_match).lower()} "
+                f"feed={str(result.replay.feed_match).lower()} "
+                f"truth={str(result.replay.ground_truth_match).lower()} "
+                f"scores={str(result.replay.scores_match).lower()} "
+                f"state={str(result.replay.state_match).lower()}"
+            )
+            print("ROUTING_TIMELINE")
+            print(result.timeline)
+            print("RUNTIME_INVARIANTS PASS")
         return
 
     if args.command == "strategy":
@@ -2265,6 +2333,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"HIDDEN_LIQUIDITY_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-multivenue":
+        from kirby2.audit.multivenue import audit_multivenue
+
+        reports = audit_multivenue()
+        print("KIRBY2_MULTIVENUE_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"MULTIVENUE_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
