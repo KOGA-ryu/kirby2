@@ -13,6 +13,7 @@
     "real_market_data": false,
     "provides_order_events": false,
     "provides_trade_events": false,
+    "provides_trade_aggressor_side": false,
     "provides_book_events": false
   },
   "constraints": {

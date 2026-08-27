@@ -363,6 +363,10 @@ def _parser() -> argparse.ArgumentParser:
         "audit-distribution-truth",
         help="audit distribution units, runtime consumers, seeded traces, and replay",
     )
+    subcommands.add_parser(
+        "audit-historical-features",
+        help="audit causal historical feature replay, provenance, and strategy gates",
+    )
 
     matrix = subcommands.add_parser(
         "matrix",
@@ -1535,6 +1539,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"DISTRIBUTION_TRUTH_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-historical-features":
+        from kirby2.audit.historical_features import audit_historical_features
+
+        reports = audit_historical_features()
+        print("KIRBY2_HISTORICAL_FEATURE_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"HISTORICAL_FEATURE_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:

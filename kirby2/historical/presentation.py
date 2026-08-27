@@ -93,6 +93,8 @@ def render_historical_ui(run: HistoricalRun, levels: int = 4) -> str:
             f"DATA_SCOPE real_market_data={str(run.provenance.real_market_data).lower()} "
             f"orders={str(run.provenance.provides_order_events).lower()} "
             f"trades={str(run.provenance.provides_trade_events).lower()} "
+            "aggressor_side="
+            f"{str(run.provenance.provides_trade_aggressor_side).lower()} "
             f"book={str(run.provenance.provides_book_events).lower()}"
         ),
         f"ORDER_PROVENANCE {run.order_provenance_label}",
@@ -124,7 +126,17 @@ def render_historical_ui(run: HistoricalRun, levels: int = 4) -> str:
 
 
 def render_historical_report(run: HistoricalRun) -> str:
+    from .features import (
+        HistoricalEvidenceScope,
+        historical_feature_provenance_summary,
+        replay_historical_features,
+    )
+
     metrics = historical_metrics(run)
+    source_features = replay_historical_features(
+        run,
+        windows_us=(1_000_000,),
+    )
     if run.mode is HistoricalDataMode.RECONSTRUCTION:
         disclosure = [RECONSTRUCTION_TITLE, RECONSTRUCTION_DISCLOSURE]
     else:
@@ -146,9 +158,18 @@ def render_historical_report(run: HistoricalRun) -> str:
             "SOURCE_CAPABILITIES "
             f"orders={str(run.provenance.provides_order_events).lower()} "
             f"trades={str(run.provenance.provides_trade_events).lower()} "
+            "aggressor_side="
+            f"{str(run.provenance.provides_trade_aggressor_side).lower()} "
             f"book={str(run.provenance.provides_book_events).lower()}"
         ),
         f"ORDER_PROVENANCE {run.order_provenance_label}",
+        "SOURCE_FEATURE_PROVENANCE "
+        + json.dumps(
+            historical_feature_provenance_summary(source_features.terminal_frame),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        f"HISTORICAL_FEATURE_REPLAY_SHA256 {source_features.replay_sha256()}",
     ]
     if run.mode is HistoricalDataMode.EXACT_REPLAY:
         lines.append(
@@ -160,6 +181,11 @@ def render_historical_report(run: HistoricalRun) -> str:
                 "REAL_MARKET_CLAIM none; this is a local pedagogical exact-event fixture"
             )
     else:
+        reconstruction_features = replay_historical_features(
+            run,
+            windows_us=(1_000_000,),
+            evidence_scope=HistoricalEvidenceScope.INCLUDE_RECONSTRUCTION,
+        )
         calibration = (
             run.reconstruction_config.get("deterministic_calibration", {})
             if run.reconstruction_config is not None
@@ -171,6 +197,14 @@ def render_historical_report(run: HistoricalRun) -> str:
                 "DETERMINISTIC_CALIBRATION "
                 + json.dumps(calibration, sort_keys=True, separators=(",", ":")),
                 "CONSTRAINT_FIT residuals are disclosed; generated orders are not observations",
+                "RECONSTRUCTION_FEATURE_PROVENANCE "
+                + json.dumps(
+                    historical_feature_provenance_summary(
+                        reconstruction_features.terminal_frame
+                    ),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 json.dumps(
                     {
                         "generated": {

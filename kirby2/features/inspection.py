@@ -14,7 +14,7 @@ from .engine import MicrostructureFeatureEngine
 from .models import FeatureFrame
 
 if TYPE_CHECKING:
-    from kirby2.historical import HistoricalRun
+    from kirby2.historical import HistoricalFeatureFrame, HistoricalRun
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +102,9 @@ def inspect_scenario_features(
 def historical_feature_frame(
     run: HistoricalRun,
     windows_us: tuple[int, ...] = (250_000, 1_000_000, 5_000_000),
-) -> FeatureFrame:
-    """Expose historical final state through the same engine; rolling values start empty."""
-    engine = MicrostructureFeatureEngine(windows_us=windows_us)
-    return engine.reset(run.duration_us, run.book)
+) -> HistoricalFeatureFrame:
+    """Causally replay historical activity and return its source-only terminal frame."""
+
+    from kirby2.historical.features import replay_historical_features
+
+    return replay_historical_features(run, windows_us=windows_us).terminal_frame

@@ -24,6 +24,12 @@ class TrafficState(str, Enum):
     RED = "RED"
 
 
+class UnavailableValuePolicy(str, Enum):
+    REFUSE = "REFUSE"
+    AS_FALSE = "AS_FALSE"
+    AS_ZERO = "AS_ZERO"
+
+
 class FeatureName(str, Enum):
     SPREAD_TICKS = "spread_ticks"
     BEST_BID_SIZE = "best_bid_size"
@@ -99,6 +105,7 @@ class StrategyDefinition:
     green_conditions: tuple[RuleCondition, ...]
     wait_conditions: tuple[RuleCondition, ...]
     source: str
+    unavailable_policy: UnavailableValuePolicy = UnavailableValuePolicy.REFUSE
 
     def __post_init__(self) -> None:
         if not _SETUP_NAME.fullmatch(self.name):
@@ -107,19 +114,24 @@ class StrategyDefinition:
             raise ValueError("strategy rolling window must be positive")
         if not self.green_conditions or not self.wait_conditions:
             raise ValueError("GREEN and WAIT rules require conditions")
+        if not isinstance(self.unavailable_policy, UnavailableValuePolicy):
+            raise TypeError("strategy unavailable-value policy is invalid")
 
     @property
     def source_sha256(self) -> str:
         return hashlib.sha256(self.source.encode("utf-8")).hexdigest()
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "green_conditions": [condition.render() for condition in self.green_conditions],
             "name": self.name,
             "source_sha256": self.source_sha256,
             "wait_conditions": [condition.render() for condition in self.wait_conditions],
             "window_us": self.window_us,
         }
+        if self.unavailable_policy is not UnavailableValuePolicy.REFUSE:
+            result["unavailable_policy"] = self.unavailable_policy.value
+        return result
 
 
 def parse_strategy(source: str) -> StrategyDefinition | StateMachineDefinition:
@@ -156,6 +168,15 @@ def parse_strategy(source: str) -> StrategyDefinition | StateMachineDefinition:
         window_us = _parse_window(parts[1], window_line, window_text)
         index += 1
 
+    unavailable_policy = UnavailableValuePolicy.REFUSE
+    if index < len(lines) and lines[index][1].lower().startswith("unavailable"):
+        policy_line, policy_text = lines[index]
+        unavailable_policy = _parse_unavailable_policy(
+            policy_text,
+            policy_line,
+        )
+        index += 1
+
     index = _expect_header(lines, index, "GREEN when")
     green, index = _parse_conditions_until(lines, index, "WAIT when")
     if not green:
@@ -179,6 +200,7 @@ def parse_strategy(source: str) -> StrategyDefinition | StateMachineDefinition:
         green_conditions=tuple(green),
         wait_conditions=tuple(wait),
         source=source,
+        unavailable_policy=unavailable_policy,
     )
 
 
@@ -200,6 +222,27 @@ def _parse_window(value: str, line_number: int, source_line: str) -> int:
         raise RuleSyntaxError(line_number, "window must be positive", source_line)
     multiplier = 1_000 if match.group(2).lower() == "ms" else 1_000_000
     return quantity * multiplier
+
+
+def _parse_unavailable_policy(
+    text: str,
+    line_number: int,
+) -> UnavailableValuePolicy:
+    parts = text.split()
+    if len(parts) != 2 or parts[0].lower() != "unavailable":
+        raise RuleSyntaxError(
+            line_number,
+            "expected 'unavailable REFUSE|AS_FALSE|AS_ZERO'",
+            text,
+        )
+    try:
+        return UnavailableValuePolicy(parts[1].upper())
+    except ValueError as error:
+        raise RuleSyntaxError(
+            line_number,
+            "unavailable policy must be REFUSE, AS_FALSE, or AS_ZERO",
+            text,
+        ) from error
 
 
 def _expect_header(

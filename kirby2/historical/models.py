@@ -32,6 +32,7 @@ class HistoricalProvenance:
     provides_order_events: bool
     provides_trade_events: bool
     provides_book_events: bool
+    provides_trade_aggressor_side: bool = False
 
     def __post_init__(self) -> None:
         if any(
@@ -50,9 +51,12 @@ class HistoricalProvenance:
             self.provides_order_events,
             self.provides_trade_events,
             self.provides_book_events,
+            self.provides_trade_aggressor_side,
         )
         if any(type(value) is not bool for value in flags):
             raise TypeError("historical provenance capability flags must be booleans")
+        if self.provides_trade_aggressor_side and not self.provides_trade_events:
+            raise ValueError("trade aggressor side requires source trade events")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -62,6 +66,7 @@ class HistoricalProvenance:
             "provides_book_events": self.provides_book_events,
             "provides_order_events": self.provides_order_events,
             "provides_trade_events": self.provides_trade_events,
+            "provides_trade_aggressor_side": self.provides_trade_aggressor_side,
             "real_market_data": self.real_market_data,
             "source_locator": self.source_locator,
             "source_name": self.source_name,
@@ -190,6 +195,7 @@ class TradePrintObservation:
     timestamp_us: int
     price_ticks: int
     quantity: int
+    aggressor_side: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.timestamp_us) is not int or self.timestamp_us < 0:
@@ -198,9 +204,12 @@ class TradePrintObservation:
             raise ValueError("print price must be positive integer ticks")
         if type(self.quantity) is not int or self.quantity <= 0:
             raise ValueError("print quantity must be positive")
+        if self.aggressor_side not in {None, "buy", "sell"}:
+            raise ValueError("print aggressor side must be buy, sell, or unavailable")
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | str | None]:
         return {
+            "aggressor_side": self.aggressor_side,
             "price_ticks": self.price_ticks,
             "quantity": self.quantity,
             "timestamp_us": self.timestamp_us,

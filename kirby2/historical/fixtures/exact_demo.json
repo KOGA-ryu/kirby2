@@ -15,6 +15,7 @@
     "real_market_data": false,
     "provides_order_events": true,
     "provides_trade_events": true,
+    "provides_trade_aggressor_side": true,
     "provides_book_events": false
   },
   "messages": [

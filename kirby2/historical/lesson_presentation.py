@@ -70,6 +70,8 @@ def render_historical_lesson_session(
             f"real_market_data={str(run.provenance.real_market_data).lower()} "
             f"source_orders={str(run.provenance.provides_order_events).lower()} "
             f"source_trades={str(run.provenance.provides_trade_events).lower()} "
+            "source_aggressor_side="
+            f"{str(run.provenance.provides_trade_aggressor_side).lower()} "
             f"source_book={str(run.provenance.provides_book_events).lower()} "
             f"synthetic_orders={str(lesson.mode is HistoricalDataMode.RECONSTRUCTION).lower()}"
         ),

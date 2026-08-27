@@ -33,6 +33,10 @@ def _provenance(payload: dict[str, object]) -> HistoricalProvenance:
         provides_order_events=_boolean(payload, "provides_order_events"),
         provides_trade_events=_boolean(payload, "provides_trade_events"),
         provides_book_events=_boolean(payload, "provides_book_events"),
+        provides_trade_aggressor_side=_optional_boolean(
+            payload,
+            "provides_trade_aggressor_side",
+        ),
     )
 
 
@@ -139,6 +143,11 @@ def load_reconstruction_fixture(path: Path | None = None) -> ReconstructionFixtu
                     timestamp_us=int(item["timestamp_us"]),
                     price_ticks=int(item["price_ticks"]),
                     quantity=int(item["quantity"]),
+                    aggressor_side=(
+                        None
+                        if item.get("aggressor_side") is None
+                        else str(item["aggressor_side"])
+                    ),
                 )
                 for item in prints
             ),
@@ -168,6 +177,13 @@ def _payload(path: Path, expected_mode: HistoricalDataMode) -> dict[str, object]
 
 def _boolean(payload: dict[str, object], key: str) -> bool:
     value = payload[key]
+    if type(value) is not bool:
+        raise ValueError(f"historical provenance {key} must be a JSON boolean")
+    return value
+
+
+def _optional_boolean(payload: dict[str, object], key: str) -> bool:
+    value = payload.get(key, False)
     if type(value) is not bool:
         raise ValueError(f"historical provenance {key} must be a JSON boolean")
     return value

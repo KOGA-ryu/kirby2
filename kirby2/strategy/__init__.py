@@ -6,6 +6,7 @@ from .language import (
     RuleSyntaxError,
     StrategyDefinition,
     TrafficState,
+    UnavailableValuePolicy,
     parse_strategy,
 )
 from .runtime import EvaluationResult, TrafficLightRuntime, TrafficTransition
@@ -47,6 +48,7 @@ __all__ = [
     "TrafficLightRuntime",
     "TrafficState",
     "TrafficTransition",
+    "UnavailableValuePolicy",
     "TimeQualifier",
     "parse_state_machine",
     "parse_strategy",

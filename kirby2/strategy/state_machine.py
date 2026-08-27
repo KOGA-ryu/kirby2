@@ -18,7 +18,9 @@ from .language import (
     FeatureName,
     RuleSyntaxError,
     TrafficState,
+    UnavailableValuePolicy,
     _meaningful_lines,
+    _parse_unavailable_policy,
     _parse_window,
 )
 
@@ -143,6 +145,7 @@ class StateMachineDefinition:
     states: tuple[StrategyStateDefinition, ...]
     transitions: tuple[StateTransitionDefinition, ...]
     source: str
+    unavailable_policy: UnavailableValuePolicy = UnavailableValuePolicy.REFUSE
 
     def __post_init__(self) -> None:
         if not _valid_name(self.name) or self.window_us <= 0:
@@ -163,6 +166,8 @@ class StateMachineDefinition:
         )
         if len(transition_ids) != len(set(transition_ids)):
             raise ValueError("state transitions must be unique")
+        if not isinstance(self.unavailable_policy, UnavailableValuePolicy):
+            raise TypeError("state-machine unavailable-value policy is invalid")
 
     @property
     def source_sha256(self) -> str:
@@ -175,7 +180,7 @@ class StateMachineDefinition:
         raise KeyError(name)
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "format": "STATE_MACHINE",
             "initial_state": self.initial_state,
             "name": self.name,
@@ -184,6 +189,9 @@ class StateMachineDefinition:
             "transitions": [transition.as_dict() for transition in self.transitions],
             "window_us": self.window_us,
         }
+        if self.unavailable_policy is not UnavailableValuePolicy.REFUSE:
+            result["unavailable_policy"] = self.unavailable_policy.value
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +608,11 @@ def parse_state_machine(source: str) -> StateMachineDefinition:
             raise RuleSyntaxError(window_line, "expected 'window NUMBERs'", window_text)
         window_us = _parse_window(window_parts[1], window_line, window_text)
         index += 1
+    unavailable_policy = UnavailableValuePolicy.REFUSE
+    if index < len(lines) and lines[index][1].lower().startswith("unavailable"):
+        policy_line, policy_text = lines[index]
+        unavailable_policy = _parse_unavailable_policy(policy_text, policy_line)
+        index += 1
     if index >= len(lines):
         raise RuleSyntaxError(line_number + 1, "expected 'initial STATE'")
     initial_line, initial_text = lines[index]
@@ -643,6 +656,7 @@ def parse_state_machine(source: str) -> StateMachineDefinition:
             tuple(states),
             tuple(transitions),
             source,
+            unavailable_policy,
         )
     except ValueError as error:
         raise RuleSyntaxError(line_number, str(error), text) from error
