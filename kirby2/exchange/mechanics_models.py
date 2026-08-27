@@ -22,6 +22,7 @@ class OrderInstruction(str, Enum):
     IOC = "IOC"
     FOK = "FOK"
     POST_ONLY = "POST_ONLY"
+    GTC = "GTC"
     DAY = "DAY"
     SESSION = "SESSION"
     GOOD_UNTIL_TIME = "GOOD_UNTIL_TIME"
@@ -38,6 +39,7 @@ TIME_IN_FORCE_INSTRUCTIONS = frozenset(
     {
         OrderInstruction.IOC,
         OrderInstruction.FOK,
+        OrderInstruction.GTC,
         OrderInstruction.DAY,
         OrderInstruction.SESSION,
         OrderInstruction.GOOD_UNTIL_TIME,

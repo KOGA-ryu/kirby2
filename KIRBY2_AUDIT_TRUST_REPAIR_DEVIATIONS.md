@@ -213,3 +213,61 @@ Commit: `Preserve mechanics expiry classification`
 
 Handoff: restore the preserved ATR-08 work and resume the real mechanics
 executor from this clean prerequisite commit.
+
+## ATR-08B — Implement genuine GTC mechanics
+
+Discovered: 2026-08-27 during ATR-08 instruction-inventory review at
+`3d8d24cc0c48d2c1a518d918e1092427dfd54449`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.exchange import OrderInstruction; assert 'GTC' in {item.value for item in OrderInstruction}; print('ATR_08B_GTC_INVENTORY PASS')"
+```
+
+The canonical ATR-08 card requires a real GTC lifecycle. Production exposes
+`SESSION`, which expires when continuous trading ends, and
+`GOOD_UNTIL_TIME`, which expires at a simulation timestamp. Neither is GTC, and
+labeling `SESSION` as a GTC alias would make the audit evidence false.
+
+Root cause: Work Order 24 deliberately implemented its original instruction
+inventory, while the later trust-repair roadmap added GTC to the literal
+mechanics mapping without first adding the production instruction.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/exchange/mechanics_models.py`
+- `kirby2/exchange/MECHANICS.md`
+- `kirby2/audit/market_mechanics.py`
+
+Repair:
+
+1. Add canonical `OrderInstruction.GTC` as a time-in-force instruction.
+2. Define GTC to survive halts, closing, postclose, closed, and the following
+   open while retaining its FIFO resting sequence and conserved quantity.
+3. Keep GTC live until a real fill or explicit cancellation; do not reuse DAY,
+   SESSION, or GOOD_UNTIL_TIME expiry behavior.
+4. Add a runtime scenario that crosses a complete session boundary, verifies
+   the same active core order and priority, then explicitly cancels it and
+   verifies exact replay-compatible event evidence.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-market-mechanics
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.exchange import OrderInstruction; assert 'GTC' in {item.value for item in OrderInstruction}; print('ATR_08B_GTC_INVENTORY PASS')"
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.audit.market_mechanics import audit_market_mechanics; case=next(item for item in audit_market_mechanics() if item.name == 'gtc_persists_until_explicit_cancel'); assert case.passed, case.as_dict(); print('ATR_08B_GTC_LIFECYCLE PASS')"
+git diff --check
+```
+
+Acceptance: GTC is a serialized canonical instruction, remains active with the
+same FIFO priority across the full session/day boundary, closes only on the
+explicit cancellation in the runtime probe, and all existing mechanics and
+model-risk audits remain green.
+
+Commit: `Implement genuine GTC mechanics`
+
+Handoff: restore the preserved ATR-08 work, replace its false SESSION-to-GTC
+alias with the genuine instruction, and resume the real mechanics executor.

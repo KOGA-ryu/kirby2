@@ -56,6 +56,7 @@ def audit_market_mechanics() -> tuple[MarketMechanicsAuditCase, ...]:
         _replace_priority_case(),
         _cancel_replace_replay_case(),
         _time_in_force_case(),
+        _gtc_persistence_case(),
         _expiration_classification_persistence_case(),
         _immediate_instruction_case(),
         _self_trade_prevention_case(),
@@ -174,6 +175,7 @@ def _rule_inventory_and_schedule_case() -> MarketMechanicsAuditCase:
         "IOC",
         "FOK",
         "POST_ONLY",
+        "GTC",
         "DAY",
         "SESSION",
         "GOOD_UNTIL_TIME",
@@ -464,6 +466,150 @@ def _time_in_force_case() -> MarketMechanicsAuditCase:
         "day_session_and_good_until_time_expiration",
         evidence,
         tuple(failures),
+    )
+
+
+def _gtc_persistence_case() -> MarketMechanicsAuditCase:
+    engine = MarketMechanicsEngine()
+    commands: list[MechanicsCommand] = []
+    time_us = 0
+
+    def transition(state: SessionState, reason: str) -> None:
+        nonlocal time_us
+        time_us += 10
+        engine.advance_to(time_us)
+        engine.transition_session(state, reason=reason)
+        commands.append(
+            MechanicsCommand(
+                len(commands) + 1,
+                time_us,
+                "TRANSITION",
+                {"reason": reason, "state": state.value},
+            )
+        )
+
+    def submit(request: AdvancedOrderRequest) -> None:
+        nonlocal time_us
+        time_us += 10
+        engine.advance_to(time_us)
+        engine.submit(request)
+        commands.append(
+            MechanicsCommand(
+                len(commands) + 1,
+                time_us,
+                "SUBMIT",
+                {"request": request.as_dict()},
+            )
+        )
+
+    for state in (
+        SessionState.PREOPEN,
+        SessionState.OPENING_AUCTION,
+        SessionState.CONTINUOUS,
+    ):
+        transition(state, "GTC_INITIAL_OPEN")
+    request = _limit(
+        "GTC-PERSIST",
+        Side.BUY,
+        100,
+        99,
+        "GTC-ACCOUNT",
+        time_in_force=OrderInstruction.GTC,
+    )
+    submit(request)
+    original_sequence = engine.book.active_orders[
+        request.order_id
+    ].resting_sequence
+    survival: dict[str, bool] = {}
+    for state in (
+        SessionState.HALTED,
+        SessionState.REOPENING_AUCTION,
+        SessionState.CONTINUOUS,
+        SessionState.CLOSING_AUCTION,
+        SessionState.POSTCLOSE,
+        SessionState.CLOSED,
+        SessionState.PREOPEN,
+        SessionState.OPENING_AUCTION,
+        SessionState.CONTINUOUS,
+    ):
+        transition(state, "GTC_CROSS_SESSION_BOUNDARY")
+        managed = engine.get_order(request.order_id)
+        core = engine.book.active_orders.get(request.order_id)
+        same_sequence = (
+            core is not None and core.resting_sequence == original_sequence
+        )
+        survival[state.value] = all(
+            (
+                managed.status == "WORKING",
+                managed.remaining_quantity == request.quantity,
+                core is not None,
+                same_sequence,
+            )
+        )
+
+    time_us += 10
+    engine.advance_to(time_us)
+    cancelled = engine.cancel(request.order_id, reason="GTC_EXPLICIT_CANCEL")
+    commands.append(
+        MechanicsCommand(
+            len(commands) + 1,
+            time_us,
+            "CANCEL",
+            {"order_id": request.order_id, "reason": "GTC_EXPLICIT_CANCEL"},
+        )
+    )
+    engine.advance_to(time_us + 10)
+    captured = MechanicsRecording.capture(engine, tuple(commands))
+    recording = MechanicsRecording.from_dict(
+        json.loads(json.dumps(captured.as_dict(), sort_keys=True))
+    )
+    replay = replay_mechanics_recording(recording)
+    managed = engine.get_order(request.order_id)
+    relevant_events = [
+        event
+        for event in engine.events
+        if event.data.get("order_id") == request.order_id
+    ]
+    expired_events = [
+        event
+        for event in relevant_events
+        if event.event_type is MechanicsEventType.ORDER_EXPIRED
+    ]
+    cancel_events = [
+        event
+        for event in relevant_events
+        if event.event_type is MechanicsEventType.ORDER_CANCELLED
+        and event.data.get("reason") == "GTC_EXPLICIT_CANCEL"
+    ]
+    passed = all(
+        (
+            all(survival.values()),
+            cancelled,
+            managed.status == "CANCELLED",
+            managed.cancelled_quantity == request.quantity,
+            managed.expired_quantity == 0,
+            not expired_events,
+            len(cancel_events) == 1,
+            original_sequence is not None,
+            replay.passed,
+        )
+    )
+    return MarketMechanicsAuditCase(
+        "gtc_persists_until_explicit_cancel",
+        {
+            "cancel_event_sequences": [event.sequence for event in cancel_events],
+            "cancelled_quantity": managed.cancelled_quantity,
+            "event_stream_sha256": engine.event_stream_sha256(),
+            "expired_event_count": len(expired_events),
+            "expired_quantity": managed.expired_quantity,
+            "original_resting_sequence": original_sequence,
+            "recording_sha256": recording.sha256(),
+            "replay_event_stream_match": replay.event_stream_match,
+            "replay_state_match": replay.state_match,
+            "session_survival": survival,
+            "status_after_explicit_cancel": managed.status,
+        },
+        () if passed else ("GTC did not persist until explicit cancellation",),
     )
 
 

@@ -26,6 +26,8 @@ self-trade settings.
 - `POST_ONLY` is a limit-order modifier. It rejects if the order would cross and
   rests normally otherwise. It cannot be combined with `MARKETABLE_LIMIT`, `IOC`,
   or `FOK`.
+- `GTC` remains eligible across halts, closing, postclose, closed, and subsequent
+  sessions until it fills or receives an explicit cancellation.
 - `DAY` remains eligible through continuous trading and halts, then expires on the
   postclose/day boundary.
 - `SESSION` expires when its current continuous session ends, including a halt.
