@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,9 +17,13 @@ from .kernel import failure_signatures, run_generated_case
 from .minimizer import minimize_failure
 from .models import (
     AUDIT_LAB_SCHEMA_VERSION,
+    CASE_RECORDING_SCHEMA_VERSION,
     AcceptanceRecord,
+    CaseRecording,
     CheckResult,
     CheckStatus,
+    ExecutorLane,
+    FaultKind,
     GeneratedCaseResult,
     GeneratedConfiguration,
     MinimizedFailure,
@@ -166,16 +171,31 @@ def run_audit_lab(
     fault_observations: list[dict[str, object]] = []
     injected_count = 0
     detected_count = 0
-    replay_failures = 0
+    replay_failures: list[dict[str, object]] = []
+    loaded_replay_count = 0
     for configuration in configurations:
         result = run_generated_case(configuration)
         generated_results.append(result)
-        replay_configuration = GeneratedConfiguration.from_dict(
-            json.loads(canonical_json(configuration.as_dict()))
-        )
-        replay = run_generated_case(replay_configuration)
-        replay_match = replay.result_sha256 == result.result_sha256
-        replay_failures += not replay_match
+        try:
+            serialized_recording = canonical_json(result.recording.as_dict())
+            loaded_recording = CaseRecording.from_dict(
+                json.loads(serialized_recording)
+            )
+            from .executors import EXECUTOR_REGISTRY
+
+            replay = EXECUTOR_REGISTRY.replay(loaded_recording)
+            parity = _recording_replay_parity(loaded_recording, replay)
+            loaded_replay_count += 1
+        except Exception as error:  # report the exact loader/replay refusal
+            parity = _recording_replay_exception(error)
+        replay_match = parity["status"] == "PASS"
+        if not replay_match:
+            replay_failures.append(
+                {
+                    "configuration_sha256": configuration.sha256,
+                    **parity,
+                }
+            )
         fault_evaluation: FaultEvaluation | None = None
         if result.fault_observation is not None:
             fault_evaluation = evaluate_fault_observation(
@@ -208,7 +228,7 @@ def run_audit_lab(
                     "signature": signature,
                 }
             )
-        cases.append(_compact_case(result, replay_match, fault_evaluation))
+        cases.append(_compact_case(result, parity, fault_evaluation))
     coverage = evidence_coverage_report(tuple(generated_results))
     minimized = tuple(
         minimize_failure(configuration, signature)
@@ -233,9 +253,12 @@ def run_audit_lab(
         max(1, fresh_process_samples),
     )
     replay_parity = {
-        "failed_count": replay_failures,
-        "passed_count": budget - replay_failures,
-        "status": "PASS" if replay_failures == 0 else "FAIL",
+        "failed_count": len(replay_failures),
+        "failures": replay_failures,
+        "loaded_replay_count": loaded_replay_count,
+        "passed_count": budget - len(replay_failures),
+        "recording_schema_version": CASE_RECORDING_SCHEMA_VERSION,
+        "status": "PASS" if not replay_failures else "FAIL",
     }
     fault_summary = {
         "detected_count": detected_count,
@@ -308,9 +331,10 @@ def run_audit_lab(
 
 def _compact_case(
     result: GeneratedCaseResult,
-    replay_match: bool,
+    replay_parity: dict[str, object],
     fault_evaluation: FaultEvaluation | None,
 ) -> dict[str, object]:
+    replay_match = replay_parity["status"] == "PASS"
     exercises = [
         {
             **item.as_dict(),
@@ -351,7 +375,9 @@ def _compact_case(
             "observable_projection_sha256"
         ],
         "recording_sha256": result.recording.sha256,
+        "recording_schema_version": result.recording.schema_version,
         "recording_type": result.recording.recording_type,
+        "replay_parity": replay_parity,
         "replay_digest_parity": replay_match,
         "result_digest": result.result_sha256,
         "source_evidence_sha256": canonical_sha256(
@@ -361,6 +387,59 @@ def _compact_case(
         "status": "PASS" if result.passed and replay_match else "FAIL",
         "typed_metrics": typed_metrics,
         "violations": list(failure_signatures(result)),
+    }
+
+
+_REPLAY_DIGEST_FIELDS = (
+    ("event", "event_sha256"),
+    ("state", "state_sha256"),
+    ("observable", "observable_sha256"),
+    ("metrics", "metrics_sha256"),
+    ("declared_outputs", "declared_outputs_sha256"),
+)
+
+
+def _recording_replay_parity(
+    recording: CaseRecording,
+    replay: GeneratedCaseResult,
+) -> dict[str, object]:
+    expected = recording.expected_outputs
+    expected_digests = expected.get("digests")
+    actual = replay.replay_expectations()
+    actual_digests = actual.get("digests")
+    if not isinstance(expected_digests, Mapping):
+        raise TypeError("recording expected digests must be an object")
+    if not isinstance(actual_digests, Mapping):
+        raise TypeError("replay digests must be an object")
+    field_digests: dict[str, dict[str, object]] = {}
+    first_differing_field: str | None = None
+    for field_name, digest_name in _REPLAY_DIGEST_FIELDS:
+        expected_sha256 = expected_digests.get(digest_name)
+        actual_sha256 = actual_digests.get(digest_name)
+        matches = expected_sha256 == actual_sha256
+        field_digests[field_name] = {
+            "actual_sha256": actual_sha256,
+            "expected_sha256": expected_sha256,
+            "matches": matches,
+        }
+        if not matches and first_differing_field is None:
+            first_differing_field = field_name
+    return {
+        "field_digests": field_digests,
+        "first_differing_field": first_differing_field,
+        "loaded_recording_sha256": recording.sha256,
+        "status": "PASS" if first_differing_field is None else "FAIL",
+    }
+
+
+def _recording_replay_exception(error: Exception) -> dict[str, object]:
+    return {
+        "exception_message": str(error),
+        "exception_type": type(error).__name__,
+        "field_digests": {},
+        "first_differing_field": "replay_exception",
+        "loaded_recording_sha256": None,
+        "status": "FAIL",
     }
 
 
@@ -410,13 +489,7 @@ def _fresh_process_determinism(
     configurations: tuple[GeneratedConfiguration, ...],
     sample_count: int,
 ) -> dict[str, object]:
-    count = min(sample_count, len(configurations))
-    indices = sorted(
-        {
-            round(index * (len(configurations) - 1) / max(1, count - 1))
-            for index in range(count)
-        }
-    )
+    indices = _determinism_sample_indices(configurations, sample_count)
     evidence = []
     failures = []
     environment = dict(os.environ)
@@ -451,6 +524,12 @@ def _fresh_process_determinism(
             {
                 "configuration_sha256": configuration.sha256,
                 "declared_output_sha256": canonical_sha256(expected),
+                "fault": (
+                    None
+                    if configuration.injected_fault is None
+                    else configuration.injected_fault.value
+                ),
+                "lane": configuration.lane.value,
                 "matched": matched,
             }
         )
@@ -461,6 +540,42 @@ def _fresh_process_determinism(
         "sample_count": len(indices),
         "status": "PASS" if not failures else "FAIL",
     }
+
+
+def _determinism_sample_indices(
+    configurations: tuple[GeneratedConfiguration, ...],
+    requested_count: int,
+) -> tuple[int, ...]:
+    selected: set[int] = set()
+    for lane in ExecutorLane:
+        index = next(
+            (
+                index
+                for index, configuration in enumerate(configurations)
+                if configuration.lane is lane
+            ),
+            None,
+        )
+        if index is not None:
+            selected.add(index)
+    for fault in FaultKind:
+        index = next(
+            (
+                index
+                for index, configuration in enumerate(configurations)
+                if configuration.injected_fault is fault
+            ),
+            None,
+        )
+        if index is not None:
+            selected.add(index)
+    target = min(len(configurations), max(requested_count, len(selected)))
+    if len(selected) < target:
+        for index in range(len(configurations)):
+            selected.add(index)
+            if len(selected) == target:
+                break
+    return tuple(sorted(selected))
 
 
 def _acceptance_record(

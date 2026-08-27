@@ -33,6 +33,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from .base import finalize_recording
 
 
 LATENCY_RECORDING_TYPE = "NATIVE_LATENCY_RECORDING"
@@ -116,14 +117,17 @@ class LatencyExecutor:
                 "race_schedule": scenario.race.value,
             },
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            scenario.recording,
-            scenario.session,
-            scenario.observable_ready_time_us,
-            scenario.race.value,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                scenario.recording,
+                scenario.session,
+                scenario.observable_ready_time_us,
+                scenario.race.value,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:

@@ -19,6 +19,31 @@ _ACCEPTANCE_ID = re.compile(r"^acceptance-[A-Za-z0-9_-]{1,96}$")
 _CAPABILITY_NAME = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _CELL_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CASE_RECORDING_FIELDS = frozenset(
+    {
+        "expected_outputs",
+        "lane",
+        "payload",
+        "recording_type",
+        "schema_version",
+        "sha256",
+    }
+)
+_FAULT_OBSERVATION_FIELDS = frozenset(
+    {
+        "details",
+        "detector",
+        "fault",
+        "injection_event",
+        "injection_location",
+        "manifest",
+        "observed_code",
+        "raw_events",
+        "raw_issues",
+        "subsystem",
+    }
+)
+CASE_RECORDING_SCHEMA_VERSION = 2
 
 
 class UnsupportedSchemaVersionError(ValueError):
@@ -437,26 +462,36 @@ class CaseRecording:
     lane: ExecutorLane
     recording_type: str
     payload: Mapping[str, object]
-    schema_version: int = 1
+    expected_outputs: Mapping[str, object] | None = None
+    schema_version: int = CASE_RECORDING_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         if not isinstance(self.lane, ExecutorLane):
             raise TypeError("recording lane must use ExecutorLane")
         if type(self.recording_type) is not str or not self.recording_type:
             raise ValueError("recording type is required")
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != CASE_RECORDING_SCHEMA_VERSION
+        ):
             raise UnsupportedSchemaVersionError(
                 artifact="case recording",
-                expected=1,
+                expected=CASE_RECORDING_SCHEMA_VERSION,
                 actual=self.schema_version,
             )
         frozen = _frozen_mapping(self.payload, "case recording payload")
         if not frozen:
             raise ValueError("case recording payload must not be empty")
+        frozen_outputs = _frozen_mapping(
+            {} if self.expected_outputs is None else self.expected_outputs,
+            "case recording expected outputs",
+        )
         object.__setattr__(self, "payload", frozen)
+        object.__setattr__(self, "expected_outputs", frozen_outputs)
 
     def identity_dict(self) -> dict[str, object]:
         return {
+            "expected_outputs": thaw_json(self.expected_outputs),
             "lane": self.lane.value,
             "payload": thaw_json(self.payload),
             "recording_type": self.recording_type,
@@ -469,6 +504,62 @@ class CaseRecording:
 
     def as_dict(self) -> dict[str, object]:
         return {**self.identity_dict(), "sha256": self.sha256}
+
+    def with_expected_outputs(
+        self,
+        expected_outputs: Mapping[str, object],
+    ) -> CaseRecording:
+        if self.expected_outputs:
+            raise ValueError("case recording expectations are already finalized")
+        if not expected_outputs:
+            raise ValueError("case recording expectations must not be empty")
+        return CaseRecording(
+            lane=self.lane,
+            recording_type=self.recording_type,
+            payload=self.payload,
+            expected_outputs=expected_outputs,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> CaseRecording:
+        if not isinstance(payload, Mapping):
+            raise TypeError("serialized case recording must be an object")
+        fields = set(payload)
+        missing = sorted(_CASE_RECORDING_FIELDS.difference(fields))
+        unknown = sorted(fields.difference(_CASE_RECORDING_FIELDS))
+        if missing or unknown:
+            raise ValueError(
+                "case-recording fields are not exact: "
+                f"missing={missing} unknown={unknown}"
+            )
+        schema_version = _serialized_int(payload, "schema_version")
+        if schema_version != CASE_RECORDING_SCHEMA_VERSION:
+            raise UnsupportedSchemaVersionError(
+                artifact="case recording",
+                expected=CASE_RECORDING_SCHEMA_VERSION,
+                actual=schema_version,
+            )
+        raw_payload = payload["payload"]
+        raw_outputs = payload["expected_outputs"]
+        if not isinstance(raw_payload, Mapping):
+            raise TypeError("serialized case recording payload must be an object")
+        if not isinstance(raw_outputs, Mapping) or not raw_outputs:
+            raise ValueError(
+                "serialized case recording expected outputs must be nonempty"
+            )
+        recording = cls(
+            lane=ExecutorLane(_serialized_str(payload, "lane")),
+            recording_type=_serialized_str(payload, "recording_type"),
+            payload=raw_payload,
+            expected_outputs=raw_outputs,
+            schema_version=schema_version,
+        )
+        serialized_sha256 = _serialized_str(payload, "sha256")
+        if not _SHA256.fullmatch(serialized_sha256):
+            raise ValueError("serialized case recording digest is invalid")
+        if recording.sha256 != serialized_sha256:
+            raise ValueError("serialized case recording digest does not match content")
+        return recording
 
 
 @dataclass(frozen=True, slots=True)
@@ -534,6 +625,42 @@ class FaultObservation:
             "raw_issues": thaw_json(self.raw_issues),
             "subsystem": self.subsystem,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> FaultObservation:
+        if set(payload) != _FAULT_OBSERVATION_FIELDS:
+            raise ValueError("fault-observation fields are not exact")
+        raw_manifest = payload["manifest"]
+        raw_events = payload["raw_events"]
+        raw_issues = payload["raw_issues"]
+        raw_details = payload["details"]
+        if not isinstance(raw_manifest, Mapping):
+            raise TypeError("fault-observation manifest must be an object")
+        if not isinstance(raw_events, (tuple, list)) or any(
+            not isinstance(item, Mapping) for item in raw_events
+        ):
+            raise TypeError("fault-observation raw events must be objects")
+        if not isinstance(raw_issues, (tuple, list)) or any(
+            not isinstance(item, Mapping) for item in raw_issues
+        ):
+            raise TypeError("fault-observation raw issues must be objects")
+        if not isinstance(raw_details, Mapping):
+            raise TypeError("fault-observation details must be an object")
+        raw_code = payload["observed_code"]
+        if raw_code is not None and type(raw_code) is not str:
+            raise TypeError("fault-observation code must be a string or null")
+        return cls(
+            fault=FaultKind(_serialized_str(payload, "fault")),
+            subsystem=_serialized_str(payload, "subsystem"),
+            detector=_serialized_str(payload, "detector"),
+            injection_location=_serialized_str(payload, "injection_location"),
+            observed_code=raw_code,
+            injection_event=_serialized_int(payload, "injection_event"),
+            manifest=raw_manifest,
+            raw_events=tuple(raw_events),
+            raw_issues=tuple(raw_issues),
+            details=raw_details,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,6 +778,26 @@ class GeneratedCaseResult:
             "state_sha256": self.state_sha256,
         }
 
+    def replay_expectations(self) -> dict[str, object]:
+        """Return outputs whose identity is independent of the wrapper digest."""
+
+        declared_outputs = _without_recording_identity(self.declared_outputs())
+        if not isinstance(declared_outputs, dict):
+            raise TypeError("replay-safe declared outputs must be an object")
+        digests = {
+            "declared_outputs_sha256": canonical_sha256(declared_outputs),
+            "event_sha256": self.event_sha256,
+            "metrics_sha256": canonical_sha256(thaw_json(self.metrics)),
+            "observable_sha256": canonical_sha256(
+                thaw_json(self.observable_projection)
+            ),
+            "state_sha256": self.state_sha256,
+        }
+        return {
+            "declared_outputs": declared_outputs,
+            "digests": digests,
+        }
+
     @property
     def result_sha256(self) -> str:
         return canonical_sha256(self.declared_outputs())
@@ -665,6 +812,18 @@ class GeneratedCaseResult:
             "recording": self.recording.as_dict(),
             "result_sha256": self.result_sha256,
         }
+
+
+def _without_recording_identity(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_recording_identity(item)
+            for key, item in value.items()
+            if key != "recording_sha256"
+        }
+    if isinstance(value, (tuple, list)):
+        return [_without_recording_identity(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)

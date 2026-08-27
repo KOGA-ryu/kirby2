@@ -47,6 +47,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from .base import finalize_recording
 
 
 FRAGMENTED_RECORDING_TYPE = "NATIVE_FRAGMENTED_RECORDING"
@@ -134,13 +135,16 @@ class FragmentedExecutor:
                 ),
             },
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            scenario.native_recording,
-            scenario.coordinator,
-            scenario.observable_crossed_intervals,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                scenario.native_recording,
+                scenario.coordinator,
+                scenario.observable_crossed_intervals,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:

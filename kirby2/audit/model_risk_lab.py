@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import json
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -34,7 +35,9 @@ from kirby2.auditlab.executors import (
     FRAGMENTED_RECORDING_TYPE,
     LATENCY_RECORDING_TYPE,
     MECHANICS_RECORDING_TYPE,
+    AlgorithmExecutor,
     ExecutorRegistry,
+    FaultExecutor,
 )
 from kirby2.auditlab.generator import (
     AXES,
@@ -44,6 +47,7 @@ from kirby2.auditlab.generator import (
 from kirby2.auditlab.models import (
     AUDIT_LAB_SCHEMA_VERSION,
     AUDIT_PACKET_SCHEMA_VERSION,
+    CASE_RECORDING_SCHEMA_VERSION,
     LEGACY_AUDIT_PACKET_SCHEMA_VERSION,
     AcceptanceRecord,
     AutomatedStatus,
@@ -2190,15 +2194,165 @@ def _fault_case(result) -> ModelRiskLabAuditCase:
 
 def _determinism_case(result) -> ModelRiskLabAuditCase:
     failures = []
+    evidence = result.determinism["evidence"]
+    sampled_lanes = {item["lane"] for item in evidence}
+    sampled_faults = {
+        item["fault"] for item in evidence if item["fault"] is not None
+    }
+    recording_schema_v2 = all(
+        case["recording_schema_version"] == CASE_RECORDING_SCHEMA_VERSION
+        for case in result.cases
+    )
+    parity_fields_complete = all(
+        set(case["replay_parity"]["field_digests"])
+        == {"event", "state", "observable", "metrics", "declared_outputs"}
+        and case["replay_parity"]["first_differing_field"] is None
+        and all(
+            item["matches"]
+            for item in case["replay_parity"]["field_digests"].values()
+        )
+        for case in result.cases
+    )
+    mutation_probe = _serialized_replay_mutation_probe()
+    from kirby2.auditlab import runner as audit_runner
+
+    runner_source = inspect.getsource(audit_runner.run_audit_lab)
+    algorithm_replay_source = inspect.getsource(AlgorithmExecutor.replay)
+    fault_replay_source = inspect.getsource(FaultExecutor.replay)
+    loaded_path_proved = all(
+        (
+            "CaseRecording.from_dict" in runner_source,
+            "EXECUTOR_REGISTRY.replay" in runner_source,
+            "_build_scenario" not in algorithm_replay_source,
+            "inject_and_observe" not in fault_replay_source,
+        )
+    )
     if result.determinism["status"] != "PASS":
         failures.append("fresh-process determinism failed")
     if result.replay_parity["status"] != "PASS":
         failures.append("loaded replay parity failed")
+    if sampled_lanes != {item.value for item in ExecutorLane}:
+        failures.append("fresh-process samples did not cover every lane")
+    if sampled_faults != {item.value for item in FaultKind}:
+        failures.append("fresh-process samples did not cover every fault family")
+    if not recording_schema_v2 or not parity_fields_complete:
+        failures.append("schema-v2 recording parity evidence is incomplete")
+    if result.replay_parity["loaded_replay_count"] != result.budget:
+        failures.append("not every serialized recording was loaded and replayed")
+    if not mutation_probe["passed"]:
+        failures.append("serialized command mutation did not affect replay")
+    if not loaded_path_proved:
+        failures.append("source path still permits configuration regeneration")
     return ModelRiskLabAuditCase(
         "fresh_process_determinism_and_loaded_replay_parity",
-        {"determinism": result.determinism, "replay_parity": result.replay_parity},
+        {
+            "determinism": result.determinism,
+            "loaded_path_proved": loaded_path_proved,
+            "mutation_probe": mutation_probe,
+            "parity_fields_complete": parity_fields_complete,
+            "recording_schema_v2": recording_schema_v2,
+            "replay_parity": result.replay_parity,
+            "sampled_faults": sorted(sampled_faults),
+            "sampled_lanes": sorted(sampled_lanes),
+            "source_sha256": {
+                "algorithm_replay": canonical_sha256(algorithm_replay_source),
+                "fault_replay": canonical_sha256(fault_replay_source),
+                "runner": canonical_sha256(runner_source),
+            },
+        },
         tuple(failures),
     )
+
+
+def _serialized_replay_mutation_probe() -> dict[str, object]:
+    configuration = replace(
+        next(
+            item
+            for item in generate_configurations(seed=771, budget=840)
+            if item.lane is ExecutorLane.CORE_FLOW
+        ),
+        duration_us=2_000_000,
+    )
+    original = EXECUTOR_REGISTRY.execute(configuration)
+    serialized = json.loads(canonical_json(original.recording.as_dict()))
+    configuration_wire = canonical_json(serialized["payload"]["configuration"])
+    flow_event = next(
+        item
+        for item in serialized["payload"]["flow_events"]
+        if item["applied"] and int(item["command"].get("quantity", 0)) > 1
+    )
+    original_quantity = int(flow_event["command"]["quantity"])
+    flow_event["command"]["quantity"] = max(1, original_quantity // 2)
+    stale_digest_refused = False
+    try:
+        CaseRecording.from_dict(serialized)
+    except ValueError:
+        stale_digest_refused = True
+    serialized["sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in serialized.items()
+            if key != "sha256"
+        }
+    )
+    loaded = CaseRecording.from_dict(serialized)
+    loaded_payload = thaw_json(loaded.payload)
+    configuration_unchanged = (
+        canonical_json(loaded_payload["configuration"]) == configuration_wire
+    )
+    expected = thaw_json(loaded.expected_outputs)["digests"]
+    actual: dict[str, object] | None = None
+    replay_exception: dict[str, str] | None = None
+    differing_fields: list[str] = []
+    try:
+        replay = EXECUTOR_REGISTRY.replay(loaded)
+        actual = replay.replay_expectations()["digests"]
+        differing_fields = [
+            field
+            for field in (
+                "event_sha256",
+                "state_sha256",
+                "observable_sha256",
+                "metrics_sha256",
+                "declared_outputs_sha256",
+            )
+            if expected[field] != actual[field]
+        ]
+    except Exception as error:
+        replay_exception = {
+            "message": str(error),
+            "type": type(error).__name__,
+        }
+    replay_changed_or_failed = bool(differing_fields or replay_exception)
+    passed = all(
+        (
+            stale_digest_refused,
+            configuration_unchanged,
+            loaded.sha256 != original.recording.sha256,
+            replay_changed_or_failed,
+        )
+    )
+    return {
+        "actual_digests": actual,
+        "configuration_unchanged": configuration_unchanged,
+        "differing_fields": differing_fields,
+        "expected_digests": expected,
+        "first_differing_field": (
+            differing_fields[0]
+            if differing_fields
+            else "replay_exception"
+            if replay_exception is not None
+            else None
+        ),
+        "modified_quantity": flow_event["command"]["quantity"],
+        "modified_recording_sha256": loaded.sha256,
+        "original_quantity": original_quantity,
+        "original_recording_sha256": original.recording.sha256,
+        "passed": passed,
+        "replay_changed_or_failed": replay_changed_or_failed,
+        "replay_exception": replay_exception,
+        "stale_digest_refused": stale_digest_refused,
+    }
 
 
 def _minimization_case(result) -> ModelRiskLabAuditCase:

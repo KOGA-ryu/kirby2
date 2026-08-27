@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Protocol, runtime_checkable
+
+from kirby2.immutable import thaw_json
 
 from ..models import (
     CaseRecording,
@@ -160,6 +163,8 @@ class ExecutorRegistry:
         return result
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:
+        if not recording.expected_outputs:
+            raise ValueError("executor replay requires finalized expected outputs")
         executor = self._executor(recording.lane)
         result = executor.replay(recording)
         if result.recording.sha256 != recording.sha256:
@@ -171,3 +176,21 @@ class ExecutorRegistry:
             return self._executors[lane]
         except KeyError as error:
             raise LookupError(f"no real executor is registered for {lane.value}") from error
+
+
+def finalize_recording(
+    draft: CaseRecording,
+    result_factory: Callable[[CaseRecording], GeneratedCaseResult],
+) -> GeneratedCaseResult:
+    """Finalize schema-v2 expectations without making the wrapper hash recursive."""
+
+    if draft.expected_outputs:
+        raise ValueError("case recording draft is already finalized")
+    provisional = result_factory(draft)
+    finalized = draft.with_expected_outputs(provisional.replay_expectations())
+    result = result_factory(finalized)
+    if thaw_json(result.replay_expectations()) != thaw_json(
+        finalized.expected_outputs
+    ):
+        raise RuntimeError("final case recording expectations are unstable")
+    return result

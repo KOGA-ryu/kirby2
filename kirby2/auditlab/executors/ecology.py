@@ -31,6 +31,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from .base import finalize_recording
 
 
 ECOLOGY_RECORDING_TYPE = "NATIVE_ECOLOGY_RECORDING"
@@ -101,13 +102,16 @@ class EcologyExecutor:
                 "native_recording": native.as_dict(),
             },
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            native,
-            scenario,
-            different_seed_probe,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                native,
+                scenario,
+                different_seed_probe,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:

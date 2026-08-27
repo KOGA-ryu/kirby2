@@ -7,10 +7,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
 from kirby2.algorithms import (
+    AlgorithmAction,
     AlgorithmActionType,
+    AlgorithmDecision,
     AlgorithmName,
     AlgorithmObservation,
+    AlgorithmParameterManifest,
+    ClientFill,
+    ExecutionBenchmarkMetrics,
     ExecutionCellResult,
+    ExecutionObjective,
     RiskLimits,
     default_algorithm_manifest,
     run_execution_cell,
@@ -19,6 +25,8 @@ from kirby2.exchange import Side
 from kirby2.immutable import thaw_json
 from kirby2.multivenue import (
     MultiVenueRecording,
+    RoutePolicy,
+    RouteStyle,
     replay_multivenue_recording,
 )
 from kirby2.session.objectives import ObjectiveType
@@ -36,6 +44,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from .base import finalize_recording
 
 
 ALGORITHM_RECORDING_TYPE = "NATIVE_ALGORITHM_RECORDINGS"
@@ -45,6 +54,24 @@ _RECORDING_FIELDS = frozenset(
         "execution_mapping",
         "legs",
         "winner_declaration",
+    }
+)
+_LEG_FIELDS = frozenset(
+    {
+        "background_path_sha256",
+        "client_fills",
+        "control_final_state_sha256",
+        "decisions",
+        "final_signed_position",
+        "fork_state_sha256",
+        "leg_sequence",
+        "manifest",
+        "metrics",
+        "native_recording",
+        "objective",
+        "observe_only",
+        "scenario_name",
+        "seed",
     }
 )
 _MAPPING_VERSION = 1
@@ -117,11 +144,14 @@ class AlgorithmExecutor:
                 **scenario_payload,
             },
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            scenario,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                scenario,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:
@@ -153,19 +183,26 @@ class AlgorithmExecutor:
         configuration = GeneratedConfiguration.from_dict(raw_configuration)
         self._require_configuration(configuration)
         mismatches: list[str] = []
-        for index, raw_leg in enumerate(raw_legs, start=1):
-            raw_native = raw_leg.get("native_recording")
-            if not isinstance(raw_native, dict):
-                raise TypeError("algorithm leg requires a native recording")
-            native = MultiVenueRecording.from_dict(raw_native)
-            native_replay = replay_multivenue_recording(native)
-            if not native_replay.passed:
-                mismatches.append(f"native_leg_{index}")
-        scenario = _build_scenario(configuration)
-        recomputed = _scenario_payload(scenario)
-        for name in ("execution_mapping", "legs", "winner_declaration"):
-            if recomputed[name] != payload[name]:
-                mismatches.append(name)
+        legs = tuple(
+            _load_recorded_leg(raw_leg, index, mismatches)
+            for index, raw_leg in enumerate(raw_legs, start=1)
+        )
+        scenario = _Scenario(
+            configuration,
+            ObjectiveType(configuration.objective),
+            legs,
+            dict(raw_mapping),
+        )
+        if raw_mapping != _execution_mapping(configuration):
+            mismatches.append("execution_mapping")
+        if raw_winner != _WINNER_DECLARATION:
+            mismatches.append("winner_declaration")
+        if _scenario_payload(scenario) != {
+            "execution_mapping": raw_mapping,
+            "legs": raw_legs,
+            "winner_declaration": raw_winner,
+        }:
+            mismatches.append("loaded_scenario_projection")
         return _result(
             configuration,
             recording,
@@ -213,7 +250,19 @@ def _build_scenario(configuration: GeneratedConfiguration) -> _Scenario:
         )
         for side in _SIDES_BY_OBJECTIVE[objective]
     )
-    mapping = {
+    mapping = _execution_mapping(configuration)
+    return _Scenario(configuration, objective, legs, mapping)
+
+
+def _execution_mapping(
+    configuration: GeneratedConfiguration,
+) -> dict[str, object]:
+    objective = ObjectiveType(configuration.objective)
+    algorithm = AlgorithmName(configuration.strategy)
+    manifest = default_algorithm_manifest(algorithm)
+    scenario_name = _SCENARIO_BY_OBJECTIVE[objective]
+    observe_only = objective is ObjectiveType.OBSERVE_ONLY
+    return {
         "algorithm_manifest": manifest.as_dict(),
         "algorithm_manifest_sha256": manifest.sha256(),
         "configured_objective": objective.value,
@@ -231,7 +280,145 @@ def _build_scenario(configuration: GeneratedConfiguration) -> _Scenario:
         "seed": configuration.seed,
         "strategy": algorithm.value,
     }
-    return _Scenario(configuration, objective, legs, mapping)
+
+
+def _load_recorded_leg(
+    raw_leg: dict[str, object],
+    expected_sequence: int,
+    mismatches: list[str],
+) -> ExecutionCellResult:
+    if set(raw_leg) != _LEG_FIELDS:
+        raise ValueError("algorithm leg fields are not exact")
+    if raw_leg["leg_sequence"] != expected_sequence:
+        mismatches.append(f"leg_{expected_sequence}_sequence")
+    raw_manifest = _object(raw_leg, "manifest")
+    raw_objective = _object(raw_leg, "objective")
+    raw_decisions = _object_array(raw_leg, "decisions")
+    raw_fills = _object_array(raw_leg, "client_fills")
+    raw_metrics = _object(raw_leg, "metrics")
+    raw_native = _object(raw_leg, "native_recording")
+    manifest = AlgorithmParameterManifest(
+        algorithm=AlgorithmName(str(raw_manifest["algorithm"])),
+        parameters=_object(raw_manifest, "parameters"),
+        simulator_only=bool(raw_manifest["simulator_only"]),
+    )
+    objective = ExecutionObjective(
+        side=Side(str(raw_objective["side"])),
+        target_quantity=int(raw_objective["target_quantity"]),
+        start_time_us=int(raw_objective["start_time_us"]),
+        deadline_us=int(raw_objective["deadline_us"]),
+        arrival_midpoint_x2=int(raw_objective["arrival_midpoint_x2"]),
+    )
+    native = MultiVenueRecording.from_dict(raw_native)
+    native_replay = replay_multivenue_recording(native)
+    if not native_replay.passed:
+        mismatches.append(f"native_leg_{expected_sequence}")
+    leg = ExecutionCellResult(
+        scenario_name=str(raw_leg["scenario_name"]),
+        seed=int(raw_leg["seed"]),
+        manifest=manifest,
+        objective=objective,
+        fork_state_sha256=str(raw_leg["fork_state_sha256"]),
+        background_path_sha256=str(raw_leg["background_path_sha256"]),
+        control_final_state_sha256=str(raw_leg["control_final_state_sha256"]),
+        decisions=tuple(_load_decision(item) for item in raw_decisions),
+        client_fills=tuple(_load_fill(item) for item in raw_fills),
+        recording=native,
+        metrics=ExecutionBenchmarkMetrics(**raw_metrics),
+        observe_only=bool(raw_leg["observe_only"]),
+    )
+    if leg.final_signed_position != raw_leg["final_signed_position"]:
+        mismatches.append(f"leg_{expected_sequence}_position")
+    return leg
+
+
+def _load_decision(raw: dict[str, object]) -> AlgorithmDecision:
+    raw_action = _object(raw, "action")
+    action_type = AlgorithmActionType(str(raw_action["action_type"]))
+    raw_route_policy = raw_action["route_policy"]
+    raw_route_style = raw_action["route_style"]
+    action = AlgorithmAction(
+        action_type=action_type,
+        reason=str(raw_action["reason"]),
+        quantity=int(raw_action["quantity"]),
+        route_policy=(
+            None
+            if raw_route_policy is None
+            else RoutePolicy(str(raw_route_policy))
+        ),
+        route_style=(
+            None
+            if raw_route_style is None
+            else RouteStyle(str(raw_route_style))
+        ),
+        direct_venue_id=(
+            None
+            if raw_action["direct_venue_id"] is None
+            else str(raw_action["direct_venue_id"])
+        ),
+        limit_price_ticks=(
+            None
+            if raw_action["limit_price_ticks"] is None
+            else int(raw_action["limit_price_ticks"])
+        ),
+        maximum_venues=int(raw_action["maximum_venues"]),
+        target_order_ids=tuple(str(item) for item in raw_action["target_order_ids"]),
+    )
+    observation = _object(raw, "observation")
+    return AlgorithmDecision(
+        sequence=int(raw["sequence"]),
+        simulation_time_us=int(raw["simulation_time_us"]),
+        observation_sha256=str(raw["observation_sha256"]),
+        observation=observation,
+        manifest_sha256=str(raw["manifest_sha256"]),
+        action=action,
+        action_accepted=bool(raw["action_accepted"]),
+        rejection_reason=(
+            None
+            if raw["rejection_reason"] is None
+            else str(raw["rejection_reason"])
+        ),
+        resulting_route_id=(
+            None
+            if raw["resulting_route_id"] is None
+            else str(raw["resulting_route_id"])
+        ),
+    )
+
+
+def _load_fill(raw: dict[str, object]) -> ClientFill:
+    midpoint = raw["observed_midpoint_x2_at_decision"]
+    return ClientFill(
+        venue_id=str(raw["venue_id"]),
+        trade_id=str(raw["trade_id"]),
+        order_id=str(raw["order_id"]),
+        side=Side(str(raw["side"])),
+        price_x2=int(raw["price_x2"]),
+        quantity=int(raw["quantity"]),
+        received_time_us=int(raw["received_time_us"]),
+        observed_midpoint_x2_at_decision=(
+            None if midpoint is None else int(midpoint)
+        ),
+    )
+
+
+def _object(payload: Mapping[str, object], name: str) -> dict[str, object]:
+    value = payload[name]
+    if not isinstance(value, dict):
+        raise TypeError(f"serialized algorithm {name} must be an object")
+    return value
+
+
+def _object_array(
+    payload: Mapping[str, object],
+    name: str,
+) -> list[dict[str, object]]:
+    value = payload[name]
+    if not isinstance(value, list) or any(
+        not isinstance(item, dict) for item in value
+    ):
+        raise TypeError(f"serialized algorithm {name} must be an object array")
+    return value
 
 
 def _scenario_payload(scenario: _Scenario) -> dict[str, object]:

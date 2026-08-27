@@ -33,6 +33,7 @@ from ..models import (
     canonical_sha256,
 )
 from ..projectors import EventLedgerProjector, FillLedgerProjector
+from .base import finalize_recording
 
 
 CORE_FLOW_RECORDING_TYPE = "CORE_FLOW_EVENT_TAPE"
@@ -101,14 +102,17 @@ class CoreFlowExecutor:
             profile_id,
             definition_sha256,
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            engine,
-            dimensions,
-            model,
-            profile_id,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                engine,
+                dimensions,
+                model,
+                profile_id,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:

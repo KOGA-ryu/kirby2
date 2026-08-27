@@ -34,6 +34,7 @@ from ..models import (
     GeneratedConfiguration,
     canonical_sha256,
 )
+from .base import finalize_recording
 
 
 MECHANICS_RECORDING_TYPE = "NATIVE_MECHANICS_RECORDING"
@@ -123,12 +124,15 @@ class MechanicsExecutor:
                 "native_recording": scenario.recording.as_dict(),
             },
         )
-        return _result(
-            configuration,
+        return finalize_recording(
             recording,
-            scenario.recording,
-            scenario.engine,
-            replay_mismatches=(),
+            lambda finalized: _result(
+                configuration,
+                finalized,
+                scenario.recording,
+                scenario.engine,
+                replay_mismatches=(),
+            ),
         )
 
     def replay(self, recording: CaseRecording) -> GeneratedCaseResult:
