@@ -15,6 +15,7 @@ from kirby2.auditlab.executors import (
     ExecutorRegistry,
 )
 from kirby2.auditlab.generator import (
+    AXES,
     evidence_coverage_report,
     generate_configurations,
 )
@@ -179,6 +180,7 @@ def _coverage_case(result) -> ModelRiskLabAuditCase:
 def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
     schedule = generate_configurations(seed=771, budget=420)
     repeated_schedule = generate_configurations(seed=771, budget=420)
+    axis_schedule = generate_configurations(seed=771, budget=4_200)
     schedule_wire = canonical_json([item.as_dict() for item in schedule])
     repeated_wire = canonical_json(
         [item.as_dict() for item in repeated_schedule]
@@ -254,6 +256,57 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
         for item in schedule
         if item.partition is ExperimentPartition.HOLDOUT
     }
+
+    lane_axis_coverage: dict[str, dict[str, object]] = {}
+    lane_axes_pass = True
+    for lane, lane_capability in CAPABILITY_MATRIX.items():
+        if lane is ExecutorLane.FAULT:
+            continue
+        lane_configurations = tuple(
+            item
+            for item in axis_schedule
+            if item.lane is lane and item.replicate_index == 0
+        )
+        dimensions: dict[str, object] = {}
+        for dimension in lane_capability.credited_dimensions:
+            observed = {getattr(item, dimension) for item in lane_configurations}
+            if dimension in AXES:
+                expected = set(AXES[dimension])
+                passed_dimension = observed == expected
+                expected_rendered: object = sorted(
+                    str(value) for value in expected
+                )
+                observed_rendered: object = sorted(
+                    str(value) for value in observed
+                )
+            elif dimension == "agent_count":
+                expected = set(range(1, 9))
+                passed_dimension = observed == expected
+                expected_rendered = sorted(expected)
+                observed_rendered = sorted(observed)
+            elif dimension == "seed":
+                passed_dimension = len(observed) == len(lane_configurations)
+                expected_rendered = "one unique seed per representative cell"
+                observed_rendered = {
+                    "count": len(observed),
+                    "maximum": max(observed),
+                    "minimum": min(observed),
+                }
+            elif dimension == "duration_us":
+                passed_dimension = len(observed) > 1
+                expected_rendered = "more than one simulation duration"
+                observed_rendered = sorted(observed)
+            else:
+                passed_dimension = False
+                expected_rendered = "declared audit expectation"
+                observed_rendered = sorted(str(value) for value in observed)
+            lane_axes_pass = lane_axes_pass and passed_dimension
+            dimensions[dimension] = {
+                "expected": expected_rendered,
+                "observed": observed_rendered,
+                "status": "PASS" if passed_dimension else "PARTIAL",
+            }
+        lane_axis_coverage[lane.value] = dimensions
 
     round_trip = all(
         GeneratedConfiguration.from_dict(item.as_dict()) == item
@@ -437,6 +490,7 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             len(fault_cells) == 6,
             complete_fault_cells == len(fault_cells),
             train_seeds.isdisjoint(holdout_seeds),
+            lane_axes_pass,
             round_trip,
             all(schema_refusals.values()),
             len(schema_refusals) == len(schema_mutations),
@@ -474,6 +528,7 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
                 "direct_mutation_rejected": direct_mutation_rejected,
                 "export_mutation_preserved": export_mutation_preserved,
             },
+            "lane_axis_coverage": lane_axis_coverage,
             "no_declared_dimension_credit": no_declared_dimension_credit,
             "no_unexercised_check_credit": no_unexercised_check_credit,
             "only_reported_dimension_credited": only_reported_dimension_credited,

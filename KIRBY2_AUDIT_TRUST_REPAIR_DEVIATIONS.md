@@ -103,3 +103,54 @@ Acceptance: CORE_FLOW exposes exactly the six roadmap-authorized credits and
 the complete model-risk runtime audit remains green.
 
 Commit: `Align core flow duration capability`
+
+## ATR-06B — Cycle configuration axes within each executor lane
+
+Discovered: 2026-08-27 during the resumed ATR-07 preflight at
+`51b948a9e3f67a10b124a9137d45506b50329cb9`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.executors import CAPABILITY_MATRIX; from kirby2.auditlab.generator import generate_configurations; from kirby2.auditlab.models import ExecutorLane; configs=generate_configurations(771,10000); print({lane.value:{dimension:len({getattr(c,dimension) for c in configs if c.lane is lane}) for dimension in spec.credited_dimensions} for lane,spec in CAPABILITY_MATRIX.items() if lane is not ExecutorLane.FAULT})"
+```
+
+The CORE_FLOW lane reports only one flow model, one volume, and two of twelve
+regimes. MECHANICS, FRAGMENTED, ECOLOGY, and ALGORITHM similarly freeze or omit
+values on their own credited axes even though aggregate declaration coverage is
+green.
+
+Root cause: the scheduler multiplies each lane's cell index by the six
+scientific lanes before applying modular axis placement. That stride is not
+coprime with two-, three-, four-, six-, eight-, or twelve-value axes, so those
+values cannot cycle within one lane.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/auditlab/generator.py`
+- `kirby2/audit/model_risk_lab.py`
+
+Repair:
+
+1. Advance the axis placement index by one for every new cell inside each lane.
+2. Retain a deterministic lane offset so lanes need not start on identical
+   configurations.
+3. Prove every categorical credited value and all eight ecology agent counts
+   occur inside their own lane; prove per-lane seed uniqueness and duration
+   variation separately.
+4. Preserve six equal scientific replicates, fault rotation, deterministic
+   bytes, and the temporary 256-case legacy coverage gate.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.auditlab.executors import CAPABILITY_MATRIX; from kirby2.auditlab.generator import AXES, generate_configurations; from kirby2.auditlab.models import ExecutorLane; configs=generate_configurations(771,4200); assert all({getattr(c,d) for c in configs if c.lane is lane and c.replicate_index == 0} == set(AXES[d]) for lane,spec in CAPABILITY_MATRIX.items() if lane is not ExecutorLane.FAULT for d in spec.credited_dimensions if d in AXES); print('ATR_06B_LANE_AXIS_COVERAGE PASS')"
+git diff --check
+```
+
+Acceptance: no executor lane can receive declaration credit for an axis value
+that its deterministic scheduler can never emit.
+
+Commit: `Cycle audit axes within executor lanes`

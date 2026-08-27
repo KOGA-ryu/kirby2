@@ -73,7 +73,7 @@ def generate_configurations(
             replicate_index = lane_index % len(FaultKind)
             partition = ExperimentPartition.FAULT
             fault = tuple(FaultKind)[replicate_index]
-            coverage_index = cell_index * len(_LANES) + lane_ordinal
+            coverage_index = lane_ordinal * len(_SCIENTIFIC_LANES) + cell_index
         else:
             cell_index = lane_index // 6
             replicate_index = lane_index % 6
@@ -83,10 +83,7 @@ def generate_configurations(
                 else ExperimentPartition.HOLDOUT
             )
             fault = None
-            scientific_ordinal = _SCIENTIFIC_LANES.index(lane)
-            coverage_index = (
-                cell_index * len(_SCIENTIFIC_LANES) + scientific_ordinal
-            )
+            coverage_index = lane_ordinal * len(_SCIENTIFIC_LANES) + cell_index
         values = _axis_values(seed, coverage_index)
         cell_token = _mix(seed, 1_000 + lane_ordinal) & 0xFFFF_FFFF
         configs.append(
