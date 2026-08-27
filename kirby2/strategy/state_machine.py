@@ -255,6 +255,19 @@ class StateMachineTransition:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class StateMachineBoundaryStep:
+    evaluation: StateMachineEvaluation
+    transition: StateMachineTransition | None
+
+
+class StateMachineInvariantViolation(RuntimeError):
+    pass
+
+
+MAX_TRANSITIONS_PER_BOUNDARY = 64
+
+
 class StateMachineRuntime:
     def __init__(
         self,
@@ -282,7 +295,84 @@ class StateMachineRuntime:
             (),
         )
         self.current = evaluation
+        self._prime_true_for(simulation_time_us, features, book)
         return StateMachineTransition(None, evaluation)
+
+    @property
+    def next_deadline_us(self) -> int | None:
+        if self.current is None:
+            return None
+        now = self.current.simulation_time_us
+        current_name = self.current.machine_state
+        current_state = self.definition.state(current_name)
+        candidates: list[int] = []
+        feature_expiry = self.tracker.next_expiry_time_us
+        if feature_expiry is not None and feature_expiry > now:
+            candidates.append(feature_expiry)
+        cooldown_end = self._state_entered_us + current_state.cooldown_us
+        if cooldown_end > now:
+            candidates.append(cooldown_end)
+        for index, transition in enumerate(self.definition.transitions):
+            if transition.source_state != current_name:
+                continue
+            if transition.qualifier is TimeQualifier.TRUE_FOR:
+                started = self._true_since.get(index)
+                if started is not None:
+                    deadline = started + transition.duration_us
+                    if deadline > now:
+                        candidates.append(deadline)
+            elif transition.qualifier is TimeQualifier.EVENTS_WITHIN:
+                matches = self._matched_events.get(index)
+                if matches:
+                    expiry = matches[0] + transition.duration_us + 1
+                    if expiry > now:
+                        candidates.append(expiry)
+            elif transition.qualifier is TimeQualifier.OCCURRED_WITHIN:
+                for condition in transition.conditions:
+                    occurred = self._last_occurred.get(_condition_key(condition))
+                    if occurred is not None:
+                        expiry = occurred + transition.duration_us + 1
+                        if expiry > now:
+                            candidates.append(expiry)
+        return min(candidates) if candidates else None
+
+    def settle(
+        self,
+        simulation_time_us: int,
+        events: Iterable[SimulationEvent],
+        book: OrderBook,
+    ) -> tuple[StateMachineBoundaryStep, ...]:
+        """Consume one event batch once, then settle zero-time transitions."""
+
+        pending_events = tuple(events)
+        steps: list[StateMachineBoundaryStep] = []
+        state_path = [
+            "UNINITIALIZED" if self.current is None else self.current.machine_state
+        ]
+        transitions = 0
+        while True:
+            transition = self.observe(
+                simulation_time_us,
+                pending_events,
+                book,
+            )
+            pending_events = ()
+            if self.current is None:
+                raise RuntimeError("state-machine observation omitted its evaluation")
+            if transition is None:
+                if steps:
+                    self.current = steps[-1].evaluation
+                    return tuple(steps)
+                steps.append(StateMachineBoundaryStep(self.current, None))
+                return tuple(steps)
+            steps.append(StateMachineBoundaryStep(self.current, transition))
+            transitions += 1
+            state_path.append(transition.evaluation.machine_state)
+            if transitions >= MAX_TRANSITIONS_PER_BOUNDARY:
+                raise StateMachineInvariantViolation(
+                    "state-machine zero-time transition bound exceeded at "
+                    f"{simulation_time_us}: " + " -> ".join(state_path)
+                )
 
     def observe(
         self,
@@ -294,9 +384,28 @@ class StateMachineRuntime:
         features = self.tracker.observe(simulation_time_us, captured, book)
         if self.current is None:
             raise RuntimeError("state-machine runtime must be reset before observation")
-        self._record_occurrences(simulation_time_us, features, book)
+        self._record_occurrences(simulation_time_us, captured, features, book)
         current_name = self.current.machine_state
         current_state = self.definition.state(current_name)
+        evaluated: list[
+            tuple[
+                StateTransitionDefinition,
+                bool,
+                tuple[StatefulConditionResult, ...],
+            ]
+        ] = []
+        for index, transition in enumerate(self.definition.transitions):
+            if transition.source_state != current_name:
+                continue
+            matched, results = self._transition_matches(
+                index,
+                transition,
+                simulation_time_us,
+                captured,
+                features,
+                book,
+            )
+            evaluated.append((transition, matched, results))
         if simulation_time_us < self._state_entered_us + current_state.cooldown_us:
             self.current = self._evaluation(
                 current_name,
@@ -309,17 +418,7 @@ class StateMachineRuntime:
                 (),
             )
             return None
-        for index, transition in enumerate(self.definition.transitions):
-            if transition.source_state != current_name:
-                continue
-            matched, results = self._transition_matches(
-                index,
-                transition,
-                simulation_time_us,
-                captured,
-                features,
-                book,
-            )
+        for transition, matched, results in evaluated:
             if not matched:
                 continue
             previous = current_name
@@ -388,7 +487,7 @@ class StateMachineRuntime:
             cutoff = simulation_time_us - transition.duration_us
             while matches and matches[0] < cutoff:
                 matches.popleft()
-            if conditions_match:
+            if events and conditions_match:
                 matches.append(simulation_time_us)
             return len(matches) >= transition.event_count, results
         occurred_results: list[StatefulConditionResult] = []
@@ -415,15 +514,38 @@ class StateMachineRuntime:
     def _record_occurrences(
         self,
         simulation_time_us: int,
+        events: tuple[SimulationEvent, ...],
         features: FeatureSnapshot,
         book: OrderBook,
     ) -> None:
+        if not events:
+            return
         for transition in self.definition.transitions:
             if transition.qualifier is not TimeQualifier.OCCURRED_WITHIN:
                 continue
             for condition in transition.conditions:
                 if _condition_result(condition, features, book).matched:
                     self._last_occurred[_condition_key(condition)] = simulation_time_us
+
+    def _prime_true_for(
+        self,
+        simulation_time_us: int,
+        features: FeatureSnapshot,
+        book: OrderBook,
+    ) -> None:
+        if self.current is None:
+            return
+        current_name = self.current.machine_state
+        for index, transition in enumerate(self.definition.transitions):
+            if (
+                transition.source_state == current_name
+                and transition.qualifier is TimeQualifier.TRUE_FOR
+                and all(
+                    _condition_result(condition, features, book).matched
+                    for condition in transition.conditions
+                )
+            ):
+                self._true_since[index] = simulation_time_us
 
     def _evaluation(
         self,

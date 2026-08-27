@@ -103,3 +103,19 @@ both exit and entry permission. A denied permission rejects the player action
 before it can change exchange state; cancellations remain available. Session
 reports and `timeline --kind TRAFFIC` include the transition reason, qualifier,
 condition evidence, and permissions.
+
+## Simulation-time boundary order
+
+Strategy time advances independently of exchange activity. At a timestamp shared by
+market activity and a strategy deadline, Kirby2 applies scheduled market activity,
+emits and consumes its exchange events, updates rolling features, and only then
+evaluates the state machine. Zero-time transitions are settled in source order under
+a deterministic cycle bound. The originating exchange batch is consumed only once.
+
+`when for TIME` transitions occur at their exact simulation-time deadline, including
+during a quiet market. Cooldowns are reevaluated at exact expiry. Event and
+occurrence windows use inclusive endpoints, so evidence recorded at time `T` expires
+at `T + window + 1` microsecond. Feature-window and timer deadlines are semantic
+boundaries; arbitrary UI update chunking does not add canonical strategy records or
+change replay results. Every causal evaluation is recorded as
+`STRATEGY_EVALUATION`, while actual state changes remain `TRAFFIC` timeline records.

@@ -90,6 +90,46 @@ class MicrostructureFeatureEngine:
         self._prune(simulation_time_us)
         return self.snapshot(simulation_time_us, book)
 
+    def advance_to(self, simulation_time_us: int, book: OrderBook) -> FeatureFrame:
+        """Advance rolling windows without inventing market activity."""
+
+        if not self._initialized:
+            return self.reset(simulation_time_us, book)
+        if simulation_time_us < self._last_time_us:
+            raise ValueError("feature clock cannot move backward")
+        self._last_time_us = simulation_time_us
+        self._prune(simulation_time_us)
+        return self.snapshot(simulation_time_us, book)
+
+    @property
+    def next_expiry_time_us(self) -> int | None:
+        """Earliest time at which a retained rolling observation can change."""
+
+        if not self._initialized:
+            return None
+        candidates: list[int] = []
+        for window_us in self.windows_us:
+            for activity in self._activities:
+                expiry = activity.time_us + window_us + 1
+                if expiry > self._last_time_us:
+                    candidates.append(expiry)
+                    break
+
+        max_window_us = max(self.windows_us)
+        if len(self._midpoints) > 1:
+            expiry = self._midpoints[1].time_us + max_window_us
+            if expiry > self._last_time_us:
+                candidates.append(expiry)
+        for window_us in self.windows_us:
+            if window_us == max_window_us:
+                continue
+            for midpoint in tuple(self._midpoints)[1:]:
+                expiry = midpoint.time_us + window_us + 1
+                if expiry > self._last_time_us:
+                    candidates.append(expiry)
+                    break
+        return min(candidates) if candidates else None
+
     def snapshot(self, simulation_time_us: int, book: OrderBook) -> FeatureFrame:
         if not self._initialized:
             return self.reset(simulation_time_us, book)

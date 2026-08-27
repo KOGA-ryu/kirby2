@@ -21,6 +21,8 @@ from kirby2.simulation.clock import MICROSECONDS_PER_SECOND
 from kirby2.simulation.flow import FlowEvent
 from kirby2.strategy import (
     StateMachineDefinition,
+    StateMachineBoundaryStep,
+    StateMachineEvaluation,
     StateMachineRuntime,
     StateMachineTransition,
     StrategyDefinition,
@@ -116,6 +118,16 @@ class CommandOutcome:
 
 
 class LiveMarketSession:
+    """Deterministic training session with one causal boundary order.
+
+    At a shared simulation timestamp, scheduled market or intraday activity is
+    applied first. Emitted exchange events update rolling features next. Strategy
+    evaluation and bounded zero-time transitions follow. A clock-only strategy
+    deadline is evaluated only if no exchange batch already evaluated that same
+    timestamp. Arbitrary caller chunk boundaries update the current snapshot
+    silently so advance slicing cannot change the canonical timeline.
+    """
+
     def __init__(
         self,
         definition: ScenarioDefinition,
@@ -282,7 +294,20 @@ class LiveMarketSession:
                 self.simulation_time_us,
                 self.engine.book,
             )
-            self._record_traffic_transition(initial_transition)
+            if isinstance(initial_transition, StateMachineTransition):
+                self._record_strategy_evaluation(initial_transition.evaluation)
+                self._record_traffic_transition(initial_transition)
+                initial_steps = self._traffic_runtime.settle(
+                    self.simulation_time_us,
+                    (),
+                    self.engine.book,
+                )
+                if any(step.transition is not None for step in initial_steps):
+                    self._record_state_machine_steps(initial_steps, True)
+                else:
+                    self._traffic_runtime.current = initial_transition.evaluation
+            else:
+                self._record_traffic_transition(initial_transition)
         self.complete = False
         self.running = start
         self.status_message = "RUNNING" if start else "RESET - SPACE starts simulated flow"
@@ -293,7 +318,39 @@ class LiveMarketSession:
         if not self.running or self.complete or delta_us == 0:
             return ()
         target = min(self.duration_us, self.simulation_time_us + delta_us)
-        flow_events = self.engine.advance_to(target, on_event=self._capture_flow_trades)
+        flow_events: list[FlowEvent] = []
+        if self._traffic_runtime is None:
+            flow_events.extend(
+                self.engine.advance_to(target, on_event=self._capture_flow_trades)
+            )
+        while self.simulation_time_us < target:
+            current_time_us = self.simulation_time_us
+            scheduled_time_us = self.engine.next_scheduled_time_us
+            strategy_deadline_us = self._strategy_deadline_us()
+            candidates = [target]
+            if scheduled_time_us is not None:
+                if scheduled_time_us <= current_time_us:
+                    raise RuntimeError("simulation scheduler failed to advance its arrival")
+                candidates.append(scheduled_time_us)
+            if strategy_deadline_us is not None:
+                if strategy_deadline_us <= current_time_us:
+                    raise RuntimeError("strategy scheduler failed to advance its deadline")
+                candidates.append(strategy_deadline_us)
+            boundary_us = min(candidates)
+            is_strategy_deadline = strategy_deadline_us == boundary_us
+            emitted = self.engine.advance_to(
+                boundary_us,
+                on_event=self._capture_flow_trades,
+            )
+            flow_events.extend(emitted)
+            if self._traffic_evaluation_time_us() < boundary_us:
+                self._update_traffic(
+                    (),
+                    boundary_us,
+                    record_evaluation=(
+                        is_strategy_deadline or boundary_us == self.duration_us
+                    ),
+                )
         if target == self.duration_us:
             self.running = False
             self.complete = True
@@ -318,7 +375,7 @@ class LiveMarketSession:
                     {"drill": self.curriculum_drill.as_dict()},
                     target,
                 )
-        return flow_events
+        return tuple(flow_events)
 
     def handle_input(self, key: str, bindings: BindingMap) -> InputRecord:
         if not isinstance(key, str) or not key:
@@ -1215,8 +1272,18 @@ class LiveMarketSession:
         self,
         events: Iterable[SimulationEvent],
         simulation_time_us: int,
+        *,
+        record_evaluation: bool = True,
     ) -> None:
         if self._traffic_runtime is None:
+            return
+        if isinstance(self._traffic_runtime, StateMachineRuntime):
+            steps = self._traffic_runtime.settle(
+                simulation_time_us,
+                events,
+                self.engine.book,
+            )
+            self._record_state_machine_steps(steps, record_evaluation)
             return
         transition = self._traffic_runtime.observe(
             simulation_time_us,
@@ -1225,6 +1292,47 @@ class LiveMarketSession:
         )
         if transition is not None:
             self._record_traffic_transition(transition)
+
+    def _record_state_machine_steps(
+        self,
+        steps: tuple[StateMachineBoundaryStep, ...],
+        record_evaluation: bool,
+    ) -> None:
+        for step in steps:
+            if record_evaluation or step.transition is not None:
+                self._record_strategy_evaluation(step.evaluation)
+            if step.transition is not None:
+                self._record_traffic_transition(step.transition)
+
+    def _record_strategy_evaluation(
+        self,
+        evaluation: StateMachineEvaluation,
+    ) -> None:
+        self._append_timeline(
+            TimelineKind.STRATEGY_EVALUATION,
+            (
+                f"STRATEGY EVALUATION state={evaluation.machine_state} "
+                f"signal={evaluation.state.value} [{evaluation.setup_name}]: "
+                f"{evaluation.reason}"
+            ),
+            {
+                "evaluation": evaluation.as_dict(),
+                "record_type": "STRATEGY_EVALUATION",
+            },
+            evaluation.simulation_time_us,
+        )
+
+    def _strategy_deadline_us(self) -> int | None:
+        if self._traffic_runtime is None:
+            return None
+        return self._traffic_runtime.next_deadline_us
+
+    def _traffic_evaluation_time_us(self) -> int:
+        if self._traffic_runtime is None:
+            return self.simulation_time_us
+        if self._traffic_runtime.current is None:
+            raise RuntimeError("configured strategy runtime lacks an evaluation")
+        return self._traffic_runtime.current.simulation_time_us
 
     def _record_traffic_transition(
         self,

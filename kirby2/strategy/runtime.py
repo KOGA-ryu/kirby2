@@ -86,6 +86,10 @@ class TrafficLightRuntime:
         self.current = evaluation
         return TrafficTransition(None, evaluation)
 
+    @property
+    def next_deadline_us(self) -> int | None:
+        return self.tracker.next_expiry_time_us
+
     def observe(
         self,
         simulation_time_us: int,

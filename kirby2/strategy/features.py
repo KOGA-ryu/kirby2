@@ -51,7 +51,20 @@ class ObservableFeatureTracker:
         events: Iterable[SimulationEvent],
         book: OrderBook,
     ) -> FeatureSnapshot:
-        return self._adapt(self.engine.observe(simulation_time_us, events, book))
+        captured = tuple(events)
+        frame = (
+            self.engine.observe(simulation_time_us, captured, book)
+            if captured
+            else self.engine.advance_to(simulation_time_us, book)
+        )
+        return self._adapt(frame)
+
+    def advance_to(self, simulation_time_us: int, book: OrderBook) -> FeatureSnapshot:
+        return self._adapt(self.engine.advance_to(simulation_time_us, book))
+
+    @property
+    def next_expiry_time_us(self) -> int | None:
+        return self.engine.next_expiry_time_us
 
     def snapshot(self, simulation_time_us: int, book: OrderBook) -> FeatureSnapshot:
         return self._adapt(self.engine.snapshot(simulation_time_us, book))

@@ -17,7 +17,8 @@ from .objectives import SessionObjective
 from .records import InputRecord, MarketStateRecord, TimelineKind, TimelineRecord
 
 
-RECORDING_SCHEMA_VERSION = 1
+# Version 2 records clock-driven strategy evaluations and exact timed transitions.
+RECORDING_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)

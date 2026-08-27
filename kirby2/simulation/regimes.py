@@ -452,6 +452,12 @@ class RegimeOrderFlow(SyntheticOrderFlow):
         return tuple(self._flow_events)
 
     @property
+    def next_scheduled_time_us(self) -> int | None:
+        """Next flow arrival or intraday transition owned by simulation time."""
+
+        return self._pending_arrival_time_us
+
+    @property
     def initial_exchange_event_count(self) -> int:
         return self._initial_exchange_event_count
 

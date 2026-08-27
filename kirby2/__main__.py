@@ -355,6 +355,10 @@ def _parser() -> argparse.ArgumentParser:
         "audit-hawkes-stability",
         help="run adversarial Hawkes branching-stability certification cases",
     )
+    subcommands.add_parser(
+        "audit-strategy-time",
+        help="audit simulation-time strategy deadlines, ordering, and replay",
+    )
 
     matrix = subcommands.add_parser(
         "matrix",
@@ -1492,6 +1496,22 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"HAWKES_STABILITY_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-strategy-time":
+        from kirby2.audit.strategy_time import audit_strategy_time
+
+        reports = audit_strategy_time()
+        print("KIRBY2_STRATEGY_TIME_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"STRATEGY_TIME_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
