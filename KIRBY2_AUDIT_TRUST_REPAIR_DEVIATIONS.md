@@ -410,3 +410,64 @@ Commit: `Embed ecology definitions in replay records`
 
 Handoff: resume ATR-11 from this clean prerequisite commit and capture each
 generated population through portable ecology recording schema v2.
+
+## ATR-12A — Expose automated algorithm names on the strategy axis
+
+Discovered: 2026-08-27 during ATR-12 preflight at
+`4a877f18a5c79325b3d2b0615d4da085d595cb89`.
+
+Reproducer:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.algorithms import AlgorithmName; from kirby2.auditlab.generator import AXES; expected={item.value for item in AlgorithmName if item is not AlgorithmName.MANUAL_REPLAY}; assert set(AXES['strategy']) == expected"
+```
+
+Observed values:
+
+```text
+PASSIVE AGGRESSIVE ADAPTIVE OBSERVE
+```
+
+ATR-12 requires each credited strategy value to be one real automated
+`AlgorithmName` other than `MANUAL_REPLAY`. The four legacy labels cannot map
+bijectively to the nine production algorithms, so retaining them would either
+omit algorithms or let one configured value silently select different policy
+implementations.
+
+Root cause: the original generative kernel used four behavioral labels before
+the typed executor architecture existed. The later roadmap made the strategy
+dimension an algorithm-identity axis, but the generated-axis inventory was not
+updated with that contract.
+
+Owned files:
+
+- `KIRBY2_AUDIT_TRUST_REPAIR_DEVIATIONS.md`
+- `kirby2/auditlab/generator.py`
+
+Repair:
+
+1. Define the strategy axis from every canonical `AlgorithmName` except
+   `MANUAL_REPLAY`, preserving enum order.
+2. Import the enum from its model module so generation does not depend on an
+   audit-only mapping or instantiate benchmark infrastructure.
+3. Keep the generated-configuration schema unchanged; strategy remains a
+   serialized string whose value now has exact production identity.
+4. Prove the deterministic per-lane scheduler emits all nine names and that the
+   existing model-risk audit remains green before resuming ATR-12.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m kirby2 audit-model-risk-lab
+PYTHONDONTWRITEBYTECODE=1 python3 -c "from kirby2.algorithms import AlgorithmName; from kirby2.auditlab.generator import AXES, generate_configurations; from kirby2.auditlab.models import ExecutorLane; expected=tuple(item.value for item in AlgorithmName if item is not AlgorithmName.MANUAL_REPLAY); observed={item.strategy for item in generate_configurations(771,4200) if item.lane is ExecutorLane.ALGORITHM and item.replicate_index == 0}; assert AXES['strategy'] == expected and observed == set(expected); print('ATR_12A_AUTOMATED_STRATEGY_AXIS PASS values=%d' % len(expected))"
+git diff --check
+```
+
+Acceptance: the strategy axis contains exactly the nine automated production
+algorithm identities, the ALGORITHM lane deterministically reaches all nine,
+`MANUAL_REPLAY` is absent, and existing audit generation remains deterministic.
+
+Commit: `Expose automated algorithm strategy axis`
+
+Handoff: resume ATR-12 from the clean prerequisite commit and map each
+configured strategy directly through `default_algorithm_manifest()`.

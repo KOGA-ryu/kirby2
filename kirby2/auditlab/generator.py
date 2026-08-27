@@ -6,6 +6,7 @@ import math
 from enum import Enum
 
 from kirby2.agents import POPULATION_IDS
+from kirby2.algorithms.models import AlgorithmName
 from kirby2.exchange import SessionState
 from kirby2.latency import LatencyProfileName
 from kirby2.session.objectives import ObjectiveType
@@ -41,7 +42,11 @@ AXES: dict[str, tuple[object, ...]] = {
     "venue_count": (1, 2, 3, 4),
     "auction_state": ("NONE", "OPENING", "REOPENING", "CLOSING"),
     "agent_population": tuple(POPULATION_IDS),
-    "strategy": ("PASSIVE", "AGGRESSIVE", "ADAPTIVE", "OBSERVE"),
+    "strategy": tuple(
+        item.value
+        for item in AlgorithmName
+        if item is not AlgorithmName.MANUAL_REPLAY
+    ),
     "objective": tuple(item.value for item in ObjectiveType),
 }
 
