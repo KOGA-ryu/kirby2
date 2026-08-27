@@ -13,6 +13,7 @@ from kirby2.auditlab.executors import (
     CAPABILITY_MATRIX,
     CORE_FLOW_RECORDING_TYPE,
     EXECUTOR_REGISTRY,
+    LATENCY_RECORDING_TYPE,
     MECHANICS_RECORDING_TYPE,
     ExecutorRegistry,
 )
@@ -139,6 +140,7 @@ def audit_model_risk_lab() -> tuple[ModelRiskLabAuditCase, ...]:
             _truthful_execution_contract_case(),
             _real_core_flow_executor_case(),
             _real_mechanics_executor_case(),
+            _real_latency_executor_case(),
             _structural_case(result),
             _fault_case(result),
             _determinism_case(result),
@@ -510,7 +512,11 @@ def _truthful_execution_contract_case() -> ModelRiskLabAuditCase:
             export_mutation_preserved,
             empty_registry_refused,
             EXECUTOR_REGISTRY.registered_lanes
-            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
+            == (
+                ExecutorLane.CORE_FLOW,
+                ExecutorLane.MECHANICS,
+                ExecutorLane.LATENCY,
+            ),
         )
     )
     return ModelRiskLabAuditCase(
@@ -677,7 +683,11 @@ def _real_core_flow_executor_case() -> ModelRiskLabAuditCase:
     passed = all(
         (
             EXECUTOR_REGISTRY.registered_lanes
-            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
+            == (
+                ExecutorLane.CORE_FLOW,
+                ExecutorLane.MECHANICS,
+                ExecutorLane.LATENCY,
+            ),
             {item.configuration.flow_model for item in results}
             == {"simple", "hawkes"},
             all(item.automated_status is AutomatedStatus.PASS for item in results),
@@ -886,7 +896,11 @@ def _real_mechanics_executor_case() -> ModelRiskLabAuditCase:
     passed = all(
         (
             EXECUTOR_REGISTRY.registered_lanes
-            == (ExecutorLane.CORE_FLOW, ExecutorLane.MECHANICS),
+            == (
+                ExecutorLane.CORE_FLOW,
+                ExecutorLane.MECHANICS,
+                ExecutorLane.LATENCY,
+            ),
             len(configurations) == len(AXES["session_phase"]),
             exact_axes,
             exact_exercises,
@@ -926,6 +940,215 @@ def _real_mechanics_executor_case() -> ModelRiskLabAuditCase:
             "tapes": tapes,
         },
         () if passed else ("real market-mechanics executor proof failed",),
+    )
+
+
+def _real_latency_executor_case() -> ModelRiskLabAuditCase:
+    configurations = tuple(
+        item
+        for item in generate_configurations(seed=771, budget=840)
+        if item.lane is ExecutorLane.LATENCY
+        and item.replicate_index == 0
+    )[: len(AXES["latency"])]
+    results = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    repeated = tuple(
+        EXECUTOR_REGISTRY.execute(configuration)
+        for configuration in configurations
+    )
+    replayed = tuple(
+        EXECUTOR_REGISTRY.replay(result.recording) for result in results
+    )
+    capability = CAPABILITY_MATRIX[ExecutorLane.LATENCY]
+    coverage = evidence_coverage_report(results)
+    latency_coverage = coverage["lanes"][ExecutorLane.LATENCY.value]
+
+    actual_outcomes: set[str] = set()
+    acknowledged_outcomes: set[str] = set()
+    command_offsets: set[tuple[int, ...]] = set()
+    event_types: set[str] = set()
+    native_profiles: set[str] = set()
+    race_schedules: set[str] = set()
+    draw_trace_digests: set[str] = set()
+    event_backed_exercises = True
+    tapes: dict[str, object] = {}
+    result_evidence: dict[str, object] = {}
+    for result, repeat, replay in zip(results, repeated, replayed):
+        payload = thaw_json(result.recording.payload)
+        native = payload["native_recording"]
+        events = native["expected_events"]
+        commands = native["commands"]
+        origin = int(payload["observable_ready_time_us"])
+        offsets = tuple(
+            int(command["simulation_time_us"]) - origin
+            for command in commands
+        )
+        schedule = str(payload["race_schedule"])
+        profile = str(native["profile"]["name"])
+        command_offsets.add(offsets)
+        race_schedules.add(schedule)
+        native_profiles.add(profile)
+        event_types.update(str(event["event_type"]) for event in events)
+        acknowledgements = [
+            event
+            for event in events
+            if event["event_type"] == "VENUE_ACKNOWLEDGED_CANCEL"
+        ]
+        acknowledged_outcomes.update(
+            str(event["data"]["outcome"]) for event in acknowledgements
+        )
+        actual_outcomes.add(str(result.metrics["cancel_race_outcome"]))
+        event_backed_exercises = event_backed_exercises and all(
+            bool(thaw_json(exercise.evidence).get("event_sequences"))
+            for exercise in result.exercises
+        )
+        metric_check = next(
+            check
+            for check in result.checks
+            if check.name == "latency_metric_reconciliation"
+        )
+        metric_evidence = thaw_json(metric_check.evidence)
+        draw_trace_digests.add(str(metric_evidence["draw_trace_sha256"]))
+        tapes[result.configuration.cell_id] = {
+            "command_offsets_us": list(offsets),
+            "completed_time_us": native["completed_time_us"],
+            "event_count": len(events),
+            "native_event_sha256": native["expected_event_stream_sha256"],
+            "native_profile": profile,
+            "native_state_sha256": native["expected_state_sha256"],
+            "observable_ready_time_us": origin,
+            "race_schedule": schedule,
+            "recording_sha256": result.recording.sha256,
+        }
+        result_evidence[result.configuration.cell_id] = {
+            "actual_outcome": result.metrics["cancel_race_outcome"],
+            "automated_status": result.automated_status.value,
+            "check_statuses": {
+                check.name: check.status.value for check in result.checks
+            },
+            "event_sha256": result.event_sha256,
+            "latency": result.configuration.latency,
+            "repeated_result_match": result.result_sha256 == repeat.result_sha256,
+            "replay_event_match": result.event_sha256 == replay.event_sha256,
+            "replay_result_match": result.result_sha256 == replay.result_sha256,
+            "replay_state_match": result.state_sha256 == replay.state_sha256,
+            "result_sha256": result.result_sha256,
+        }
+
+    exact_profiles = {
+        item.latency for item in configurations
+    } == set(AXES["latency"])
+    exact_exercises = all(
+        tuple(item.capability for item in result.exercises)
+        == capability.credited_dimensions
+        and all(
+            item.status is ExerciseStatus.EXERCISED
+            for item in result.exercises
+        )
+        for result in results
+    )
+    exact_checks = all(
+        {item.name for item in result.checks}
+        == set(capability.required_checks)
+        and all(item.status is CheckStatus.PASS for item in result.checks)
+        for result in results
+    )
+    replay_exact = all(
+        all(
+            (
+                result.event_sha256 == replay.event_sha256,
+                result.state_sha256 == replay.state_sha256,
+                result.result_sha256 == replay.result_sha256,
+            )
+        )
+        for result, replay in zip(results, replayed)
+    )
+    deterministic = all(
+        result.result_sha256 == repeat.result_sha256
+        for result, repeat in zip(results, repeated)
+    )
+    latency_coverage_passed = all(
+        item["status"] == "PASS"
+        for group in (
+            latency_coverage["dimensions"],
+            latency_coverage["checks"],
+        )
+        for item in group.values()
+    )
+    required_event_types = {
+        "KEY_PRESSED",
+        "CLIENT_CREATED_ORDER",
+        "ORDER_LEFT_CLIENT",
+        "GATEWAY_RECEIVED_ORDER",
+        "VENUE_RECEIVED_ORDER",
+        "VENUE_ACKNOWLEDGED_ORDER",
+        "CLIENT_RECEIVED_ACK",
+        "CANCEL_CREATED",
+        "CANCEL_LEFT_CLIENT",
+        "GATEWAY_RECEIVED_CANCEL",
+        "VENUE_RECEIVED_CANCEL",
+        "VENUE_ACKNOWLEDGED_CANCEL",
+        "CLIENT_RECEIVED_CANCEL_ACK",
+        "EXTERNAL_AGGRESSIVE_ORDER",
+        "FILL_OCCURRED",
+        "FILL_REPORT_LEFT_VENUE",
+        "CLIENT_RECEIVED_FILL",
+        "UI_DISPLAYED_FILL",
+    }
+    passed = all(
+        (
+            EXECUTOR_REGISTRY.registered_lanes
+            == (
+                ExecutorLane.CORE_FLOW,
+                ExecutorLane.MECHANICS,
+                ExecutorLane.LATENCY,
+            ),
+            len(configurations) == len(AXES["latency"]),
+            exact_profiles,
+            native_profiles == set(AXES["latency"]),
+            exact_exercises,
+            event_backed_exercises,
+            exact_checks,
+            replay_exact,
+            deterministic,
+            latency_coverage_passed,
+            all(item.automated_status is AutomatedStatus.PASS for item in results),
+            all(not item.failures for item in results),
+            all(
+                item.recording.recording_type == LATENCY_RECORDING_TYPE
+                for item in results
+            ),
+            actual_outcomes == {"CANCEL_WON", "FILL_BEFORE_CANCEL"},
+            acknowledged_outcomes == actual_outcomes,
+            race_schedules == {"cancel-wins", "fill-wins"},
+            command_offsets == {
+                (2_000, 6_000, 8_000),
+                (2_000, 6_000, 10_000),
+            },
+            required_event_types <= event_types,
+            len(draw_trace_digests) == len(configurations),
+        )
+    )
+    return ModelRiskLabAuditCase(
+        "real_asynchronous_latency_executes_and_replays_natively",
+        {
+            "actual_outcomes": sorted(actual_outcomes),
+            "acknowledged_outcomes": sorted(acknowledged_outcomes),
+            "command_offsets_us": [
+                list(item) for item in sorted(command_offsets)
+            ],
+            "draw_trace_digest_count": len(draw_trace_digests),
+            "event_backed_exercises": event_backed_exercises,
+            "event_types": sorted(event_types),
+            "latency_coverage": latency_coverage,
+            "native_profiles": sorted(native_profiles),
+            "race_schedules": sorted(race_schedules),
+            "results": result_evidence,
+            "tapes": tapes,
+        },
+        () if passed else ("real asynchronous-latency executor proof failed",),
     )
 
 
