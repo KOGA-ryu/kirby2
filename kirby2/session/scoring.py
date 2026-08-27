@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Iterable
 
 from kirby2.exchange import Order, OrderBook, OrderOwner, OrderType, Side
+from kirby2.immutable import thaw_json
 
 from .events import EventType, SimulationEvent
 from .objectives import ObjectiveType, SessionObjective
@@ -643,13 +645,13 @@ def _reading_score(records: tuple[TimelineRecord, ...]) -> ScoreFamily:
     state_counts = {"GREEN": 0, "WAIT": 0, "RED": 0}
     for transition in transitions:
         evaluation = transition.data["evaluation"]
-        if not isinstance(evaluation, dict):
+        if not isinstance(evaluation, Mapping):
             raise RuntimeError("traffic transition lacks evaluation details")
         state = str(evaluation["state"])
         state_counts[state] += 1
         if evaluation.get("kind") == "state_machine":
             conditions = evaluation.get("condition_results", [])
-            if not isinstance(conditions, list):
+            if not _is_json_sequence(conditions):
                 raise RuntimeError("state-machine transition conditions must be a list")
             supports.append(
                 Decimal(1) if not conditions else _condition_match_ratio(conditions)
@@ -657,7 +659,7 @@ def _reading_score(records: tuple[TimelineRecord, ...]) -> ScoreFamily:
             continue
         green = evaluation["green_conditions"]
         wait = evaluation["wait_conditions"]
-        if not isinstance(green, list) or not isinstance(wait, list):
+        if not _is_json_sequence(green) or not _is_json_sequence(wait):
             raise RuntimeError("traffic transition conditions must be lists")
         green_match = _condition_match_ratio(green)
         wait_match = _condition_match_ratio(wait)
@@ -692,11 +694,16 @@ def _state_machine_transition_report(
         if record.kind is not TimelineKind.TRAFFIC:
             continue
         evaluation = record.data.get("evaluation")
-        if not isinstance(evaluation, dict) or evaluation.get("kind") != "state_machine":
+        if (
+            not isinstance(evaluation, Mapping)
+            or evaluation.get("kind") != "state_machine"
+        ):
             continue
         result.append(
             {
-                "condition_results": evaluation.get("condition_results", []),
+                "condition_results": thaw_json(
+                    evaluation.get("condition_results", [])
+                ),
                 "current_state": str(evaluation["machine_state"]),
                 "entry_permission": str(evaluation["entry_permission"]),
                 "exit_permission": str(evaluation["exit_permission"]),
@@ -725,7 +732,7 @@ def _discipline_score(
     state_by_id: dict[str, str] = {}
     for record in market_states:
         traffic = record.snapshot.get("traffic_light")
-        if isinstance(traffic, dict) and traffic.get("state") is not None:
+        if isinstance(traffic, Mapping) and traffic.get("state") is not None:
             state_by_id[record.state_id] = str(traffic["state"])
     if not state_by_id:
         return ScoreFamily(
@@ -857,15 +864,22 @@ def _execution_score(
     )
 
 
-def _condition_match_ratio(conditions: list[object]) -> Decimal:
+def _condition_match_ratio(conditions: Sequence[object]) -> Decimal:
     if not conditions:
         return Decimal(0)
     matched = sum(
         bool(condition.get("matched"))
         for condition in conditions
-        if isinstance(condition, dict)
+        if isinstance(condition, Mapping)
     )
     return Decimal(matched) / Decimal(len(conditions))
+
+
+def _is_json_sequence(value: object) -> bool:
+    return isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    )
 
 
 def _display_decimal(value: Decimal | None) -> str:
