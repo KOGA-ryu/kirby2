@@ -654,6 +654,27 @@ def _parser() -> argparse.ArgumentParser:
         "audit-agent-ecology",
         help="audit bounded agents, disclosure boundaries, drills, emergence, and replay",
     )
+    subcommands.add_parser(
+        "audit-model-risk-lab",
+        help="audit generative coverage, explicit faults, minimization, and immutable evidence",
+    )
+
+    audit_lab = subcommands.add_parser(
+        "audit-lab",
+        help="run the generative model-risk laboratory and persist an immutable packet",
+    )
+    audit_lab.add_argument("--budget", type=_positive_int, default=10_000)
+    audit_lab.add_argument("--seed", type=_nonnegative_int, default=771)
+    audit_lab.add_argument(
+        "--store",
+        type=Path,
+        default=Path(".kirby2") / "research" / "audit_lab",
+    )
+    audit_lab.add_argument(
+        "--save-failures",
+        action="store_true",
+        help="persist complete event-level minimized reproducers",
+    )
 
     ingest_market_data = subcommands.add_parser(
         "ingest-market-data",
@@ -2876,6 +2897,36 @@ def main() -> None:
         failed = [report for report in reports if not report.passed]
         print(
             f"AGENT_ECOLOGY_AUDIT {'FAIL' if failed else 'PASS'} "
+            f"cases={len(reports)} failures={len(failed)}"
+        )
+        if failed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-lab":
+        from kirby2.auditlab import run_audit_lab
+
+        result = run_audit_lab(
+            budget=args.budget,
+            seed=args.seed,
+            store_root=args.store,
+            save_failures=args.save_failures,
+        )
+        print(result.render())
+        if not result.passed:
+            raise SystemExit(1)
+        return
+
+    if args.command == "audit-model-risk-lab":
+        from kirby2.audit.model_risk_lab import audit_model_risk_lab
+
+        reports = audit_model_risk_lab()
+        print("KIRBY2_MODEL_RISK_LAB_AUDIT")
+        for report in reports:
+            print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")))
+        failed = [report for report in reports if not report.passed]
+        print(
+            f"MODEL_RISK_LAB_AUDIT {'FAIL' if failed else 'PASS'} "
             f"cases={len(reports)} failures={len(failed)}"
         )
         if failed:
