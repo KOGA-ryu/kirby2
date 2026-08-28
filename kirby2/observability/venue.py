@@ -38,6 +38,9 @@ from .models import (
 )
 
 
+HIDDEN_LIQUIDITY_CHECKPOINT_SCHEMA_VERSION = 1
+
+
 @dataclass(slots=True)
 class _VenueOrder:
     request: HiddenOrderRequest
@@ -513,10 +516,241 @@ class HiddenLiquidityVenue:
             "truth_events": [event.as_dict() for event in self._truth_events],
         }
 
+    def checkpoint_state(self) -> dict[str, object]:
+        """Return the complete privileged venue owner state for exact restore."""
+
+        self._flush_observable()
+        self.assert_invariants()
+        state: dict[str, object] = {
+            "allocators": {
+                "arrival_sequence": self._arrival_sequence,
+                "pending_ordinal": self._pending_ordinal,
+                "priority_sequence": self._priority_sequence,
+                "trade_sequence": self._trade_sequence,
+            },
+            "clock": self.clock.checkpoint_state(),
+            "complete": self._complete,
+            "observable_events": [
+                event.as_dict() for event in self._observable_events
+            ],
+            "orders": [
+                {
+                    "arrival_sequence": order.arrival_sequence,
+                    "cancelled_quantity": order.cancelled_quantity,
+                    "displayed_remaining": order.displayed_remaining,
+                    "filled_quantity": order.filled_quantity,
+                    "hidden_remaining": order.hidden_remaining,
+                    "priority_sequence": order.priority_sequence,
+                    "refresh_count": order.refresh_count,
+                    "request": order.request.as_dict(),
+                    "reserve_remaining": order.reserve_remaining,
+                    "status": order.status,
+                }
+                for order in self._ordered_orders()
+            ],
+            "pending_observable": [
+                _pending_observable_as_dict(item)
+                for item in sorted(
+                    self._pending,
+                    key=lambda value: (value.due_time_us, value.ordinal),
+                )
+            ],
+            "player_ledger": {
+                "bought_quantity": self._player_bought_quantity,
+                "position": self._player_position,
+                "sold_quantity": self._player_sold_quantity,
+            },
+            "public_tape": [item.as_dict() for item in self._public_tape],
+            "published_book": self._published_book.as_dict(),
+            "published_own_orders": [
+                self._published_own_orders[key].as_dict()
+                for key in sorted(self._published_own_orders)
+            ],
+            "published_player_position": self._published_player_position.as_dict(),
+            "rules": self.rules.as_dict(),
+            "schema_version": HIDDEN_LIQUIDITY_CHECKPOINT_SCHEMA_VERSION,
+            "seen_order_ids": sorted(self._seen_order_ids),
+            "strategy_events": [event.as_dict() for event in self._strategy_events],
+            "truth_events": [event.as_dict() for event in self._truth_events],
+        }
+        _validate_checkpoint_json(state)
+        return state
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> HiddenLiquidityVenue:
+        """Reconstruct one hidden venue without replaying its truth prefix."""
+
+        fields = {
+            "allocators",
+            "clock",
+            "complete",
+            "observable_events",
+            "orders",
+            "pending_observable",
+            "player_ledger",
+            "public_tape",
+            "published_book",
+            "published_own_orders",
+            "published_player_position",
+            "rules",
+            "schema_version",
+            "seen_order_ids",
+            "strategy_events",
+            "truth_events",
+        }
+        _require_state_fields(payload, fields, "hidden-liquidity checkpoint")
+        _validate_checkpoint_json(payload)
+        if payload["schema_version"] != HIDDEN_LIQUIDITY_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("unsupported hidden-liquidity checkpoint schema")
+        rules = HiddenLiquidityRules.from_dict(
+            _state_object(payload["rules"], "hidden-liquidity rules")
+        )
+        restored = cls(rules)
+        restored.clock = SimulationClock.from_checkpoint_state(
+            _state_object(payload["clock"], "hidden-liquidity clock")
+        )
+
+        orders: dict[str, _VenueOrder] = {}
+        for raw in _state_object_array(payload["orders"], "hidden-liquidity orders"):
+            _require_state_fields(
+                raw,
+                {
+                    "arrival_sequence",
+                    "cancelled_quantity",
+                    "displayed_remaining",
+                    "filled_quantity",
+                    "hidden_remaining",
+                    "priority_sequence",
+                    "refresh_count",
+                    "request",
+                    "reserve_remaining",
+                    "status",
+                },
+                "hidden-liquidity order",
+            )
+            request = HiddenOrderRequest.from_dict(
+                _state_object(raw["request"], "hidden-liquidity order request")
+            )
+            if request.order_id in orders:
+                raise ValueError("hidden-liquidity checkpoint duplicates an order ID")
+            order = _VenueOrder(
+                request=request,
+                arrival_sequence=_state_int(raw["arrival_sequence"], "arrival sequence"),
+                priority_sequence=_state_int(raw["priority_sequence"], "priority sequence"),
+                displayed_remaining=_state_int(raw["displayed_remaining"], "displayed remaining"),
+                reserve_remaining=_state_int(raw["reserve_remaining"], "reserve remaining"),
+                hidden_remaining=_state_int(raw["hidden_remaining"], "hidden remaining"),
+                filled_quantity=_state_int(raw["filled_quantity"], "filled quantity"),
+                cancelled_quantity=_state_int(raw["cancelled_quantity"], "cancelled quantity"),
+                refresh_count=_state_int(raw["refresh_count"], "refresh count"),
+                status=_state_string(raw["status"], "hidden-liquidity order status"),
+            )
+            orders[request.order_id] = order
+        restored._orders = orders
+
+        allocators = _state_object(payload["allocators"], "hidden-liquidity allocators")
+        _require_state_fields(
+            allocators,
+            {
+                "arrival_sequence",
+                "pending_ordinal",
+                "priority_sequence",
+                "trade_sequence",
+            },
+            "hidden-liquidity allocators",
+        )
+        restored._arrival_sequence = _state_int(
+            allocators["arrival_sequence"], "arrival allocator"
+        )
+        restored._pending_ordinal = _state_int(
+            allocators["pending_ordinal"], "pending observable allocator"
+        )
+        restored._priority_sequence = _state_int(
+            allocators["priority_sequence"], "priority allocator"
+        )
+        restored._trade_sequence = _state_int(
+            allocators["trade_sequence"], "trade allocator"
+        )
+        restored._truth_events = [
+            TruthEvent.from_dict(row)
+            for row in _state_object_array(payload["truth_events"], "truth events")
+        ]
+        restored._pending = [
+            _pending_observable_from_dict(row)
+            for row in _state_object_array(
+                payload["pending_observable"], "pending observable messages"
+            )
+        ]
+        restored._observable_events = [
+            ObservableEvent.from_dict(row)
+            for row in _state_object_array(
+                payload["observable_events"], "observable events"
+            )
+        ]
+        restored._strategy_events = [
+            _simulation_event_from_dict(row)
+            for row in _state_object_array(payload["strategy_events"], "strategy events")
+        ]
+        restored._public_tape = [
+            PublicTrade.from_dict(row)
+            for row in _state_object_array(payload["public_tape"], "public tape")
+        ]
+        restored._published_book = ObservableDepthBook.from_dict(
+            _state_object(payload["published_book"], "published book")
+        )
+        own_orders = [
+            OwnOrderState.from_dict(row)
+            for row in _state_object_array(
+                payload["published_own_orders"], "published own orders"
+            )
+        ]
+        restored._published_own_orders = {
+            order.order_id: order for order in own_orders
+        }
+        if len(restored._published_own_orders) != len(own_orders):
+            raise ValueError("published own-order IDs are duplicated")
+        restored._published_player_position = ObservablePlayerPosition.from_dict(
+            _state_object(
+                payload["published_player_position"],
+                "published player position",
+            )
+        )
+        player = _state_object(payload["player_ledger"], "player ledger")
+        _require_state_fields(
+            player,
+            {"bought_quantity", "position", "sold_quantity"},
+            "player ledger",
+        )
+        restored._player_position = _state_signed_int(player["position"], "player position")
+        restored._player_bought_quantity = _state_int(
+            player["bought_quantity"], "player bought quantity"
+        )
+        restored._player_sold_quantity = _state_int(
+            player["sold_quantity"], "player sold quantity"
+        )
+        seen = payload["seen_order_ids"]
+        if type(seen) is not list or any(type(value) is not str or not value for value in seen):
+            raise TypeError("seen order IDs must be a string array")
+        if seen != sorted(set(seen)):
+            raise ValueError("seen order IDs are not canonical")
+        restored._seen_order_ids = set(seen)
+        if type(payload["complete"]) is not bool:
+            raise TypeError("hidden-liquidity completion state must be boolean")
+        restored._complete = payload["complete"]
+        restored.assert_invariants()
+        if restored.checkpoint_state() != dict(payload):
+            raise ValueError("hidden-liquidity checkpoint is not a canonical fixed point")
+        return restored
+
     def assert_invariants(self) -> None:
         arrival = [order.arrival_sequence for order in self._ordered_orders()]
         if len(arrival) != len(set(arrival)):
             raise RuntimeError("ground-truth arrival sequences are duplicated")
+        if arrival != list(range(1, len(arrival) + 1)):
+            raise RuntimeError("ground-truth arrival sequence is not contiguous")
         active_priorities = [
             order.priority_sequence
             for order in self._ordered_orders()
@@ -524,6 +758,13 @@ class HiddenLiquidityVenue:
         ]
         if len(active_priorities) != len(set(active_priorities)):
             raise RuntimeError("active ground-truth priorities are duplicated")
+        if self._arrival_sequence != len(arrival):
+            raise RuntimeError("ground-truth arrival allocator is inconsistent")
+        if self._priority_sequence != max(
+            (order.priority_sequence for order in self._ordered_orders()),
+            default=0,
+        ):
+            raise RuntimeError("ground-truth priority allocator is inconsistent")
         for order in self._ordered_orders():
             quantities = (
                 order.displayed_remaining,
@@ -550,6 +791,17 @@ class HiddenLiquidityVenue:
                 "FILLED",
             }:
                 raise RuntimeError("closed ground-truth order has a live status")
+            if order.remaining_quantity > 0 and order.status not in {
+                "PARTIALLY_FILLED",
+                "WORKING",
+            }:
+                raise RuntimeError("working ground-truth order has a closed status")
+            if order.filled_quantity and order.remaining_quantity and (
+                order.status != "PARTIALLY_FILLED"
+            ):
+                raise RuntimeError("partially filled order has an invalid status")
+            if order.request.kind is not LiquidityKind.ICEBERG and order.refresh_count:
+                raise RuntimeError("non-iceberg order contains a refresh count")
         visible = self._visible_book()
         if visible.best_bid is not None and visible.best_ask is not None:
             if visible.best_bid >= visible.best_ask:
@@ -566,6 +818,50 @@ class HiddenLiquidityVenue:
             raise RuntimeError("observable event sequence is not contiguous")
         if receive_times != sorted(receive_times):
             raise RuntimeError("observable receive times are not monotonic")
+        pending_ordinals = [item.ordinal for item in self._pending]
+        if len(pending_ordinals) != len(set(pending_ordinals)) or any(
+            ordinal <= 0 or ordinal > self._pending_ordinal
+            for ordinal in pending_ordinals
+        ):
+            raise RuntimeError("pending observable ordinals are invalid")
+        if self._pending_ordinal != len(self._observable_events) + len(self._pending):
+            raise RuntimeError("pending observable allocator is inconsistent")
+        if any(
+            item.source_time_us + self.rules.feed_delay_us != item.due_time_us
+            or item.due_time_us <= self.clock.current_time_us
+            for item in self._pending
+        ):
+            raise RuntimeError("pending observable delivery violates causal time")
+        if self._trade_sequence != sum(
+            event.event_type is TruthEventType.TRADE for event in self._truth_events
+        ):
+            raise RuntimeError("hidden-liquidity trade allocator is inconsistent")
+        accepted_ids: set[str] = set()
+        for event in self._truth_events:
+            if event.event_type is not TruthEventType.ORDER_ACCEPTED:
+                continue
+            raw_order = event.data.get("order")
+            if isinstance(raw_order, Mapping):
+                accepted_ids.add(str(raw_order.get("order_id")))
+            else:
+                accepted_ids.add(str(event.data.get("order_id")))
+        if self._seen_order_ids != accepted_ids or set(self._orders) - self._seen_order_ids:
+            raise RuntimeError("seen order IDs differ from accepted truth")
+        _assert_private_public_projection(
+            {
+                "observable_events": [event.as_dict() for event in self._observable_events],
+                "pending_observable": [
+                    _pending_observable_as_dict(item) for item in self._pending
+                ],
+                "public_tape": [item.as_dict() for item in self._public_tape],
+                "published_book": self._published_book.as_dict(),
+                "published_own_orders": [
+                    item.as_dict() for item in self._published_own_orders.values()
+                ],
+                "published_player_position": self._published_player_position.as_dict(),
+                "strategy_events": [event.as_dict() for event in self._strategy_events],
+            }
+        )
         public_payload = json.dumps(
             self.observable_feed().as_dict(),
             sort_keys=True,
@@ -1068,3 +1364,195 @@ def _level_quantities(book: ObservableDepthBook) -> dict[tuple[Side, int], int]:
 def _sha256(payload: object) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _pending_observable_as_dict(item: _PendingObservable) -> dict[str, object]:
+    return {
+        "book": None if item.book is None else item.book.as_dict(),
+        "data": thaw_json(item.data),
+        "due_time_us": item.due_time_us,
+        "event_type": item.event_type.value,
+        "ordinal": item.ordinal,
+        "own_order": None if item.own_order is None else item.own_order.as_dict(),
+        "player_position": (
+            None if item.player_position is None else item.player_position.as_dict()
+        ),
+        "source_time_us": item.source_time_us,
+        "strategy_data": (
+            None if item.strategy_data is None else thaw_json(item.strategy_data)
+        ),
+        "strategy_event_type": (
+            None if item.strategy_event_type is None else item.strategy_event_type.value
+        ),
+        "trade": None if item.trade is None else item.trade.as_dict(),
+    }
+
+
+def _pending_observable_from_dict(
+    payload: Mapping[str, object],
+) -> _PendingObservable:
+    _require_state_fields(
+        payload,
+        {
+            "book",
+            "data",
+            "due_time_us",
+            "event_type",
+            "ordinal",
+            "own_order",
+            "player_position",
+            "source_time_us",
+            "strategy_data",
+            "strategy_event_type",
+            "trade",
+        },
+        "pending observable message",
+    )
+    data = _state_object(payload["data"], "pending observable data")
+    strategy_data = payload["strategy_data"]
+    return _PendingObservable(
+        due_time_us=_state_int(payload["due_time_us"], "pending due time"),
+        source_time_us=_state_int(payload["source_time_us"], "pending source time"),
+        ordinal=_state_int(payload["ordinal"], "pending ordinal", minimum=1),
+        event_type=ObservableEventType(
+            _state_string(payload["event_type"], "pending event type")
+        ),
+        data=data,
+        book=(
+            None
+            if payload["book"] is None
+            else ObservableDepthBook.from_dict(
+                _state_object(payload["book"], "pending book")
+            )
+        ),
+        trade=(
+            None
+            if payload["trade"] is None
+            else PublicTrade.from_dict(_state_object(payload["trade"], "pending trade"))
+        ),
+        own_order=(
+            None
+            if payload["own_order"] is None
+            else OwnOrderState.from_dict(
+                _state_object(payload["own_order"], "pending own order")
+            )
+        ),
+        player_position=(
+            None
+            if payload["player_position"] is None
+            else ObservablePlayerPosition.from_dict(
+                _state_object(payload["player_position"], "pending player position")
+            )
+        ),
+        strategy_event_type=(
+            None
+            if payload["strategy_event_type"] is None
+            else EventType(
+                _state_string(
+                    payload["strategy_event_type"], "pending strategy event type"
+                )
+            )
+        ),
+        strategy_data=(
+            None
+            if strategy_data is None
+            else _state_object(strategy_data, "pending strategy data")
+        ),
+    )
+
+
+def _simulation_event_from_dict(payload: Mapping[str, object]) -> SimulationEvent:
+    _require_state_fields(
+        payload,
+        {"data", "sequence", "type"},
+        "strategy simulation event",
+    )
+    return SimulationEvent(
+        _state_int(payload["sequence"], "strategy event sequence", minimum=1),
+        EventType(_state_string(payload["type"], "strategy event type")),
+        _state_object(payload["data"], "strategy event data"),
+    )
+
+
+def _assert_private_public_projection(payload: object) -> None:
+    public = json.dumps(payload, sort_keys=True, separators=(",", ":")).lower()
+    forbidden = (
+        "reserve_quantity",
+        "reserve_remaining",
+        "hidden_quantity",
+        "hidden_remaining",
+        "priority_sequence",
+        "ground_truth",
+        "maker_order_id",
+        "liquidity_source",
+    )
+    if any(field in public for field in forbidden):
+        raise RuntimeError("observable checkpoint payload leaked simulator ground truth")
+
+
+def _validate_checkpoint_json(value: object) -> None:
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        raise TypeError("binary floats are forbidden in hidden-liquidity checkpoints")
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise TypeError("hidden-liquidity checkpoint keys must be strings")
+        for item in value.values():
+            _validate_checkpoint_json(item)
+        return
+    if type(value) in {list, tuple}:
+        for item in value:
+            _validate_checkpoint_json(item)
+        return
+    raise TypeError(
+        f"unsupported hidden-liquidity checkpoint value: {type(value).__name__}"
+    )
+
+
+def _require_state_fields(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _state_object(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be an object")
+    return value
+
+
+def _state_object_array(
+    value: object,
+    label: str,
+) -> tuple[dict[str, object], ...]:
+    if type(value) is not list or any(type(row) is not dict for row in value):
+        raise TypeError(f"{label} must be an object array")
+    return tuple(value)
+
+
+def _state_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def _state_signed_int(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an integer")
+    return value
+
+
+def _state_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} must be a nonempty string")
+    return value

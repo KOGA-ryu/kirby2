@@ -1,9 +1,9 @@
-"""Strict fresh-process restoration for the single-venue mechanics core.
+"""Strict fresh-process restoration for bounded authoritative owner graphs.
 
-This module deliberately restores only :class:`MarketMechanicsEngine` and the
-owners nested beneath it.  It does not reconstruct a prefix from a seed and it
-does not claim to restore flow, agents, latency, features, strategies,
-algorithms, multiple venues, or historical cursors.
+The full-day path restores :class:`MarketMechanicsEngine` and its selected
+single-venue owners.  A separate component-only protocol restores the existing
+multi-venue/hidden owner; it does not claim coexistence with that single-engine
+profile.  Neither protocol reconstructs a prefix from a seed.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from kirby2.full_day.models import (
     canonical_json_bytes,
     canonical_sha256,
     parse_canonical_json_object,
+    validate_strict_json,
 )
 from kirby2.immutable import freeze_json, thaw_json
 
@@ -43,6 +44,14 @@ FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID = (
 FULL_DAY_RUNTIME_RESTORE_RESULT_SCHEMA_VERSION = 1
 FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID = (
     "KIRBY2_FULL_DAY_RUNTIME_RESTORE_RESULT_V1"
+)
+MULTIVENUE_HIDDEN_RESTORE_REQUEST_SCHEMA_VERSION = 1
+MULTIVENUE_HIDDEN_RESTORE_REQUEST_FORMAT_ID = (
+    "KIRBY2_MULTIVENUE_HIDDEN_RESTORE_REQUEST_V1"
+)
+MULTIVENUE_HIDDEN_RESTORE_RESULT_SCHEMA_VERSION = 1
+MULTIVENUE_HIDDEN_RESTORE_RESULT_FORMAT_ID = (
+    "KIRBY2_MULTIVENUE_HIDDEN_RESTORE_RESULT_V1"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1336,6 +1345,400 @@ def full_day_runtime_restore_worker_main() -> int:
     return 0
 
 
+@dataclass(frozen=True, slots=True)
+class MultiVenueHiddenRestoreRequestV1:
+    """One privileged component checkpoint and its post-checkpoint commands."""
+
+    schema_version: int
+    format_id: str
+    checkpoint_state: Mapping[str, object]
+    checkpoint_state_sha256: str
+    suffix_commands: tuple[object, ...]
+    completed_time_us: int
+
+    def __post_init__(self) -> None:
+        from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+        from kirby2.multivenue import MultiVenueCommand
+
+        if (
+            _wire_int(
+                self.schema_version,
+                "multi-venue restore request schema version",
+                minimum=1,
+            )
+            != MULTIVENUE_HIDDEN_RESTORE_REQUEST_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported multi-venue restore request schema")
+        if self.format_id != MULTIVENUE_HIDDEN_RESTORE_REQUEST_FORMAT_ID:
+            raise ValueError("unsupported multi-venue restore request format")
+        detached = _detached_object(
+            _wire_object(self.checkpoint_state, "multi-venue component checkpoint")
+        )
+        digest = _wire_sha256(
+            self.checkpoint_state_sha256,
+            "multi-venue checkpoint state SHA-256",
+        )
+        if canonical_sha256(detached) != digest:
+            raise ValueError("multi-venue checkpoint state digest does not match")
+        owner = MultiVenueHiddenOwnerV1.from_checkpoint_state(detached)
+        if type(self.suffix_commands) is not tuple or any(
+            type(command) is not MultiVenueCommand for command in self.suffix_commands
+        ):
+            raise TypeError("multi-venue suffix commands must be a canonical tuple")
+        sequences = tuple(command.sequence for command in self.suffix_commands)
+        if sequences != tuple(range(1, len(self.suffix_commands) + 1)):
+            raise ValueError("multi-venue suffix command sequence must start at one")
+        times = tuple(command.simulation_time_us for command in self.suffix_commands)
+        if times != tuple(sorted(times)):
+            raise ValueError("multi-venue suffix command time moved backward")
+        if times and times[0] < owner.coordinator.clock.current_time_us:
+            raise ValueError("multi-venue suffix command precedes the checkpoint")
+        completed = _wire_int(
+            self.completed_time_us,
+            "multi-venue restore completion time",
+        )
+        if completed < owner.coordinator.clock.current_time_us:
+            raise ValueError("multi-venue restore completion precedes the checkpoint")
+        if times and completed < times[-1]:
+            raise ValueError("multi-venue restore completion precedes its final command")
+        for command in self.suffix_commands:
+            _validate_multivenue_suffix_command(command)
+        object.__setattr__(self, "checkpoint_state", freeze_json(detached))
+
+    @classmethod
+    def capture(
+        cls,
+        owner: object,
+        *,
+        suffix_commands: Sequence[object],
+        completed_time_us: int,
+    ) -> MultiVenueHiddenRestoreRequestV1:
+        from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+
+        if type(owner) is not MultiVenueHiddenOwnerV1:
+            raise TypeError("multi-venue restore capture requires its exact owner")
+        if not isinstance(suffix_commands, Sequence) or isinstance(
+            suffix_commands, (str, bytes, bytearray)
+        ):
+            raise TypeError("multi-venue suffix commands must be a sequence")
+        state = owner.checkpoint_state()
+        return cls(
+            schema_version=MULTIVENUE_HIDDEN_RESTORE_REQUEST_SCHEMA_VERSION,
+            format_id=MULTIVENUE_HIDDEN_RESTORE_REQUEST_FORMAT_ID,
+            checkpoint_state=state,
+            checkpoint_state_sha256=canonical_sha256(state),
+            suffix_commands=tuple(suffix_commands),
+            completed_time_us=completed_time_us,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_state": _as_plain_object(self.checkpoint_state),
+            "checkpoint_state_sha256": self.checkpoint_state_sha256,
+            "completed_time_us": self.completed_time_us,
+            "format_id": self.format_id,
+            "schema_version": self.schema_version,
+            "suffix_commands": [command.as_dict() for command in self.suffix_commands],
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.as_dict())
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> MultiVenueHiddenRestoreRequestV1:
+        from kirby2.multivenue import MultiVenueCommand
+
+        _require_exact_fields(
+            payload,
+            {
+                "checkpoint_state",
+                "checkpoint_state_sha256",
+                "completed_time_us",
+                "format_id",
+                "schema_version",
+                "suffix_commands",
+            },
+            "MultiVenueHiddenRestoreRequestV1",
+        )
+        commands: list[MultiVenueCommand] = []
+        for raw in _wire_array(payload["suffix_commands"], "multi-venue suffix commands"):
+            command = _wire_object(raw, "multi-venue suffix command")
+            _require_exact_fields(
+                command,
+                {"command_type", "parameters", "sequence", "simulation_time_us"},
+                "multi-venue suffix command",
+            )
+            commands.append(
+                MultiVenueCommand(
+                    sequence=_wire_int(
+                        command["sequence"], "multi-venue suffix sequence", minimum=1
+                    ),
+                    simulation_time_us=_wire_int(
+                        command["simulation_time_us"],
+                        "multi-venue suffix time",
+                    ),
+                    command_type=_wire_string(
+                        command["command_type"], "multi-venue suffix command type"
+                    ),
+                    parameters=_wire_object(
+                        command["parameters"], "multi-venue suffix parameters"
+                    ),
+                )
+            )
+        return cls(
+            schema_version=_wire_int(
+                payload["schema_version"],
+                "multi-venue restore request schema version",
+                minimum=1,
+            ),
+            format_id=_wire_string(payload["format_id"], "restore request format"),
+            checkpoint_state=_wire_object(
+                payload["checkpoint_state"], "multi-venue component checkpoint"
+            ),
+            checkpoint_state_sha256=_wire_sha256(
+                payload["checkpoint_state_sha256"],
+                "multi-venue checkpoint state SHA-256",
+            ),
+            suffix_commands=tuple(commands),
+            completed_time_us=_wire_int(
+                payload["completed_time_us"], "multi-venue completion time"
+            ),
+        )
+
+    @classmethod
+    def from_json_bytes(cls, payload: bytes) -> MultiVenueHiddenRestoreRequestV1:
+        return cls.from_dict(parse_canonical_json_object(payload))
+
+
+def _validate_multivenue_suffix_command(command: object) -> None:
+    from kirby2.multivenue import MultiVenueCommand, RoutingRequest
+    from kirby2.observability import HiddenOrderRequest
+
+    if type(command) is not MultiVenueCommand:
+        raise TypeError("multi-venue suffix command has the wrong type")
+    expected = {
+        "ADD": {"request", "venue_id"},
+        "SIM_MARKET": {"order_id", "quantity", "side", "venue_id"},
+        "ROUTE": {"request"},
+        "ADVANCE": set(),
+        "CANCEL_ALL": set(),
+        "SESSION": {"state", "venue_id"},
+        "COMPLETE": set(),
+    }[command.command_type]
+    _require_exact_fields(
+        command.parameters,
+        expected,
+        f"multi-venue {command.command_type} parameters",
+    )
+    if command.command_type == "ADD":
+        venue_id = command.parameters["venue_id"]
+        if type(venue_id) is not str or not venue_id:
+            raise TypeError("multi-venue ADD venue ID must be a nonempty string")
+        raw_request = _wire_object(
+            command.parameters["request"], "multi-venue ADD request"
+        )
+        parsed = HiddenOrderRequest.from_dict(raw_request)
+        if parsed.as_dict() != raw_request:
+            raise ValueError("multi-venue ADD request is not a canonical fixed point")
+    elif command.command_type == "ROUTE":
+        raw_request = _wire_object(
+            command.parameters["request"], "multi-venue ROUTE request"
+        )
+        parsed = RoutingRequest.from_dict(raw_request)
+        if parsed.as_dict() != raw_request:
+            raise ValueError("multi-venue ROUTE request is not a canonical fixed point")
+    elif command.command_type == "SIM_MARKET":
+        if any(
+            type(command.parameters[key]) is not str
+            or not command.parameters[key]
+            for key in ("order_id", "side", "venue_id")
+        ):
+            raise TypeError("multi-venue market identity and side must be strings")
+        quantity = command.parameters["quantity"]
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("multi-venue market quantity must be positive")
+        Side(str(command.parameters["side"]))
+    elif command.command_type == "SESSION":
+        if any(
+            type(command.parameters[key]) is not str
+            or not command.parameters[key]
+            for key in ("state", "venue_id")
+        ):
+            raise TypeError("multi-venue session state and venue must be strings")
+        SessionState(str(command.parameters["state"]))
+    validate_strict_json(command.as_dict())
+
+
+def _multivenue_prefix_counts(
+    checkpoint_state: Mapping[str, object],
+) -> dict[str, object]:
+    coordinator = _wire_object(
+        checkpoint_state["coordinator"], "multi-venue coordinator checkpoint"
+    )
+    venues = _wire_object(coordinator["venues"], "multi-venue checkpoint venues")
+    observable_counts: dict[str, int] = {}
+    truth_counts: dict[str, int] = {}
+    for venue_id, raw_venue in sorted(venues.items()):
+        venue = _wire_object(raw_venue, f"checkpoint venue {venue_id}")
+        engine = _wire_object(venue["engine"], f"checkpoint venue engine {venue_id}")
+        observable_counts[venue_id] = len(
+            _wire_array(engine["observable_events"], f"observable events {venue_id}")
+        )
+        truth_counts[venue_id] = len(
+            _wire_array(engine["truth_events"], f"truth events {venue_id}")
+        )
+    return {
+        "coordinator_event_count": len(
+            _wire_array(coordinator["events"], "checkpoint coordinator events")
+        ),
+        "observable_event_counts": observable_counts,
+        "truth_event_counts": truth_counts,
+    }
+
+
+def _multivenue_restore_result(
+    owner: object,
+    request: MultiVenueHiddenRestoreRequestV1,
+    route_ids: tuple[str, ...],
+) -> dict[str, object]:
+    from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+
+    if type(owner) is not MultiVenueHiddenOwnerV1:
+        raise TypeError("multi-venue restore result requires its exact owner")
+    prefix_counts = _multivenue_prefix_counts(
+        _as_plain_object(request.checkpoint_state)
+    )
+    final_state = owner.checkpoint_state()
+    coordinator = _wire_object(final_state["coordinator"], "final coordinator state")
+    prefix_coordinator_count = _wire_int(
+        prefix_counts["coordinator_event_count"], "prefix coordinator event count"
+    )
+    coordinator_events = _wire_array(coordinator["events"], "final coordinator events")
+    coordinator_suffix = coordinator_events[prefix_coordinator_count:]
+    prefix_observable = _wire_object(
+        prefix_counts["observable_event_counts"], "prefix observable counts"
+    )
+    prefix_truth = _wire_object(prefix_counts["truth_event_counts"], "prefix truth counts")
+    observable_suffix: dict[str, object] = {}
+    truth_suffix: dict[str, object] = {}
+    venues = _wire_object(coordinator["venues"], "final venues")
+    for venue_id, raw_venue in sorted(venues.items()):
+        venue = _wire_object(raw_venue, f"final venue {venue_id}")
+        engine = _wire_object(venue["engine"], f"final venue engine {venue_id}")
+        observable_events = _wire_array(
+            engine["observable_events"], f"final observable events {venue_id}"
+        )
+        truth_events = _wire_array(engine["truth_events"], f"final truth events {venue_id}")
+        observable_rows = observable_events[
+            _wire_int(prefix_observable[venue_id], f"prefix observable count {venue_id}") :
+        ]
+        truth_rows = truth_events[
+            _wire_int(prefix_truth[venue_id], f"prefix truth count {venue_id}") :
+        ]
+        observable_suffix[venue_id] = {
+            "event_count": len(observable_rows),
+            "event_sha256": canonical_sha256(observable_rows),
+        }
+        truth_suffix[venue_id] = {
+            "event_count": len(truth_rows),
+            "event_sha256": canonical_sha256(truth_rows),
+        }
+    prefix = {
+        **prefix_counts,
+        "checkpoint_state_sha256": request.checkpoint_state_sha256,
+    }
+    suffix = {
+        "coordinator_event_count": len(coordinator_suffix),
+        "coordinator_event_sha256": canonical_sha256(coordinator_suffix),
+        "observable_events": observable_suffix,
+        "route_ids": list(route_ids),
+        "truth_events": truth_suffix,
+    }
+    final = {
+        "coordinator_state_sha256": owner.coordinator.state_sha256(),
+        "public_projection": owner.public_projection(),
+        "restorable_state_sha256": canonical_sha256(final_state),
+    }
+    invariant_projection = {"final": final, "prefix": prefix, "suffix": suffix}
+    return {
+        "final": final,
+        "format_id": MULTIVENUE_HIDDEN_RESTORE_RESULT_FORMAT_ID,
+        "invariant_sha256": canonical_sha256(invariant_projection),
+        "prefix": prefix,
+        "schema_version": MULTIVENUE_HIDDEN_RESTORE_RESULT_SCHEMA_VERSION,
+        "suffix": suffix,
+    }
+
+
+def execute_multivenue_hidden_restore_request(
+    request: MultiVenueHiddenRestoreRequestV1,
+) -> dict[str, object]:
+    """Restore the standalone fragmented-market owner and execute only its suffix."""
+
+    from kirby2.full_day.components_multivenue import (
+        MultiVenueHiddenOwnerV1,
+        apply_multivenue_hidden_suffix,
+    )
+
+    if type(request) is not MultiVenueHiddenRestoreRequestV1:
+        raise TypeError("multi-venue restore execution requires its canonical request")
+    owner = MultiVenueHiddenOwnerV1.from_checkpoint_state(
+        _as_plain_object(request.checkpoint_state)
+    )
+    route_ids = apply_multivenue_hidden_suffix(
+        owner,
+        request.suffix_commands,
+        completed_time_us=request.completed_time_us,
+    )
+    return _multivenue_restore_result(owner, request, route_ids)
+
+
+def execute_uninterrupted_multivenue_hidden_suffix(
+    owner: object,
+    request: MultiVenueHiddenRestoreRequestV1,
+) -> dict[str, object]:
+    """Reference suffix over the already-running standalone owner."""
+
+    from kirby2.full_day.components_multivenue import (
+        MultiVenueHiddenOwnerV1,
+        apply_multivenue_hidden_suffix,
+    )
+
+    if type(owner) is not MultiVenueHiddenOwnerV1:
+        raise TypeError("uninterrupted multi-venue suffix requires its exact owner")
+    if owner.canonical_state_bytes() != canonical_json_bytes(
+        _as_plain_object(request.checkpoint_state)
+    ):
+        raise ValueError("uninterrupted multi-venue owner differs from checkpoint")
+    route_ids = apply_multivenue_hidden_suffix(
+        owner,
+        request.suffix_commands,
+        completed_time_us=request.completed_time_us,
+    )
+    return _multivenue_restore_result(owner, request, route_ids)
+
+
+def multivenue_hidden_restore_worker_main() -> int:
+    """Canonical stdin/stdout worker for WO31-E5 component restoration."""
+
+    raw = sys.stdin.buffer.read()
+    try:
+        request = MultiVenueHiddenRestoreRequestV1.from_json_bytes(raw)
+        result = execute_multivenue_hidden_restore_request(request)
+        output = canonical_json_bytes(result)
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        diagnostic = (
+            f"MULTIVENUE_HIDDEN_RESTORE_REFUSED {type(error).__name__}: {error}\n"
+        ).encode("utf-8", errors="backslashreplace")
+        sys.stderr.buffer.write(diagnostic)
+        return 2
+    sys.stdout.buffer.write(output)
+    return 0
+
+
 __all__ = [
     "CORE_RESTORE_REQUEST_FORMAT_ID",
     "CORE_RESTORE_REQUEST_SCHEMA_VERSION",
@@ -1352,11 +1755,19 @@ __all__ = [
     "FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID",
     "FULL_DAY_RUNTIME_RESTORE_RESULT_SCHEMA_VERSION",
     "FullDayRuntimeRestoreRequestV1",
+    "MULTIVENUE_HIDDEN_RESTORE_REQUEST_FORMAT_ID",
+    "MULTIVENUE_HIDDEN_RESTORE_REQUEST_SCHEMA_VERSION",
+    "MULTIVENUE_HIDDEN_RESTORE_RESULT_FORMAT_ID",
+    "MULTIVENUE_HIDDEN_RESTORE_RESULT_SCHEMA_VERSION",
+    "MultiVenueHiddenRestoreRequestV1",
     "apply_full_day_runtime_suffix",
     "apply_core_session_suffix",
     "execute_full_day_runtime_restore_request",
     "execute_core_restore_request",
+    "execute_multivenue_hidden_restore_request",
     "execute_uninterrupted_full_day_runtime_suffix",
     "execute_uninterrupted_suffix",
+    "execute_uninterrupted_multivenue_hidden_suffix",
     "full_day_runtime_restore_worker_main",
+    "multivenue_hidden_restore_worker_main",
 ]

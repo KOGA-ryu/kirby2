@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import heapq
+import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from kirby2.exchange import SessionState
@@ -29,6 +31,9 @@ from .models import (
 )
 from .routers import router_for_policy
 from .venue import Venue, VenueResponse
+
+
+MULTIVENUE_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 @dataclass(order=True, slots=True)
@@ -568,9 +573,246 @@ class MarketCoordinator:
             ],
         }
 
+    def checkpoint_state(self) -> dict[str, object]:
+        """Return the complete fragmented-market owner state for exact restore."""
+
+        self.assert_invariants()
+        state: dict[str, object] = {
+            "allocators": {
+                "route_sequence": self._route_sequence,
+                "schedule_sequence": self._schedule_sequence,
+            },
+            "clock": self.clock.checkpoint_state(),
+            "complete": self._complete,
+            "consolidated_feed_state": self.consolidated_feed().as_dict(),
+            "depth_subscriptions": sorted(self.depth_subscriptions),
+            "events": [event.as_dict() for event in self._events],
+            "global_player_position": self._global_player_position,
+            "observable_cursors": {
+                venue_id: len(venue.engine._observable_events)
+                for venue_id, venue in sorted(self.venues.items())
+            },
+            "pending_route_legs": [
+                {
+                    "due_time_us": item.due_time_us,
+                    "leg_index": item.leg_index,
+                    "order_id": item.order_id,
+                    "route_id": item.route_id,
+                    "routing_latency_us": item.routing_latency_us,
+                    "schedule_sequence": item.schedule_sequence,
+                }
+                for item in sorted(self._pending)
+            ],
+            "routes": {
+                route_id: {
+                    "decision": state.decision.as_dict(),
+                    "executions": [
+                        state.executions[index].as_dict()
+                        for index in sorted(state.executions)
+                    ],
+                    "request": state.request.as_dict(),
+                }
+                for route_id, state in sorted(self._routes.items())
+            },
+            "schema_version": MULTIVENUE_CHECKPOINT_SCHEMA_VERSION,
+            "seed": self.seed,
+            "truth_cursors": {
+                venue_id: len(venue.engine._truth_events)
+                for venue_id, venue in sorted(self.venues.items())
+            },
+            "venues": {
+                venue_id: venue.checkpoint_state()
+                for venue_id, venue in sorted(self.venues.items())
+            },
+        }
+        _validate_multivenue_checkpoint_json(state)
+        return state
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> MarketCoordinator:
+        """Reconstruct every venue and coordinator owner without prefix replay."""
+
+        _require_checkpoint_fields(
+            payload,
+            {
+                "allocators",
+                "clock",
+                "complete",
+                "consolidated_feed_state",
+                "depth_subscriptions",
+                "events",
+                "global_player_position",
+                "observable_cursors",
+                "pending_route_legs",
+                "routes",
+                "schema_version",
+                "seed",
+                "truth_cursors",
+                "venues",
+            },
+            "multi-venue checkpoint",
+        )
+        _validate_multivenue_checkpoint_json(payload)
+        if payload["schema_version"] != MULTIVENUE_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("unsupported multi-venue checkpoint schema")
+        raw_venues = _checkpoint_object(payload["venues"], "multi-venue venues")
+        if not raw_venues:
+            raise ValueError("multi-venue checkpoint requires at least one venue")
+        venues: dict[str, Venue] = {}
+        for venue_id, raw in sorted(raw_venues.items()):
+            restored_venue = Venue.from_checkpoint_state(
+                _checkpoint_object(raw, f"venue {venue_id}")
+            )
+            if restored_venue.venue_id != venue_id:
+                raise ValueError("multi-venue checkpoint venue key differs from config")
+            venues[venue_id] = restored_venue
+        subscriptions = _checkpoint_string_array(
+            payload["depth_subscriptions"], "depth subscriptions"
+        )
+        seed = _checkpoint_signed_int(payload["seed"], "multi-venue seed")
+        restored = cls(
+            tuple(venue.config for venue in venues.values()),
+            seed=seed,
+            depth_subscriptions=frozenset(subscriptions),
+        )
+        restored.clock = SimulationClock.from_checkpoint_state(
+            _checkpoint_object(payload["clock"], "multi-venue clock")
+        )
+        restored.venues = venues
+        restored._events = [
+            CoordinatorEvent.from_dict(row)
+            for row in _checkpoint_object_array(payload["events"], "coordinator events")
+        ]
+        routes: dict[str, _RouteState] = {}
+        raw_routes = _checkpoint_object(payload["routes"], "multi-venue routes")
+        for route_id, raw in sorted(raw_routes.items()):
+            route = _checkpoint_object(raw, f"route {route_id}")
+            _require_checkpoint_fields(
+                route,
+                {"decision", "executions", "request"},
+                f"route {route_id}",
+            )
+            request_payload = _checkpoint_object(
+                route["request"], f"route {route_id} request"
+            )
+            _require_checkpoint_fields(
+                request_payload,
+                {
+                    "direct_venue_id",
+                    "limit_price_ticks",
+                    "max_venues",
+                    "order_id",
+                    "policy",
+                    "quantity",
+                    "side",
+                    "style",
+                },
+                f"route {route_id} request",
+            )
+            request = RoutingRequest.from_dict(request_payload)
+            decision = RouteDecision.from_dict(
+                _checkpoint_object(route["decision"], f"route {route_id} decision")
+            )
+            if decision.route_id != route_id:
+                raise ValueError("route decision ID differs from route key")
+            executions = [
+                RouteLegExecution.from_dict(row)
+                for row in _checkpoint_object_array(
+                    route["executions"], f"route {route_id} executions"
+                )
+            ]
+            by_index = {execution.leg_index: execution for execution in executions}
+            if len(by_index) != len(executions):
+                raise ValueError("route execution leg indexes are duplicated")
+            routes[route_id] = _RouteState(request, decision, by_index)
+        restored._routes = routes
+        restored._pending = []
+        for raw in _checkpoint_object_array(
+            payload["pending_route_legs"], "pending route legs"
+        ):
+            _require_checkpoint_fields(
+                raw,
+                {
+                    "due_time_us",
+                    "leg_index",
+                    "order_id",
+                    "route_id",
+                    "routing_latency_us",
+                    "schedule_sequence",
+                },
+                "pending route leg",
+            )
+            restored._pending.append(
+                _PendingLeg(
+                    due_time_us=_checkpoint_int(raw["due_time_us"], "pending due time"),
+                    schedule_sequence=_checkpoint_int(
+                        raw["schedule_sequence"], "pending schedule sequence", minimum=1
+                    ),
+                    route_id=_checkpoint_string(raw["route_id"], "pending route ID"),
+                    leg_index=_checkpoint_int(
+                        raw["leg_index"], "pending leg index", minimum=1
+                    ),
+                    order_id=_checkpoint_string(raw["order_id"], "pending order ID"),
+                    routing_latency_us=_checkpoint_int(
+                        raw["routing_latency_us"], "pending routing latency"
+                    ),
+                )
+            )
+        heapq.heapify(restored._pending)
+        allocators = _checkpoint_object(payload["allocators"], "multi-venue allocators")
+        _require_checkpoint_fields(
+            allocators,
+            {"route_sequence", "schedule_sequence"},
+            "multi-venue allocators",
+        )
+        restored._route_sequence = _checkpoint_int(
+            allocators["route_sequence"], "route allocator"
+        )
+        restored._schedule_sequence = _checkpoint_int(
+            allocators["schedule_sequence"], "schedule allocator"
+        )
+        restored._global_player_position = _checkpoint_signed_int(
+            payload["global_player_position"], "global player position"
+        )
+        if type(payload["complete"]) is not bool:
+            raise TypeError("multi-venue completion state must be boolean")
+        restored._complete = payload["complete"]
+        _validate_cursor_projection(
+            payload["observable_cursors"],
+            {
+                venue_id: len(venue.engine._observable_events)
+                for venue_id, venue in venues.items()
+            },
+            "observable cursors",
+        )
+        _validate_cursor_projection(
+            payload["truth_cursors"],
+            {
+                venue_id: len(venue.engine._truth_events)
+                for venue_id, venue in venues.items()
+            },
+            "truth cursors",
+        )
+        restored.assert_invariants()
+        if restored.consolidated_feed().as_dict() != payload["consolidated_feed_state"]:
+            raise ValueError("restored consolidated feed differs from checkpoint")
+        if restored.checkpoint_state() != dict(payload):
+            raise ValueError("multi-venue checkpoint is not a canonical fixed point")
+        return restored
+
     def assert_invariants(self) -> None:
         for venue in self.venues.values():
             venue.assert_invariants()
+        if any(
+            venue.engine.clock.current_time_us != self.clock.current_time_us
+            for venue in self.venues.values()
+        ):
+            raise RuntimeError("venue and coordinator clocks differ")
+        if any(venue.engine.complete != self._complete for venue in self.venues.values()):
+            raise RuntimeError("venue and coordinator completion states differ")
         if self._global_player_position != sum(
             venue.player_position for venue in self.venues.values()
         ):
@@ -583,15 +825,90 @@ class MarketCoordinator:
             raise RuntimeError("coordinator event time moved backward")
         if any(item.due_time_us < self.clock.current_time_us for item in self._pending):
             raise RuntimeError("pending route leg is overdue")
+        route_ids = tuple(sorted(self._routes))
+        expected_route_ids = tuple(
+            f"R{sequence:06d}" for sequence in range(1, self._route_sequence + 1)
+        )
+        if route_ids != expected_route_ids:
+            raise RuntimeError("route allocator or route identity is inconsistent")
+        scheduled_events = sum(
+            event.event_type is CoordinatorEventType.ROUTE_LEG_SCHEDULED
+            for event in self._events
+        )
+        if self._schedule_sequence != scheduled_events:
+            raise RuntimeError("route schedule allocator differs from event history")
+        pending_sequences = [item.schedule_sequence for item in self._pending]
+        if len(pending_sequences) != len(set(pending_sequences)) or any(
+            sequence <= 0 or sequence > self._schedule_sequence
+            for sequence in pending_sequences
+        ):
+            raise RuntimeError("pending route schedule sequences are invalid")
         for route_id, state in self._routes.items():
             if state.decision.route_id != route_id:
                 raise RuntimeError("route state identity does not reconcile")
+            if state.decision.policy is not state.request.policy:
+                raise RuntimeError("route decision policy differs from its request")
+            if sum(leg.quantity for leg in state.decision.legs) > state.request.quantity:
+                raise RuntimeError("route plan exceeds its requested quantity")
+            if any(leg.venue_id not in self.venues for leg in state.decision.legs):
+                raise RuntimeError("route plan references an unknown venue")
             if state.decision.observable_feed_sha256 != canonical_sha256(
                 state.decision.observable_feed
             ):
                 raise RuntimeError("route decision evidence was mutated")
             if set(state.executions) - set(range(1, len(state.decision.legs) + 1)):
                 raise RuntimeError("route execution references a nonexistent leg")
+            if state.decision.decision_time_us > self.clock.current_time_us:
+                raise RuntimeError("route decision lies beyond coordinator time")
+            pending_for_route = {
+                item.leg_index: item
+                for item in self._pending
+                if item.route_id == route_id
+            }
+            if len(pending_for_route) != sum(
+                item.route_id == route_id for item in self._pending
+            ):
+                raise RuntimeError("route has duplicate pending leg indexes")
+            expected_legs = set(range(1, len(state.decision.legs) + 1))
+            if set(state.executions) | set(pending_for_route) != expected_legs:
+                raise RuntimeError("route lifecycle does not cover every planned leg")
+            if set(state.executions) & set(pending_for_route):
+                raise RuntimeError("route leg is both pending and executed")
+            for leg_index, pending in pending_for_route.items():
+                leg = state.decision.legs[leg_index - 1]
+                if (
+                    pending.order_id
+                    != f"{state.request.order_id}-{route_id}-L{leg_index}"
+                    or leg.venue_id not in self.venues
+                    or pending.due_time_us
+                    != state.decision.decision_time_us + pending.routing_latency_us
+                ):
+                    raise RuntimeError("pending route leg identity or causal time differs")
+            for leg_index, execution in state.executions.items():
+                leg = state.decision.legs[leg_index - 1]
+                if (
+                    execution.venue_id != leg.venue_id
+                    or execution.requested_quantity != leg.quantity
+                    or execution.arrival_time_us > self.clock.current_time_us
+                ):
+                    raise RuntimeError("route execution differs from its planned leg")
+        if any(item.route_id not in self._routes for item in self._pending):
+            raise RuntimeError("pending route leg references an orphan route")
+        public_feed = json.dumps(
+            self.consolidated_feed().as_dict(), sort_keys=True, separators=(",", ":")
+        ).lower()
+        if any(
+            field in public_feed
+            for field in (
+                "reserve_quantity",
+                "reserve_remaining",
+                "hidden_quantity",
+                "hidden_remaining",
+                "priority_sequence",
+                "ground_truth",
+            )
+        ):
+            raise RuntimeError("consolidated observable feed leaked venue truth")
 
     def _execute_pending_leg(self, pending: _PendingLeg) -> None:
         state = self._route_state(pending.route_id)
@@ -760,3 +1077,90 @@ def _response_dict(response: VenueResponse) -> dict[str, object]:
         "status": response.status.value,
         "venue_id": response.venue_id,
     }
+
+
+def _validate_cursor_projection(
+    value: object,
+    expected: Mapping[str, int],
+    label: str,
+) -> None:
+    payload = _checkpoint_object(value, label)
+    if set(payload) != set(expected):
+        raise ValueError(f"{label} venue inventory differs")
+    actual = {
+        venue_id: _checkpoint_int(payload[venue_id], f"{label} {venue_id}")
+        for venue_id in sorted(payload)
+    }
+    if actual != dict(sorted(expected.items())):
+        raise ValueError(f"{label} differ from venue event prefixes")
+
+
+def _validate_multivenue_checkpoint_json(value: object) -> None:
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        raise TypeError("binary floats are forbidden in multi-venue checkpoints")
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise TypeError("multi-venue checkpoint keys must be strings")
+        for item in value.values():
+            _validate_multivenue_checkpoint_json(item)
+        return
+    if type(value) in {list, tuple}:
+        for item in value:
+            _validate_multivenue_checkpoint_json(item)
+        return
+    raise TypeError(f"unsupported multi-venue checkpoint value: {type(value).__name__}")
+
+
+def _require_checkpoint_fields(
+    payload: Mapping[str, object], expected: set[str], label: str
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _checkpoint_object(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be an object")
+    return value
+
+
+def _checkpoint_object_array(
+    value: object, label: str
+) -> tuple[dict[str, object], ...]:
+    if type(value) is not list or any(type(row) is not dict for row in value):
+        raise TypeError(f"{label} must be an object array")
+    return tuple(value)
+
+
+def _checkpoint_string_array(value: object, label: str) -> tuple[str, ...]:
+    if type(value) is not list or any(type(item) is not str or not item for item in value):
+        raise TypeError(f"{label} must be a string array")
+    if value != sorted(set(value)):
+        raise ValueError(f"{label} must be sorted and unique")
+    return tuple(value)
+
+
+def _checkpoint_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def _checkpoint_signed_int(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an integer")
+    return value
+
+
+def _checkpoint_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} must be a nonempty string")
+    return value

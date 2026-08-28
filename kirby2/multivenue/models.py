@@ -400,6 +400,19 @@ class RouteLegPlan:
     observed_quote_age_us: int
     rationale: str
 
+    def __post_init__(self) -> None:
+        if not self.venue_id or not self.rationale:
+            raise ValueError("route leg identity and rationale are required")
+        if type(self.quantity) is not int or self.quantity <= 0:
+            raise ValueError("route leg quantity must be positive")
+        if self.reference_price_ticks is not None and (
+            type(self.reference_price_ticks) is not int
+            or self.reference_price_ticks <= 0
+        ):
+            raise ValueError("route leg reference price must be positive ticks")
+        if type(self.observed_quote_age_us) is not int or self.observed_quote_age_us < 0:
+            raise ValueError("route leg quote age must be nonnegative")
+
     def as_dict(self) -> dict[str, object]:
         return {
             "observed_quote_age_us": self.observed_quote_age_us,
@@ -408,6 +421,31 @@ class RouteLegPlan:
             "reference_price_ticks": self.reference_price_ticks,
             "venue_id": self.venue_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RouteLegPlan:
+        _require_model_fields(
+            payload,
+            {
+                "observed_quote_age_us",
+                "quantity",
+                "rationale",
+                "reference_price_ticks",
+                "venue_id",
+            },
+            "route leg plan",
+        )
+        return cls(
+            venue_id=_model_string(payload["venue_id"], "route leg venue ID"),
+            quantity=_model_int(payload["quantity"], "route leg quantity", minimum=1),
+            reference_price_ticks=_model_optional_int(
+                payload["reference_price_ticks"], "route leg reference price", minimum=1
+            ),
+            observed_quote_age_us=_model_int(
+                payload["observed_quote_age_us"], "route leg quote age"
+            ),
+            rationale=_model_string(payload["rationale"], "route leg rationale"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +459,16 @@ class RouteDecision:
     explanation: str
 
     def __post_init__(self) -> None:
+        if not self.route_id or type(self.decision_time_us) is not int or self.decision_time_us < 0:
+            raise ValueError("route decision identity or time is invalid")
+        if not isinstance(self.policy, RoutePolicy) or not self.explanation:
+            raise ValueError("route decision policy or explanation is invalid")
+        if type(self.observable_feed) is not dict:
+            raise TypeError("route decision observable feed must be an object")
+        if type(self.legs) is not tuple or any(
+            type(leg) is not RouteLegPlan for leg in self.legs
+        ):
+            raise TypeError("route decision legs must be canonical route plans")
         if canonical_sha256(self.observable_feed) != self.observable_feed_sha256:
             raise ValueError("route decision evidence digest is invalid")
 
@@ -434,6 +482,39 @@ class RouteDecision:
             "policy": self.policy.value,
             "route_id": self.route_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RouteDecision:
+        _require_model_fields(
+            payload,
+            {
+                "decision_time_us",
+                "explanation",
+                "legs",
+                "observable_feed",
+                "observable_feed_sha256",
+                "policy",
+                "route_id",
+            },
+            "route decision",
+        )
+        raw_feed = payload["observable_feed"]
+        raw_legs = payload["legs"]
+        if type(raw_feed) is not dict:
+            raise TypeError("route decision feed must be an object")
+        if type(raw_legs) is not list or any(type(row) is not dict for row in raw_legs):
+            raise TypeError("route decision legs must be an object array")
+        return cls(
+            route_id=_model_string(payload["route_id"], "route ID"),
+            decision_time_us=_model_int(payload["decision_time_us"], "decision time"),
+            policy=RoutePolicy(_model_string(payload["policy"], "route policy")),
+            observable_feed_sha256=_model_sha256(
+                payload["observable_feed_sha256"], "observable feed digest"
+            ),
+            observable_feed=dict(raw_feed),
+            legs=tuple(RouteLegPlan.from_dict(row) for row in raw_legs),
+            explanation=_model_string(payload["explanation"], "route explanation"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +530,30 @@ class RouteLegExecution:
     rejection_reason: str | None
     stale_quote_exposure: bool
 
+    def __post_init__(self) -> None:
+        if type(self.leg_index) is not int or self.leg_index <= 0:
+            raise ValueError("route execution leg index must be positive")
+        if not self.venue_id or not self.order_id:
+            raise ValueError("route execution venue and order IDs are required")
+        if any(
+            type(value) is not int or value < 0
+            for value in (
+                self.requested_quantity,
+                self.filled_quantity,
+                self.arrival_time_us,
+                self.routing_latency_us,
+            )
+        ) or self.requested_quantity <= 0 or self.filled_quantity > self.requested_quantity:
+            raise ValueError("route execution quantities or times are invalid")
+        if not isinstance(self.status, VenueOrderStatus):
+            raise TypeError("route execution status must use VenueOrderStatus")
+        if self.rejection_reason is not None and (
+            type(self.rejection_reason) is not str or not self.rejection_reason
+        ):
+            raise TypeError("route rejection reason must be null or nonempty")
+        if type(self.stale_quote_exposure) is not bool:
+            raise TypeError("route stale-quote exposure must be boolean")
+
     def as_dict(self) -> dict[str, object]:
         return {
             "arrival_time_us": self.arrival_time_us,
@@ -462,6 +567,47 @@ class RouteLegExecution:
             "status": self.status.value,
             "venue_id": self.venue_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RouteLegExecution:
+        _require_model_fields(
+            payload,
+            {
+                "arrival_time_us",
+                "filled_quantity",
+                "leg_index",
+                "order_id",
+                "rejection_reason",
+                "requested_quantity",
+                "routing_latency_us",
+                "stale_quote_exposure",
+                "status",
+                "venue_id",
+            },
+            "route leg execution",
+        )
+        rejection = payload["rejection_reason"]
+        stale = payload["stale_quote_exposure"]
+        if rejection is not None and (type(rejection) is not str or not rejection):
+            raise TypeError("route rejection reason must be null or nonempty")
+        if type(stale) is not bool:
+            raise TypeError("route stale-quote exposure must be boolean")
+        return cls(
+            leg_index=_model_int(payload["leg_index"], "route leg index", minimum=1),
+            venue_id=_model_string(payload["venue_id"], "route venue ID"),
+            order_id=_model_string(payload["order_id"], "route order ID"),
+            requested_quantity=_model_int(
+                payload["requested_quantity"], "route requested quantity", minimum=1
+            ),
+            filled_quantity=_model_int(payload["filled_quantity"], "route filled quantity"),
+            arrival_time_us=_model_int(payload["arrival_time_us"], "route arrival time"),
+            routing_latency_us=_model_int(
+                payload["routing_latency_us"], "route latency"
+            ),
+            status=VenueOrderStatus(_model_string(payload["status"], "route status")),
+            rejection_reason=rejection,
+            stale_quote_exposure=stale,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,6 +678,12 @@ class CoordinatorEvent:
     data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("coordinator event sequence must be positive")
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("coordinator event time must be nonnegative")
+        if not isinstance(self.event_type, CoordinatorEventType):
+            raise TypeError("coordinator event type must use CoordinatorEventType")
         frozen = freeze_json(self.data)
         if not isinstance(frozen, Mapping):
             raise TypeError("coordinator event data must be a JSON object")
@@ -545,7 +697,66 @@ class CoordinatorEvent:
             "simulation_time_us": self.simulation_time_us,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> CoordinatorEvent:
+        _require_model_fields(
+            payload,
+            {"data", "event_type", "sequence", "simulation_time_us"},
+            "coordinator event",
+        )
+        data = payload["data"]
+        if type(data) is not dict:
+            raise TypeError("coordinator event data must be an object")
+        return cls(
+            _model_int(payload["sequence"], "coordinator event sequence", minimum=1),
+            _model_int(payload["simulation_time_us"], "coordinator event time"),
+            CoordinatorEventType(
+                _model_string(payload["event_type"], "coordinator event type")
+            ),
+            data,
+        )
+
 
 def canonical_sha256(payload: object) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_model_fields(
+    payload: Mapping[str, object], expected: set[str], label: str
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _model_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def _model_optional_int(
+    value: object, label: str, *, minimum: int = 0
+) -> int | None:
+    if value is None:
+        return None
+    return _model_int(value, label, minimum=minimum)
+
+
+def _model_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} must be a nonempty string")
+    return value
+
+
+def _model_sha256(value: object, label: str) -> str:
+    digest = _model_string(value, label)
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{label} must be lowercase SHA-256")
+    return digest

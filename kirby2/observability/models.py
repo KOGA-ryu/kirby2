@@ -266,6 +266,19 @@ class ObservablePriceLevel:
             "total_quantity": self.total_quantity,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ObservablePriceLevel:
+        _require_exact_fields(
+            payload,
+            {"price_ticks", "side", "total_quantity"},
+            "observable price level",
+        )
+        return cls(
+            _required_int(payload, "price_ticks"),
+            Side(_required_string(payload, "side")),
+            _required_int(payload, "total_quantity"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ObservableDepthBook:
@@ -321,6 +334,16 @@ class ObservableDepthBook:
             "bids": [level.as_dict() for level in self.bid_levels],
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ObservableDepthBook:
+        _require_exact_fields(payload, {"asks", "bids"}, "observable depth book")
+        bids = _object_array(payload["bids"], "observable bids")
+        asks = _object_array(payload["asks"], "observable asks")
+        return cls(
+            tuple(ObservablePriceLevel.from_dict(row) for row in bids),
+            tuple(ObservablePriceLevel.from_dict(row) for row in asks),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PublicTrade:
@@ -357,6 +380,31 @@ class PublicTrade:
             "simulation_time_us": self.simulation_time_us,
             "trade_id": self.trade_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PublicTrade:
+        _require_exact_fields(
+            payload,
+            {
+                "aggressor_side",
+                "price_ticks",
+                "price_x2",
+                "quantity",
+                "simulation_time_us",
+                "trade_id",
+            },
+            "public trade",
+        )
+        trade = cls(
+            _required_string(payload, "trade_id"),
+            _required_int(payload, "simulation_time_us"),
+            _required_int(payload, "price_x2"),
+            _required_int(payload, "quantity"),
+            Side(_required_string(payload, "aggressor_side")),
+        )
+        if payload["price_ticks"] != str(trade.price_ticks):
+            raise ValueError("public trade price representations differ")
+        return trade
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +453,38 @@ class OwnOrderState:
             "status": self.status,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> OwnOrderState:
+        _require_exact_fields(
+            payload,
+            {
+                "acknowledged",
+                "displayed_quantity",
+                "filled_quantity",
+                "order_id",
+                "original_quantity",
+                "price_ticks",
+                "remaining_quantity",
+                "side",
+                "status",
+            },
+            "own order state",
+        )
+        acknowledged = payload["acknowledged"]
+        if type(acknowledged) is not bool:
+            raise TypeError("own order acknowledgement must be boolean")
+        return cls(
+            order_id=_required_string(payload, "order_id"),
+            side=Side(_required_string(payload, "side")),
+            price_ticks=_optional_int(payload["price_ticks"]),
+            acknowledged=acknowledged,
+            status=_required_string(payload, "status"),
+            original_quantity=_required_int(payload, "original_quantity"),
+            filled_quantity=_required_int(payload, "filled_quantity"),
+            remaining_quantity=_required_int(payload, "remaining_quantity"),
+            displayed_quantity=_required_int(payload, "displayed_quantity"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ObservablePlayerPosition:
@@ -428,6 +508,19 @@ class ObservablePlayerPosition:
             "position": self.position,
             "sold_quantity": self.sold_quantity,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ObservablePlayerPosition:
+        _require_exact_fields(
+            payload,
+            {"bought_quantity", "position", "sold_quantity"},
+            "observable player position",
+        )
+        return cls(
+            _required_int(payload, "position"),
+            _required_int(payload, "bought_quantity"),
+            _required_int(payload, "sold_quantity"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +604,30 @@ class ObservableEvent:
             "source_time_us": self.source_time_us,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ObservableEvent:
+        _require_exact_fields(
+            payload,
+            {
+                "data",
+                "event_type",
+                "received_time_us",
+                "sequence",
+                "source_time_us",
+            },
+            "observable event",
+        )
+        data = payload["data"]
+        if type(data) is not dict:
+            raise TypeError("observable event data must be an object")
+        return cls(
+            _required_int(payload, "sequence"),
+            _required_int(payload, "source_time_us"),
+            _required_int(payload, "received_time_us"),
+            ObservableEventType(_required_string(payload, "event_type")),
+            data,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ObservableMarketFeed:
@@ -580,6 +697,23 @@ class TruthEvent:
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> TruthEvent:
+        _require_exact_fields(
+            payload,
+            {"data", "event_type", "sequence", "simulation_time_us"},
+            "truth event",
+        )
+        data = payload["data"]
+        if type(data) is not dict:
+            raise TypeError("truth event data must be an object")
+        return cls(
+            _required_int(payload, "sequence"),
+            _required_int(payload, "simulation_time_us"),
+            TruthEventType(_required_string(payload, "event_type")),
+            data,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,3 +878,32 @@ def _optional_int(value: object) -> int | None:
     if type(value) is not int:
         raise TypeError("optional integer field is invalid")
     return value
+
+
+def _required_string(payload: Mapping[str, object], key: str) -> str:
+    value = payload[key]
+    if type(value) is not str or not value:
+        raise TypeError(f"{key} must be a nonempty string")
+    return value
+
+
+def _require_exact_fields(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: "
+            f"missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _object_array(value: object, label: str) -> tuple[dict[str, object], ...]:
+    if type(value) is not list or any(type(row) is not dict for row in value):
+        raise TypeError(f"{label} must be an object array")
+    return tuple(value)

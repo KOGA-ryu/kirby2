@@ -20,6 +20,7 @@ INITIAL_PROFILE_ID = "SINGLE_VENUE_AGENT_MECHANICS_V1"
 FLOW_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_V1"
 DELIVERY_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_V1"
 RESEARCH_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1"
+MULTIVENUE_HIDDEN_PROFILE_ID = "MULTIVENUE_HIDDEN_RESEARCH_V1"
 INITIAL_MATRIX_ID = "COMPOSITION_MATRIX_V1"
 
 FULL_DAY_RUNTIME_COMPONENT = "FULL_DAY_RUNTIME_V1"
@@ -30,6 +31,7 @@ FLOW_HAWKES_COMPONENT = "FLOW_HAWKES_V1"
 FLOW_QUEUE_REACTIVE_COMPONENT = "FLOW_QUEUE_REACTIVE_V1"
 DELIVERY_ASYNC_COMPONENT = "DELIVERY_ASYNC_V1"
 FEATURE_STRATEGY_PLAYER_COMPONENT = "FEATURE_STRATEGY_PLAYER_V1"
+MULTIVENUE_HIDDEN_COMPONENT = "VENUE_MULTIVENUE_HIDDEN_V1"
 
 FLOW_COMPONENT_IDS = (
     FLOW_HAWKES_COMPONENT,
@@ -1467,6 +1469,76 @@ def executable_research_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def restorable_multivenue_hidden_composition_matrix() -> CompositionMatrixV1:
+    """Append WO31-E5 without claiming a second executable exchange profile.
+
+    The fragmented-market owner can restore independently, so its component status
+    is exact ``RESTORABLE_COMPONENT_ONLY``.  The named research composition remains
+    ``CONTRACT_ONLY`` because the owner replaces, rather than wraps, the E4
+    single-engine owner graph.
+    """
+
+    previous = executable_research_composition_matrix()
+    multivenue = ComponentSpecV1(
+        schema_version=1,
+        component_id=MULTIVENUE_HIDDEN_COMPONENT,
+        component_version=1,
+        implementation_status="RESTORABLE_COMPONENT_ONLY",
+        active_predicate="ALWAYS",
+        dependencies=(),
+        owned_resources=tuple(
+            sorted(
+                {
+                    "CONSOLIDATED_OBSERVABLE_FEED",
+                    "HIDDEN_LIQUIDITY_TRUTH",
+                    "MARKET_MECHANICS_ENGINE",
+                    "MULTIVENUE_COORDINATOR",
+                    "MULTIVENUE_ROUTE_STATE",
+                    "ORDER_BOOK",
+                    "SIMULATION_CLOCK",
+                    "VENUE_LATENCY_RNG_SUBSTREAMS",
+                }
+            )
+        ),
+        borrowed_resources=(),
+        rng_label_prefixes=("full_day/multivenue",),
+        checkpoint_state_ids=tuple(
+            sorted({"HIDDEN_LIQUIDITY_V1", "MULTIVENUE_V1"})
+        ),
+    )
+    profile = CompositionProfileV1(
+        schema_version=1,
+        profile_id=MULTIVENUE_HIDDEN_PROFILE_ID,
+        profile_version=1,
+        implementation_status="CONTRACT_ONLY",
+        runtime_owner_component_id=MULTIVENUE_HIDDEN_COMPONENT,
+        components=(multivenue,),
+        refused_component_ids=tuple(
+            sorted(
+                {
+                    "ALGORITHMS",
+                    "ENGINE_MARKET_MECHANICS_V1",
+                    "FEATURES",
+                    "FULL_DAY_RUNTIME_V1",
+                    "HISTORICAL_REPLAY",
+                    "PLAYER_OVERLAY",
+                    "STRATEGIES",
+                }
+            )
+        ),
+        exactly_one_component_groups=(),
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1489,6 +1561,8 @@ __all__ = [
     "INITIAL_MATRIX_ID",
     "INITIAL_PROFILE_ID",
     "MECHANICS_COMPONENT",
+    "MULTIVENUE_HIDDEN_COMPONENT",
+    "MULTIVENUE_HIDDEN_PROFILE_ID",
     "RESEARCH_PROFILE_ID",
     "agent_scheduler_is_active",
     "component_configured_predicate",
@@ -1499,4 +1573,5 @@ __all__ = [
     "executable_research_composition_matrix",
     "executable_simple_flow_composition_matrix",
     "initial_composition_matrix",
+    "restorable_multivenue_hidden_composition_matrix",
 ]

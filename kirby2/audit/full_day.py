@@ -14306,6 +14306,435 @@ def audit_wo31e4_research_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e5_owner(boundary: str):
+    from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+    from kirby2.latency import LatencyProfileName, get_latency_profile
+    from kirby2.multivenue import MarketCoordinator, RoutePolicy, RoutingRequest, VenueConfig
+    from kirby2.observability import (
+        HiddenLiquidityRules,
+        HiddenOrderRequest,
+        IcebergDefinition,
+        IcebergRefreshBehavior,
+        LiquidityKind,
+        RefreshEventVisibility,
+    )
+
+    rules = HiddenLiquidityRules(feed_delay_us=500)
+    coordinator = MarketCoordinator(
+        (
+            VenueConfig(
+                "A",
+                get_latency_profile(LatencyProfileName.LOW_LATENCY),
+                hidden_rules=rules,
+            ),
+            VenueConfig(
+                "B",
+                get_latency_profile(LatencyProfileName.NORMAL),
+                hidden_rules=rules,
+            ),
+        ),
+        seed=31_005,
+        depth_subscriptions=frozenset({"A", "B"}),
+    )
+    coordinator.add_resting_order(
+        "A",
+        HiddenOrderRequest(
+            "E5-A-BID",
+            Side.BUY,
+            LiquidityKind.DISPLAYED_LIMIT,
+            OrderOwner.SIMULATED,
+            "E5-SIM",
+            200,
+            99,
+        ),
+    )
+    coordinator.add_resting_order(
+        "A",
+        HiddenOrderRequest(
+            "E5-A-ICE",
+            Side.SELL,
+            LiquidityKind.ICEBERG,
+            OrderOwner.SIMULATED,
+            "E5-SIM",
+            200,
+            101,
+            IcebergDefinition(
+                50,
+                150,
+                50,
+                IcebergRefreshBehavior.AUTOMATIC,
+                RefreshEventVisibility.QUOTE_UPDATE_ONLY,
+            ),
+        ),
+    )
+    coordinator.add_resting_order(
+        "B",
+        HiddenOrderRequest(
+            "E5-B-BID",
+            Side.BUY,
+            LiquidityKind.DISPLAYED_LIMIT,
+            OrderOwner.SIMULATED,
+            "E5-SIM",
+            200,
+            98,
+        ),
+    )
+    coordinator.add_resting_order(
+        "B",
+        HiddenOrderRequest(
+            "E5-B-ASK",
+            Side.SELL,
+            LiquidityKind.DISPLAYED_LIMIT,
+            OrderOwner.SIMULATED,
+            "E5-SIM",
+            200,
+            102,
+        ),
+    )
+    coordinator.advance_to(1_000)
+    if boundary == "pending_route":
+        coordinator.submit_route(
+            RoutingRequest(
+                "E5-PREFIX-ROUTE",
+                Side.BUY,
+                120,
+                RoutePolicy.SWEEP,
+                max_venues=2,
+            )
+        )
+        coordinator.execute_simulated_market(
+            "A",
+            "E5-PREFIX-STALE-HIT",
+            Side.BUY,
+            10,
+        )
+    elif boundary in {"pending_feed", "reserve"}:
+        coordinator.execute_simulated_market(
+            "A",
+            "E5-PREFIX-HIT",
+            Side.BUY,
+            60,
+        )
+        if boundary == "reserve":
+            coordinator.advance_to(1_500)
+    else:
+        raise ValueError(f"unknown WO31-E5 boundary: {boundary}")
+    return MultiVenueHiddenOwnerV1(coordinator)
+
+
+def _wo31e5_suffix(boundary: str):
+    from kirby2.multivenue import MultiVenueCommand, RoutePolicy, RoutingRequest
+
+    if boundary == "pending_route":
+        first = MultiVenueCommand(1, 5_000, "ADVANCE", {})
+    elif boundary == "pending_feed":
+        first = MultiVenueCommand(1, 1_500, "ADVANCE", {})
+    elif boundary == "reserve":
+        first = MultiVenueCommand(
+            1,
+            2_000,
+            "SIM_MARKET",
+            {
+                "order_id": "E5-SUFFIX-HIT",
+                "quantity": 80,
+                "side": Side.BUY.value,
+                "venue_id": "A",
+            },
+        )
+    else:
+        raise ValueError(f"unknown WO31-E5 boundary: {boundary}")
+    route_time = 6_000 if boundary == "pending_route" else 3_000
+    route = MultiVenueCommand(
+        2,
+        route_time,
+        "ROUTE",
+        {
+            "request": RoutingRequest(
+                f"E5-{boundary.upper()}-SUFFIX-ROUTE",
+                Side.BUY,
+                20,
+                RoutePolicy.BEST_DISPLAYED_PRICE,
+            ).as_dict()
+        },
+    )
+    complete = MultiVenueCommand(3, 8_000, "COMPLETE", {})
+    return (first, route, complete), 100_000
+
+
+def _wo31e5_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.composition import (
+        FULL_DAY_RUNTIME_COMPONENT,
+        MULTIVENUE_HIDDEN_COMPONENT,
+        MULTIVENUE_HIDDEN_PROFILE_ID,
+        ComponentSpecV1,
+        CompositionProfileV1,
+        executable_research_composition_matrix,
+        restorable_multivenue_hidden_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_research_composition_matrix()
+    matrix = restorable_multivenue_hidden_composition_matrix()
+    profile = matrix.profile(MULTIVENUE_HIDDEN_PROFILE_ID, 1)
+    component = next(
+        row for row in profile.components if row.component_id == MULTIVENUE_HIDDEN_COMPONENT
+    )
+    if matrix.previous_matrix_sha256 != previous.sha256:
+        failures.append("E5 composition matrix does not bind the exact E4 matrix")
+    if matrix.profiles[:-1] != previous.profiles:
+        failures.append("E5 composition matrix rewrote a prior profile")
+    if profile.implementation_status != "CONTRACT_ONLY":
+        failures.append("mixed multivenue research profile overclaims executable status")
+    if component.implementation_status != "RESTORABLE_COMPONENT_ONLY":
+        failures.append("multivenue owner lacks exact component-only restore status")
+    if set(component.checkpoint_state_ids) != {"HIDDEN_LIQUIDITY_V1", "MULTIVENUE_V1"}:
+        failures.append("multivenue checkpoint ownership inventory is incomplete")
+    if "HISTORICAL_REPLAY" not in profile.refused_component_ids:
+        failures.append("multivenue profile does not refuse historical mixing")
+
+    e4 = previous.profile("SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1", 1)
+    duplicate_owner_refused = False
+    try:
+        CompositionProfileV1(
+            schema_version=1,
+            profile_id="HOSTILE_DOUBLE_EXCHANGE_OWNER_V1",
+            profile_version=1,
+            implementation_status="CONTRACT_ONLY",
+            runtime_owner_component_id=FULL_DAY_RUNTIME_COMPONENT,
+            components=tuple(sorted((*e4.components, component), key=lambda row: row.component_id)),
+            refused_component_ids=e4.refused_component_ids,
+            exactly_one_component_groups=e4.exactly_one_component_groups,
+        )
+    except (TypeError, ValueError):
+        duplicate_owner_refused = True
+    if not duplicate_owner_refused:
+        failures.append("composition accepted two exchange/book/clock owners")
+
+    return FullDayAuditCase(
+        "full_day_multivenue_component_composition",
+        (
+            f"matrix_version={matrix.matrix_version} profile={profile.profile_id} "
+            f"profile_status={profile.implementation_status} "
+            f"component_status={component.implementation_status} "
+            "prior_profiles_immutable=true double_owner_refused=true "
+            "historical_mixing_refused=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e5_checkpoint_case() -> FullDayAuditCase:
+    from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+
+    failures: list[str] = []
+    owner = _wo31e5_owner("reserve")
+    state = owner.checkpoint_state()
+    restored = MultiVenueHiddenOwnerV1.from_canonical_state_bytes(
+        owner.canonical_state_bytes()
+    )
+    if restored.checkpoint_state() != state:
+        failures.append("multivenue component checkpoint did not round trip exactly")
+    coordinator = state["coordinator"]
+    assert isinstance(coordinator, dict)
+    venue_a = coordinator["venues"]["A"]
+    engine = venue_a["engine"]
+    reserve = sum(row["reserve_remaining"] for row in engine["orders"])
+    if reserve <= 0:
+        failures.append("checkpoint fixture lacks live hidden reserve")
+    if not coordinator["observable_cursors"] or not coordinator["truth_cursors"]:
+        failures.append("checkpoint omitted observable or truth cursors")
+    public = restored.public_projection()
+    serialized = str(public).lower()
+    if any(token in serialized for token in ("reserve_remaining", "hidden_remaining")):
+        failures.append("public restored projection exposed hidden reserve")
+    return FullDayAuditCase(
+        "full_day_multivenue_checkpoint_privacy_and_conservation",
+        (
+            f"venue_count={len(restored.coordinator.venues)} reserve_quantity={reserve} "
+            f"state_sha256={restored.state_sha256()} cursors_preserved=true "
+            "public_reserve_absent=true conservation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e5_run_worker(raw: bytes):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    prior_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(repository)
+        if not prior_path
+        else str(repository) + os.pathsep + prior_path
+    )
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    script = (
+        "from kirby2.full_day.restore import "
+        "multivenue_hidden_restore_worker_main as main; "
+        "raise SystemExit(main())"
+    )
+    with TemporaryDirectory(prefix="kirby2-wo31e5-worker-") as temporary:
+        directory = Path(temporary)
+        before = tuple(directory.rglob("*"))
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            input=raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=directory,
+            env=environment,
+            check=False,
+            timeout=30,
+        )
+        after = tuple(directory.rglob("*"))
+    return completed.returncode, completed.stdout, completed.stderr, before != after
+
+
+def _wo31e5_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes, parse_canonical_json_object
+    from kirby2.full_day.restore import (
+        MultiVenueHiddenRestoreRequestV1,
+        execute_uninterrupted_multivenue_hidden_suffix,
+    )
+
+    failures: list[str] = []
+    digests: list[str] = []
+    for boundary in ("pending_route", "pending_feed", "reserve"):
+        owner = _wo31e5_owner(boundary)
+        commands, completed_time_us = _wo31e5_suffix(boundary)
+        request = MultiVenueHiddenRestoreRequestV1.capture(
+            owner,
+            suffix_commands=commands,
+            completed_time_us=completed_time_us,
+        )
+        returncode, stdout, stderr, wrote_files = _wo31e5_run_worker(
+            request.canonical_bytes()
+        )
+        expected = execute_uninterrupted_multivenue_hidden_suffix(owner, request)
+        if returncode != 0:
+            failures.append(
+                f"{boundary} fresh worker returned {returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            continue
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"{boundary} fresh worker emitted invalid JSON: {error}")
+            continue
+        if stderr or wrote_files:
+            failures.append(f"{boundary} fresh worker produced side effects")
+        if canonical_json_bytes(actual) != stdout or actual != expected:
+            failures.append(f"{boundary} fresh suffix differs from uninterrupted suffix")
+        public = actual["final"]["public_projection"]
+        if any(
+            token in str(public).lower()
+            for token in ("reserve_remaining", "hidden_remaining", "priority_sequence")
+        ):
+            failures.append(f"{boundary} fresh result leaked hidden venue truth")
+        digests.append(str(actual["invariant_sha256"]))
+    return FullDayAuditCase(
+        "full_day_multivenue_fresh_process_restore",
+        (
+            f"fresh_process_boundaries={len(digests)} "
+            f"invariant_sha256={','.join(digests)} "
+            "pending_route=true pending_feed=true reserve_state=true "
+            "prefix_replay=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e5_hostile_case() -> FullDayAuditCase:
+    from kirby2.full_day.components_multivenue import MultiVenueHiddenOwnerV1
+
+    owner = _wo31e5_owner("pending_route")
+    state = owner.checkpoint_state()
+    before = owner.canonical_state_bytes()
+    probes: list[tuple[str, dict[str, object]]] = []
+
+    unknown_component = copy.deepcopy(state)
+    unknown_component["schema_version"] = 999
+    probes.append(("unknown component schema", unknown_component))
+
+    unknown_coordinator = copy.deepcopy(state)
+    unknown_coordinator["coordinator"]["schema_version"] = 999
+    probes.append(("unknown coordinator schema", unknown_coordinator))
+
+    unknown_venue = copy.deepcopy(state)
+    unknown_venue["coordinator"]["venues"]["A"]["schema_version"] = 999
+    probes.append(("unknown venue schema", unknown_venue))
+
+    orphan_route = copy.deepcopy(state)
+    orphan_route["coordinator"]["pending_route_legs"][0]["route_id"] = "R999999"
+    probes.append(("orphan route", orphan_route))
+
+    early_delivery = copy.deepcopy(state)
+    current_time = early_delivery["coordinator"]["clock"]["current_time_us"]
+    early_delivery["coordinator"]["pending_route_legs"][0]["due_time_us"] = current_time - 1
+    probes.append(("early route delivery", early_delivery))
+
+    reserve_leak = copy.deepcopy(state)
+    pending = reserve_leak["coordinator"]["venues"]["A"]["engine"]["pending_observable"]
+    pending[0]["data"]["reserve_remaining"] = 1
+    probes.append(("reserve leakage", reserve_leak))
+
+    nonconserving = copy.deepcopy(state)
+    orders = nonconserving["coordinator"]["venues"]["A"]["engine"]["orders"]
+    iceberg = next(row for row in orders if row["request"]["kind"] == "ICEBERG")
+    iceberg["reserve_remaining"] += 1
+    probes.append(("hidden quantity conservation", nonconserving))
+
+    unknown_venue_id = copy.deepcopy(state)
+    venue_state = unknown_venue_id["coordinator"]["venues"].pop("A")
+    unknown_venue_id["coordinator"]["venues"]["UNKNOWN"] = venue_state
+    probes.append(("unknown venue identity", unknown_venue_id))
+
+    historical_mix = copy.deepcopy(state)
+    historical_mix["historical_cursor"] = {"row": 1}
+    probes.append(("historical state mixing", historical_mix))
+
+    failures: list[str] = []
+    refused = 0
+    for label, hostile in probes:
+        refusal = _expect_refusal(
+            lambda hostile=hostile: MultiVenueHiddenOwnerV1.from_checkpoint_state(hostile),
+            label,
+        )
+        if refusal is None:
+            refused += 1
+        else:
+            failures.append(refusal)
+    if owner.canonical_state_bytes() != before:
+        failures.append("hostile restore probes mutated the authoritative owner")
+    return FullDayAuditCase(
+        "full_day_multivenue_hostile_refusals",
+        (
+            f"refusals={refused} unknown_schema=true unknown_venue=true "
+            "orphan_route=true early_delivery=true reserve_leak=true "
+            "conservation=true historical_mixing=true failure_atomicity=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e5_multivenue_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise standalone fragmented-market restoration and refusal boundaries."""
+
+    return (
+        _wo31e5_composition_case(),
+        _wo31e5_checkpoint_case(),
+        _wo31e5_fresh_restore_case(),
+        _wo31e5_hostile_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -14321,4 +14750,5 @@ __all__ = [
     "audit_wo31e2_flow_restore",
     "audit_wo31e3_delivery_restore",
     "audit_wo31e4_research_restore",
+    "audit_wo31e5_multivenue_restore",
 ]
