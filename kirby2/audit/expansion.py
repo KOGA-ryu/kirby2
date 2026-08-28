@@ -102,6 +102,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0002",
     "DEV-0003",
     "WO31-B",
+    "WO31-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1342,6 +1343,55 @@ def _audit_wo31b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31c() -> ExpansionGateReport:
+    """Run the required portable-checkpoint and governed-data-path audit."""
+
+    from kirby2.audit.full_day import audit_wo31c_checkpoints
+    from kirby2.full_day.checkpoints import RUNTIME_CHECKPOINT_FORMAT_ID
+
+    cases = audit_wo31c_checkpoints()
+    checks: list[ExpansionGateCheck] = []
+    failures: list[str] = []
+    if not cases:
+        failures.append("WO31-C audit must return at least one required case")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-C cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-C cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO31-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("checkpoint_case_count", str(len(cases))),
+            ("checkpoint_format", RUNTIME_CHECKPOINT_FORMAT_ID),
+            ("checkpoint_runtime", "EXECUTED"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1423,6 +1473,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0002", _audit_dev0002),
     ("DEV-0003", _audit_dev0003),
     ("WO31-B", _audit_wo31b),
+    ("WO31-C", _audit_wo31c),
 )
 
 

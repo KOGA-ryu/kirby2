@@ -9,6 +9,7 @@ from enum import Enum
 from kirby2.exchange import OrderType
 from kirby2.immutable import freeze_json, thaw_json
 from kirby2.multivenue.models import canonical_sha256
+from kirby2.runtime_state import RuntimeComponentStatusV1 as ComponentStatus
 from kirby2.session.bindings import SessionCommand
 
 
@@ -33,11 +34,6 @@ class CounterfactualMode(str, Enum):
         if normalized in aliases:
             return aliases[normalized]
         return cls(normalized.upper())
-
-
-class ComponentStatus(str, Enum):
-    PRESERVED = "PRESERVED"
-    ABSENT = "ABSENT"
 
 
 @dataclass(frozen=True, slots=True)

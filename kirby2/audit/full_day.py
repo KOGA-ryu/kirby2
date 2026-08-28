@@ -7097,10 +7097,2404 @@ def _limit(
     )
 
 
+def _wo31c_data_paths_case() -> FullDayAuditCase:
+    """Prove data-root discovery is non-writing and every area stays contained."""
+
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from kirby2.research.paths import (
+        DataAreaId,
+        DataPaths,
+        _open_or_create_directory_at,
+        _safe_directory_open_flags,
+    )
+
+    failures: list[str] = []
+    hostile_refusals = 0
+    with TemporaryDirectory(prefix="kirby2-wo31c-paths-") as temporary:
+        sandbox = Path(temporary).resolve()
+
+        untouched_root = (sandbox / "untouched").resolve()
+        untouched = DataPaths(untouched_root)
+        untouched.validate()
+        if untouched_root.exists():
+            failures.append("DataPaths construction or validation created its root")
+        if untouched.ensure(()) != () or untouched_root.exists():
+            failures.append("empty DataPaths.ensure request wrote filesystem state")
+
+        requested = untouched.ensure((DataAreaId.CACHE, DataAreaId.CHECKPOINTS))
+        expected_requested = (untouched.checkpoints, untouched.cache)
+        if requested != expected_requested:
+            failures.append("selective DataPaths.ensure order is not declaration-stable")
+        actual_children = tuple(sorted(path.name for path in untouched_root.iterdir()))
+        if actual_children != ("cache", "checkpoints"):
+            failures.append(
+                "selective DataPaths.ensure created an unrequested governed area"
+            )
+        if any(
+            untouched.area(area_id).exists()
+            for area_id in DataAreaId
+            if area_id not in {DataAreaId.CACHE, DataAreaId.CHECKPOINTS}
+        ):
+            failures.append("an unrequested DataPaths area exists after selective ensure")
+
+        hostile_constructors: tuple[tuple[str, Callable[[], object]], ...] = (
+            (
+                "relative data root",
+                lambda: DataPaths("relative/kirby2"),
+            ),
+            (
+                "unresolved data root",
+                lambda: DataPaths(sandbox / "missing" / ".." / "unresolved"),
+            ),
+            (
+                "absolute area child",
+                lambda: DataPaths(
+                    (sandbox / "absolute-child-root").resolve(),
+                    area_children={
+                        DataAreaId.CHECKPOINTS: str(
+                            (sandbox / "absolute-child").resolve()
+                        )
+                    },
+                ),
+            ),
+            (
+                "parent traversal area child",
+                lambda: DataPaths(
+                    (sandbox / "traversal-root").resolve(),
+                    area_children={DataAreaId.CHECKPOINTS: "../outside"},
+                ),
+            ),
+            (
+                "exact area alias",
+                lambda: DataPaths(
+                    (sandbox / "exact-alias-root").resolve(),
+                    area_children={DataAreaId.EVIDENCE: "runs"},
+                ),
+            ),
+            (
+                "area containment alias",
+                lambda: DataPaths(
+                    (sandbox / "containment-root").resolve(),
+                    area_children={DataAreaId.EVIDENCE: "runs/child"},
+                ),
+            ),
+            (
+                "case-folded area alias",
+                lambda: DataPaths(
+                    (sandbox / "case-alias-root").resolve(),
+                    area_children={
+                        DataAreaId.RUNS: "CaseSensitive",
+                        DataAreaId.EVIDENCE: "casesensitive",
+                    },
+                ),
+            ),
+            (
+                "Unicode-normalized area alias",
+                lambda: DataPaths(
+                    (sandbox / "unicode-alias-root").resolve(),
+                    area_children={
+                        DataAreaId.RUNS: "\u00e9vidence",
+                        DataAreaId.EVIDENCE: "e\u0301vidence",
+                    },
+                ),
+            ),
+            (
+                "duplicate selective ensure ID",
+                lambda: untouched.ensure(
+                    (DataAreaId.CACHE, DataAreaId.CACHE)
+                ),
+            ),
+        )
+        for label, operation in hostile_constructors:
+            refusal = _expect_refusal(operation, label)
+            if refusal:
+                failures.append(refusal)
+            else:
+                hostile_refusals += 1
+
+        file_root = (sandbox / "file-root").resolve()
+        file_root.mkdir()
+        (file_root / "checkpoints").write_bytes(b"not-a-directory")
+        refusal = _expect_refusal(
+            lambda: DataPaths(file_root),
+            "file occupying a governed directory",
+        )
+        if refusal:
+            failures.append(refusal)
+        else:
+            hostile_refusals += 1
+
+        rebound_root = (sandbox / "rebound-root").resolve()
+        rebound = DataPaths(rebound_root)
+        rebound_root.mkdir()
+        rebound_target = (sandbox / "rebound-target").resolve()
+        rebound_target.mkdir()
+        os.symlink(rebound_target, rebound_root / "checkpoints")
+        refusal = _expect_refusal(
+            lambda: rebound.validate((DataAreaId.CHECKPOINTS,)),
+            "post-construction symlink rebind",
+        )
+        if refusal:
+            failures.append(refusal)
+        else:
+            hostile_refusals += 1
+
+        # Reproduce the write-boundary interleaving directly: pin the governed
+        # root, move its pathname aside, and replace that pathname with a symlink
+        # before the selected child is created.  The fd-relative primitive must
+        # create beneath the pinned original directory, never beneath the external
+        # target, and the subsequent pathname validation must refuse the rebind.
+        pinned_root = (sandbox / "pinned-root").resolve()
+        pinned_parked = (sandbox / "pinned-root-parked").resolve()
+        pinned_external = (sandbox / "pinned-root-external").resolve()
+        pinned_paths = DataPaths(pinned_root)
+        pinned_root.mkdir()
+        pinned_external.mkdir()
+        open_flags = _safe_directory_open_flags()
+        pinned_fd = os.open(pinned_root, open_flags)
+        child_fd: int | None = None
+        try:
+            pinned_root.rename(pinned_parked)
+            os.symlink(pinned_external, pinned_root)
+            child_fd = _open_or_create_directory_at(
+                pinned_fd,
+                DataAreaId.RUNS.value,
+                open_flags=open_flags,
+                display_path=pinned_root / DataAreaId.RUNS.value,
+            )
+        finally:
+            if child_fd is not None:
+                os.close(child_fd)
+            os.close(pinned_fd)
+        if (pinned_external / DataAreaId.RUNS.value).exists():
+            failures.append("fd-relative ensure primitive wrote through rebound root")
+        if not (pinned_parked / DataAreaId.RUNS.value).is_dir():
+            failures.append("fd-relative ensure primitive lost its pinned root")
+        refusal = _expect_refusal(
+            lambda: pinned_paths.validate((DataAreaId.RUNS,)),
+            "descriptor-pinned root pathname rebind",
+        )
+        if refusal:
+            failures.append(refusal)
+        else:
+            hostile_refusals += 1
+
+        portable_root = (sandbox / "portable-sibling-root").resolve()
+        portable_root.mkdir()
+        (portable_root / "CHECKPOINTS").mkdir()
+        refusal = _expect_refusal(
+            lambda: DataPaths(portable_root),
+            "existing case-colliding governed sibling",
+        )
+        if refusal:
+            failures.append(refusal)
+        else:
+            hostile_refusals += 1
+
+    return FullDayAuditCase(
+        "portable_data_paths_governance",
+        (
+            f"area_count={len(DataAreaId)} construction_writes=0 "
+            "selective_ensure=('checkpoints','cache') "
+            f"hostile_refusals={hostile_refusals}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31c_genesis_checkpoint_prefix(plan=None):
+    """Return a validated t=0 boundary/anchor/checkpoint outer-event prefix."""
+
+    from kirby2.full_day.checkpoint_contract import QuiescentCutV1
+    from kirby2.full_day.events import (
+        FullDayEventPayloadV1,
+        FullDayEventTypeV1,
+        FullDayEventV1,
+        ScheduledWorkKeyV1,
+        WorkStageV1,
+        canonical_event_prefix_sha256,
+        validate_full_day_event_stream,
+    )
+    from kirby2.full_day.transitions import HierarchicalStateRuntimeV1
+
+    if plan is None:
+        plan = _sample_plan()
+    runtime_id = "FULL_DAY_RUNTIME_V1"
+
+    def work(stage: WorkStageV1, local_sequence: int) -> ScheduledWorkKeyV1:
+        return ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=stage,
+            source_component_id=runtime_id,
+            component_local_sequence=local_sequence,
+        )
+
+    def event(
+        event_type: FullDayEventTypeV1,
+        item: ScheduledWorkKeyV1,
+        sequence: int,
+        data: dict[str, object],
+    ) -> FullDayEventV1:
+        return FullDayEventV1(
+            schema_version=1,
+            global_event_sequence=sequence,
+            simulation_time_us=0,
+            microstep=0,
+            stage=item.stage_ordinal,
+            source_component_id=runtime_id,
+            component_local_sequence=item.component_local_sequence,
+            event_type=event_type,
+            causal_parent_ids=(item.work_id,),
+            payload=FullDayEventPayloadV1(
+                schema_version=1,
+                payload_type=event_type.value,
+                payload_version=1,
+                native_event=None,
+                data=data,
+            ),
+        )
+
+    runtime = HierarchicalStateRuntimeV1.create(plan)
+    boundary_work = work(
+        WorkStageV1.ATOMIC_CALENDAR_BOUNDARY,
+        runtime.reserve_component_local_sequence(),
+    )
+    anchor_emissions = runtime.advance_to(0)
+    if len(anchor_emissions) != 1:
+        raise RuntimeError("genesis fixture requires exactly one runtime anchor")
+    anchor_emission = anchor_emissions[0]
+    if anchor_emission.event_type is not FullDayEventTypeV1.DAY_STATE_ANCHOR_RESET:
+        raise RuntimeError("genesis runtime emitted the wrong state event")
+    anchor_work = anchor_emission.scheduled_work_key
+    checkpoint_work = work(
+        WorkStageV1.CHECKPOINT_CAPTURE,
+        runtime.reserve_component_local_sequence(),
+    )
+    pending_local_sequence = runtime.reserve_component_local_sequence()
+    runtime_snapshot = runtime.state()
+    operation = plan.calendar.boundary_operations[0]
+    pending_state_times = tuple(
+        max(
+            level.deadline_time_us,
+            (
+                level.deadline_time_us
+                if level.next_eligible_transition_time_us is None
+                else level.next_eligible_transition_time_us
+            ),
+        )
+        for level in (runtime_snapshot.day, runtime_snapshot.local)
+    )
+    next_pending_time_us = min(pending_state_times)
+    events = (
+        event(
+            FullDayEventTypeV1.CALENDAR_BOUNDARY,
+            boundary_work,
+            1,
+            {
+                "boundary_operation_index": 0,
+                "destination_session_state": (
+                    operation.destination_session_state.value
+                ),
+                "uncross_before": operation.uncross_before,
+            },
+        ),
+        event(
+            FullDayEventTypeV1.DAY_STATE_ANCHOR_RESET,
+            anchor_work,
+            2,
+            {
+                "anchored_state": anchor_emission.anchored_state.value,
+                "entered_time_us": anchor_emission.simulation_time_us,
+                "macro_segment_index": anchor_emission.macro_segment_index,
+                "macro_segment_sha256": anchor_emission.macro_segment_sha256,
+                "previous_state": anchor_emission.previous_state.value,
+                "sampled_duration_us": anchor_emission.sampled_duration_us,
+            },
+        ),
+        event(
+            FullDayEventTypeV1.CHECKPOINT_CAPTURE_MARKER,
+            checkpoint_work,
+            3,
+            {"checkpoint_request_id": "WO31_C_GENESIS_CHECKPOINT_V1"},
+        ),
+    )
+    executed = {
+        item.work_id: item
+        for item in (boundary_work, anchor_work, checkpoint_work)
+    }
+    validate_full_day_event_stream(
+        events,
+        executed_work_items=executed,
+        native_event_ledger={},
+        scheduled_event_ledger={},
+        full_day_plan=plan,
+    )
+    cut = QuiescentCutV1(
+        schema_version=1,
+        simulation_time_us=0,
+        microstep=0,
+        checkpoint_stage_ordinal=int(WorkStageV1.CHECKPOINT_CAPTURE),
+        last_global_event_sequence=3,
+        event_prefix_last_global_sequence=3,
+        event_prefix_sha256=canonical_event_prefix_sha256(events),
+        pending_work_count=1,
+        next_pending_time_us=next_pending_time_us,
+        next_pending_microstep=0,
+        due_work_at_or_before_cut=0,
+        generated_microsteps_complete=True,
+        checkpoint_stage_complete=True,
+        boundary_complete_at_cut=True,
+    )
+    pending_work = ScheduledWorkKeyV1(
+        simulation_time_us=next_pending_time_us,
+        microstep=0,
+        stage_ordinal=WorkStageV1.DAY_STATE_TRANSITION,
+        source_component_id=runtime_id,
+        component_local_sequence=pending_local_sequence,
+    )
+    return plan, events, cut, runtime_snapshot, pending_work
+
+
+def _wo31c_runtime_flat_state(runtime_snapshot) -> dict[str, object]:
+    """Project the authoritative state-runtime snapshot into frozen owned fields."""
+
+    day = runtime_snapshot.day
+    local = runtime_snapshot.local
+    return {
+        "state.component_local_sequence": runtime_snapshot.component_local_sequence,
+        "state.component_sequence_offset": runtime_snapshot.component_sequence_offset,
+        "state.current_day": day.current_state,
+        "state.current_local": local.current_state,
+        "state.day_elapsed_age_us": day.elapsed_age_us,
+        "state.day_entered_time_us": day.entered_time_us,
+        "state.day_next_eligible_transition_id": (
+            day.next_eligible_transition_id
+        ),
+        "state.day_next_eligible_transition_time_us": (
+            day.next_eligible_transition_time_us
+        ),
+        "state.day_sampled_deadline_us": day.deadline_time_us,
+        "state.day_sampled_duration_us": day.sampled_duration_us,
+        "state.day_transition_count": runtime_snapshot.day_transition_count,
+        "state.day_transitions_since_macro_anchor": (
+            runtime_snapshot.day_transitions_since_macro_anchor
+        ),
+        "state.day_trigger_memory": [
+            memory.as_dict() for memory in day.trigger_memory
+        ],
+        "state.input_closed_through_time_us": (
+            runtime_snapshot.input_closed_through_time_us
+        ),
+        "state.local_elapsed_age_us": local.elapsed_age_us,
+        "state.local_entered_time_us": local.entered_time_us,
+        "state.local_next_eligible_transition_id": (
+            local.next_eligible_transition_id
+        ),
+        "state.local_next_eligible_transition_time_us": (
+            local.next_eligible_transition_time_us
+        ),
+        "state.local_sampled_deadline_us": local.deadline_time_us,
+        "state.local_sampled_duration_us": local.sampled_duration_us,
+        "state.local_transition_count": runtime_snapshot.local_transition_count,
+        "state.local_trigger_memory": [
+            memory.as_dict() for memory in local.trigger_memory
+        ],
+        "state.next_macro_segment_index": runtime_snapshot.next_macro_segment_index,
+        "state.observation_ids_seen": list(runtime_snapshot.observation_ids_seen),
+        "state.plan_sha256": runtime_snapshot.plan_sha256,
+        "state.runtime_emission_count": runtime_snapshot.runtime_emission_count,
+        "state.state_model_sha256": runtime_snapshot.state_model_sha256,
+    }
+
+
+def _wo31c_preserved_state(
+    item,
+    *,
+    plan,
+    expectation,
+    cut,
+    runtime_snapshot,
+    pending_work,
+    event_prefix,
+) -> dict[str, object]:
+    """Build strict, complete audit state for one frozen inventory row."""
+
+    from random import Random
+
+    from kirby2.full_day.checkpoints import (
+        OWNED_PRNG_CODEC_REGISTRY_ID,
+        OwnedPrngStateV1,
+    )
+    from kirby2.full_day.models import RNG_LABEL_PREFIXES_BY_COMPONENT_V1
+    from kirby2.full_day.states import (
+        DAY_STATE_RNG_SUBSTREAM_PATH_V1,
+        LOCAL_STATE_RNG_SUBSTREAM_PATH_V1,
+    )
+
+    state: dict[str, object] = {
+        field: {} for field in item.owned_state_fields
+    }
+    transition_rng_by_substream = {
+        runtime_snapshot.day_rng.substream_label: runtime_snapshot.day_rng,
+        runtime_snapshot.local_rng.substream_label: runtime_snapshot.local_rng,
+    }
+    active_owner_ids = {
+        expectation.state_owner_ids[component_id]
+        for component_id in expectation.active_component_ids
+    }
+    rng_records: list[dict[str, object]] = []
+    rng_owner_by_substream: dict[str, str] = {}
+    for declaration in plan.seed_policy.substreams:
+        owners = tuple(
+            component_id
+            for component_id, prefixes in RNG_LABEL_PREFIXES_BY_COMPONENT_V1.items()
+            if any(
+                declaration.semantic_path == prefix
+                or declaration.semantic_path.startswith(prefix + "/")
+                for prefix in prefixes
+            )
+        )
+        if len(owners) != 1:
+            raise RuntimeError("audit PRNG substream has ambiguous frozen ownership")
+        if owners[0] not in active_owner_ids:
+            continue
+        rng_owner_by_substream[declaration.semantic_path] = owners[0]
+        if declaration.semantic_path in {
+            DAY_STATE_RNG_SUBSTREAM_PATH_V1,
+            LOCAL_STATE_RNG_SUBSTREAM_PATH_V1,
+        }:
+            transition_rng = transition_rng_by_substream[declaration.semantic_path]
+            owned_state = OwnedPrngStateV1.splitmix64(
+                substream_id=transition_rng.substream_label,
+                initial_seed=transition_rng.initial_seed,
+                state_u64=transition_rng.state_u64,
+                draw_count=transition_rng.draw_count,
+                sample_count=transition_rng.sample_count,
+            )
+        else:
+            generator = Random(declaration.derived_seed)
+            random_state = generator.getstate()[1]
+            owned_state = OwnedPrngStateV1.cpython_mt19937(
+                substream_id=declaration.semantic_path,
+                initial_seed=declaration.derived_seed,
+                state_words=tuple(random_state[:-1]),
+                state_index=random_state[-1],
+            )
+        rng_records.append(owned_state.as_dict())
+    rng_records.sort(key=lambda record: record["substream_id"])
+
+    marker_events = tuple(
+        event
+        for event in event_prefix
+        if event.event_type.value == "CHECKPOINT_CAPTURE_MARKER"
+    )
+    request_ids = [
+        event.payload.data["checkpoint_request_id"] for event in marker_events
+    ]
+    coincident_request_ids = [
+        event.payload.data["checkpoint_request_id"]
+        for event in marker_events
+        if event.chronological_key
+        == (
+            cut.simulation_time_us,
+            cut.microstep,
+            cut.checkpoint_stage_ordinal,
+        )
+    ]
+    next_checkpoint_time_us = next(
+        (
+            time_us
+            for time_us in plan.resolved_checkpoint_times_us
+            if time_us > cut.simulation_time_us
+        ),
+        None,
+    )
+    participant_specifications = {
+        participant.participant_id: participant.specification.as_dict()
+        for participant in sorted(
+            plan.participant_definitions,
+            key=lambda definition: definition.participant_id,
+        )
+    }
+    participant_generations = {
+        participant.participant_id: 0
+        for participant in sorted(
+            plan.participant_definitions,
+            key=lambda definition: definition.participant_id,
+        )
+    }
+
+    scalar_overrides: dict[str, object] = {
+        "calendar.boundary_operation_index": 1,
+        "calendar.current_phase_id": (
+            plan.calendar.boundary_operations[0].destination_session_state.value
+        ),
+        "calendar.next_boundary_time_us": (
+            plan.calendar.boundary_operations[1].boundary.simulation_time_us
+        ),
+        "checkpoint.capture_policy_state": {
+            "checkpoint_policy": plan.checkpoint_policy.as_dict(),
+            "resolved_checkpoint_times_us": list(
+                plan.resolved_checkpoint_times_us
+            ),
+        },
+        "checkpoint.coincident_request_state": {
+            "capture_time_us": cut.simulation_time_us,
+            "request_ids": coincident_request_ids,
+        },
+        "checkpoint.completed_count": 1,
+        "checkpoint.next_time_us": next_checkpoint_time_us,
+        "checkpoint.pending_request_state": {
+            "pending_work_ids": sorted(
+                item.work_id
+                for item in (pending_work,)
+                if int(item.stage_ordinal) == cut.checkpoint_stage_ordinal
+            ),
+        },
+        "checkpoint.sequence_allocator_state": {
+            "allocated_request_ids": request_ids,
+            "next_sequence": len(request_ids) + 1,
+        },
+        "full_day.current_time_us": cut.simulation_time_us,
+        "global_event_allocator.next_sequence": (
+            cut.last_global_event_sequence + 1
+        ),
+        "ledger.event_prefix_last_global_sequence": (
+            cut.event_prefix_last_global_sequence
+        ),
+        "ledger.event_prefix_sha256": cut.event_prefix_sha256,
+        "observable.last_published_global_sequence": 0,
+        "observable.client_publication_cursor": 0,
+        "observable.publication_time_us": cut.simulation_time_us,
+        "participant_schedule.next_index": 0,
+        "participant_schedule.replacement_generation": participant_generations,
+        "participant_schedule.spec_version_bindings": participant_specifications,
+        "plan.composition_matrix_sha256": expectation.composition_matrix_sha256,
+        "plan.composition_profile_id": expectation.composition_profile_id,
+        "plan.composition_profile_version": expectation.composition_profile_version,
+        "plan.semantic_sha256": plan.semantic_sha256,
+        "runtime.derived_seed_registry": [
+            declaration.as_dict()
+            for declaration in plan.seed_policy.substreams
+        ],
+        "runtime.non_state_component_local_event_sequence_allocators": {},
+        "runtime.rng_algorithm_codec_version": (
+            OWNED_PRNG_CODEC_REGISTRY_ID
+        ),
+        "runtime.rng_states": rng_records,
+        "runtime.root_seed": plan.seed_policy.root_seed,
+        "runtime.substream_policy_version": plan.seed_policy.policy_version,
+        "scheduled_event.next_index": 0,
+        "scheduled_event.state": {},
+        "scheduled_work.dequeued_count": 0,
+        "scheduled_work.pending_heap": [pending_work.as_dict()],
+    }
+    scalar_overrides.update(_wo31c_runtime_flat_state(runtime_snapshot))
+    for field in tuple(state):
+        if field in scalar_overrides:
+            state[field] = scalar_overrides[field]
+        elif field.endswith(".rng_state") or field.endswith(".rng_states"):
+            state[field] = [
+                record
+                for record in rng_records
+                if rng_owner_by_substream[record["substream_id"]]
+                == item.state_owner_id
+            ]
+    return state
+
+
+def _wo31c_checkpoint_fixture(plan=None):
+    """Build one complete composition-derived checkpoint and its real prefix."""
+
+    from kirby2.full_day.checkpoint_contract import checkpoint_inventory_v1
+    from kirby2.full_day.checkpoints import (
+        ABSENT_NATIVE_PLAN,
+        RUNTIME_CHECKPOINT_FORMAT_ID,
+        EngineRuntimeCompatibilityV1,
+        RuntimeCheckpointV1,
+        derive_checkpoint_composition_expectation,
+    )
+    from kirby2.full_day.composition import initial_composition_matrix
+    from kirby2.runtime_state import RuntimeComponentStateV1
+
+    (
+        selected_plan,
+        events,
+        cut,
+        runtime_snapshot,
+        pending_work,
+    ) = _wo31c_genesis_checkpoint_prefix(plan)
+    matrix = initial_composition_matrix()
+    inventory = checkpoint_inventory_v1()
+    expectation = derive_checkpoint_composition_expectation(
+        selected_plan,
+        matrix,
+        inventory,
+    )
+    active = set(expectation.active_component_ids)
+    records: list[RuntimeComponentStateV1] = []
+    for item in inventory.items:
+        if item.component_id in active:
+            records.append(
+                RuntimeComponentStateV1.preserved(
+                    component_id=item.component_id,
+                    component_schema_version=(
+                        expectation.component_schema_versions[item.component_id]
+                    ),
+                    implementation_version=(
+                        expectation.implementation_versions[item.component_id]
+                    ),
+                    state=_wo31c_preserved_state(
+                        item,
+                        plan=selected_plan,
+                        expectation=expectation,
+                        cut=cut,
+                        runtime_snapshot=runtime_snapshot,
+                        pending_work=pending_work,
+                        event_prefix=events,
+                    ),
+                    dependencies=(
+                        expectation.dependencies_by_component[item.component_id]
+                    ),
+                )
+            )
+        else:
+            records.append(
+                RuntimeComponentStateV1.absent(
+                    component_id=item.component_id,
+                    absent_reason=(
+                        expectation.absent_reasons_by_component[item.component_id]
+                    ),
+                )
+            )
+    checkpoint = RuntimeCheckpointV1(
+        schema_version=1,
+        format_id=RUNTIME_CHECKPOINT_FORMAT_ID,
+        engine_runtime=EngineRuntimeCompatibilityV1.current(),
+        native_plan_compiler_identity=ABSENT_NATIVE_PLAN,
+        semantic_plan_sha256=expectation.semantic_plan_sha256,
+        composition_matrix_sha256=expectation.composition_matrix_sha256,
+        composition_profile_id=expectation.composition_profile_id,
+        composition_profile_version=expectation.composition_profile_version,
+        composition_profile_sha256=expectation.composition_profile_sha256,
+        checkpoint_inventory_id=expectation.checkpoint_inventory_id,
+        checkpoint_inventory_sha256=expectation.checkpoint_inventory_sha256,
+        component_inventory=expectation.component_inventory,
+        quiescent_cut=cut,
+        components=tuple(records),
+    )
+    return (
+        selected_plan,
+        matrix,
+        inventory,
+        expectation,
+        events,
+        checkpoint,
+        runtime_snapshot,
+        pending_work,
+    )
+
+
+def audit_wo31c_checkpoints() -> tuple[FullDayAuditCase, ...]:
+    """Exercise portable checkpoint truth and governed data paths end to end."""
+
+    return (
+        _wo31c_data_paths_case(),
+        _wo31c_checkpoint_inventory_truth_case(),
+        _wo31c_checkpoint_wire_prefix_case(),
+        _wo31c_checkpoint_hostile_case(),
+        _wo31c_checkpoint_relocation_case(),
+    )
+
+
+def _wo31c_checkpoint_inventory_truth_case() -> FullDayAuditCase:
+    """Prove all 29 rows follow exact composition PRESERVED/ABSENT truth."""
+
+    from kirby2.full_day.checkpoints import validate_runtime_checkpoint
+    from kirby2.runtime_state import RuntimeComponentStatusV1
+
+    failures: list[str] = []
+    full = _wo31c_checkpoint_fixture()
+    (
+        full_plan,
+        matrix,
+        inventory,
+        full_expectation,
+        full_events,
+        full_checkpoint,
+        _,
+        _,
+    ) = full
+    try:
+        validated_full = validate_runtime_checkpoint(
+            full_checkpoint,
+            plan=full_plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=full_events,
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"complete checkpoint fixture was refused: {error}")
+        validated_full = None
+
+    inactive_plan = replace(full_plan, participant_schedule=())
+    inactive = _wo31c_checkpoint_fixture(inactive_plan)
+    (
+        inactive_plan,
+        inactive_matrix,
+        inactive_inventory,
+        inactive_expectation,
+        inactive_events,
+        inactive_checkpoint,
+        _,
+        _,
+    ) = inactive
+    try:
+        validated_inactive = validate_runtime_checkpoint(
+            inactive_checkpoint,
+            plan=inactive_plan,
+            composition_matrix=inactive_matrix,
+            inventory=inactive_inventory,
+            event_prefix=inactive_events,
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"inactive checkpoint fixture was refused: {error}")
+        validated_inactive = None
+
+    def preserved_ids(checkpoint) -> tuple[str, ...]:
+        return tuple(
+            record.component_id
+            for record in checkpoint.components
+            if record.status is RuntimeComponentStatusV1.PRESERVED
+        )
+
+    def absent_reasons(checkpoint) -> dict[str, str]:
+        return {
+            record.component_id: record.absent_reason
+            for record in checkpoint.components
+            if record.status is RuntimeComponentStatusV1.ABSENT
+        }
+
+    if len(full_checkpoint.components) != 29 or len(inactive_checkpoint.components) != 29:
+        failures.append("checkpoint fixtures do not contain the frozen 29-row inventory")
+    if full_checkpoint.component_inventory != inactive_checkpoint.component_inventory:
+        failures.append("active/inactive fixtures changed the frozen component inventory")
+    if preserved_ids(full_checkpoint) != full_expectation.active_component_ids:
+        failures.append("complete fixture PRESERVED rows differ from composition truth")
+    if absent_reasons(full_checkpoint) != dict(
+        full_expectation.absent_reasons_by_component
+    ):
+        failures.append("complete fixture ABSENT reasons differ from composition truth")
+    if preserved_ids(inactive_checkpoint) != inactive_expectation.active_component_ids:
+        failures.append("inactive fixture PRESERVED rows differ from composition truth")
+    if absent_reasons(inactive_checkpoint) != dict(
+        inactive_expectation.absent_reasons_by_component
+    ):
+        failures.append("inactive fixture ABSENT reasons differ from composition truth")
+    if "AGENT_SCHEDULER_METAORDERS_V1" not in preserved_ids(full_checkpoint):
+        failures.append("scheduled-agent checkpoint state was not preserved")
+    inactive_agent = next(
+        record
+        for record in inactive_checkpoint.components
+        if record.component_id == "AGENT_SCHEDULER_METAORDERS_V1"
+    )
+    if (
+        inactive_agent.status is not RuntimeComponentStatusV1.ABSENT
+        or inactive_agent.absent_reason != "COMPOSITION_ACTIVE_PREDICATE_FALSE"
+    ):
+        failures.append("inactive AgentScheduler lacks its composition proof")
+    if validated_full is not None and validated_full.as_dict() != full_expectation.as_dict():
+        failures.append("complete checkpoint validation changed derived expectation")
+    if (
+        validated_inactive is not None
+        and validated_inactive.as_dict() != inactive_expectation.as_dict()
+    ):
+        failures.append("inactive checkpoint validation changed derived expectation")
+
+    return FullDayAuditCase(
+        "checkpoint_composition_inventory_truth",
+        (
+            "inventory_rows=29 "
+            f"full_preserved={len(full_expectation.active_component_ids)} "
+            f"full_absent={len(full_expectation.absent_reasons_by_component)} "
+            f"inactive_preserved={len(inactive_expectation.active_component_ids)} "
+            f"inactive_absent={len(inactive_expectation.absent_reasons_by_component)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31c_checkpoint_wire_prefix_case() -> FullDayAuditCase:
+    """Prove canonical bytes and a real marker-inclusive genesis prefix."""
+
+    from kirby2.full_day.checkpoints import (
+        RuntimeCheckpointV1,
+        validate_checkpoint_event_prefix,
+        validate_runtime_checkpoint,
+    )
+    from kirby2.full_day.models import canonical_json_bytes
+
+    failures: list[str] = []
+    (
+        plan,
+        matrix,
+        inventory,
+        expectation,
+        events,
+        checkpoint,
+        runtime_snapshot,
+        _,
+    ) = (
+        _wo31c_checkpoint_fixture()
+    )
+    wire = checkpoint.canonical_bytes()
+    try:
+        restored = RuntimeCheckpointV1.from_json_bytes(wire)
+        validate_checkpoint_event_prefix(restored, events)
+        validate_runtime_checkpoint(
+            restored,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=events,
+        )
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"canonical checkpoint round trip was refused: {error}")
+        restored = None
+    if restored is not None:
+        if restored.canonical_bytes() != wire:
+            failures.append("checkpoint canonical bytes changed after round trip")
+        if (
+            restored.semantic_sha256 != checkpoint.semantic_sha256
+            or restored.checkpoint_id != checkpoint.checkpoint_id
+        ):
+            failures.append("checkpoint semantic identity changed after round trip")
+    event_types = tuple(event.event_type.value for event in events)
+    expected_types = (
+        "CALENDAR_BOUNDARY",
+        "DAY_STATE_ANCHOR_RESET",
+        "CHECKPOINT_CAPTURE_MARKER",
+    )
+    if event_types != expected_types:
+        failures.append("genesis checkpoint prefix lacks its exact causal events")
+    if (
+        checkpoint.quiescent_cut.simulation_time_us != 0
+        or checkpoint.quiescent_cut.last_global_event_sequence != 3
+        or events[-1].chronological_key != (0, 0, 11)
+    ):
+        failures.append("genesis checkpoint is not aligned after all t=0 microsteps")
+    if expectation.component_inventory != checkpoint.component_inventory:
+        failures.append("wire checkpoint inventory differs from derived expectation")
+    state_record = next(
+        record
+        for record in checkpoint.components
+        if record.component_id
+        == "CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1"
+    )
+    if state_record.state is None or canonical_json_bytes(
+        state_record.state
+    ) != canonical_json_bytes(_wo31c_runtime_flat_state(runtime_snapshot)):
+        failures.append("checkpoint state fields differ from the real runtime snapshot")
+    root_record = next(
+        record
+        for record in checkpoint.components
+        if record.component_id
+        == "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+    )
+    root_rng_rows = (
+        ()
+        if root_record.state is None
+        else root_record.state["runtime.rng_states"]
+    )
+    root_rng_by_id = {
+        row["substream_id"]: row for row in root_rng_rows
+    }
+    for label, transition_rng in (
+        (runtime_snapshot.day_rng.substream_label, runtime_snapshot.day_rng),
+        (runtime_snapshot.local_rng.substream_label, runtime_snapshot.local_rng),
+    ):
+        row = root_rng_by_id.get(label)
+        expected = {
+            "draw_count": transition_rng.draw_count,
+            "initial_seed": transition_rng.initial_seed,
+            "sample_count": transition_rng.sample_count,
+            "state_u64": transition_rng.state_u64,
+            "substream_id": transition_rng.substream_label,
+        }
+        if row is None or any(row.get(key) != value for key, value in expected.items()):
+            failures.append(f"checkpoint {label} RNG differs from runtime snapshot")
+        elif row["draw_count"] != 2 or row["sample_count"] != 2:
+            failures.append(f"genesis {label} RNG did not record its two samples")
+
+    return FullDayAuditCase(
+        "canonical_checkpoint_and_genesis_prefix",
+        (
+            "canonical_roundtrip=byte_identical t0_cut=(0,0,11) "
+            "prefix=('CALENDAR_BOUNDARY','DAY_STATE_ANCHOR_RESET',"
+            "'CHECKPOINT_CAPTURE_MARKER') runtime_snapshot=exact "
+            "owned_prng_codecs=validated"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31c_checkpoint_hostile_case() -> FullDayAuditCase:
+    """Exercise the required fail-closed checkpoint corruption classes."""
+
+    from kirby2.full_day.events import (
+        FullDayEventPayloadV1,
+        FullDayEventTypeV1,
+        FullDayEventV1,
+        NativeEventReferenceV1,
+        ScheduledWorkKeyV1,
+        WorkStageV1,
+        canonical_event_prefix_sha256,
+    )
+    from kirby2.full_day.checkpoints import (
+        OwnedPrngStateV1,
+        RuntimeCheckpointV1,
+        checkpoint_artifact_reference,
+        validate_checkpoint_event_prefix,
+        validate_runtime_checkpoint,
+    )
+    from kirby2.full_day.models import canonical_sha256
+    from kirby2.runtime_state import (
+        RuntimeComponentStateV1,
+        RuntimeComponentStatusV1,
+        validate_runtime_component_inventory,
+    )
+
+    (
+        plan,
+        matrix,
+        inventory,
+        expectation,
+        events,
+        checkpoint,
+        runtime_snapshot,
+        pending_work,
+    ) = (
+        _wo31c_checkpoint_fixture()
+    )
+    row_by_id = {item.component_id: item for item in inventory.items}
+    failures: list[str] = []
+    refusal_count = 0
+
+    def validate(candidate) -> object:
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=events,
+        )
+
+    def replace_record(component_id: str, replacement_record, *, candidate=checkpoint):
+        return replace(
+            candidate,
+            components=tuple(
+                replacement_record if record.component_id == component_id else record
+                for record in candidate.components
+            ),
+        )
+
+    def mutate_component_state(
+        component_id: str,
+        mutator: Callable[[dict[str, object]], None],
+        *,
+        candidate=checkpoint,
+    ):
+        record = next(
+            row for row in candidate.components if row.component_id == component_id
+        )
+        payload = record.as_dict()
+        state = payload["state"]
+        assert isinstance(state, dict)
+        mutator(state)
+        replacement_record = RuntimeComponentStateV1.preserved(
+            component_id=record.component_id,
+            component_schema_version=record.component_schema_version,
+            implementation_version=record.implementation_version,
+            state=state,
+            dependencies=record.dependencies or (),
+        )
+        return replace_record(
+            component_id,
+            replacement_record,
+            candidate=candidate,
+        )
+
+    def rebind_checkpoint_prefix(candidate, event_prefix):
+        prefix_digest = canonical_event_prefix_sha256(event_prefix)
+        prefix_length = len(event_prefix)
+        candidate = replace(
+            candidate,
+            quiescent_cut=replace(
+                candidate.quiescent_cut,
+                last_global_event_sequence=prefix_length,
+                event_prefix_last_global_sequence=prefix_length,
+                event_prefix_sha256=prefix_digest,
+            ),
+        )
+        candidate = mutate_component_state(
+            "GLOBAL_EVENT_ALLOCATOR_V1",
+            lambda state: state.__setitem__(
+                "global_event_allocator.next_sequence", prefix_length + 1
+            ),
+            candidate=candidate,
+        )
+
+        def mutate_ledger(state: dict[str, object]) -> None:
+            state["ledger.event_prefix_last_global_sequence"] = prefix_length
+            state["ledger.event_prefix_sha256"] = prefix_digest
+
+        return mutate_component_state(
+            "LEDGER_PREFIX_V1",
+            mutate_ledger,
+            candidate=candidate,
+        )
+
+    active_record = next(
+        record
+        for record in checkpoint.components
+        if record.status is RuntimeComponentStatusV1.PRESERVED
+    )
+    inactive_record = next(
+        record
+        for record in checkpoint.components
+        if record.status is RuntimeComponentStatusV1.ABSENT
+    )
+
+    def missing_active_state() -> object:
+        replacement_record = RuntimeComponentStateV1.absent(
+            component_id=active_record.component_id,
+            absent_reason="COMPOSITION_ACTIVE_PREDICATE_FALSE",
+        )
+        return validate(replace_record(active_record.component_id, replacement_record))
+
+    def preserved_inactive_state() -> object:
+        item = row_by_id[inactive_record.component_id]
+        replacement_record = RuntimeComponentStateV1.preserved(
+            component_id=item.component_id,
+            component_schema_version=item.state_schema_version,
+            implementation_version=1,
+            state=_wo31c_preserved_state(
+                item,
+                plan=plan,
+                expectation=expectation,
+                cut=checkpoint.quiescent_cut,
+                runtime_snapshot=runtime_snapshot,
+                pending_work=pending_work,
+                event_prefix=events,
+            ),
+            dependencies=item.dependencies,
+        )
+        return validate(replace_record(item.component_id, replacement_record))
+
+    def corrupt_component_digest() -> object:
+        payload = active_record.as_dict()
+        state = payload["state"]
+        assert isinstance(state, dict)
+        first_field = sorted(state)[0]
+        state[first_field] = {"corrupt": True}
+        return RuntimeComponentStateV1.from_dict(payload)
+
+    def duplicate_component_record() -> object:
+        payload = checkpoint.as_dict()
+        components = payload["components"]
+        assert isinstance(components, list)
+        components[1] = copy.deepcopy(components[0])
+        return RuntimeCheckpointV1.from_dict(payload)
+
+    def cyclic_dependencies() -> object:
+        left_id = "COMPONENT_LOCAL_ALLOCATORS_V1"
+        right_id = "GLOBAL_EVENT_ALLOCATOR_V1"
+        cycle_dependencies = dict(expectation.dependencies_by_component)
+        cycle_dependencies[left_id] = (right_id,)
+        cycle_dependencies[right_id] = (left_id,)
+        cycle_records = []
+        for record in checkpoint.components:
+            if record.component_id not in {left_id, right_id}:
+                cycle_records.append(record)
+                continue
+            state = record.as_dict()["state"]
+            assert isinstance(state, dict)
+            cycle_records.append(
+                RuntimeComponentStateV1.preserved(
+                    component_id=record.component_id,
+                    component_schema_version=record.component_schema_version,
+                    implementation_version=record.implementation_version,
+                    state=state,
+                    dependencies=cycle_dependencies[record.component_id],
+                )
+            )
+        return validate_runtime_component_inventory(
+            tuple(cycle_records),
+            expected_component_ids=expectation.component_inventory,
+            active_component_ids=expectation.active_component_ids,
+            dependencies_by_component=cycle_dependencies,
+            absent_reasons_by_component=expectation.absent_reasons_by_component,
+        )
+
+    def wrong_engine_runtime() -> object:
+        payload = checkpoint.as_dict()
+        engine = payload["engine_runtime"]
+        assert isinstance(engine, dict)
+        engine["python_minor"] = engine["python_minor"] + 1
+        return RuntimeCheckpointV1.from_dict(payload)
+
+    def component_with_mutated_rng(mutator: Callable[[dict[str, object]], None]):
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record for record in checkpoint.components if record.component_id == root_id
+        )
+        root_state = root_record.as_dict()["state"]
+        assert isinstance(root_state, dict)
+        rng_states = root_state["runtime.rng_states"]
+        assert isinstance(rng_states, list) and rng_states
+        selected = next(
+            row
+            for row in rng_states
+            if row["algorithm_id"] == "CPYTHON_MT19937_V1"
+        )
+        mutator(selected)
+        replacement_record = RuntimeComponentStateV1.preserved(
+            component_id=root_id,
+            component_schema_version=root_record.component_schema_version,
+            implementation_version=root_record.implementation_version,
+            state=root_state,
+            dependencies=root_record.dependencies or (),
+        )
+        return validate(replace_record(root_id, replacement_record))
+
+    def wrong_rng_codec() -> object:
+        return component_with_mutated_rng(
+            lambda row: row.__setitem__("codec_id", "UNSUPPORTED_CODEC_V1")
+        )
+
+    def wrong_rng_runtime() -> object:
+        return component_with_mutated_rng(
+            lambda row: row.__setitem__("python_minor", row["python_minor"] + 1)
+        )
+
+    def unknown_checkpoint_schema() -> object:
+        payload = checkpoint.as_dict()
+        payload["schema_version"] = 2
+        return RuntimeCheckpointV1.from_dict(payload)
+
+    def nonquiescent_cut() -> object:
+        return replace(checkpoint.quiescent_cut, due_work_at_or_before_cut=1)
+
+    def incomplete_t0_prefix() -> object:
+        marker = replace(
+            events[-1],
+            global_event_sequence=2,
+            component_local_sequence=2,
+        )
+        incomplete = (events[0], marker)
+        cut = replace(
+            checkpoint.quiescent_cut,
+            last_global_event_sequence=2,
+            event_prefix_last_global_sequence=2,
+            event_prefix_sha256=canonical_event_prefix_sha256(incomplete),
+        )
+        candidate = replace(checkpoint, quiescent_cut=cut)
+        return validate_checkpoint_event_prefix(candidate, incomplete)
+
+    def embedded_self_digest() -> object:
+        payload = checkpoint.as_dict()
+        payload["checkpoint_sha256"] = checkpoint.semantic_sha256
+        return RuntimeCheckpointV1.from_dict(payload)
+
+    def unknown_component_implementation() -> object:
+        assert active_record.state is not None
+        replacement_record = RuntimeComponentStateV1.preserved(
+            component_id=active_record.component_id,
+            component_schema_version=active_record.component_schema_version,
+            implementation_version=(active_record.implementation_version or 0) + 1,
+            state=active_record.state,
+            dependencies=active_record.dependencies or (),
+        )
+        return validate(replace_record(active_record.component_id, replacement_record))
+
+    def floating_state() -> object:
+        payload = active_record.as_dict()
+        state = payload["state"]
+        assert isinstance(state, dict)
+        state[sorted(state)[0]] = 1.5
+        return RuntimeComponentStateV1.from_dict(payload)
+
+    def noncanonical_checkpoint_bytes() -> object:
+        return RuntimeCheckpointV1.from_json_bytes(b" " + checkpoint.canonical_bytes())
+
+    def duplicate_global_event_sequence() -> object:
+        malformed_events = (
+            events[0],
+            events[1],
+            replace(events[2], global_event_sequence=2),
+        )
+        malformed_digest = canonical_sha256(
+            [event.as_dict() for event in malformed_events]
+        )
+        candidate = replace(
+            checkpoint,
+            quiescent_cut=replace(
+                checkpoint.quiescent_cut,
+                event_prefix_sha256=malformed_digest,
+            ),
+        )
+        candidate = mutate_component_state(
+            "LEDGER_PREFIX_V1",
+            lambda state: state.__setitem__(
+                "ledger.event_prefix_sha256", malformed_digest
+            ),
+            candidate=candidate,
+        )
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=malformed_events,
+        )
+
+    def negative_zero_gaussian_cache() -> object:
+        return component_with_mutated_rng(
+            lambda row: row.__setitem__(
+                "gaussian_cache_u64", 0x8000000000000000
+            )
+        )
+
+    state_runtime_id = (
+        "CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1"
+    )
+
+    def forged_day_duration() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            entered = state["state.day_entered_time_us"]
+            duration = state["state.day_sampled_duration_us"]
+            assert type(entered) is int and type(duration) is int
+            state["state.day_sampled_duration_us"] = duration + 1
+            state["state.day_sampled_deadline_us"] = entered + duration + 1
+
+        return validate(mutate_component_state(state_runtime_id, mutate))
+
+    def forged_day_deadline() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            deadline = state["state.day_sampled_deadline_us"]
+            assert type(deadline) is int
+            state["state.day_sampled_deadline_us"] = deadline + 1
+
+        return validate(mutate_component_state(state_runtime_id, mutate))
+
+    def forged_day_eligible_time() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            eligible = state["state.day_next_eligible_transition_time_us"]
+            assert type(eligible) is int
+            state["state.day_next_eligible_transition_time_us"] = eligible + 1
+
+        return validate(mutate_component_state(state_runtime_id, mutate))
+
+    def participant_cursor_advance() -> object:
+        return validate(
+            mutate_component_state(
+                "PARTICIPANT_SCHEDULE_RUNTIME_V1",
+                lambda state: state.__setitem__(
+                    "participant_schedule.next_index", 1
+                ),
+            )
+        )
+
+    def scheduled_event_cursor_advance() -> object:
+        return validate(
+            mutate_component_state(
+                "SCHEDULED_EVENT_SHOCK_HALT_REOPEN_STATE_V1",
+                lambda state: state.__setitem__("scheduled_event.next_index", 1),
+            )
+        )
+
+    def wrong_algorithm_root_owner_swap() -> object:
+        agent_id = "AGENT_SCHEDULER_METAORDERS_V1"
+        agent_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == agent_id
+        )
+        agent_payload = agent_record.as_dict()
+        agent_state = agent_payload["state"]
+        assert isinstance(agent_state, dict)
+        agent_rng = agent_state["agent.rng_states"]
+        assert isinstance(agent_rng, list) and agent_rng
+        selected_label = agent_rng[0]["substream_id"]
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected = next(
+            row for row in root_rng if row["substream_id"] == selected_label
+        )
+        fake = OwnedPrngStateV1.splitmix64(
+            substream_id=selected_label,
+            initial_seed=selected["initial_seed"],
+            state_u64=selected["initial_seed"],
+            draw_count=0,
+            sample_count=0,
+        ).as_dict()
+
+        def swap(rows: object) -> list[object]:
+            assert isinstance(rows, list)
+            return [
+                copy.deepcopy(fake)
+                if row["substream_id"] == selected_label
+                else row
+                for row in rows
+            ]
+
+        candidate = mutate_component_state(
+            root_id,
+            lambda state: state.__setitem__(
+                "runtime.rng_states", swap(state["runtime.rng_states"])
+            ),
+        )
+        candidate = mutate_component_state(
+            agent_id,
+            lambda state: state.__setitem__(
+                "agent.rng_states", swap(state["agent.rng_states"])
+            ),
+            candidate=candidate,
+        )
+        return validate(candidate)
+
+    def extra_day_splitmix_raw_draw() -> object:
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        day_label = runtime_snapshot.day_rng.substream_label
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected = next(
+            row for row in root_rng if row["substream_id"] == day_label
+        )
+        advanced = OwnedPrngStateV1.splitmix64(
+            substream_id=day_label,
+            initial_seed=selected["initial_seed"],
+            state_u64=(
+                selected["state_u64"] + 0x9E3779B97F4A7C15
+            )
+            & ((1 << 64) - 1),
+            draw_count=selected["draw_count"] + 1,
+            sample_count=selected["sample_count"],
+        ).as_dict()
+
+        def mutate(state: dict[str, object]) -> None:
+            rows = state["runtime.rng_states"]
+            assert isinstance(rows, list)
+            state["runtime.rng_states"] = [
+                copy.deepcopy(advanced)
+                if row["substream_id"] == day_label
+                else row
+                for row in rows
+            ]
+
+        return validate(mutate_component_state(root_id, mutate))
+
+    def future_participant_mt_raw_draw() -> object:
+        from random import Random
+
+        participant = next(
+            participant
+            for participant in plan.participant_definitions
+            if not participant.initially_active
+            and all(
+                entry.simulation_time_us > checkpoint.quiescent_cut.simulation_time_us
+                for entry in plan.participant_schedule
+                if entry.participant_id == participant.participant_id
+            )
+        )
+        selected_label = participant.rng_substream_label
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected = next(
+            row for row in root_rng if row["substream_id"] == selected_label
+        )
+        assert selected["gaussian_cache_u64"] is None
+        generator = Random()
+        generator.setstate(
+            (
+                selected["random_state_version"],
+                tuple(selected["state_words"]) + (selected["state_index"],),
+                None,
+            )
+        )
+        generator.getrandbits(32)
+        random_state_version, inner_state, gaussian_cache = generator.getstate()
+        assert gaussian_cache is None
+        advanced = OwnedPrngStateV1.cpython_mt19937(
+            substream_id=selected_label,
+            initial_seed=selected["initial_seed"],
+            state_words=tuple(inner_state[:-1]),
+            state_index=inner_state[-1],
+        ).as_dict()
+
+        def replace_row(rows: object) -> list[object]:
+            assert isinstance(rows, list)
+            return [
+                copy.deepcopy(advanced)
+                if row["substream_id"] == selected_label
+                else row
+                for row in rows
+            ]
+
+        candidate = mutate_component_state(
+            root_id,
+            lambda state: state.__setitem__(
+                "runtime.rng_states", replace_row(state["runtime.rng_states"])
+            ),
+        )
+        candidate = mutate_component_state(
+            "AGENT_SCHEDULER_METAORDERS_V1",
+            lambda state: state.__setitem__(
+                "agent.rng_states", replace_row(state["agent.rng_states"])
+            ),
+            candidate=candidate,
+        )
+        return validate(candidate)
+
+    def initially_active_participant_mt_raw_draw() -> object:
+        from random import Random
+
+        selected_participant_id = "AUDIT_MAKER"
+        alternate_plan = replace(
+            plan,
+            participant_definitions=tuple(
+                replace(participant, initially_active=True)
+                if participant.participant_id == selected_participant_id
+                else participant
+                for participant in plan.participant_definitions
+            ),
+        )
+        (
+            alternate_plan,
+            alternate_matrix,
+            alternate_inventory,
+            _,
+            alternate_events,
+            alternate_checkpoint,
+            _,
+            _,
+        ) = _wo31c_checkpoint_fixture(alternate_plan)
+        participant = next(
+            participant
+            for participant in alternate_plan.participant_definitions
+            if participant.participant_id == selected_participant_id
+        )
+        selected_label = participant.rng_substream_label
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record
+            for record in alternate_checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected = next(
+            row for row in root_rng if row["substream_id"] == selected_label
+        )
+        assert selected["gaussian_cache_u64"] is None
+        generator = Random()
+        generator.setstate(
+            (
+                selected["random_state_version"],
+                tuple(selected["state_words"]) + (selected["state_index"],),
+                None,
+            )
+        )
+        generator.getrandbits(32)
+        _, inner_state, gaussian_cache = generator.getstate()
+        assert gaussian_cache is None
+        advanced = OwnedPrngStateV1.cpython_mt19937(
+            substream_id=selected_label,
+            initial_seed=selected["initial_seed"],
+            state_words=tuple(inner_state[:-1]),
+            state_index=inner_state[-1],
+        ).as_dict()
+
+        def replace_row(rows: object) -> list[object]:
+            assert isinstance(rows, list)
+            return [
+                copy.deepcopy(advanced)
+                if row["substream_id"] == selected_label
+                else row
+                for row in rows
+            ]
+
+        candidate = mutate_component_state(
+            root_id,
+            lambda state: state.__setitem__(
+                "runtime.rng_states", replace_row(state["runtime.rng_states"])
+            ),
+            candidate=alternate_checkpoint,
+        )
+        candidate = mutate_component_state(
+            "AGENT_SCHEDULER_METAORDERS_V1",
+            lambda state: state.__setitem__(
+                "agent.rng_states", replace_row(state["agent.rng_states"])
+            ),
+            candidate=candidate,
+        )
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=alternate_plan,
+            composition_matrix=alternate_matrix,
+            inventory=alternate_inventory,
+            event_prefix=alternate_events,
+        )
+
+    def forged_participant_decision_rng_exemption() -> object:
+        from random import Random
+
+        participant = next(
+            participant
+            for participant in plan.participant_definitions
+            if participant.participant_id == "AUDIT_MAKER"
+        )
+        selected_label = participant.rng_substream_label
+        decision_work = ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=WorkStageV1.ENDOGENOUS_PARTICIPANT_DECISION,
+            source_component_id="AGENT_SCHEDULER_V1",
+            component_local_sequence=1,
+        )
+        native = NativeEventReferenceV1(
+            schema_version=1,
+            owner_component_id="AGENT_SCHEDULER_V1",
+            native_ledger_id="AGENT_EVENT_LEDGER_V1",
+            event_type="PARTICIPANT_DECISION",
+            local_sequence=1,
+            event_id="FORGED_NATIVE_DECISION_V1",
+        )
+        decision = FullDayEventV1(
+            schema_version=1,
+            global_event_sequence=3,
+            simulation_time_us=0,
+            microstep=0,
+            stage=WorkStageV1.ENDOGENOUS_PARTICIPANT_DECISION,
+            source_component_id="AGENT_SCHEDULER_V1",
+            component_local_sequence=1,
+            event_type=FullDayEventTypeV1.PARTICIPANT_DECISION,
+            causal_parent_ids=(decision_work.work_id,),
+            payload=FullDayEventPayloadV1(
+                schema_version=1,
+                payload_type=FullDayEventTypeV1.PARTICIPANT_DECISION.value,
+                payload_version=1,
+                native_event=native,
+                data={
+                    "decision_id": "FORGED_DECISION_V1",
+                    "information_cutoff_us": 0,
+                    "native_payload_sha256": "d" * 64,
+                    "participant_id": participant.participant_id,
+                },
+            ),
+        )
+        forged_events = (
+            events[0],
+            events[1],
+            decision,
+            replace(events[2], global_event_sequence=4),
+        )
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected = next(
+            row for row in root_rng if row["substream_id"] == selected_label
+        )
+        generator = Random()
+        generator.setstate(
+            (
+                selected["random_state_version"],
+                tuple(selected["state_words"]) + (selected["state_index"],),
+                None,
+            )
+        )
+        generator.getrandbits(32)
+        _, inner_state, gaussian_cache = generator.getstate()
+        assert gaussian_cache is None
+        advanced = OwnedPrngStateV1.cpython_mt19937(
+            substream_id=selected_label,
+            initial_seed=selected["initial_seed"],
+            state_words=tuple(inner_state[:-1]),
+            state_index=inner_state[-1],
+        ).as_dict()
+
+        def replace_row(rows: object) -> list[object]:
+            assert isinstance(rows, list)
+            return [
+                copy.deepcopy(advanced)
+                if row["substream_id"] == selected_label
+                else row
+                for row in rows
+            ]
+
+        candidate = mutate_component_state(
+            root_id,
+            lambda state: state.__setitem__(
+                "runtime.rng_states", replace_row(state["runtime.rng_states"])
+            ),
+        )
+        candidate = mutate_component_state(
+            "AGENT_SCHEDULER_METAORDERS_V1",
+            lambda state: state.__setitem__(
+                "agent.rng_states", replace_row(state["agent.rng_states"])
+            ),
+            candidate=candidate,
+        )
+        candidate = mutate_component_state(
+            "COMPONENT_LOCAL_ALLOCATORS_V1",
+            lambda state: state.__setitem__(
+                "runtime.non_state_component_local_event_sequence_allocators",
+                {"AGENT_SCHEDULER_V1": 1},
+            ),
+            candidate=candidate,
+        )
+        candidate = rebind_checkpoint_prefix(candidate, forged_events)
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=forged_events,
+        )
+
+    def omitted_non_state_allocator() -> object:
+        refused_work = ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=WorkStageV1.ENDOGENOUS_PARTICIPANT_DECISION,
+            source_component_id="AGENT_SCHEDULER_V1",
+            component_local_sequence=1,
+        )
+        refused = FullDayEventV1(
+            schema_version=1,
+            global_event_sequence=3,
+            simulation_time_us=0,
+            microstep=0,
+            stage=WorkStageV1.ENDOGENOUS_PARTICIPANT_DECISION,
+            source_component_id="AGENT_SCHEDULER_V1",
+            component_local_sequence=1,
+            event_type=FullDayEventTypeV1.CAPABILITY_REFUSED,
+            causal_parent_ids=(refused_work.work_id,),
+            payload=FullDayEventPayloadV1(
+                schema_version=1,
+                payload_type=FullDayEventTypeV1.CAPABILITY_REFUSED.value,
+                payload_version=1,
+                native_event=None,
+                data={
+                    "capability_id": "FORGED_CAPABILITY_V1",
+                    "reason_code": "FORGED_REFUSAL_V1",
+                },
+            ),
+        )
+        forged_events = (
+            events[0],
+            events[1],
+            refused,
+            replace(events[2], global_event_sequence=4),
+        )
+        candidate = rebind_checkpoint_prefix(checkpoint, forged_events)
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=forged_events,
+        )
+
+    def forged_shock_rng_exemption() -> object:
+        from random import Random
+
+        runtime_id = "FULL_DAY_RUNTIME_V1"
+        candidate_work = ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=WorkStageV1.SCHEDULED_INFORMATION,
+            source_component_id=runtime_id,
+            component_local_sequence=2,
+        )
+        shock_candidate = FullDayEventV1(
+            schema_version=1,
+            global_event_sequence=2,
+            simulation_time_us=0,
+            microstep=0,
+            stage=WorkStageV1.SCHEDULED_INFORMATION,
+            source_component_id=runtime_id,
+            component_local_sequence=2,
+            event_type=FullDayEventTypeV1.SHOCK_CANDIDATE,
+            causal_parent_ids=(candidate_work.work_id,),
+            payload=FullDayEventPayloadV1(
+                schema_version=1,
+                payload_type=FullDayEventTypeV1.SHOCK_CANDIDATE.value,
+                payload_version=1,
+                native_event=None,
+                data={
+                    "candidate_id": "FORGED_SHOCK_CANDIDATE_V1",
+                    "information_cutoff_us": 0,
+                    "quantity_shares": 1,
+                    "side": "BUY",
+                },
+            ),
+        )
+        shock_rejected = FullDayEventV1(
+            schema_version=1,
+            global_event_sequence=3,
+            simulation_time_us=0,
+            microstep=0,
+            stage=WorkStageV1.SCHEDULED_INFORMATION,
+            source_component_id=runtime_id,
+            component_local_sequence=3,
+            event_type=FullDayEventTypeV1.SHOCK_REJECTED,
+            causal_parent_ids=(shock_candidate.event_id,),
+            payload=FullDayEventPayloadV1(
+                schema_version=1,
+                payload_type=FullDayEventTypeV1.SHOCK_REJECTED.value,
+                payload_version=1,
+                native_event=None,
+                data={
+                    "candidate_id": "FORGED_SHOCK_CANDIDATE_V1",
+                    "information_cutoff_us": 0,
+                    "reason_code": "FORGED_SHOCK_REJECTION_V1",
+                },
+            ),
+        )
+        anchor_work = ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=WorkStageV1.DAY_STATE_TRANSITION,
+            source_component_id=runtime_id,
+            component_local_sequence=4,
+        )
+        marker_work = ScheduledWorkKeyV1(
+            simulation_time_us=0,
+            microstep=0,
+            stage_ordinal=WorkStageV1.CHECKPOINT_CAPTURE,
+            source_component_id=runtime_id,
+            component_local_sequence=5,
+        )
+        anchor = replace(
+            events[1],
+            global_event_sequence=4,
+            component_local_sequence=4,
+            causal_parent_ids=(anchor_work.work_id,),
+        )
+        marker = replace(
+            events[2],
+            global_event_sequence=5,
+            component_local_sequence=5,
+            causal_parent_ids=(marker_work.work_id,),
+        )
+        forged_events = (
+            events[0],
+            shock_candidate,
+            shock_rejected,
+            anchor,
+            marker,
+        )
+        root_id = "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id == root_id
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        selected_label = plan.unscheduled_shock_policy.substream_label
+        selected = next(
+            row for row in root_rng if row["substream_id"] == selected_label
+        )
+        generator = Random()
+        generator.setstate(
+            (
+                selected["random_state_version"],
+                tuple(selected["state_words"]) + (selected["state_index"],),
+                None,
+            )
+        )
+        generator.getrandbits(32)
+        _, inner_state, gaussian_cache = generator.getstate()
+        assert gaussian_cache is None
+        advanced = OwnedPrngStateV1.cpython_mt19937(
+            substream_id=selected_label,
+            initial_seed=selected["initial_seed"],
+            state_words=tuple(inner_state[:-1]),
+            state_index=inner_state[-1],
+        ).as_dict()
+
+        def mutate_root_rng(state: dict[str, object]) -> None:
+            rows = state["runtime.rng_states"]
+            assert isinstance(rows, list)
+            state["runtime.rng_states"] = [
+                copy.deepcopy(advanced)
+                if row["substream_id"] == selected_label
+                else row
+                for row in rows
+            ]
+
+        candidate = mutate_component_state(root_id, mutate_root_rng)
+
+        def mutate_runtime(state: dict[str, object]) -> None:
+            state["state.component_local_sequence"] = 6
+            state["state.component_sequence_offset"] = 5
+
+        candidate = mutate_component_state(
+            state_runtime_id,
+            mutate_runtime,
+            candidate=candidate,
+        )
+        future_state_work = ScheduledWorkKeyV1(
+            simulation_time_us=pending_work.simulation_time_us,
+            microstep=pending_work.microstep,
+            stage_ordinal=pending_work.stage_ordinal,
+            source_component_id=runtime_id,
+            component_local_sequence=6,
+        )
+        candidate = mutate_component_state(
+            "SCHEDULED_WORK_QUEUE_V1",
+            lambda state: state.__setitem__(
+                "scheduled_work.pending_heap", [future_state_work.as_dict()]
+            ),
+            candidate=candidate,
+        )
+
+        def mutate_shock_state(state: dict[str, object]) -> None:
+            state["shock.accepted_count"] = 0
+            state["shock.candidate_draw_count"] = 1
+            state["shock.last_accepted_time_us"] = None
+            state["shock.proposal_sequence"] = 1
+            state["shock.rejected_count"] = 1
+
+        candidate = mutate_component_state(
+            "SCHEDULED_EVENT_SHOCK_HALT_REOPEN_STATE_V1",
+            mutate_shock_state,
+            candidate=candidate,
+        )
+        candidate = rebind_checkpoint_prefix(candidate, forged_events)
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=forged_events,
+        )
+
+    def pending_event_base_fixture():
+        future_work = ScheduledWorkKeyV1(
+            simulation_time_us=pending_work.simulation_time_us + 1,
+            microstep=0,
+            stage_ordinal=WorkStageV1.ENDOGENOUS_PARTICIPANT_DECISION,
+            source_component_id="AGENT_SCHEDULER_V1",
+            component_local_sequence=1,
+        )
+        native = NativeEventReferenceV1(
+            schema_version=1,
+            owner_component_id="AGENT_SCHEDULER_V1",
+            native_ledger_id="AGENT_EVENT_LEDGER_V1",
+            event_type="PARTICIPANT_DECISION",
+            local_sequence=1,
+            event_id="PENDING_NATIVE_DECISION_V1",
+        )
+        payload = FullDayEventPayloadV1(
+            schema_version=1,
+            payload_type=FullDayEventTypeV1.PARTICIPANT_DECISION.value,
+            payload_version=1,
+            native_event=native,
+            data={
+                "decision_id": "PENDING_DECISION_V1",
+                "information_cutoff_us": 0,
+                "native_payload_sha256": "e" * 64,
+                "participant_id": "AUDIT_MAKER",
+            },
+        )
+        candidate = replace(
+            checkpoint,
+            quiescent_cut=replace(
+                checkpoint.quiescent_cut,
+                pending_work_count=2,
+            ),
+        )
+        ordered_work = tuple(
+            sorted((pending_work, future_work), key=lambda item: item.ordering_key)
+        )
+        candidate = mutate_component_state(
+            "SCHEDULED_WORK_QUEUE_V1",
+            lambda state: state.__setitem__(
+                "scheduled_work.pending_heap",
+                [item.as_dict() for item in ordered_work],
+            ),
+            candidate=candidate,
+        )
+        candidate = mutate_component_state(
+            "COMPONENT_LOCAL_ALLOCATORS_V1",
+            lambda state: state.__setitem__(
+                "runtime.non_state_component_local_event_sequence_allocators",
+                {"AGENT_SCHEDULER_V1": 1},
+            ),
+            candidate=candidate,
+        )
+
+        def mutate_pending(state: dict[str, object]) -> None:
+            state["pending_event.causal_parent_by_work_id"] = {
+                future_work.work_id: future_work.work_id
+            }
+            state["pending_event.payloads_by_work_id"] = {
+                future_work.work_id: payload.as_dict()
+            }
+
+        candidate = mutate_component_state(
+            "PENDING_EVENT_QUEUES_V1",
+            mutate_pending,
+            candidate=candidate,
+        )
+        return candidate, future_work
+
+    pending_event_base, pending_event_work = pending_event_base_fixture()
+    try:
+        validate(pending_event_base)
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"valid pending-event hostile base was refused: {error}")
+
+    def mismatched_pending_work_parent() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            causal = state["pending_event.causal_parent_by_work_id"]
+            assert isinstance(causal, dict)
+            causal[pending_event_work.work_id] = "work:" + "0" * 64
+
+        return validate(
+            mutate_component_state(
+                "PENDING_EVENT_QUEUES_V1",
+                mutate,
+                candidate=pending_event_base,
+            )
+        )
+
+    def wrong_stage_pending_payload() -> object:
+        native = NativeEventReferenceV1(
+            schema_version=1,
+            owner_component_id="AGENT_SCHEDULER_V1",
+            native_ledger_id="AGENT_EVENT_LEDGER_V1",
+            event_type="BACKGROUND_FLOW_PROPOSAL",
+            local_sequence=1,
+            event_id="PENDING_WRONG_STAGE_NATIVE_V1",
+        )
+        wrong_payload = FullDayEventPayloadV1(
+            schema_version=1,
+            payload_type=FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL.value,
+            payload_version=1,
+            native_event=native,
+            data={
+                "native_payload_sha256": "f" * 64,
+                "observation_cutoff_us": 0,
+                "proposal_id": "PENDING_WRONG_STAGE_PROPOSAL_V1",
+            },
+        )
+
+        def mutate(state: dict[str, object]) -> None:
+            payloads = state["pending_event.payloads_by_work_id"]
+            assert isinstance(payloads, dict)
+            payloads[pending_event_work.work_id] = wrong_payload.as_dict()
+
+        return validate(
+            mutate_component_state(
+                "PENDING_EVENT_QUEUES_V1",
+                mutate,
+                candidate=pending_event_base,
+            )
+        )
+
+    def omitted_nonplan_pending_event_state() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            causal = state["pending_event.causal_parent_by_work_id"]
+            payloads = state["pending_event.payloads_by_work_id"]
+            assert isinstance(causal, dict)
+            assert isinstance(payloads, dict)
+            del causal[pending_event_work.work_id]
+            del payloads[pending_event_work.work_id]
+
+        return validate(
+            mutate_component_state(
+                "PENDING_EVENT_QUEUES_V1",
+                mutate,
+                candidate=pending_event_base,
+            )
+        )
+
+    def runtime_allocator_rollback() -> object:
+        def mutate(state: dict[str, object]) -> None:
+            state["state.component_local_sequence"] = 3
+            state["state.component_sequence_offset"] = 2
+
+        return validate(mutate_component_state(state_runtime_id, mutate))
+
+    def calendar_cursor_advance() -> object:
+        second_operation = plan.calendar.boundary_operations[1]
+        third_operation = plan.calendar.boundary_operations[2]
+
+        def mutate(state: dict[str, object]) -> None:
+            state["calendar.boundary_operation_index"] = 2
+            state["calendar.current_phase_id"] = (
+                second_operation.destination_session_state.value
+            )
+            state["calendar.next_boundary_time_us"] = (
+                third_operation.boundary.simulation_time_us
+            )
+
+        return validate(mutate_component_state("CALENDAR_CURSOR_V1", mutate))
+
+    def forged_calendar_phase() -> object:
+        return validate(
+            mutate_component_state(
+                "CALENDAR_CURSOR_V1",
+                lambda state: state.__setitem__(
+                    "calendar.current_phase_id", "CLOSED"
+                ),
+            )
+        )
+
+    def observable_cursor_ahead() -> object:
+        return validate(
+            mutate_component_state(
+                "OBSERVABLE_PUBLICATION_CURSOR_V1",
+                lambda state: state.__setitem__(
+                    "observable.client_publication_cursor",
+                    checkpoint.quiescent_cut.last_global_event_sequence + 1,
+                ),
+            )
+        )
+
+    def forged_t0_event_source() -> object:
+        forged_events = (
+            replace(
+                events[0],
+                source_component_id="ENGINE_MARKET_MECHANICS_V1",
+            ),
+            *events[1:],
+        )
+        forged_digest = canonical_event_prefix_sha256(forged_events)
+        forged_cut = replace(
+            checkpoint.quiescent_cut,
+            event_prefix_sha256=forged_digest,
+        )
+        candidate = replace(checkpoint, quiescent_cut=forged_cut)
+        candidate = mutate_component_state(
+            "LEDGER_PREFIX_V1",
+            lambda state: state.__setitem__(
+                "ledger.event_prefix_sha256", forged_digest
+            ),
+            candidate=candidate,
+        )
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=forged_events,
+        )
+
+    def forged_t0_work_parent() -> object:
+        forged_events = (
+            replace(
+                events[0],
+                causal_parent_ids=("work:" + "0" * 64,),
+            ),
+            *events[1:],
+        )
+        forged_digest = canonical_event_prefix_sha256(forged_events)
+        forged_cut = replace(
+            checkpoint.quiescent_cut,
+            event_prefix_sha256=forged_digest,
+        )
+        candidate = replace(checkpoint, quiescent_cut=forged_cut)
+        candidate = mutate_component_state(
+            "LEDGER_PREFIX_V1",
+            lambda state: state.__setitem__(
+                "ledger.event_prefix_sha256", forged_digest
+            ),
+            candidate=candidate,
+        )
+        return validate_runtime_checkpoint(
+            candidate,
+            plan=plan,
+            composition_matrix=matrix,
+            inventory=inventory,
+            event_prefix=forged_events,
+        )
+
+    def forged_seen_observation() -> object:
+        return validate(
+            mutate_component_state(
+                state_runtime_id,
+                lambda state: state.__setitem__(
+                    "state.observation_ids_seen",
+                    ["FORGED_OBSERVATION_V1"],
+                ),
+            )
+        )
+
+    def dot_artifact_path() -> object:
+        return checkpoint_artifact_reference(checkpoint, "./checkpoint.json")
+
+    def nul_artifact_path() -> object:
+        return checkpoint_artifact_reference(
+            checkpoint,
+            "checkpoints/\x00checkpoint.json",
+        )
+
+    def empty_owner_rng_copy() -> object:
+        return validate(
+            mutate_component_state(
+                "AGENT_SCHEDULER_METAORDERS_V1",
+                lambda state: state.__setitem__("agent.rng_states", []),
+            )
+        )
+
+    def cross_owner_rng_copy() -> object:
+        root_record = next(
+            record
+            for record in checkpoint.components
+            if record.component_id
+            == "ROOT_SEED_DERIVED_LABEL_REGISTRY_ACTIVE_RNG_V1"
+        )
+        root_payload = root_record.as_dict()
+        root_state = root_payload["state"]
+        assert isinstance(root_state, dict)
+        root_rng = root_state["runtime.rng_states"]
+        assert isinstance(root_rng, list)
+        foreign = next(
+            row
+            for row in root_rng
+            if row["substream_id"] == runtime_snapshot.day_rng.substream_label
+        )
+
+        def mutate(state: dict[str, object]) -> None:
+            rows = state["agent.rng_states"]
+            assert isinstance(rows, list)
+            state["agent.rng_states"] = sorted(
+                [*rows, copy.deepcopy(foreign)],
+                key=lambda row: row["substream_id"],
+            )
+
+        return validate(
+            mutate_component_state(
+                "AGENT_SCHEDULER_METAORDERS_V1",
+                mutate,
+            )
+        )
+
+    probes: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("missing active component state", missing_active_state),
+        ("preserved inactive component state", preserved_inactive_state),
+        ("corrupt component state digest", corrupt_component_digest),
+        ("duplicate component record", duplicate_component_record),
+        ("component dependency cycle", cyclic_dependencies),
+        ("wrong engine runtime", wrong_engine_runtime),
+        ("wrong RNG codec", wrong_rng_codec),
+        ("wrong RNG runtime", wrong_rng_runtime),
+        ("unknown checkpoint schema", unknown_checkpoint_schema),
+        ("nonquiescent checkpoint cut", nonquiescent_cut),
+        ("t=0 checkpoint before macro anchor", incomplete_t0_prefix),
+        ("embedded checkpoint self digest", embedded_self_digest),
+        ("unknown component implementation", unknown_component_implementation),
+        ("floating component state", floating_state),
+        ("noncanonical checkpoint bytes", noncanonical_checkpoint_bytes),
+        ("duplicate global event sequence", duplicate_global_event_sequence),
+        ("negative-zero Gaussian cache", negative_zero_gaussian_cache),
+        ("forged day sampled duration", forged_day_duration),
+        ("forged day deadline", forged_day_deadline),
+        ("forged day eligible time", forged_day_eligible_time),
+        ("participant schedule cursor advance", participant_cursor_advance),
+        ("scheduled event cursor advance", scheduled_event_cursor_advance),
+        ("wrong algorithm root and owner swap", wrong_algorithm_root_owner_swap),
+        ("extra day SplitMix raw draw", extra_day_splitmix_raw_draw),
+        ("future participant MT raw draw", future_participant_mt_raw_draw),
+        (
+            "initially active participant MT raw draw",
+            initially_active_participant_mt_raw_draw,
+        ),
+        (
+            "forged participant decision RNG exemption",
+            forged_participant_decision_rng_exemption,
+        ),
+        ("forged shock RNG exemption", forged_shock_rng_exemption),
+        ("omitted non-state allocator", omitted_non_state_allocator),
+        ("mismatched pending work parent", mismatched_pending_work_parent),
+        ("wrong-stage pending payload", wrong_stage_pending_payload),
+        (
+            "omitted non-plan pending event state",
+            omitted_nonplan_pending_event_state,
+        ),
+        ("full-day runtime allocator rollback", runtime_allocator_rollback),
+        ("calendar cursor advance", calendar_cursor_advance),
+        ("forged calendar phase", forged_calendar_phase),
+        ("observable cursor ahead", observable_cursor_ahead),
+        ("forged t=0 event source", forged_t0_event_source),
+        ("forged t=0 work parent", forged_t0_work_parent),
+        ("forged seen observation", forged_seen_observation),
+        ("dot artifact path", dot_artifact_path),
+        ("NUL artifact path", nul_artifact_path),
+        ("empty owner RNG copy", empty_owner_rng_copy),
+        ("cross-owner RNG copy", cross_owner_rng_copy),
+    )
+    for label, operation in probes:
+        refusal = _expect_refusal(operation, label)
+        if refusal:
+            failures.append(refusal)
+        else:
+            refusal_count += 1
+
+    return FullDayAuditCase(
+        "checkpoint_hostile_refusals",
+        (
+            f"hostile_refusals={refusal_count} "
+            "missing_active=refused preserved_inactive=refused digest=refused "
+            "duplicate=refused cycle=refused runtime_rng=refused "
+            "rng_extra_draws=refused initial_active_rng=refused t0=refused "
+            "rng_event_exemptions=refused negative_zero=refused "
+            "semantic_forgery=refused work_parent=refused event_sequence=refused "
+            "observation_forgery=refused cursor_rollback=refused paths=refused "
+            "allocator_coverage=refused pending_events=refused "
+            "pending_event_coverage=refused self_digest=refused"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31c_checkpoint_relocation_case() -> FullDayAuditCase:
+    """Prove paths are metadata while artifact hashes still bind exact bytes."""
+
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from kirby2.full_day.checkpoints import (
+        RuntimeCheckpointV1,
+        checkpoint_artifact_reference,
+    )
+    from kirby2.research.paths import DataAreaId, DataPaths
+
+    failures: list[str] = []
+    _, _, _, _, _, checkpoint, _, _ = _wo31c_checkpoint_fixture()
+    wire = checkpoint.canonical_bytes()
+    filename = checkpoint.checkpoint_id + ".json"
+    with TemporaryDirectory(prefix="kirby2-wo31c-relocation-") as temporary:
+        sandbox = Path(temporary).resolve()
+        left = DataPaths((sandbox / "left-root").resolve())
+        right = DataPaths((sandbox / "right-root").resolve())
+        left.ensure((DataAreaId.CHECKPOINTS,))
+        right.ensure((DataAreaId.CHECKPOINTS,))
+        left_path = left.checkpoints / filename
+        right_directory = right.checkpoints / "relocated"
+        right_directory.mkdir()
+        right_path = right_directory / filename
+        left_path.write_bytes(wire)
+        right_path.write_bytes(left_path.read_bytes())
+        relocated = RuntimeCheckpointV1.from_json_bytes(right_path.read_bytes())
+        if (
+            relocated.semantic_sha256 != checkpoint.semantic_sha256
+            or relocated.checkpoint_id != checkpoint.checkpoint_id
+        ):
+            failures.append("checkpoint relocation changed semantic identity")
+        left_reference = checkpoint_artifact_reference(
+            checkpoint,
+            f"checkpoints/{filename}",
+        )
+        right_reference = checkpoint_artifact_reference(
+            checkpoint,
+            f"checkpoints/relocated/{filename}",
+        )
+        artifact_sha256 = hashlib.sha256(wire).hexdigest()
+        if (
+            left_reference.sha256 != artifact_sha256
+            or right_reference.sha256 != artifact_sha256
+        ):
+            failures.append("artifact references do not bind exact checkpoint bytes")
+        if left_reference.relative_path == right_reference.relative_path:
+            failures.append("relocation fixture did not exercise distinct paths")
+        if str(left.root) in wire.decode("utf-8") or str(right.root) in wire.decode("utf-8"):
+            failures.append("checkpoint semantic bytes contain a local data root")
+        if hashlib.sha256(wire + b"\n").hexdigest() == artifact_sha256:
+            failures.append("transport substitution did not change artifact identity")
+
+    traversal_refusal = _expect_refusal(
+        lambda: checkpoint_artifact_reference(checkpoint, "../checkpoint.json"),
+        "checkpoint artifact traversal path",
+    )
+    if traversal_refusal:
+        failures.append(traversal_refusal)
+    identity_keys = set(checkpoint.semantic_identity_dict())
+    forbidden_identity_keys = {
+        "artifact_sha256",
+        "checkpoint_id",
+        "checkpoint_sha256",
+        "display_metadata",
+        "path",
+        "relative_path",
+        "semantic_sha256",
+    }
+    if identity_keys & forbidden_identity_keys:
+        failures.append("checkpoint semantic projection includes path or self identity")
+
+    return FullDayAuditCase(
+        "checkpoint_identity_and_path_relocation",
+        (
+            "semantic_identity=relocation_stable artifact_sha256=byte_bound "
+            "self_digest=excluded traversal_path=refused relocations=2"
+        ),
+        tuple(failures),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
     "audit_dev0003_state_checkpoint_inventory",
     "audit_wo31a_contracts",
     "audit_wo31b_transitions",
+    "audit_wo31c_checkpoints",
 ]
