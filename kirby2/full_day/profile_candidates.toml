@@ -1,0 +1,157 @@
+"candidate_order" = ["QUIET_RANGE_PRESSURE", "TREND_PRESSURE", "EVENT_SHOCK_PRESSURE", "DISORDERLY_OPEN_STABILIZATION_PRESSURE"]
+"manifest_id" = "WO31_H_PROFILE_CANDIDATES_V1"
+"manifest_sha256" = "850f69efafa92b32d4a2f11978e0daf941a60fa0851b5ec610d815c3ed20aaf7"
+"manifest_version" = 1
+"policy_version" = "FULL_DAY_PROFILE_V1"
+"schema_version" = 1
+"semantic_sha256" = "f3ab33d06a65fa4488e337460893d5ccae2d987bb3f6472da1b4f661b410237e"
+"semantic_version" = 1
+
+["arithmetic"]
+"boundary_mapping" = "continuous_start_us+floor((b*continuous_duration_us+S-1)/S)"
+"boundary_mapping_application" = "ONCE_BEFORE_INTERVAL_COMPARISON"
+"fixed_point_scale" = 1000000
+"multiplier_operation" = "mul_ppm(a,b)=round_div_even(a*b,S)"
+"normalized_time" = "floor((t-continuous_start_us)*S/continuous_duration_us)"
+"rounding" = "ROUND_DIV_EVEN_V1"
+
+["base_plan"]
+"composition_matrix_sha256" = "c32ba6793b9598221e625a210bfc29924f8f3b24ff7245ca95019554aa93dd08"
+"composition_profile_id" = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1"
+"composition_profile_sha256" = "c32ba6793b9598221e625a210bfc29924f8f3b24ff7245ca95019554aa93dd08"
+"composition_profile_version" = 1
+"plan_id" = "WO31_F_COMPLETE_DAY_AUDIT_V1"
+"plan_sha256" = "24ebad3b86eebdd0db1ff8dea33fbf9f4d57ee92478354944de9c0e48fefb860"
+"plan_version" = 1
+
+["candidates"]
+
+["candidates"."DISORDERLY_OPEN_STABILIZATION_PRESSURE"]
+"candidate_id" = "DISORDERLY_OPEN_STABILIZATION_PRESSURE"
+"display_label" = "DISORDERLY_OPEN_STABILIZING"
+"display_label_semantics" = "REQUESTED_HYPOTHESIS_NOT_GUARANTEED_PATH"
+"intervals" = [{ "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1600000, "aggressive_primary_ppm" = 1600000, "cancel_ppm" = 2000000, "end_ppm" = 80000, "liquidity_ppm" = 550000, "start_ppm" = 0, "volatility_ppm" = 2200000, "volume_ppm" = 2200000 }, { "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1250000, "aggressive_primary_ppm" = 1250000, "cancel_ppm" = 1300000, "end_ppm" = 200000, "liquidity_ppm" = 800000, "start_ppm" = 80000, "volatility_ppm" = 1500000, "volume_ppm" = 1500000 }, { "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1000000, "aggressive_primary_ppm" = 1000000, "cancel_ppm" = 1000000, "end_ppm" = 1000000, "liquidity_ppm" = 1000000, "start_ppm" = 200000, "volatility_ppm" = 1000000, "volume_ppm" = 1000000 }]
+"profile_version" = 1
+
+["candidates"."DISORDERLY_OPEN_STABILIZATION_PRESSURE"."controls"]
+"active_end_ppm" = "NOT_APPLICABLE"
+"active_start_ppm" = "NOT_APPLICABLE"
+"publication_ppm" = "NOT_APPLICABLE"
+"side_label" = "NOT_APPLICABLE"
+"side_rule" = "NOT_APPLICABLE"
+
+["candidates"."EVENT_SHOCK_PRESSURE"]
+"candidate_id" = "EVENT_SHOCK_PRESSURE"
+"display_label" = "EVENT_SHOCK_AND_RECOVERY"
+"display_label_semantics" = "REQUESTED_HYPOTHESIS_NOT_GUARANTEED_PATH"
+"intervals" = [{ "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1000000, "aggressive_primary_ppm" = 1000000, "cancel_ppm" = 1000000, "end_ppm" = 450000, "liquidity_ppm" = 1000000, "start_ppm" = 0, "volatility_ppm" = 1000000, "volume_ppm" = 1000000 }, { "aggressive_mode" = "SHOCK_SIDE", "aggressive_other_ppm" = 800000, "aggressive_primary_ppm" = 1800000, "cancel_ppm" = 1800000, "end_ppm" = 550000, "liquidity_ppm" = 550000, "start_ppm" = 450000, "volatility_ppm" = 2500000, "volume_ppm" = 2200000 }, { "aggressive_mode" = "SHOCK_SIDE", "aggressive_other_ppm" = 900000, "aggressive_primary_ppm" = 1200000, "cancel_ppm" = 1200000, "end_ppm" = 750000, "liquidity_ppm" = 850000, "start_ppm" = 550000, "volatility_ppm" = 1400000, "volume_ppm" = 1300000 }, { "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1000000, "aggressive_primary_ppm" = 1000000, "cancel_ppm" = 1000000, "end_ppm" = 1000000, "liquidity_ppm" = 1000000, "start_ppm" = 750000, "volatility_ppm" = 1000000, "volume_ppm" = 1000000 }]
+"profile_version" = 1
+
+["candidates"."EVENT_SHOCK_PRESSURE"."controls"]
+"active_end_ppm" = 550000
+"active_start_ppm" = 450000
+"publication_ppm" = 450000
+"side_label" = "full_day/EVENT_SHOCK_PRESSURE/shock_side"
+"side_rule" = "LABELED_SEED_LOW_BIT_ZERO_BUY_ONE_SELL"
+
+["candidates"."QUIET_RANGE_PRESSURE"]
+"candidate_id" = "QUIET_RANGE_PRESSURE"
+"display_label" = "QUIET_RANGE_DAY"
+"display_label_semantics" = "REQUESTED_HYPOTHESIS_NOT_GUARANTEED_PATH"
+"intervals" = [{ "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 700000, "aggressive_primary_ppm" = 700000, "cancel_ppm" = 800000, "end_ppm" = 1000000, "liquidity_ppm" = 1300000, "start_ppm" = 0, "volatility_ppm" = 650000, "volume_ppm" = 700000 }]
+"profile_version" = 1
+
+["candidates"."QUIET_RANGE_PRESSURE"."controls"]
+"active_end_ppm" = "NOT_APPLICABLE"
+"active_start_ppm" = "NOT_APPLICABLE"
+"publication_ppm" = "NOT_APPLICABLE"
+"side_label" = "NOT_APPLICABLE"
+"side_rule" = "NOT_APPLICABLE"
+
+["candidates"."TREND_PRESSURE"]
+"candidate_id" = "TREND_PRESSURE"
+"display_label" = "TREND_DAY"
+"display_label_semantics" = "REQUESTED_HYPOTHESIS_NOT_GUARANTEED_PATH"
+"intervals" = [{ "aggressive_mode" = "SYMMETRIC", "aggressive_other_ppm" = 1000000, "aggressive_primary_ppm" = 1000000, "cancel_ppm" = 1000000, "end_ppm" = 150000, "liquidity_ppm" = 1000000, "start_ppm" = 0, "volatility_ppm" = 900000, "volume_ppm" = 950000 }, { "aggressive_mode" = "FAVORED_SIDE", "aggressive_other_ppm" = 700000, "aggressive_primary_ppm" = 1600000, "cancel_ppm" = 1100000, "end_ppm" = 850000, "liquidity_ppm" = 900000, "start_ppm" = 150000, "volatility_ppm" = 1100000, "volume_ppm" = 1250000 }, { "aggressive_mode" = "FAVORED_SIDE", "aggressive_other_ppm" = 850000, "aggressive_primary_ppm" = 1200000, "cancel_ppm" = 900000, "end_ppm" = 1000000, "liquidity_ppm" = 1000000, "start_ppm" = 850000, "volatility_ppm" = 900000, "volume_ppm" = 1000000 }]
+"profile_version" = 1
+
+["candidates"."TREND_PRESSURE"."controls"]
+"active_end_ppm" = 800000
+"active_start_ppm" = 200000
+"publication_ppm" = "NOT_APPLICABLE"
+"side_label" = "full_day/TREND_PRESSURE/favored_side"
+"side_rule" = "LABELED_SEED_LOW_BIT_ZERO_BUY_ONE_SELL"
+
+["execution_scope"]
+"action" = "VALIDATE_MANIFESTS_ONLY"
+"automated_readiness" = "NOT_EXERCISED"
+"development_evidence" = "NOT_EXECUTED"
+"holdout" = "NOT_EXERCISED"
+"human_acceptance" = "PENDING"
+"qualification" = "NOT_EXERCISED"
+
+["scaling_rules"]
+"aggressive_and_cancel_modify_rates_only" = true
+"controls_affect_normal_rates_and_participants_only" = true
+"controls_never_set_price_or_force_trade" = true
+"derived_child_quantities_scaled_again" = false
+"integer_quantity_rule" = "CLAMP_TO_ONE_ONLY_IF_BASE_POSITIVE_AND_REQUIRED"
+"left_to_right_round_after_each_multiplier" = true
+"no_other_field_changes" = true
+"price_spread_target_or_forced_trade_controls" = "FORBIDDEN"
+"zero_rate_remains_zero" = true
+
+["scaling_rules"."targets"]
+
+["scaling_rules"."targets"."INITIAL_QUEUE_DISTRIBUTION_VALUES"]
+"multiplier_order" = ["LIQUIDITY"]
+"paths" = ["/base_flow/initial_queue_sizes/values/*"]
+
+["scaling_rules"."targets"."LIMIT_RATE_BUY_SELL"]
+"multiplier_order" = ["VOLUME", "LIQUIDITY"]
+"paths" = ["/base_flow/rates/limit_buy", "/base_flow/rates/limit_sell"]
+
+["scaling_rules"."targets"."LIMIT_SIZE_DISTRIBUTION_VALUES"]
+"multiplier_order" = ["VOLUME", "LIQUIDITY"]
+"paths" = ["/base_flow/order_sizes/limit_buy/values/*", "/base_flow/order_sizes/limit_sell/values/*"]
+
+["scaling_rules"."targets"."MARKET_RATE_BUY_SELL"]
+"multiplier_order" = ["VOLUME", "VOLATILITY", "SIDE_AGGRESSIVE"]
+"paths" = ["/base_flow/rates/market_buy", "/base_flow/rates/market_sell"]
+
+["scaling_rules"."targets"."MARKET_SIZE_DISTRIBUTION_VALUES"]
+"multiplier_order" = ["VOLUME", "VOLATILITY"]
+"paths" = ["/base_flow/order_sizes/market_buy/values/*", "/base_flow/order_sizes/market_sell/values/*"]
+
+["scaling_rules"."targets"."SCHEDULED_PARTICIPANT_PARENT_QUANTITY"]
+"multiplier_order" = ["VOLUME"]
+"paths" = ["/scheduled_participants/*/parent_quantity_shares"]
+
+["scaling_rules"."targets"."SCHEDULED_SHOCK_ORDER_QUANTITY"]
+"multiplier_order" = ["VOLUME", "VOLATILITY"]
+"paths" = ["/scheduled_events/*/quantity_shares"]
+
+["scaling_rules"."targets"."SIDE_CANCEL_RATE"]
+"multiplier_order" = ["VOLUME", "CANCEL"]
+"paths" = ["/base_flow/rates/cancel_bid", "/base_flow/rates/cancel_ask"]
+
+["seed_policy"]
+"candidate_component_label" = "full_day/<candidate_id>/<component_label>"
+"development_roots" = [3101000, 3101001, 3101002, 3101003]
+"holdout_roots" = [3103000, 3103001, 3103002, 3103003]
+"partitions_disjoint" = true
+"qualification_roots" = [3102000, 3102001, 3102002, 3102003, 3102004, 3102005, 3102006, 3102007]
+"review_label" = "full_day/review"
+"review_root" = 3199001
+"review_stream_may_consume_generator_stream" = false
+"root_replacement" = "FORBIDDEN"
+"shared_numeric_root_cross_candidate_substream" = false
+"simulation_seed_formula" = "int.from_bytes(SHA256(u64be(root)||NUL||utf8_nfc(policy_version)||NUL||utf8_nfc(label))[0:8],big)&((1<<63)-1)"
+
+["transition_source_eligibility"]
+"base_plan_eligible" = false
+"ineligibility_reason" = "LOCAL_TRANSITION_ROWS_HAVE_FEWER_THAN_TWO_POSITIVE_DESTINATIONS"
+"minimum_positive_destination_weight" = 200001
+"minimum_positive_destinations_per_local_row" = 2
+"required_row_weight_sum" = 1000000
+"source_policy_id" = "BOUNDED_SEARCH_CONTROLLED_V1"

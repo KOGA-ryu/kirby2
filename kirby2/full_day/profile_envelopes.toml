@@ -1,0 +1,184 @@
+"manifest_id" = "WO31_H_PROFILE_ENVELOPES_V1"
+"manifest_sha256" = "35daf755163585fd9201ca920283625d18a60d03924f434ef74859e98eacef90"
+"manifest_version" = 1
+"policy_version" = "FULL_DAY_PROFILE_V1"
+"profile_candidates_manifest_sha256" = "850f69efafa92b32d4a2f11978e0daf941a60fa0851b5ec610d815c3ed20aaf7"
+"schema_version" = 1
+"semantic_sha256" = "2f6f5a3287bac4a23c395af124e0bdf8eba1aab1f0afd2d8606ab3ce8446cada"
+"semantic_version" = 1
+
+["aggregation"]
+"common_order" = "ASCENDING_SEMANTIC_ID_THEN_ROOT_THEN_EVENT_OR_ATTEMPT_ORDINAL"
+"disorderly_open" = "POOL_OPEN_AND_MIDDAY_SPREAD_DISTRIBUTIONS;POOL_CANCEL_COUNTS_AND_ELIGIBLE_DURATIONS;RATIO_PPM(open_cancel_count*mid_eligible_us,mid_cancel_count*open_eligible_us);POOL_FINAL_OCCUPANCY_AND_SPREAD"
+"event" = "POOL_SHOCK_AND_PRE_AGGRESSIVE_SHARES_AND_DURATIONS;P50_PER_ROOT_RANGE_RATIO;POOL_RECOVERY_OCCUPANCY;COMPARE_POOLED_RECOVERY_AND_SHOCK_SPREAD_MEDIANS"
+"forbidden_implicit_reductions" = "NO_MEAN_OF_RATIOS_NO_WORST_ROOT_NO_UNDECLARED_REDUCTION"
+"maximum" = "MAXIMUM_OF_PER_ROOT_MAXIMA"
+"nonadditive_range_ratio" = "COMPUTE_PER_ROOT_THEN_REDUCE_P50"
+"occupancy" = "POOL_OCCUPIED_DURATION_OVER_ELIGIBLE_DURATION"
+"paired_distributions" = "POOL_SEPARATELY_BEFORE_COMPARISON"
+"quiet" = "POOL_SPREAD_DURATIONS_AND_AGGRESSIVE_NUMERATORS_DENOMINATORS;MAXIMUM_DISPLACEMENT_ACROSS_ROOTS"
+"ratio_share" = "POOL_RAW_INTEGER_NUMERATORS_AND_DENOMINATORS_THEN_DIVIDE_ONCE"
+"time_weighted_distribution" = "POOL_POSITIVE_DURATION_SEGMENTS_IN_ASCENDING_ROOT_TIME_ORDER"
+"trend" = "POOL_FAVORED_AND_TOTAL_AGGRESSIVE_SHARES;PER_ROOT_SIGNED_DISPLACEMENT_REDUCED_P50;COUNT_STRICTLY_POSITIVE_ROOTS"
+
+["behavioral_gates"]
+
+["behavioral_gates"."DISORDERLY_OPEN_STABILIZATION_PRESSURE"]
+"behavioral_miss" = "WARNING_AND_AUTOMATED_READY_FALSE"
+"final_eighty_percent_median_spread_max_ticks" = 8
+"final_eighty_percent_two_sided_occupancy_min_ppm" = 950000
+"first_eight_percent_cancel_rate_over_midday_min_ppm" = 1500000
+"first_eight_percent_median_spread_vs_midday" = "GREATER_THAN_OR_EQUAL"
+
+["behavioral_gates"."EVENT_SHOCK_PRESSURE"]
+"behavioral_miss" = "WARNING_AND_AUTOMATED_READY_FALSE"
+"recovery_median_spread_vs_shock" = "LESS_THAN_OR_EQUAL"
+"recovery_two_sided_occupancy_min_ppm" = 900000
+"shock_over_pre_aggressive_volume_min_ppm" = 1500000
+"shock_over_pre_range_min_ppm" = 1200000
+
+["behavioral_gates"."QUIET_RANGE_PRESSURE"]
+"absolute_aggressive_volume_imbalance_max_ppm" = 250000
+"behavioral_miss" = "WARNING_AND_AUTOMATED_READY_FALSE"
+"maximum_absolute_trade_displacement_ticks" = 80
+"spread_p50_max_ticks" = 4
+"spread_p95_max_ticks" = 8
+
+["behavioral_gates"."TREND_PRESSURE"]
+"behavioral_miss" = "WARNING_AND_AUTOMATED_READY_FALSE"
+"favored_aggressive_volume_share_min_ppm" = 600000
+"holdout_positive_root_count_min" = 3
+"median_favored_signed_displacement_min_ticks" = 2
+"qualification_positive_root_count_min" = 6
+
+["behavioral_windows"]
+
+["behavioral_windows"."DISORDERLY_OPEN_STABILIZATION_PRESSURE"]
+"final_eighty_percent" = [200000, 1000000]
+"first_eight_percent" = [0, 80000]
+"midday" = [350000, 650000]
+
+["behavioral_windows"."EVENT_SHOCK_PRESSURE"]
+"halt_rule" = "AFFECTED_RATIO_IS_INSUFFICIENT_EVIDENCE_NO_WINDOW_RESIZE"
+"pre_event" = [350000, 450000]
+"pre_shock_equal_duration_before_halt_exclusion" = true
+"recovery" = [550000, 750000]
+"shock" = [450000, 550000]
+
+["behavioral_windows"."QUIET_RANGE_PRESSURE"]
+"continuous" = [0, 1000000]
+
+["behavioral_windows"."TREND_PRESSURE"]
+"continuous" = [0, 1000000]
+"first_last_requires_trade_count" = 2
+
+["execution_scope"]
+"automated_readiness" = "NOT_EXERCISED"
+"behavioral_qualification" = "NOT_EXERCISED"
+"holdout" = "NOT_EXERCISED"
+"human_acceptance" = "PENDING"
+"qualification" = "NOT_EXERCISED"
+"review_selection" = "NOT_EXERCISED"
+
+["formulas"]
+"aggressive_imbalance" = "abs(share_ppm(buy_shares-sell_shares,buy_shares+sell_shares))"
+"cancel_rate" = "cancellation_event_count/eligible_nonhalt_duration_us"
+"disorderly_cancel_rate_ratio" = "ratio_ppm(open_cancel_count*mid_eligible_us,mid_cancel_count*open_eligible_us)"
+"disorderly_cancel_ratio_missing" = "INSUFFICIENT_IF_EITHER_ELIGIBLE_DURATION_ZERO_OR_MID_CANCEL_COUNT_ZERO;ZERO_OPEN_CANCEL_WITH_VALID_DENOMINATOR_IS_ZERO"
+"event_range_basis" = "SPREAD_RANGE_WHEN_BOTH_PERIODS_HAVE_QUOTES_ELSE_TRADE_RANGE"
+"favored_side_share" = "unsigned_share_ppm(favored_shares,total_aggressive_shares)"
+"maximum_displacement" = "max(abs(trade_price_ticks-first_continuous_trade_ticks))"
+"median" = "P50_NEAREST_RANK"
+"missing_component" = "INSUFFICIENT_EVIDENCE"
+"nonadditive_ratio_reduction" = "P50_PER_ROOT"
+"occupancy" = "unsigned_share_ppm(sum(occupied_us),sum(eligible_us))"
+"occupancy_eligible_duration" = "NAMED_CONTINUOUS_WINDOW_INTERSECT_CONTINUOUS_SESSION_NOT_HALTED"
+"occupancy_occupied_duration" = "POSITIVE_DURATION_SEGMENTS_WITH_BOTH_BEST_BID_AND_BEST_ASK"
+"percentile" = "NEAREST_RANK_V1"
+"ratio" = "UNBOUNDED_RATIO_PPM_V1"
+"rounding" = "ROUND_DIV_EVEN_V1"
+"spread_distribution" = "TWO_SIDED_QUOTE_DURATION_SEGMENTS_ONLY"
+"time_weighted_percentile" = "TIME_WEIGHTED_NEAREST_RANK_V1"
+"trade_ranges" = "ALL_TRADES_IN_NAMED_HALF_OPEN_WINDOW"
+"trend_buy_displacement" = "last_trade_ticks-first_trade_ticks"
+"trend_sell_displacement" = "first_trade_ticks-last_trade_ticks"
+"zero_denominator" = "INSUFFICIENT_EVIDENCE"
+
+["metric_contract"]
+"fixed_point_scale" = 1000000
+"formula_version" = "FULL_DAY_QUALIFICATION_FORMULAS_V1"
+"integer_units" = ["ATTEMPT_ORDINAL", "BASIS_VALUE", "BYTES", "EVENT_COUNT", "MICROSECONDS", "MILLITICKS", "SHARES", "TICKS"]
+"mad" = "P50(abs(x-P50(x)))"
+"metric_version" = "FULL_DAY_PROFILE_METRICS_V1"
+"nearest_rank" = "rank=max(1,ceil(p_ppm*n/S));p=0_returns_minimum"
+"not_applicable_reduction" = "OMIT_FROM_WEIGHTED_NUMERATOR_AND_DENOMINATOR"
+"percentile_domain_ppm" = [0, 1000000]
+"time_weighted_nearest_rank" = "SORT_VALUE_THEN_CANONICAL_SEGMENT_ORDER;TARGET=max(1,ceil(p_ppm*D/S));p=0_returns_minimum"
+
+["review_policy"]
+"blind_fields" = ["CANDIDATE_ID", "EVENT_TYPE", "FUTURE_OUTCOME", "PRESSURE_CONTROLS", "ROOT_SEED", "TRUTH"]
+"context_template" = "WO31_REVIEW/<candidate_id>/<stratum>/<run_digest>/<start_us>"
+"eligible_start_step_us" = 1000000
+"event_window_offsets_us" = [-120000000, 480000000]
+"intersection_over_union_max_ppm" = 500000
+"packet_order" = "DISPLAY_LABEL_ORDER_THEN_STRATUM_ORDER_THEN_SELECTION_DIGEST"
+"retained_fields" = ["OBSERVABLE_FEED", "PHASE_RELATIVE_TIME"]
+"review_label" = "full_day/review"
+"selected_window_manifest_fields" = ["schema_version", "selection_policy_version", "profile_candidates_manifest_sha256", "profile_envelopes_manifest_sha256", "run_digest", "stratum", "start_us", "end_us", "selection_context", "selection_digest", "observable_window_sha256", "blind_fields", "shortfall_status"]
+"selected_window_manifest_schema" = "FULL_DAY_SELECTED_WINDOW_MANIFEST_V1"
+"selection_algorithm" = "EXHAUSTIVE_ENUMERATE_FILTER_RANK_THEN_GREEDY_IOU_V1"
+"selection_digest_policy" = "COMMON_POLICY_TIE_DIGEST_V1"
+"selection_root" = 3199001
+"shortfall_rule" = "REPORT_WITHOUT_REPLACEMENT"
+"stratum_order" = ["opening", "ordinary_morning", "midday", "event_post_event", "ordinary_afternoon", "close"]
+"universe" = "EVERY_SESSION_START_PLUS_K_SECONDS_ASCENDING"
+"universe_boundary_rule" = "ENTIRE_HALF_OPEN_WINDOW_IN_EXACTLY_ONE_STRATUM;NO_HALT_OR_SESSION_BOUNDARY_IN_OPEN_INTERIOR;AUCTION_OR_CONTINUOUS_ENDPOINT_MAY_BE_WINDOW_ENDPOINT"
+"window_count_per_applicable_stratum" = 2
+"window_duration_us" = 60000000
+
+["review_policy"."candidate_stratum_applicability"]
+
+["review_policy"."candidate_stratum_applicability"."DISORDERLY_OPEN_STABILIZATION_PRESSURE"]
+"event_post_event" = "NOT_APPLICABLE"
+
+["review_policy"."candidate_stratum_applicability"."EVENT_SHOCK_PRESSURE"]
+"event_post_event" = "APPLICABLE"
+
+["review_policy"."candidate_stratum_applicability"."QUIET_RANGE_PRESSURE"]
+"event_post_event" = "NOT_APPLICABLE"
+
+["review_policy"."candidate_stratum_applicability"."TREND_PRESSURE"]
+"event_post_event" = "NOT_APPLICABLE"
+
+["review_policy"."reviewer_rubric"]
+"criteria" = ["MARKET_DYNAMICS_COHERENCE", "VISIBLE_LIQUIDITY_CONTINUITY", "EVENT_RESPONSE_PLAUSIBILITY_WHEN_APPLICABLE", "ARTIFACT_OR_DATA_QUALITY"]
+"outcomes" = ["PLAUSIBLE", "QUESTIONABLE", "IMPLAUSIBLE", "INSUFFICIENT_EVIDENCE"]
+"rubric_cannot_set_human_acceptance" = true
+
+["review_policy"."strata"]
+"close" = "[900000,S)_PLUS_CLOSING_AUCTION"
+"event_post_event" = "[event_time-120000000,event_time+480000000)"
+"midday" = "[350000,600000)"
+"opening" = "OPENING_AUCTION_PLUS_[0,100000)"
+"ordinary_afternoon" = "[600000,900000)_EXCLUDING_EVENT_POST_EVENT"
+"ordinary_morning" = "[100000,350000)_EXCLUDING_EVENT_POST_EVENT"
+
+["stopping_and_disposition"]
+"behavioral_failure_semantics" = "WARNING_NOT_ENGINE_DEFECT_OR_REALISM_CONCLUSION"
+"behavioral_pass" = "EVERY_AGGREGATE_RULE_PASSES"
+"early_stop" = "FORBIDDEN"
+"holdout_reduction" = "IDENTICAL_TO_QUALIFICATION"
+"root_substitution" = "FORBIDDEN"
+"universal_miss" = "FAIL"
+
+["universal_gates"]
+"continuous_two_sided_quote_occupancy_min_ppm" = 950000
+"exact_replay" = "PASS"
+"forced_trade_operations_max" = 0
+"maximum_continuous_spread_ticks" = 20
+"maximum_nonhalt_empty_side_episode_us" = 5000000
+"minimum_trade_count" = 100
+"runtime_invariants" = "PASS"
+"safety_abort_count_max" = 0
+"target_price_operations_max" = 0
+"universal_miss" = "FAIL"

@@ -17191,6 +17191,439 @@ def audit_wo31g_storage() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31h_candidate_manifest_case() -> FullDayAuditCase:
+    from kirby2.full_day.composition import executable_research_composition_matrix
+    from kirby2.full_day.profiles import (
+        BASE_PLAN_SHA256,
+        CANDIDATE_IDS,
+        DEVELOPMENT_ROOTS,
+        HOLDOUT_ROOTS,
+        POLICY_SCALE_PPM,
+        QUALIFICATION_ROOTS,
+        apply_multiplier_chain,
+        load_full_day_profile_bundle,
+        normalized_boundary_time_us,
+        round_div_even,
+        validate_bounded_search_transition_rows,
+    )
+
+    failures: list[str] = []
+    bundle = load_full_day_profile_bundle()
+    plan = _wo31f_plan()
+    matrix = executable_research_composition_matrix()
+    if plan.semantic_sha256 != BASE_PLAN_SHA256:
+        failures.append("candidate manifest base-plan digest differs from WO31-F")
+    if (
+        plan.composition_profile.sha256 != matrix.sha256
+        or matrix.sha256
+        != bundle.candidates.as_dict()["base_plan"]["composition_matrix_sha256"]
+    ):
+        failures.append("candidate manifest composition/profile digest is stale")
+    if tuple(candidate.candidate_id for candidate in bundle.candidates.candidates) != CANDIDATE_IDS:
+        failures.append("candidate IDs/order differ from the four frozen definitions")
+    if tuple(len(candidate.intervals) for candidate in bundle.candidates.candidates) != (1, 3, 4, 3):
+        failures.append("candidate multiplier interval counts are incorrect")
+    candidates = bundle.candidates.as_dict()
+    seed_policy = candidates["seed_policy"]
+    observed_partitions = (
+        tuple(seed_policy["development_roots"]),
+        tuple(seed_policy["qualification_roots"]),
+        tuple(seed_policy["holdout_roots"]),
+    )
+    expected_partitions = (DEVELOPMENT_ROOTS, QUALIFICATION_ROOTS, HOLDOUT_ROOTS)
+    if observed_partitions != expected_partitions:
+        failures.append("candidate seed partitions differ from the preregistration")
+    flat_roots = tuple(root for partition in observed_partitions for root in partition)
+    if len(flat_roots) != len(set(flat_roots)):
+        failures.append("development/qualification/holdout roots overlap")
+    boundary_modes = (
+        bundle.candidates.candidate("TREND_PRESSURE").interval_at(149_999).aggressive_mode,
+        bundle.candidates.candidate("TREND_PRESSURE").interval_at(150_000).aggressive_mode,
+        bundle.candidates.candidate("EVENT_SHOCK_PRESSURE").interval_at(450_000).aggressive_mode,
+        bundle.candidates.candidate("DISORDERLY_OPEN_STABILIZATION_PRESSURE").interval_at(200_000).aggressive_mode,
+    )
+    if boundary_modes != ("SYMMETRIC", "FAVORED_SIDE", "SHOCK_SIDE", "SYMMETRIC"):
+        failures.append("half-open candidate boundary selection is incorrect")
+    if (
+        round_div_even(5, 2),
+        round_div_even(7, 2),
+        round_div_even(-5, 2),
+        round_div_even(-7, 2),
+    ) != (2, 4, -2, -4):
+        failures.append("signed ties-to-even arithmetic differs from policy")
+    if apply_multiplier_chain(100, (700_000, 1_300_000)) != 91:
+        failures.append("left-to-right multiplier rounding differs from policy")
+    if normalized_boundary_time_us(150_000, 100, 11) != 102:
+        failures.append("normalized boundary ceiling was not applied exactly once")
+    try:
+        validate_bounded_search_transition_rows(
+            {"LOCAL_A": {"LOCAL_B": 499_999, "LOCAL_C": 500_001}}
+        )
+    except (TypeError, ValueError) as error:
+        failures.append(f"eligible bounded-search transition row was refused: {error}")
+    refusal = _expect_refusal(
+        lambda: validate_bounded_search_transition_rows(
+            {"LOCAL_A": {"LOCAL_B": POLICY_SCALE_PPM}}
+        ),
+        "single-destination bounded-search row",
+    )
+    if refusal is not None:
+        failures.append(refusal)
+    eligibility = candidates["transition_source_eligibility"]
+    if eligibility["base_plan_eligible"] is not False:
+        failures.append("ineligible WO31-F local transitions were promoted")
+    execution = candidates["execution_scope"]
+    if (
+        execution["qualification"] != "NOT_EXERCISED"
+        or execution["holdout"] != "NOT_EXERCISED"
+        or execution["human_acceptance"] != "PENDING"
+    ):
+        failures.append("candidate manifest overstates frozen evidence status")
+    return FullDayAuditCase(
+        "full_day_profile_candidate_manifest_identity",
+        (
+            f"candidates={len(CANDIDATE_IDS)} intervals=11 roots="
+            f"{len(DEVELOPMENT_ROOTS)}/{len(QUALIFICATION_ROOTS)}/{len(HOLDOUT_ROOTS)} "
+            f"base_plan_sha256={BASE_PLAN_SHA256} matrix_sha256={matrix.sha256} "
+            "protected_seed_execution=absent"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31h_envelope_review_case() -> FullDayAuditCase:
+    from kirby2.full_day.profiles import (
+        INSUFFICIENT_EVIDENCE,
+        REVIEW_SELECTION_ROOT,
+        InsufficientEvidenceError,
+        derive_labeled_seed,
+        load_full_day_profile_bundle,
+        median_absolute_deviation,
+        nearest_rank,
+        policy_tie_digest,
+        ratio_ppm,
+        time_weighted_nearest_rank,
+    )
+
+    failures: list[str] = []
+    bundle = load_full_day_profile_bundle()
+    payload = bundle.envelopes.as_dict()
+    universal = payload["universal_gates"]
+    if (
+        universal["minimum_trade_count"] != 100
+        or universal["continuous_two_sided_quote_occupancy_min_ppm"] != 950_000
+        or universal["maximum_nonhalt_empty_side_episode_us"] != 5_000_000
+        or universal["maximum_continuous_spread_ticks"] != 20
+        or universal["target_price_operations_max"] != 0
+        or universal["forced_trade_operations_max"] != 0
+    ):
+        failures.append("universal behavioral gates differ from frozen values")
+    if nearest_rank((1, 2, 3, 4), 500_000) != 2:
+        failures.append("nearest-rank P50 is incorrect")
+    if median_absolute_deviation((1, 2, 10)) != 1:
+        failures.append("nearest-rank MAD is incorrect")
+    weighted = ((2, 3, "ROOT42/000"), (8, 1, "ROOT42/001"))
+    if (
+        time_weighted_nearest_rank(weighted, 750_000) != 2
+        or time_weighted_nearest_rank(weighted, 1_000_000) != 8
+    ):
+        failures.append("time-weighted nearest-rank percentile is incorrect")
+    try:
+        ratio_ppm(1, 0)
+    except InsufficientEvidenceError as error:
+        if str(error) != INSUFFICIENT_EVIDENCE:
+            failures.append("zero denominator used the wrong missing outcome")
+    else:
+        failures.append("zero denominator did not yield insufficient evidence")
+    # Root 42 and a synthetic digest exercise the formulas without inspecting any
+    # development, qualification, or holdout root.
+    seed_a = derive_labeled_seed(42, "FULL_DAY_PROFILE_V1", "full_day/TEST_A")
+    seed_b = derive_labeled_seed(42, "FULL_DAY_PROFILE_V1", "full_day/TEST_B")
+    tie = policy_tie_digest(
+        "FULL_DAY_PROFILE_V1",
+        "WO31_REVIEW/TEST/open/" + "0" * 64 + "/0",
+        REVIEW_SELECTION_ROOT,
+        "0" * 64,
+    )
+    if seed_a == seed_b or len(tie) != 32:
+        failures.append("labeled-seed/tie-digest formulas are not domain separated")
+    review = payload["review_policy"]
+    if (
+        review["window_duration_us"] != 60_000_000
+        or review["eligible_start_step_us"] != 1_000_000
+        or review["window_count_per_applicable_stratum"] != 2
+        or review["intersection_over_union_max_ppm"] != 500_000
+        or review["selection_root"] != REVIEW_SELECTION_ROOT
+    ):
+        failures.append("review-window sampling policy differs from preregistration")
+    applicability = review["candidate_stratum_applicability"]
+    if tuple(
+        candidate_id
+        for candidate_id, row in applicability.items()
+        if row["event_post_event"] == "APPLICABLE"
+    ) != ("EVENT_SHOCK_PRESSURE",):
+        failures.append("event/post-event stratum applicability is incorrect")
+    if payload["execution_scope"] != {
+        "automated_readiness": "NOT_EXERCISED",
+        "behavioral_qualification": "NOT_EXERCISED",
+        "holdout": "NOT_EXERCISED",
+        "human_acceptance": "PENDING",
+        "qualification": "NOT_EXERCISED",
+        "review_selection": "NOT_EXERCISED",
+    }:
+        failures.append("envelope manifest overstates evidence or human status")
+    return FullDayAuditCase(
+        "full_day_envelope_formula_and_review_preregistration",
+        (
+            "universal_gates=9 behavioral_profiles=4 strata=6 "
+            "window_us=60000000 windows_per_stratum=2 review_rng=separate "
+            "qualification=NOT_EXERCISED human=PENDING"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31h_performance_manifest_case() -> FullDayAuditCase:
+    from kirby2.full_day.profiles import (
+        PerformancePlatformFingerprintV1,
+        aggregate_performance_status,
+        load_full_day_profile_bundle,
+    )
+
+    failures: list[str] = []
+    bundle = load_full_day_profile_bundle()
+    performance = bundle.performance
+    payload = performance.as_dict()
+    workload = payload["workload"]
+    if (
+        workload["candidate_id"] != "QUIET_RANGE_PRESSURE"
+        or workload["root_seed"] != 3_102_000
+        or workload["warmup_generation_count"] != 1
+        or workload["measured_generation_count"] != 3
+    ):
+        failures.append("performance workload identity differs from preregistration")
+    if payload["measurement"]["replay_count_per_measured_artifact"] != 1:
+        failures.append("measured artifacts do not each receive exactly one replay")
+    boundary_rows = {
+        "generation_p50_elapsed_ns": (300_000_000_000, 300_000_000_001, 900_000_000_001),
+        "replay_p50_elapsed_ns": (180_000_000_000, 180_000_000_001, 600_000_000_001),
+        "generation_throughput_events_per_second": (500, 499, 99),
+        "peak_rss_bytes": (4 * 1024**3, 4 * 1024**3 + 1, 8 * 1024**3 + 1),
+        "largest_checkpoint_bytes": (256 * 1024**2, 256 * 1024**2 + 1, 512 * 1024**2 + 1),
+        "complete_run_bytes": (4 * 1024**3, 4 * 1024**3 + 1, 12 * 1024**3 + 1),
+    }
+    for metric_id, values in boundary_rows.items():
+        statuses = tuple(performance.classify(metric_id, value) for value in values)
+        if statuses != ("PASS", "WARNING", "FAIL"):
+            failures.append(f"{metric_id} inclusive boundary classification is wrong")
+    if (
+        aggregate_performance_status(("PASS", "PASS")) != "PASS"
+        or aggregate_performance_status(("PASS", "WARNING")) != "WARNING"
+        or aggregate_performance_status(("WARNING", "FAIL")) != "FAIL"
+    ):
+        failures.append("performance aggregate precedence is incorrect")
+    platform = payload["platform_predicate"]
+    if (
+        platform["system"] != "Darwin"
+        or platform["machine"] != "arm64"
+        or platform["python_implementation"] != "CPython"
+        or (platform["python_major"], platform["python_minor"]) != (3, 14)
+        or platform["logical_cpu_count_min"] != 4
+        or platform["physical_memory_bytes_min"] != 8 * 1024**3
+        or platform["free_governed_store_bytes_min"] != 12 * 1024**3
+    ):
+        failures.append("eligible platform predicate differs from frozen values")
+    eligible_fingerprint = PerformancePlatformFingerprintV1(
+        system="Darwin",
+        machine="arm64",
+        python_implementation="CPython",
+        python_major=3,
+        python_minor=14,
+        python_patch=1,
+        python_runtime="3.14.1",
+        logical_cpu_count=4,
+        physical_memory_bytes=8 * 1024**3,
+        free_governed_store_bytes_before_warmup=12 * 1024**3,
+        ru_maxrss_normalization_rule="DARWIN_RU_MAXRSS_VALUE_IS_BYTES",
+    )
+    if (
+        not eligible_fingerprint.threshold_eligible
+        or replace(eligible_fingerprint, machine="x86_64").threshold_eligible
+        or set(eligible_fingerprint.as_dict()) != set(platform["record_exact_fields"])
+    ):
+        failures.append("platform fingerprint schema/predicate is not exact")
+    aborts = payload["hard_aborts"]
+    if (
+        aborts["outer_event_count"] != 5_000_000
+        or aborts["pending_item_count"] != 250_000
+        or aborts["timestamp_distinct_microsteps"] != 128
+        or aborts["timestamp_emitted_event_count"] != 100_000
+        or aborts["maximum_canonical_checkpoint_bytes"] != 512 * 1024**2
+        or aborts["complete_staged_run_bytes"] != 12 * 1024**3
+        or aborts["generation_elapsed_ns"] != 900_000_000_000
+        or aborts["replay_elapsed_ns"] != 600_000_000_000
+        or aborts["peak_rss_bytes"] != 8 * 1024**3
+        or aborts["deterministic_operation_trigger"]
+        != "BEFORE_ACCEPTING_OPERATION_THAT_WOULD_EXCEED_LIMIT"
+        or aborts["operational_measurement_trigger"]
+        != "AFTER_ELAPSED_OR_RSS_BECOMES_STRICTLY_GREATER_THAN_LIMIT"
+    ):
+        failures.append("deterministic resource aborts differ from preregistration")
+    if payload["execution_scope"] != {
+        "deterministic_correctness": "NOT_EXERCISED",
+        "performance_measurement": "NOT_EXERCISED",
+        "platform_qualification": "NOT_EXERCISED",
+        "source_card_action": "VALIDATE_MANIFEST_ONLY",
+    }:
+        failures.append("performance manifest overstates measured evidence")
+    return FullDayAuditCase(
+        "full_day_performance_workload_and_platform_preregistration",
+        (
+            "workload=FULL_DAY_PERFORMANCE_V1 warmup=1 measured=3 replay_each=1 "
+            "threshold_rows=6 count_byte_aborts=6 operational_aborts=3 "
+            "platform=Darwin-arm64-CPython3.14 "
+            "measurement=NOT_EXERCISED"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31h_hostile_manifest_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_sha256
+    from kirby2.full_day.profiles import (
+        PerformanceThresholdsManifestV1,
+        ProfileCandidatesManifestV1,
+        ProfileEnvelopesManifestV1,
+        load_full_day_profile_bundle,
+        validate_bounded_search_transition_rows,
+    )
+    from kirby2.research.toml_codec import canonical_toml
+
+    failures: list[str] = []
+    refusals = 0
+    bundle = load_full_day_profile_bundle()
+
+    def self_consistent(payload: dict[str, object]) -> bytes:
+        body = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"manifest_sha256", "semantic_sha256"}
+        }
+        semantic_identity = {
+            key: value for key, value in body.items() if key != "manifest_version"
+        }
+        payload = {
+            **body,
+            "semantic_sha256": canonical_sha256(semantic_identity),
+        }
+        payload["manifest_sha256"] = canonical_sha256(payload)
+        return canonical_toml(payload).encode("utf-8")
+
+    probes: list[tuple[str, Callable[[], object]]] = []
+    probes.append(
+        (
+            "noncanonical candidate bytes",
+            lambda: ProfileCandidatesManifestV1.from_toml_bytes(
+                bundle.candidates.canonical_bytes() + b"\n"
+            ),
+        )
+    )
+    changed_root = bundle.candidates.as_dict()
+    changed_root["seed_policy"]["qualification_roots"][0] = 3_101_000
+    probes.append(
+        (
+            "self-consistent overlapping seed partition",
+            lambda: ProfileCandidatesManifestV1.from_toml_bytes(
+                self_consistent(changed_root)
+            ),
+        )
+    )
+    changed_interval = bundle.candidates.as_dict()
+    changed_interval["candidates"]["TREND_PRESSURE"]["intervals"][1][
+        "volume_ppm"
+    ] = 1_250_001
+    probes.append(
+        (
+            "self-consistent changed pressure multiplier",
+            lambda: ProfileCandidatesManifestV1.from_toml_bytes(
+                self_consistent(changed_interval)
+            ),
+        )
+    )
+    float_payload = bundle.candidates.as_dict()
+    float_payload["schema_version"] = 1.0
+    probes.append(
+        (
+            "binary float in candidate identity",
+            lambda: ProfileCandidatesManifestV1.from_toml_bytes(
+                canonical_toml(float_payload).encode("utf-8")
+            ),
+        )
+    )
+    changed_blind = bundle.envelopes.as_dict()
+    changed_blind["review_policy"]["blind_fields"].remove("ROOT_SEED")
+    probes.append(
+        (
+            "self-consistent review deblinding",
+            lambda: ProfileEnvelopesManifestV1.from_toml_bytes(
+                self_consistent(changed_blind)
+            ),
+        )
+    )
+    changed_threshold = bundle.performance.as_dict()
+    changed_threshold["thresholds"]["peak_rss_bytes"]["pass_inclusive"] += 1
+    probes.append(
+        (
+            "self-consistent relaxed performance threshold",
+            lambda: PerformanceThresholdsManifestV1.from_toml_bytes(
+                self_consistent(changed_threshold)
+            ),
+        )
+    )
+    probes.append(
+        (
+            "subminimum bounded-search transition destination",
+            lambda: validate_bounded_search_transition_rows(
+                {"A": {"B": 200_000, "C": 800_000}}
+            ),
+        )
+    )
+    probes.append(
+        (
+            "nonunit bounded-search transition row",
+            lambda: validate_bounded_search_transition_rows(
+                {"A": {"B": 400_000, "C": 500_000}}
+            ),
+        )
+    )
+    for label, operation in probes:
+        refusal = _expect_refusal(operation, label)
+        if refusal is None:
+            refusals += 1
+        else:
+            failures.append(refusal)
+    return FullDayAuditCase(
+        "full_day_profile_manifest_hostile_refusals",
+        (
+            f"refusals={refusals} canonical_bytes=true source_pins=true "
+            "partition_overlap=true multiplier_mutation=true deblinding=true "
+            "threshold_relaxation=true transition_rows=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31h_profiles() -> tuple[FullDayAuditCase, ...]:
+    """Validate frozen WO31-H policy without executing protected seed sets."""
+
+    return (
+        _wo31h_candidate_manifest_case(),
+        _wo31h_envelope_review_case(),
+        _wo31h_performance_manifest_case(),
+        _wo31h_hostile_manifest_case(),
+    )
+
+
 def audit_full_day() -> tuple[FullDayAuditCase, ...]:
     """Run every implemented WO31 full-day gate without persistent output."""
 
@@ -17207,6 +17640,7 @@ def audit_full_day() -> tuple[FullDayAuditCase, ...]:
         *audit_wo31e6_execution_algorithm_restore(),
         *audit_wo31f_composition(),
         *audit_wo31g_storage(),
+        *audit_wo31h_profiles(),
     )
 
 
@@ -17231,4 +17665,5 @@ __all__ = [
     "audit_wo31e6_execution_algorithm_restore",
     "audit_wo31f_composition",
     "audit_wo31g_storage",
+    "audit_wo31h_profiles",
 ]

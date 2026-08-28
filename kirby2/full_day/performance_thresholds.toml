@@ -1,0 +1,122 @@
+"manifest_id" = "WO31_H_PERFORMANCE_THRESHOLDS_V1"
+"manifest_sha256" = "0fd8f61ddb51376e1609f8bac1303a29e370603bf88efb8f577b765adca3cd9f"
+"manifest_version" = 1
+"policy_version" = "FULL_DAY_PERFORMANCE_V1"
+"profile_candidates_manifest_sha256" = "850f69efafa92b32d4a2f11978e0daf941a60fa0851b5ec610d815c3ed20aaf7"
+"profile_envelopes_manifest_sha256" = "35daf755163585fd9201ca920283625d18a60d03924f434ef74859e98eacef90"
+"schema_version" = 1
+"semantic_sha256" = "83ab02d8aeefce42a2fc97a36aeafe29d2165372a18a0c5834321cb6752869bd"
+"semantic_version" = 1
+
+["aggregation"]
+"evaluation_order" = "PASS_FIRST_ELSE_WARNING_ELSE_FAIL"
+"inclusive_limits" = true
+"result_rule" = "FAIL_IF_ANY_FAIL_ELSE_WARNING_IF_ANY_WARNING_ELSE_PASS"
+"statuses_eligible" = ["PASS", "WARNING", "FAIL"]
+"statuses_ineligible" = ["UNSUPPORTED", "NOT_RUN"]
+
+["execution_scope"]
+"deterministic_correctness" = "NOT_EXERCISED"
+"performance_measurement" = "NOT_EXERCISED"
+"platform_qualification" = "NOT_EXERCISED"
+"source_card_action" = "VALIDATE_MANIFEST_ONLY"
+
+["hard_aborts"]
+"abort_outcome" = "EMIT_DETERMINISTIC_FAILURE_ARTIFACT_AND_REFUSE_UNCOMMITTED_OPERATION"
+"complete_staged_run_bytes" = 12884901888
+"deterministic_operation_trigger" = "BEFORE_ACCEPTING_OPERATION_THAT_WOULD_EXCEED_LIMIT"
+"generation_elapsed_ns" = 900000000000
+"maximum_canonical_checkpoint_bytes" = 536870912
+"operational_abort_data_in_semantic_identity" = false
+"operational_measurement_trigger" = "AFTER_ELAPSED_OR_RSS_BECOMES_STRICTLY_GREATER_THAN_LIMIT"
+"outer_event_count" = 5000000
+"peak_rss_bytes" = 8589934592
+"pending_item_count" = 250000
+"replay_elapsed_ns" = 600000000000
+"timestamp_distinct_microsteps" = 128
+"timestamp_emitted_event_count" = 100000
+
+["measurement"]
+"artifact_size" = "EXACT_ARTIFACT_BYTE_LENGTH"
+"generation_elapsed_clock" = "time.perf_counter_ns"
+"peak_rss" = "MAXIMUM_FRESH_CHILD_RESOURCE_GETRUSAGE_RUSAGE_SELF_RU_MAXRSS"
+"peak_rss_normalization" = "DARWIN_RU_MAXRSS_VALUE_IS_BYTES"
+"replay_count_per_measured_artifact" = 1
+"rss_and_timing_in_semantic_identity" = false
+"throughput" = "round_div_even(sum(outer_event_count)*1000000000,sum(generation_elapsed_ns))"
+
+["platform_predicate"]
+"free_governed_store_bytes_min" = 12884901888
+"logical_cpu_count_min" = 4
+"machine" = "arm64"
+"physical_memory_bytes_min" = 8589934592
+"python_implementation" = "CPython"
+"python_major" = 3
+"python_minor" = 14
+"record_exact_fields" = ["SYSTEM", "MACHINE", "PYTHON_IMPLEMENTATION", "PYTHON_MAJOR_MINOR_PATCH", "PYTHON_RUNTIME", "LOGICAL_CPU_COUNT", "PHYSICAL_MEMORY_BYTES", "FREE_GOVERNED_STORE_BYTES_BEFORE_WARMUP", "RU_MAXRSS_NORMALIZATION_RULE"]
+"system" = "Darwin"
+"unsupported_rule" = "RAW_MEASUREMENTS_PLUS_UNSUPPORTED_NEVER_THRESHOLD_PASS"
+
+["thresholds"]
+
+["thresholds"."complete_run_bytes"]
+"direction" = "MAXIMUM"
+"fail_beyond" = 12884901888
+"pass_inclusive" = 4294967296
+"unit" = "BYTES"
+"warning_inclusive" = 12884901888
+
+["thresholds"."generation_p50_elapsed_ns"]
+"direction" = "MAXIMUM"
+"fail_beyond" = 900000000000
+"pass_inclusive" = 300000000000
+"unit" = "NANOSECONDS"
+"warning_inclusive" = 900000000000
+
+["thresholds"."generation_throughput_events_per_second"]
+"direction" = "MINIMUM"
+"fail_below" = 100
+"pass_inclusive" = 500
+"unit" = "EVENTS_PER_SECOND"
+"warning_inclusive" = 100
+
+["thresholds"."largest_checkpoint_bytes"]
+"direction" = "MAXIMUM"
+"fail_beyond" = 536870912
+"pass_inclusive" = 268435456
+"unit" = "BYTES"
+"warning_inclusive" = 536870912
+
+["thresholds"."peak_rss_bytes"]
+"direction" = "MAXIMUM"
+"fail_beyond" = 8589934592
+"pass_inclusive" = 4294967296
+"unit" = "BYTES"
+"warning_inclusive" = 8589934592
+
+["thresholds"."replay_p50_elapsed_ns"]
+"direction" = "MAXIMUM"
+"fail_beyond" = 600000000000
+"pass_inclusive" = 180000000000
+"unit" = "NANOSECONDS"
+"warning_inclusive" = 600000000000
+
+["workload"]
+"candidate_id" = "QUIET_RANGE_PRESSURE"
+"checkpoint_coincident_cut_rule" = "EMIT_ONE_CHECKPOINT"
+"checkpoint_interval_continuous_us" = 900000000
+"checkpoint_phase_boundaries" = true
+"checkpoint_start" = "INITIALIZATION"
+"composition_matrix_sha256" = "c32ba6793b9598221e625a210bfc29924f8f3b24ff7245ca95019554aa93dd08"
+"composition_profile_id" = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1"
+"composition_profile_sha256" = "c32ba6793b9598221e625a210bfc29924f8f3b24ff7245ca95019554aa93dd08"
+"composition_profile_version" = 1
+"generation_order" = "SEQUENTIAL_FRESH_AUDIT_OWNED_STORE_ROOTS"
+"measured_generation_count" = 3
+"plan_id" = "WO31_F_COMPLETE_DAY_AUDIT_V1"
+"plan_sha256" = "24ebad3b86eebdd0db1ff8dea33fbf9f4d57ee92478354944de9c0e48fefb860"
+"replay_process" = "FRESH_PROCESS_PER_MEASURED_ARTIFACT"
+"retry_or_sample_substitution" = "FORBIDDEN"
+"root_seed" = 3102000
+"warmup_generation_count" = 1
+"workload_id" = "FULL_DAY_PERFORMANCE_V1"

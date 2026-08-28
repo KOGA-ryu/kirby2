@@ -114,6 +114,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-E6",
     "WO31-F",
     "WO31-G",
+    "WO31-H",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1951,6 +1952,67 @@ def _audit_wo31g() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31h() -> ExpansionGateReport:
+    """Validate preregistered full-day profiles without running protected seeds."""
+
+    from kirby2.audit.full_day import audit_wo31h_profiles
+    from kirby2.full_day.profiles import load_full_day_profile_bundle
+
+    cases = audit_wo31h_profiles()
+    expected_names = (
+        "full_day_profile_candidate_manifest_identity",
+        "full_day_envelope_formula_and_review_preregistration",
+        "full_day_performance_workload_and_platform_preregistration",
+        "full_day_profile_manifest_hostile_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-H cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-H cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-H cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    bundle = load_full_day_profile_bundle()
+    return ExpansionGateReport(
+        card_id="WO31-H",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("automated_readiness", "NOT_EXERCISED"),
+            ("bundle_sha256", bundle.bundle_sha256),
+            ("candidate_count", "4"),
+            ("holdout", "NOT_EXERCISED"),
+            ("human_acceptance", "PENDING"),
+            ("performance", "NOT_EXERCISED"),
+            ("qualification", "NOT_EXERCISED"),
+            ("review_selection", "NOT_EXERCISED"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2144,6 +2206,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-E6", _audit_wo31e6),
     ("WO31-F", _audit_wo31f),
     ("WO31-G", _audit_wo31g),
+    ("WO31-H", _audit_wo31h),
 )
 
 
