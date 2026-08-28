@@ -105,6 +105,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-C",
     "WO31-D",
     "WO31-E1",
+    "WO31-E2",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1538,6 +1539,82 @@ def _audit_wo31e1() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31e2() -> ExpansionGateReport:
+    """Run all three exactly-one full-day flow/restore models."""
+
+    from kirby2.audit.full_day import audit_wo31e2_flow_restore
+    from kirby2.full_day.composition import (
+        FLOW_PROFILE_ID,
+        executable_queue_reactive_flow_composition_matrix,
+    )
+    from kirby2.full_day.restore import (
+        FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID,
+    )
+
+    cases = audit_wo31e2_flow_restore()
+    expected_names = (
+        "full_day_simple_flow_composition",
+        "full_day_simple_flow_one_shot_subdivided",
+        "full_day_simple_flow_fresh_process_restore",
+        "full_day_simple_flow_ownership_refusals",
+        "full_day_hawkes_flow_composition",
+        "full_day_hawkes_flow_one_shot_subdivided",
+        "full_day_hawkes_flow_fresh_process_restore",
+        "full_day_hawkes_flow_ownership_refusals",
+        "full_day_queue_reactive_flow_composition",
+        "full_day_queue_reactive_one_shot_subdivided",
+        "full_day_queue_reactive_fresh_process_restore",
+        "full_day_queue_reactive_ownership_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-E2 cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-E2 cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-E2 cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    matrix = executable_queue_reactive_flow_composition_matrix()
+    profile = matrix.profile(FLOW_PROFILE_ID, 3)
+    return ExpansionGateReport(
+        card_id="WO31-E2",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("composition_matrix_sha256", matrix.sha256),
+            ("flow_model_count", "3"),
+            ("fresh_process_boundary_count", "3"),
+            ("hostile_refusal_count", "20"),
+            ("profile_id", profile.profile_id),
+            ("profile_version", str(profile.profile_version)),
+            ("restore_format", FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID),
+            ("restored_scope", "SIMPLE_HAWKES_QUEUE_REACTIVE_FLOW"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1622,6 +1699,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-C", _audit_wo31c),
     ("WO31-D", _audit_wo31d),
     ("WO31-E1", _audit_wo31e1),
+    ("WO31-E2", _audit_wo31e2),
 )
 
 

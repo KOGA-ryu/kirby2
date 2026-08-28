@@ -12652,6 +12652,560 @@ def audit_wo31e2_hawkes_flow_slice() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e2_queue_configuration():
+    from kirby2.full_day.components_flow import (
+        QueueReactiveFlowConfigurationV1,
+    )
+
+    return QueueReactiveFlowConfigurationV1.from_default_profile(
+        configuration_id="AUDIT_QUEUE_REACTIVE_FLOW_V1",
+        configuration_version=1,
+        limit_buy_microevents_per_second=5_000,
+        limit_sell_microevents_per_second=5_000,
+        market_buy_microevents_per_second=5_000,
+        market_sell_microevents_per_second=5_000,
+        cancel_bid_microevents_per_second=5_000,
+        cancel_ask_microevents_per_second=5_000,
+        minimum_quantity=1,
+        maximum_quantity=5,
+        minimum_placement_depth_ticks=0,
+        maximum_placement_depth_ticks=2,
+        account_id="WO31-E2-QUEUE",
+    )
+
+
+def _wo31e2_queue_plan():
+    from kirby2.full_day.components_flow import QUEUE_REACTIVE_FLOW_RNG_LABEL
+    from kirby2.full_day.composition import (
+        FLOW_PROFILE_ID,
+        FLOW_QUEUE_REACTIVE_COMPONENT,
+        executable_queue_reactive_flow_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        VersionedReferenceV1,
+        derive_substream_seed,
+    )
+
+    base = _wo31e1_plan()
+    configuration = _wo31e2_queue_configuration()
+    matrix = executable_queue_reactive_flow_composition_matrix()
+    declaration = SubstreamDeclarationV1(
+        QUEUE_REACTIVE_FLOW_RNG_LABEL,
+        derive_substream_seed(
+            base.seed_policy.root_seed,
+            base.seed_policy.policy_version,
+            QUEUE_REACTIVE_FLOW_RNG_LABEL,
+        ),
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            FLOW_PROFILE_ID,
+            3,
+            matrix.sha256,
+        ),
+        component_configurations=tuple(
+            sorted(
+                (
+                    *base.component_configurations,
+                    ComponentConfigurationBindingV1(
+                        FLOW_QUEUE_REACTIVE_COMPONENT,
+                        configuration.reference,
+                    ),
+                ),
+                key=lambda item: item.sort_key,
+            )
+        ),
+        seed_policy=replace(
+            base.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (*base.seed_policy.substreams, declaration),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+
+
+def _wo31e2_queue_runtime():
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e2_queue_plan()
+    return FullDayRuntime.create_with_agent_scheduler(
+        plan,
+        _wo31e1_population(plan),
+        queue_reactive_flow_configuration=_wo31e2_queue_configuration(),
+    )
+
+
+def _wo31e2_queue_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_flow import (
+        HawkesFlowComponentAdapterV2,
+        QueueReactiveFlowComponentAdapterV2,
+        SimpleFlowComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import (
+        MarketMechanicsComponentAdapterV1,
+    )
+    from kirby2.full_day.composition import (
+        FLOW_COMPONENT_IDS,
+        FLOW_HAWKES_COMPONENT,
+        FLOW_PROFILE_ID,
+        FLOW_QUEUE_REACTIVE_COMPONENT,
+        FLOW_SIMPLE_COMPONENT,
+        executable_hawkes_flow_composition_matrix,
+        executable_queue_reactive_flow_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_hawkes_flow_composition_matrix()
+    matrix = executable_queue_reactive_flow_composition_matrix()
+    if tuple(row.canonical_bytes() for row in matrix.profiles[:4]) != tuple(
+        row.canonical_bytes() for row in previous.profiles
+    ):
+        failures.append("queue-reactive matrix rewrote a published profile")
+    profile = matrix.profile(FLOW_PROFILE_ID, 3)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+            HawkesFlowComponentAdapterV2(),
+            QueueReactiveFlowComponentAdapterV2(),
+            SimpleFlowComponentAdapterV1(),
+        ),
+        plan=_wo31e2_queue_plan(),
+        profile=profile,
+    )
+    if FLOW_QUEUE_REACTIVE_COMPONENT not in graph.active_component_ids or any(
+        component_id in graph.active_component_ids
+        for component_id in (FLOW_HAWKES_COMPONENT, FLOW_SIMPLE_COMPONENT)
+    ):
+        failures.append("exactly-one flow activation does not select only queue flow")
+    statuses = {
+        component.component_id: component.implementation_status
+        for component in profile.components
+        if component.component_id in FLOW_COMPONENT_IDS
+    }
+    if statuses != {component_id: "EXECUTABLE" for component_id in FLOW_COMPONENT_IDS}:
+        failures.append("the complete flow profile does not promote all three models")
+    return FullDayAuditCase(
+        "full_day_queue_reactive_flow_composition",
+        (
+            f"matrix_v4_sha256={previous.sha256} matrix_v5_sha256={matrix.sha256} "
+            f"active_components={graph.active_component_ids} statuses={statuses}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_queue_one_shot_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+
+    failures: list[str] = []
+    one_shot = _wo31e2_queue_runtime()
+    subdivided = _wo31e2_queue_runtime()
+    target = 1_300_000_000
+    one_shot.advance_to(target)
+    for time_us in (
+        0,
+        300_000_000,
+        600_000_000,
+        900_000_000,
+        1_200_000_000,
+        1_250_000_000,
+        target,
+    ):
+        subdivided.advance_to(time_us)
+    one_shot.capture_quiescent_cut("WO31-E2-QUEUE-EQUIVALENCE")
+    subdivided.capture_quiescent_cut("WO31-E2-QUEUE-EQUIVALENCE")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("queue flow differs under one-shot/subdivided advance")
+    owner = one_shot.queue_reactive_flow
+    proposal_events = tuple(
+        event
+        for event in one_shot.events
+        if event.event_type is FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL
+        and event.source_component_id == "FLOW_QUEUE_REACTIVE_V1"
+    )
+    if (
+        owner is None
+        or not proposal_events
+        or owner.applied_count == 0
+        or owner.rejected_count == 0
+        or owner.pending_proposal is None
+    ):
+        failures.append("queue flow did not exercise applied/rejected/pending states")
+    if any(
+        "price_ticks" in entry.payload["proposal"]
+        for entry in one_shot.native_event_ledger.values()
+        if entry.reference.owner_component_id == "FLOW_QUEUE_REACTIVE_V1"
+    ):
+        failures.append("a queue proposal smuggled an absolute price command")
+    distinct_inspections = set()
+    if owner is not None:
+        for row in owner.diagnostic_draw_sequence:
+            inspection = row.get("intensity_inspection")
+            if isinstance(inspection, Mapping):
+                distinct_inspections.add(
+                    repr(inspection.get("channels"))
+                )
+        state = owner.checkpoint_state()
+        windows = state["retained_windows"]
+        if (
+            not windows["queue_changes"]
+            or any(len(rows) > 10_000 for rows in windows.values())
+        ):
+            failures.append("queue retained windows are empty or unbounded")
+        if len(distinct_inspections) < 2:
+            failures.append("queue state never changed an intensity inspection")
+        expected_seed = one_shot.plan.seed_policy.derive(owner.rng_label)
+        if owner.rng.seed != expected_seed:
+            failures.append("queue RNG is not derived from its declared substream")
+    return FullDayAuditCase(
+        "full_day_queue_reactive_one_shot_subdivided",
+        (
+            f"target_us={target} proposals={len(proposal_events)} "
+            f"applied={0 if owner is None else owner.applied_count} "
+            f"rejected={0 if owner is None else owner.rejected_count} "
+            f"distinct_inspections={len(distinct_inspections)} bounded_windows=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_queue_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import (
+        canonical_json_bytes,
+        parse_canonical_json_object,
+    )
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    runtime = _wo31e2_queue_runtime()
+    cut_time = 1_250_000_000
+    target = 1_300_000_000
+    runtime.advance_to(cut_time)
+    runtime.capture_quiescent_cut("WO31-E2-QUEUE-CUT")
+    flow_state = runtime.queue_reactive_flow.checkpoint_state()
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        runtime,
+        suffix_targets_us=(target,),
+        final_checkpoint_request_id="WO31-E2-QUEUE-FINAL",
+    )
+    returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+        request.canonical_bytes()
+    )
+    expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+    actual: dict[str, object] | None = None
+    if returncode != 0:
+        failures.append(
+            f"fresh queue worker returned {returncode}: "
+            f"{stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    else:
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"fresh queue worker emitted invalid JSON: {error}")
+    if stderr:
+        failures.append("successful queue worker wrote stderr diagnostics")
+    if wrote_files:
+        failures.append("queue restore worker wrote into its empty directory")
+    if actual is not None and (
+        canonical_json_bytes(actual) != stdout or actual != expected
+    ):
+        failures.append("fresh queue suffix differs from uninterrupted suffix")
+    windows = flow_state["retained_windows"]
+    if (
+        flow_state["pending_proposal"] is None
+        or not flow_state["diagnostic_draw_sequence"]
+        or not flow_state["rng_state"]["internal_state"]
+        or not windows["queue_changes"]
+        or flow_state["model_id_version"]["last_intensity_inspection"] is None
+    ):
+        failures.append("queue cut omits pending/draw/RNG/window/intensity state")
+    digest = "ABSENT" if actual is None else str(actual["invariant_sha256"])
+    return FullDayAuditCase(
+        "full_day_queue_reactive_fresh_process_restore",
+        (
+            f"cut_us={cut_time} target_us={target} fresh_process=true "
+            f"invariant_sha256={digest}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_queue_ownership_case() -> FullDayAuditCase:
+    from kirby2.simulation.clock import SimulationClock
+    from kirby2.full_day.components_flow import (
+        QueueReactiveFlowComponentAdapterV2,
+        QueueReactiveFlowOwnerV1,
+        QueueReactiveObservationCutV1,
+        SIMPLE_FLOW_RNG_LABEL,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        derive_substream_seed,
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    failures: list[str] = []
+    refused = 0
+    runtime = _wo31e2_queue_runtime()
+    runtime.advance_to(1_300_000_000)
+    runtime.capture_quiescent_cut("WO31-E2-QUEUE-OWNERSHIP")
+    owner = runtime.queue_reactive_flow
+    if owner is None:
+        return FullDayAuditCase(
+            "full_day_queue_reactive_ownership_refusals",
+            "owner=ABSENT",
+            ("queue-reactive owner is absent",),
+        )
+    adapter = QueueReactiveFlowComponentAdapterV2()
+    snapshot = adapter.snapshot(owner)
+    restored = adapter.restore(snapshot, plan=runtime.plan)
+    if restored.canonical_state_bytes() != owner.canonical_state_bytes():
+        failures.append("queue component adapter is not a fixed point")
+    owner.clock = SimulationClock()
+    try:
+        runtime.assert_invariants()
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("queue flow smuggled a second clock")
+    finally:
+        del owner.clock
+    forged = copy.deepcopy(snapshot.as_dict())
+    forged["state"]["retained_windows"]["queue_changes"][-1][1] += 1
+    try:
+        type(snapshot).from_dict(forged)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("forged queue snapshot digest was accepted")
+    wrong_model = owner.checkpoint_state()
+    wrong_model["model_id_version"]["model_id"] = "SIMPLE_POISSON_FLOW_V1"
+    try:
+        QueueReactiveFlowOwnerV1.from_checkpoint_state(
+            wrong_model,
+            plan=runtime.plan,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("wrong-model queue state was accepted")
+    corrupt_window = owner.checkpoint_state()
+    corrupt_window["retained_windows"]["queue_changes"][-1][1] += 1
+    try:
+        QueueReactiveFlowOwnerV1.from_checkpoint_state(
+            corrupt_window,
+            plan=runtime.plan,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("corrupt queue retained window was accepted")
+
+    stale_owner = QueueReactiveFlowOwnerV1(
+        runtime.plan,
+        _wo31e2_queue_configuration(),
+    )
+    initial = QueueReactiveObservationCutV1(
+        schema_version=1,
+        simulation_time_us=0,
+        best_bid_ticks=None,
+        best_ask_ticks=None,
+        best_bid_size=0,
+        best_ask_size=0,
+        depth_near_touch_bid=0,
+        depth_near_touch_ask=0,
+        cumulative_trade_count=0,
+        cumulative_aggressive_buy_volume=0,
+        cumulative_aggressive_sell_volume=0,
+        reference_price_ticks=runtime.engine.rules.reference_price_ticks,
+        cancellable_bid_order_ids=(),
+        cancellable_ask_order_ids=(),
+    )
+    proposal = stale_owner.plan_next(
+        initial,
+        horizon_us=runtime.plan.calendar.end_time_us,
+    )
+    if proposal is None:
+        failures.append("queue stale-observation probe scheduled no proposal")
+    else:
+        stale_owner.resolve_pending(
+            applied=False,
+            rejection_reason="AUDIT_QUEUE_STALE_SETUP",
+        )
+        for label, cut in (
+            ("stale", replace(initial, simulation_time_us=0)),
+            (
+                "rollback",
+                replace(
+                    initial,
+                    simulation_time_us=proposal.scheduled_time_us,
+                    cumulative_trade_count=1,
+                    cumulative_aggressive_buy_volume=1,
+                ),
+            ),
+        ):
+            if label == "rollback":
+                accepted = stale_owner.plan_next(
+                    cut,
+                    horizon_us=runtime.plan.calendar.end_time_us,
+                )
+                if accepted is not None:
+                    stale_owner.resolve_pending(
+                        applied=False,
+                        rejection_reason="AUDIT_QUEUE_ROLLBACK_SETUP",
+                    )
+                rollback_cut = replace(
+                    cut,
+                    simulation_time_us=cut.simulation_time_us + 1,
+                    cumulative_trade_count=0,
+                    cumulative_aggressive_buy_volume=0,
+                )
+                operation = lambda value=rollback_cut: stale_owner.plan_next(
+                    value,
+                    horizon_us=runtime.plan.calendar.end_time_us,
+                )
+            else:
+                operation = lambda value=cut: stale_owner.plan_next(
+                    value,
+                    horizon_us=runtime.plan.calendar.end_time_us,
+                )
+            try:
+                operation()
+            except (TypeError, ValueError, RuntimeError):
+                refused += 1
+            else:
+                failures.append(f"{label} queue observation was accepted")
+
+    simple_configuration = _wo31e2_simple_configuration()
+    plan = runtime.plan
+    two_flow_plan = replace(
+        plan,
+        component_configurations=tuple(
+            sorted(
+                (
+                    *plan.component_configurations,
+                    ComponentConfigurationBindingV1(
+                        "FLOW_SIMPLE_V1",
+                        simple_configuration.reference,
+                    ),
+                ),
+                key=lambda item: item.sort_key,
+            )
+        ),
+        seed_policy=replace(
+            plan.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (
+                        *plan.seed_policy.substreams,
+                        SubstreamDeclarationV1(
+                            SIMPLE_FLOW_RNG_LABEL,
+                            derive_substream_seed(
+                                plan.seed_policy.root_seed,
+                                plan.seed_policy.policy_version,
+                                SIMPLE_FLOW_RNG_LABEL,
+                            ),
+                        ),
+                    ),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+    try:
+        FullDayRuntime.create_with_agent_scheduler(
+            two_flow_plan,
+            _wo31e1_population(two_flow_plan),
+            simple_flow_configuration=simple_configuration,
+            queue_reactive_flow_configuration=_wo31e2_queue_configuration(),
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("two executable flows bypassed exactly-one selection")
+
+    atomic = _wo31e2_queue_runtime()
+    pending = atomic.queue_reactive_flow.pending_proposal
+    if pending is None:
+        failures.append("queue failure-atomicity probe has no pending proposal")
+    else:
+        atomic.advance_to(pending.scheduled_time_us - 1)
+        atomic.capture_quiescent_cut("WO31-E2-QUEUE-ATOMIC-PREFIX")
+        before = atomic.canonical_state_bytes()
+        original_emit_native = atomic._emit_native
+
+        def refuse_flow_native(**kwargs):
+            if kwargs.get("owner_component_id") == "FLOW_QUEUE_REACTIVE_V1":
+                raise RuntimeError("AUDIT_FORCED_QUEUE_NATIVE_FAILURE")
+            return original_emit_native(**kwargs)
+
+        atomic._emit_native = refuse_flow_native
+        try:
+            atomic.advance_to(pending.scheduled_time_us)
+        except RuntimeError as error:
+            if "AUDIT_FORCED_QUEUE_NATIVE_FAILURE" not in str(error):
+                failures.append("queue failure-atomicity raised the wrong error")
+            else:
+                refused += 1
+        else:
+            failures.append("queue native-ledger failure was not propagated")
+        finally:
+            del atomic._emit_native
+        if atomic.canonical_state_bytes() != before:
+            failures.append("queue failure changed owner/engine/RNG/allocator state")
+    if owner.rng is runtime.agent_scheduler.agents["AUDIT_MAKER"].rng:
+        failures.append("queue flow shares an agent RNG object")
+    return FullDayAuditCase(
+        "full_day_queue_reactive_ownership_refusals",
+        (
+            f"refusals={refused} second_clock=true forged_state=true "
+            "wrong_model=true corrupt_window=true stale_observation=true "
+            "cumulative_rollback=true multiple_flow_selection=true "
+            "failure_atomicity=true agent_rng_separation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e2_queue_reactive_flow_slice() -> tuple[FullDayAuditCase, ...]:
+    """Exercise the final queue-reactive execution and restore slice."""
+
+    return (
+        _wo31e2_queue_composition_case(),
+        _wo31e2_queue_one_shot_case(),
+        _wo31e2_queue_fresh_restore_case(),
+        _wo31e2_queue_ownership_case(),
+    )
+
+
+def audit_wo31e2_flow_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise all three exactly-one restorable full-day flow models."""
+
+    return (
+        *audit_wo31e2_simple_flow_slice(),
+        *audit_wo31e2_hawkes_flow_slice(),
+        *audit_wo31e2_queue_reactive_flow_slice(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -12662,5 +13216,7 @@ __all__ = [
     "audit_wo31d_core_restore",
     "audit_wo31e1_runtime_restore",
     "audit_wo31e2_hawkes_flow_slice",
+    "audit_wo31e2_queue_reactive_flow_slice",
     "audit_wo31e2_simple_flow_slice",
+    "audit_wo31e2_flow_restore",
 ]

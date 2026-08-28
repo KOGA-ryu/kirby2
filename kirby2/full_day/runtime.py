@@ -40,6 +40,7 @@ from .composition import (
     AGENT_SCHEDULER_COMPONENT,
     FLOW_HAWKES_COMPONENT,
     FLOW_PROFILE_ID,
+    FLOW_QUEUE_REACTIVE_COMPONENT,
     FLOW_SIMPLE_COMPONENT,
     FULL_DAY_RUNTIME_COMPONENT,
     INITIAL_PROFILE_ID,
@@ -47,6 +48,7 @@ from .composition import (
     agent_scheduler_is_active,
     executable_agent_mechanics_composition_matrix,
     executable_hawkes_flow_composition_matrix,
+    executable_queue_reactive_flow_composition_matrix,
     executable_simple_flow_composition_matrix,
 )
 from .events import (
@@ -87,6 +89,7 @@ MECHANICS_NATIVE_LEDGER_ID = "MARKET_MECHANICS_EVENTS_V1"
 AGENT_NATIVE_LEDGER_ID = "AGENT_SCHEDULER_EVENTS_V1"
 SIMPLE_FLOW_NATIVE_LEDGER_ID = "SIMPLE_FLOW_PROPOSALS_V1"
 HAWKES_FLOW_NATIVE_LEDGER_ID = "HAWKES_FLOW_PROPOSALS_V1"
+QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID = "QUEUE_REACTIVE_FLOW_PROPOSALS_V1"
 
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
@@ -102,6 +105,7 @@ _WORK_GTT_EXPIRY = "GTT_EXPIRY"
 _WORK_REOPEN_COMPLETE = "REOPEN_COMPLETE"
 _WORK_SIMPLE_FLOW_PROPOSAL = "SIMPLE_FLOW_PROPOSAL"
 _WORK_HAWKES_FLOW_PROPOSAL = "HAWKES_FLOW_PROPOSAL"
+_WORK_QUEUE_REACTIVE_FLOW_PROPOSAL = "QUEUE_REACTIVE_FLOW_PROPOSAL"
 
 _WORK_TYPES = frozenset(
     {
@@ -111,6 +115,7 @@ _WORK_TYPES = frozenset(
         _WORK_CHECKPOINT_CAPTURE,
         _WORK_GTT_EXPIRY,
         _WORK_HAWKES_FLOW_PROPOSAL,
+        _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL,
         _WORK_MECHANICS_CANCEL,
         _WORK_MECHANICS_REPLACE,
         _WORK_MECHANICS_SUBMIT,
@@ -154,6 +159,11 @@ _WORK_CONTRACTS: Mapping[
         ),
         _WORK_HAWKES_FLOW_PROPOSAL: (
             FLOW_HAWKES_COMPONENT,
+            frozenset({WorkStageV1.BACKGROUND_FLOW_PROPOSAL}),
+            frozenset({"proposal_id"}),
+        ),
+        _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL: (
+            FLOW_QUEUE_REACTIVE_COMPONENT,
             frozenset({WorkStageV1.BACKGROUND_FLOW_PROPOSAL}),
             frozenset({"proposal_id"}),
         ),
@@ -1102,6 +1112,9 @@ def _runtime_composition_matrix(plan: FullDayPlanV1):
         elif plan.composition_profile.version == 2:
             matrix = executable_hawkes_flow_composition_matrix()
             expected_version = 2
+        elif plan.composition_profile.version == 3:
+            matrix = executable_queue_reactive_flow_composition_matrix()
+            expected_version = 3
         else:
             raise ValueError("FullDayRuntime flow profile version is unsupported")
     else:
@@ -1130,6 +1143,7 @@ class FullDayRuntime:
         agent_scheduler: object | None,
         simple_flow: object | None,
         hawkes_flow: object | None,
+        queue_reactive_flow: object | None,
         order_id_allocator: RuntimeOrderIdAllocatorV1,
         bootstrap: bool,
         restoring: bool = False,
@@ -1142,6 +1156,7 @@ class FullDayRuntime:
         self.agent_scheduler = agent_scheduler
         self.simple_flow = simple_flow
         self.hawkes_flow = hawkes_flow
+        self.queue_reactive_flow = queue_reactive_flow
         self._order_id_allocator = order_id_allocator
         self._validate_profile_and_core_owners(restoring=restoring)
 
@@ -1168,6 +1183,8 @@ class FullDayRuntime:
             self._component_sequences[FLOW_SIMPLE_COMPONENT] = 0
         if self.hawkes_flow is not None:
             self._component_sequences[FLOW_HAWKES_COMPONENT] = 0
+        if self.queue_reactive_flow is not None:
+            self._component_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
         self._native_sequences: dict[str, int] = {}
         if self.agent_scheduler is not None:
             self._native_sequences[AGENT_SCHEDULER_COMPONENT] = 0
@@ -1175,6 +1192,8 @@ class FullDayRuntime:
             self._native_sequences[FLOW_SIMPLE_COMPONENT] = 0
         if self.hawkes_flow is not None:
             self._native_sequences[FLOW_HAWKES_COMPONENT] = 0
+        if self.queue_reactive_flow is not None:
+            self._native_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
         self._mechanics_event_cursor = len(self.engine.events)
         self._calendar_boundary_index = 0
         self._participant_schedule_index = 0
@@ -1208,6 +1227,9 @@ class FullDayRuntime:
                 _WORK_CHECKPOINT_CAPTURE: "_handle_checkpoint_capture",
                 _WORK_GTT_EXPIRY: "_handle_gtt_expiry",
                 _WORK_HAWKES_FLOW_PROPOSAL: "_handle_hawkes_flow_proposal",
+                _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL: (
+                    "_handle_queue_reactive_flow_proposal"
+                ),
                 _WORK_MECHANICS_CANCEL: "_handle_mechanics_cancel",
                 _WORK_MECHANICS_REPLACE: "_handle_mechanics_replace",
                 _WORK_MECHANICS_SUBMIT: "_handle_mechanics_submit",
@@ -1227,6 +1249,7 @@ class FullDayRuntime:
             self._bootstrap_plan_work()
             self._schedule_initial_simple_flow()
             self._schedule_initial_hawkes_flow()
+            self._schedule_initial_queue_reactive_flow()
             self._schedule_agent_work()
             self._schedule_next_state_batch()
             self.assert_invariants()
@@ -1241,6 +1264,7 @@ class FullDayRuntime:
         agent_scheduler: object | None = None,
         simple_flow: object | None = None,
         hawkes_flow: object | None = None,
+        queue_reactive_flow: object | None = None,
         order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
     ) -> FullDayRuntime:
         if type(plan) is not FullDayPlanV1:
@@ -1263,6 +1287,7 @@ class FullDayRuntime:
             agent_scheduler=agent_scheduler,
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
+            queue_reactive_flow=queue_reactive_flow,
             order_id_allocator=allocator,
             bootstrap=True,
         )
@@ -1277,6 +1302,7 @@ class FullDayRuntime:
         engine: MarketMechanicsEngine | None = None,
         simple_flow_configuration: object | None = None,
         hawkes_flow_configuration: object | None = None,
+        queue_reactive_flow_configuration: object | None = None,
     ) -> FullDayRuntime:
         """Construct the scheduler only after the sole owners exist."""
 
@@ -1353,6 +1379,25 @@ class FullDayRuntime:
                     "Hawkes flow configuration must use HawkesFlowConfigurationV1"
                 )
             hawkes_flow = HawkesFlowOwnerV1(plan, hawkes_flow_configuration)
+        queue_reactive_flow = None
+        if queue_reactive_flow_configuration is not None:
+            from .components_flow import (
+                QueueReactiveFlowConfigurationV1,
+                QueueReactiveFlowOwnerV1,
+            )
+
+            if (
+                type(queue_reactive_flow_configuration)
+                is not QueueReactiveFlowConfigurationV1
+            ):
+                raise TypeError(
+                    "queue-reactive configuration must use "
+                    "QueueReactiveFlowConfigurationV1"
+                )
+            queue_reactive_flow = QueueReactiveFlowOwnerV1(
+                plan,
+                queue_reactive_flow_configuration,
+            )
         return cls.create(
             plan,
             engine=selected_engine,
@@ -1360,6 +1405,7 @@ class FullDayRuntime:
             agent_scheduler=scheduler,
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
+            queue_reactive_flow=queue_reactive_flow,
             order_id_allocator=allocator,
         )
 
@@ -1409,8 +1455,6 @@ class FullDayRuntime:
             ),
         )
         active_components = set(profile.resolve_active_components(predicate_values))
-        if "FLOW_QUEUE_REACTIVE_V1" in active_components:
-            raise ValueError("FLOW_QUEUE_REACTIVE_V1 remains contract-only")
         if type(self.engine) is not MarketMechanicsEngine:
             raise TypeError("runtime engine must be exactly MarketMechanicsEngine")
         if type(self.clock) is not SimulationClock or self.clock is not self.engine.clock:
@@ -1558,6 +1602,23 @@ class FullDayRuntime:
             self.hawkes_flow.assert_invariants(self.plan)
             self._reject_smuggled_core_owner(
                 self.hawkes_flow, owner_label="Hawkes-flow component"
+            )
+        queue_required = FLOW_QUEUE_REACTIVE_COMPONENT in active_components
+        if queue_required != (self.queue_reactive_flow is not None):
+            raise ValueError(
+                "queue-reactive presence differs from its active predicate"
+            )
+        if self.queue_reactive_flow is not None:
+            from .components_flow import QueueReactiveFlowOwnerV1
+
+            if type(self.queue_reactive_flow) is not QueueReactiveFlowOwnerV1:
+                raise ValueError(
+                    "runtime requires the exact QueueReactiveFlowOwnerV1"
+                )
+            self.queue_reactive_flow.assert_invariants(self.plan)
+            self._reject_smuggled_core_owner(
+                self.queue_reactive_flow,
+                owner_label="queue-reactive component",
             )
         self.engine.assert_invariants()
 
@@ -1717,6 +1778,56 @@ class FullDayRuntime:
             cancellable_ask_order_ids=tuple(sorted(asks)),
         )
 
+    def _queue_reactive_observation_cut(self):
+        """Detach cumulative venue evidence for one queue-feedback decision."""
+
+        from .components_flow import QueueReactiveObservationCutV1
+
+        owner = self.queue_reactive_flow
+        if owner is None:
+            raise RuntimeError("queue-reactive observation requires its owner")
+        levels = owner.configuration.near_touch_levels
+        bid_prices = self.engine.book.bid_prices[:levels]
+        ask_prices = self.engine.book.ask_prices[:levels]
+        bid_book = self.engine.book.bids
+        ask_book = self.engine.book.asks
+        best_bid = self.engine.book.best_bid
+        best_ask = self.engine.book.best_ask
+        trades = self.engine.book.trades
+        bids: list[str] = []
+        asks: list[str] = []
+        for order_id, order in self.engine.book.active_orders.items():
+            if order.owner is not OrderOwner.SIMULATED:
+                continue
+            if order.side is Side.BUY:
+                bids.append(order_id)
+            elif order.side is Side.SELL:
+                asks.append(order_id)
+        return QueueReactiveObservationCutV1(
+            schema_version=1,
+            simulation_time_us=self.clock.current_time_us,
+            best_bid_ticks=best_bid,
+            best_ask_ticks=best_ask,
+            best_bid_size=(0 if best_bid is None else bid_book[best_bid].total_quantity),
+            best_ask_size=(0 if best_ask is None else ask_book[best_ask].total_quantity),
+            depth_near_touch_bid=sum(
+                bid_book[price].total_quantity for price in bid_prices
+            ),
+            depth_near_touch_ask=sum(
+                ask_book[price].total_quantity for price in ask_prices
+            ),
+            cumulative_trade_count=len(trades),
+            cumulative_aggressive_buy_volume=sum(
+                trade.quantity for trade in trades if trade.taker_side is Side.BUY
+            ),
+            cumulative_aggressive_sell_volume=sum(
+                trade.quantity for trade in trades if trade.taker_side is Side.SELL
+            ),
+            reference_price_ticks=self.engine.rules.reference_price_ticks,
+            cancellable_bid_order_ids=tuple(sorted(bids)),
+            cancellable_ask_order_ids=tuple(sorted(asks)),
+        )
+
     def _schedule_initial_simple_flow(self) -> None:
         if self.simple_flow is None:
             return
@@ -1762,6 +1873,32 @@ class FullDayRuntime:
             stage=WorkStageV1.BACKGROUND_FLOW_PROPOSAL,
             source_component_id=FLOW_HAWKES_COMPONENT,
             work_type=_WORK_HAWKES_FLOW_PROPOSAL,
+            payload={"proposal_id": proposal.proposal_id},
+        )
+
+    def _schedule_initial_queue_reactive_flow(self) -> None:
+        if self.queue_reactive_flow is None:
+            return
+        proposal = self.queue_reactive_flow.plan_next(
+            self._queue_reactive_observation_cut(),
+            horizon_us=self.plan.calendar.end_time_us,
+        )
+        if proposal is not None:
+            self._enqueue_queue_reactive_flow_proposal(proposal)
+
+    def _enqueue_queue_reactive_flow_proposal(
+        self, proposal: object
+    ) -> RuntimeWorkItemV1:
+        from .components_flow import QueueReactiveFlowProposalV1
+
+        if type(proposal) is not QueueReactiveFlowProposalV1:
+            raise TypeError("runtime requires a typed queue-reactive proposal")
+        return self._enqueue_new(
+            simulation_time_us=proposal.scheduled_time_us,
+            microstep=0,
+            stage=WorkStageV1.BACKGROUND_FLOW_PROPOSAL,
+            source_component_id=FLOW_QUEUE_REACTIVE_COMPONENT,
+            work_type=_WORK_QUEUE_REACTIVE_FLOW_PROPOSAL,
             payload={"proposal_id": proposal.proposal_id},
         )
 
@@ -2018,6 +2155,11 @@ class FullDayRuntime:
                 else self.hawkes_flow.checkpoint_state()
             ),
             "order_id_allocator": self._order_id_allocator.checkpoint_state(),
+            "queue_reactive_flow": (
+                None
+                if self.queue_reactive_flow is None
+                else self.queue_reactive_flow.checkpoint_state()
+            ),
             "simple_flow": (
                 None
                 if self.simple_flow is None
@@ -2070,6 +2212,7 @@ class FullDayRuntime:
                 self.agent_scheduler,
                 self.simple_flow,
                 self.hawkes_flow,
+                self.queue_reactive_flow,
                 self._state_runtime,
                 self._order_id_allocator,
             ),
@@ -2104,6 +2247,7 @@ class FullDayRuntime:
             scheduler,
             simple_flow,
             hawkes_flow,
+            queue_reactive_flow,
             state_runtime,
             order_allocator,
         ) = snapshot["owner_identities"]
@@ -2180,6 +2324,29 @@ class FullDayRuntime:
                 )
             hawkes_flow.__dict__.clear()
             hawkes_flow.__dict__.update(restored_hawkes_flow.__dict__)
+        raw_queue_reactive_flow = owner_bundle["queue_reactive_flow"]
+        if raw_queue_reactive_flow is None:
+            if queue_reactive_flow is not None:
+                raise RuntimeError(
+                    "transaction snapshot queue-reactive identity is inconsistent"
+                )
+        else:
+            from .components_flow import QueueReactiveFlowOwnerV1
+
+            restored_queue_reactive_flow = (
+                QueueReactiveFlowOwnerV1.from_checkpoint_state(
+                    raw_queue_reactive_flow,
+                    plan=self.plan,
+                )
+            )
+            if queue_reactive_flow is None:
+                raise RuntimeError(
+                    "transaction snapshot queue-reactive identity is inconsistent"
+                )
+            queue_reactive_flow.__dict__.clear()
+            queue_reactive_flow.__dict__.update(
+                restored_queue_reactive_flow.__dict__
+            )
         state_runtime_state = HierarchicalStateRuntimeStateV1.from_dict(
             owner_bundle["state_runtime"]
         )
@@ -2197,6 +2364,7 @@ class FullDayRuntime:
         self.agent_scheduler = scheduler
         self.simple_flow = simple_flow
         self.hawkes_flow = hawkes_flow
+        self.queue_reactive_flow = queue_reactive_flow
         self._state_runtime = state_runtime
         self._order_id_allocator = order_allocator
         self._heap = snapshot["heap"]
@@ -3081,6 +3249,18 @@ class FullDayRuntime:
             native_event_id_prefix="HAWKES_FLOW_PROPOSAL",
         )
 
+    def _assert_queue_reactive_flow_native_reconciliation(self) -> None:
+        from .components_flow import QueueReactiveFlowProposalV1
+
+        self._assert_background_flow_native_reconciliation(
+            owner=self.queue_reactive_flow,
+            proposal_type=QueueReactiveFlowProposalV1,
+            component_id=FLOW_QUEUE_REACTIVE_COMPONENT,
+            work_type=_WORK_QUEUE_REACTIVE_FLOW_PROPOSAL,
+            native_ledger_id=QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="QUEUE_REACTIVE_FLOW_PROPOSAL",
+        )
+
     def _assert_background_flow_native_reconciliation(
         self,
         *,
@@ -3675,6 +3855,21 @@ class FullDayRuntime:
             enqueue_next=self._enqueue_hawkes_flow_proposal,
         )
 
+    def _handle_queue_reactive_flow_proposal(
+        self, item: RuntimeWorkItemV1
+    ) -> None:
+        from .components_flow import QueueReactiveFlowProposalV1
+
+        self._handle_background_flow_proposal(
+            item,
+            owner=self.queue_reactive_flow,
+            proposal_type=QueueReactiveFlowProposalV1,
+            component_id=FLOW_QUEUE_REACTIVE_COMPONENT,
+            native_ledger_id=QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="QUEUE_REACTIVE_FLOW_PROPOSAL",
+            enqueue_next=self._enqueue_queue_reactive_flow_proposal,
+        )
+
     def _handle_background_flow_proposal(
         self,
         item: RuntimeWorkItemV1,
@@ -3827,8 +4022,13 @@ class FullDayRuntime:
             parent_id=flow_outer.event_id,
             scheduler_book_before=scheduler_book_before,
         )
+        observation = (
+            self._queue_reactive_observation_cut()
+            if component_id == FLOW_QUEUE_REACTIVE_COMPONENT
+            else self._flow_observation_cut()
+        )
         next_proposal = owner.plan_next(
-            self._flow_observation_cut(),
+            observation,
             horizon_us=self.plan.calendar.end_time_us,
         )
         if next_proposal is not None:
@@ -3954,6 +4154,19 @@ class FullDayRuntime:
             "status": "PRESERVED",
         }
 
+    def _queue_reactive_flow_checkpoint_union(self) -> dict[str, object]:
+        if self.queue_reactive_flow is None:
+            return {
+                "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
+                "status": "ABSENT",
+            }
+        state = self.queue_reactive_flow.checkpoint_state()
+        return {
+            "state": _plain(state),
+            "state_sha256": canonical_sha256(state),
+            "status": "PRESERVED",
+        }
+
     @staticmethod
     def _component_presence_inventory(
         plan: FullDayPlanV1,
@@ -3961,6 +4174,7 @@ class FullDayRuntime:
         scheduler_present: bool,
         simple_flow_present: bool,
         hawkes_flow_present: bool,
+        queue_reactive_flow_present: bool,
     ) -> list[dict[str, object]]:
         matrix = _runtime_composition_matrix(plan)
         profile = matrix.profile(
@@ -3994,6 +4208,12 @@ class FullDayRuntime:
         if (FLOW_HAWKES_COMPONENT in active) != hawkes_flow_present:
             raise ValueError(
                 "Hawkes-flow presence differs from the composition active predicate"
+            )
+        if (
+            FLOW_QUEUE_REACTIVE_COMPONENT in active
+        ) != queue_reactive_flow_present:
+            raise ValueError(
+                "queue-reactive presence differs from the composition active predicate"
             )
         rows: list[dict[str, object]] = []
         for component in profile.components:
@@ -4076,6 +4296,9 @@ class FullDayRuntime:
                 scheduler_present=self.agent_scheduler is not None,
                 simple_flow_present=self.simple_flow is not None,
                 hawkes_flow_present=self.hawkes_flow is not None,
+                queue_reactive_flow_present=(
+                    self.queue_reactive_flow is not None
+                ),
             ),
             "dequeued_count": self._dequeued_count,
             "engine": self.engine.checkpoint_state(),
@@ -4133,6 +4356,10 @@ class FullDayRuntime:
             state["simple_flow"] = self._simple_flow_checkpoint_union()
         elif self.hawkes_flow is not None:
             state["hawkes_flow"] = self._hawkes_flow_checkpoint_union()
+        elif self.queue_reactive_flow is not None:
+            state["queue_reactive_flow"] = (
+                self._queue_reactive_flow_checkpoint_union()
+            )
         validate_strict_json(state)
         if (
             len(canonical_json_bytes(state))
@@ -4158,6 +4385,7 @@ class FullDayRuntime:
             del state[field]
         state.pop("simple_flow", None)
         state.pop("hawkes_flow", None)
+        state.pop("queue_reactive_flow", None)
         validate_strict_json(state)
         return state
 
@@ -4226,6 +4454,9 @@ class FullDayRuntime:
             ),
             simple_flow_present=FLOW_SIMPLE_COMPONENT in plan.selected_component_ids,
             hawkes_flow_present=FLOW_HAWKES_COMPONENT in plan.selected_component_ids,
+            queue_reactive_flow_present=(
+                FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids
+            ),
         )
         if payload["component_presence"] != expected_presence:
             raise ValueError(
@@ -4705,6 +4936,12 @@ class FullDayRuntime:
             hawkes_flow = self._hawkes_flow_checkpoint_union()
             result["hawkes_flow_state_sha256"] = hawkes_flow.get("state_sha256")
             result["hawkes_flow_status"] = hawkes_flow["status"]
+        elif self.queue_reactive_flow is not None:
+            queue_flow = self._queue_reactive_flow_checkpoint_union()
+            result["queue_reactive_flow_state_sha256"] = queue_flow.get(
+                "state_sha256"
+            )
+            result["queue_reactive_flow_status"] = queue_flow["status"]
         return result
 
     @classmethod
@@ -4754,6 +4991,8 @@ class FullDayRuntime:
             expected.add("simple_flow")
         if FLOW_HAWKES_COMPONENT in plan.selected_component_ids:
             expected.add("hawkes_flow")
+        if FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids:
+            expected.add("queue_reactive_flow")
         _require_exact_fields(payload, expected, "FullDayRuntime checkpoint")
         if (
             payload["schema_version"] != FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION
@@ -4819,6 +5058,7 @@ class FullDayRuntime:
             raise ValueError("agent scheduler checkpoint union status is unsupported")
         simple_flow: object | None = None
         hawkes_flow: object | None = None
+        queue_reactive_flow: object | None = None
         if FLOW_SIMPLE_COMPONENT in plan.selected_component_ids:
             raw_simple_flow = _plain_object(
                 payload["simple_flow"], "simple-flow union"
@@ -4875,11 +5115,44 @@ class FullDayRuntime:
                 raise ValueError(
                     "executable Hawkes profile requires preserved flow state"
                 )
+        if FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids:
+            raw_queue_flow = _plain_object(
+                payload["queue_reactive_flow"],
+                "queue-reactive union",
+            )
+            flow_status = raw_queue_flow.get("status")
+            if flow_status == "PRESERVED":
+                _require_exact_fields(
+                    raw_queue_flow,
+                    {"state", "state_sha256", "status"},
+                    "preserved queue-reactive flow",
+                )
+                raw_flow_state = _plain_object(
+                    raw_queue_flow["state"],
+                    "queue-reactive state",
+                )
+                if raw_queue_flow["state_sha256"] != canonical_sha256(
+                    raw_flow_state
+                ):
+                    raise ValueError("queue-reactive state digest mismatch")
+                from .components_flow import QueueReactiveFlowOwnerV1
+
+                queue_reactive_flow = (
+                    QueueReactiveFlowOwnerV1.from_checkpoint_state(
+                        raw_flow_state,
+                        plan=plan,
+                    )
+                )
+            else:
+                raise ValueError(
+                    "executable queue-reactive profile requires preserved flow state"
+                )
         if payload["component_presence"] != cls._component_presence_inventory(
             plan,
             scheduler_present=scheduler is not None,
             simple_flow_present=simple_flow is not None,
             hawkes_flow_present=hawkes_flow is not None,
+            queue_reactive_flow_present=queue_reactive_flow is not None,
         ):
             raise ValueError(
                 "runtime checkpoint component presence differs from composition"
@@ -4891,6 +5164,7 @@ class FullDayRuntime:
             agent_scheduler=scheduler,
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
+            queue_reactive_flow=queue_reactive_flow,
             order_id_allocator=allocator,
             bootstrap=False,
             restoring=True,
@@ -5084,6 +5358,8 @@ class FullDayRuntime:
             active_component_ids.add(FLOW_SIMPLE_COMPONENT)
         if self.hawkes_flow is not None:
             active_component_ids.add(FLOW_HAWKES_COMPONENT)
+        if self.queue_reactive_flow is not None:
+            active_component_ids.add(FLOW_QUEUE_REACTIVE_COMPONENT)
         if set(self._component_sequences) != active_component_ids:
             raise RuntimeError(
                 "component allocator owners differ from the exact active profile"
@@ -5157,6 +5433,7 @@ class FullDayRuntime:
         self._assert_agent_deadline_replay()
         self._assert_simple_flow_native_reconciliation()
         self._assert_hawkes_flow_native_reconciliation()
+        self._assert_queue_reactive_flow_native_reconciliation()
         published_scheduled_ids = {
             str(event.payload.data["scheduled_event_id"])
             for event in self._events
@@ -5451,6 +5728,10 @@ class FullDayRuntime:
             (AGENT_SCHEDULER_COMPONENT, self.agent_scheduler is not None),
             (FLOW_SIMPLE_COMPONENT, self.simple_flow is not None),
             (FLOW_HAWKES_COMPONENT, self.hawkes_flow is not None),
+            (
+                FLOW_QUEUE_REACTIVE_COMPONENT,
+                self.queue_reactive_flow is not None,
+            ),
         ):
             if present:
                 expected_native_sequences[component_id] = max(
