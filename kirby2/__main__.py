@@ -1003,11 +1003,18 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="save the complete provenance-labeled replay stream",
     )
+    from kirby2.cli.expansion import register_expansion_commands
+
+    register_expansion_commands(subcommands)
     return parser
 
 
 def main() -> None:
+    from kirby2.cli.expansion import dispatch_expansion_command
+
     args = _parser().parse_args()
+    if dispatch_expansion_command(args):
+        return
     if args.command == "demo":
         print(run_demo(args.seed))
         return

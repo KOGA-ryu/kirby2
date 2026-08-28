@@ -1,0 +1,63 @@
+"""Explicit parser and handler declarations for the WO31-40 expansion."""
+
+from __future__ import annotations
+
+import argparse
+
+from .registry import (
+    CommandModule,
+    CommandRegistry,
+    CommandSpec,
+    dispatch_registered_command,
+)
+
+
+def _configure_audit_expansion(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gate",
+        required=True,
+        metavar="CARD_ID",
+        help="exact registered card ID, or lowercase all",
+    )
+
+
+def _handle_audit_expansion(args: argparse.Namespace) -> int:
+    from kirby2.audit.expansion import run_registered_expansion_audit
+
+    return run_registered_expansion_audit(args.gate)
+
+
+EXPANSION_COMMAND_MODULES = (
+    CommandModule(
+        module_id="EXPANSION_AUDIT",
+        commands=(
+            CommandSpec(
+                command_id="AUDIT_EXPANSION",
+                name="audit-expansion",
+                help="run one registered WO31-40 expansion gate",
+                handler=_handle_audit_expansion,
+                configure=_configure_audit_expansion,
+            ),
+        ),
+    ),
+)
+
+
+def declared_expansion_command_names() -> tuple[str, ...]:
+    return tuple(
+        command.name
+        for module in EXPANSION_COMMAND_MODULES
+        for command in module.commands
+    )
+
+
+def register_expansion_commands(
+    subcommands: argparse._SubParsersAction,
+) -> CommandRegistry:
+    registry = CommandRegistry(subcommands)
+    registry.register_modules(EXPANSION_COMMAND_MODULES)
+    return registry
+
+
+def dispatch_expansion_command(args: argparse.Namespace) -> bool:
+    return dispatch_registered_command(args)
