@@ -30,6 +30,7 @@ from .events import (
 )
 from .models import (
     FullDayPlanV1,
+    PressureKindV1,
     _require_exact_fields,
     canonical_json_bytes,
     canonical_sha256,
@@ -926,6 +927,170 @@ def apply_bounded_modifiers_v1(
             base.denominator * item.modifier.denominator,
         )
     return MappingProxyType(dict(sorted(result.items(), key=lambda row: row[0].value)))
+
+
+@dataclass(frozen=True, slots=True)
+class FullDayParameterSnapshotV1:
+    """Exact non-imperative controls visible to composed runtime consumers.
+
+    Pressure, hierarchical state, and each accepted-shock batch remain
+    provenance-separated.  Consumers may inspect the resulting exact ratios,
+    but the closed ``ParameterTargetV1`` enum makes a price, desired return,
+    forced trade, inventory liquidation, or direct book write unrepresentable.
+    """
+
+    simulation_time_us: int
+    pressure_modifiers: tuple[BoundedParameterModifierV1, ...]
+    day_state_modifiers: tuple[BoundedParameterModifierV1, ...]
+    local_state_modifiers: tuple[BoundedParameterModifierV1, ...]
+    shock_modifier_batches: tuple[tuple[BoundedParameterModifierV1, ...], ...]
+    effective_values: Mapping[ParameterTargetV1, FixedPointValueV1]
+
+    def __post_init__(self) -> None:
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("full-day parameter snapshot time must be nonnegative")
+        for rows, context in (
+            (self.pressure_modifiers, "pressure"),
+            (self.day_state_modifiers, "day-state"),
+            (self.local_state_modifiers, "local-state"),
+        ):
+            if type(rows) is not tuple or any(
+                type(row) is not BoundedParameterModifierV1 for row in rows
+            ):
+                raise TypeError(f"{context} modifiers use the wrong contract")
+            targets = tuple(row.target for row in rows)
+            if len(targets) != len(set(targets)):
+                raise ValueError(f"{context} modifier targets are duplicated")
+        if type(self.shock_modifier_batches) is not tuple or any(
+            type(batch) is not tuple
+            or any(type(row) is not BoundedParameterModifierV1 for row in batch)
+            or len(tuple(row.target for row in batch))
+            != len(set(row.target for row in batch))
+            for batch in self.shock_modifier_batches
+        ):
+            raise TypeError("shock modifier batches use the wrong contract")
+        if not isinstance(self.effective_values, Mapping) or any(
+            type(key) is not ParameterTargetV1
+            or type(value) is not FixedPointValueV1
+            for key, value in self.effective_values.items()
+        ):
+            raise TypeError("effective full-day values use the wrong exact contract")
+        if set(self.effective_values) != set(ParameterTargetV1):
+            raise ValueError("effective full-day values do not cover every target")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "day_state_modifiers": [
+                row.as_dict() for row in self.day_state_modifiers
+            ],
+            "effective_values": {
+                target.value: self.effective_values[target].as_dict()
+                for target in ParameterTargetV1
+            },
+            "local_state_modifiers": [
+                row.as_dict() for row in self.local_state_modifiers
+            ],
+            "pressure_modifiers": [
+                row.as_dict() for row in self.pressure_modifiers
+            ],
+            "shock_modifier_batches": [
+                [row.as_dict() for row in batch]
+                for batch in self.shock_modifier_batches
+            ],
+            "simulation_time_us": self.simulation_time_us,
+        }
+
+
+_PRESSURE_TARGET_V1 = MappingProxyType(
+    {
+        PressureKindV1.VOLUME: ParameterTargetV1.PARTICIPANT_ACTIVITY_SCALE,
+        PressureKindV1.LIQUIDITY: ParameterTargetV1.LIQUIDITY_PROVISION_SCALE,
+        PressureKindV1.VOLATILITY: ParameterTargetV1.DEPTH_PLACEMENT_SCALE,
+    }
+)
+
+
+def _fixed_ppm(value: int) -> FixedPointValueV1:
+    return FixedPointValueV1.reduced(value, 1_000_000)
+
+
+def full_day_parameter_snapshot_v1(
+    plan: FullDayPlanV1,
+    state_runtime: HierarchicalStateRuntimeV1,
+    *,
+    simulation_time_us: int,
+    accepted_shock_effect_batches: Sequence[Sequence[ParameterEffectV1]] = (),
+) -> FullDayParameterSnapshotV1:
+    """Compose all bounded full-day parameter sources without floats.
+
+    This function deliberately returns values instead of mutating an adapter.
+    Each executable consumer remains responsible for applying only the targets
+    it owns through its normal configuration interface.
+    """
+
+    if type(plan) is not FullDayPlanV1:
+        raise TypeError("full-day parameter snapshot requires FullDayPlanV1")
+    if type(state_runtime) is not HierarchicalStateRuntimeV1:
+        raise TypeError(
+            "full-day parameter snapshot requires HierarchicalStateRuntimeV1"
+        )
+    if (
+        type(simulation_time_us) is not int
+        or simulation_time_us < 0
+        or simulation_time_us > plan.calendar.end_time_us
+        or state_runtime.current_time_us != simulation_time_us
+    ):
+        raise ValueError("parameter snapshot time differs from the state runtime")
+
+    pressure_rows: list[BoundedParameterModifierV1] = []
+    for profile in plan.pressure_profiles:
+        segment = next(
+            (
+                row
+                for row in profile.segments
+                if row.start_us <= simulation_time_us < row.end_us
+            ),
+            profile.segments[-1]
+            if simulation_time_us == plan.calendar.end_time_us
+            else None,
+        )
+        if segment is None:  # pragma: no cover - FullDayPlan coverage prevents it
+            raise RuntimeError("pressure profile omits the requested time")
+        pressure_rows.append(
+            BoundedParameterModifierV1(
+                target=_PRESSURE_TARGET_V1[profile.pressure_kind],
+                modifier=_fixed_ppm(segment.modifier_ppm),
+                minimum=_fixed_ppm(profile.minimum_ppm),
+                maximum=_fixed_ppm(profile.maximum_ppm),
+            )
+        )
+    pressure_modifiers = tuple(
+        sorted(pressure_rows, key=lambda row: row.target.value)
+    )
+    day_modifiers = state_runtime.active_modifiers(StateLevelV1.DAY)
+    local_modifiers = state_runtime.active_modifiers(StateLevelV1.LOCAL)
+    shock_batches = tuple(
+        tuple(BoundedParameterModifierV1.from_effect(effect) for effect in batch)
+        for batch in accepted_shock_effect_batches
+    )
+    values: Mapping[ParameterTargetV1, FixedPointValueV1] = MappingProxyType(
+        {target: FixedPointValueV1(1, 1) for target in ParameterTargetV1}
+    )
+    for batch in (
+        pressure_modifiers,
+        day_modifiers,
+        local_modifiers,
+        *shock_batches,
+    ):
+        values = apply_bounded_modifiers_v1(values, batch)
+    return FullDayParameterSnapshotV1(
+        simulation_time_us=simulation_time_us,
+        pressure_modifiers=pressure_modifiers,
+        day_state_modifiers=day_modifiers,
+        local_state_modifiers=local_modifiers,
+        shock_modifier_batches=shock_batches,
+        effective_values=values,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2163,6 +2328,7 @@ __all__ = [
     "DAY_STATE_ANCHOR_EMISSION_SCHEMA_VERSION",
     "DayStateAnchorEmissionV1",
     "FixedPointValueV1",
+    "FullDayParameterSnapshotV1",
     "FULL_DAY_RUNTIME_COMPONENT_ID_V1",
     "HierarchicalStateRuntimeStateV1",
     "HierarchicalStateRuntimeV1",
@@ -2179,6 +2345,7 @@ __all__ = [
     "TriggerObservationPhaseV1",
     "TriggerObservationV1",
     "apply_bounded_modifiers_v1",
+    "full_day_parameter_snapshot_v1",
     "project_transition_payload_v1",
     "project_anchor_payload_v1",
     "trigger_parameter_set_sha256_v1",

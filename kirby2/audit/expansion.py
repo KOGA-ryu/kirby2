@@ -112,6 +112,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-E5",
     "DEV-0004",
     "WO31-E6",
+    "WO31-F",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1823,6 +1824,76 @@ def _audit_wo31e6() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31f() -> ExpansionGateReport:
+    """Run complete executable-profile full-day composition evidence."""
+
+    from kirby2.audit.full_day import audit_wo31f_composition
+    from kirby2.full_day.checkpoint_contract import load_pilot_limits
+    from kirby2.full_day.composition import (
+        RESEARCH_PROFILE_ID,
+        executable_research_composition_matrix,
+    )
+
+    cases = audit_wo31f_composition()
+    expected_names = (
+        "full_day_composition_profile_and_pilot",
+        "full_day_participant_scheduled_shock_orchestration",
+        "full_day_complete_bounded_day_replay_restore",
+        "full_day_nonexecutable_and_hostile_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-F cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-F cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-F cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    matrix = executable_research_composition_matrix()
+    profile = matrix.profile(RESEARCH_PROFILE_ID, 1)
+    pilot = load_pilot_limits()
+    return ExpansionGateReport(
+        card_id="WO31-F",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("complete_day_count", "1"),
+            ("composition_matrix_sha256", matrix.sha256),
+            ("execution_algorithm", "NOT_EXERCISED"),
+            ("historical_replay", "NOT_EXERCISED"),
+            ("multivenue_hidden", "NOT_EXERCISED"),
+            ("pilot_manifest_sha256", pilot.manifest_sha256),
+            ("pilot_semantic_sha256", pilot.semantic_sha256),
+            ("profile_id", profile.profile_id),
+            ("profile_status", profile.implementation_status),
+            ("profile_version", str(profile.profile_version)),
+            ("short_executable_profile_count", "5"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2014,6 +2085,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-E5", _audit_wo31e5),
     ("DEV-0004", _audit_dev0004),
     ("WO31-E6", _audit_wo31e6),
+    ("WO31-F", _audit_wo31f),
 )
 
 

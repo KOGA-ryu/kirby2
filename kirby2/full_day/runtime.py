@@ -37,9 +37,11 @@ from .calendar import TradingDayCalendarV1
 from .checkpoint_contract import QuiescentCutV1
 from .composition import (
     ABSENT_REASON_COMPONENT_INACTIVE,
+    ABSENT_REASON_SYNTHETIC_NO_HISTORICAL_CURSOR,
     AGENT_SCHEDULER_COMPONENT,
     DELIVERY_ASYNC_COMPONENT,
     DELIVERY_PROFILE_ID,
+    EXECUTION_ALGORITHM_PROFILE_ID,
     FEATURE_STRATEGY_PLAYER_COMPONENT,
     FLOW_HAWKES_COMPONENT,
     FLOW_PROFILE_ID,
@@ -48,6 +50,7 @@ from .composition import (
     FULL_DAY_RUNTIME_COMPONENT,
     INITIAL_PROFILE_ID,
     MECHANICS_COMPONENT,
+    MULTIVENUE_HIDDEN_PROFILE_ID,
     RESEARCH_PROFILE_ID,
     agent_scheduler_is_active,
     executable_agent_mechanics_composition_matrix,
@@ -56,6 +59,8 @@ from .composition import (
     executable_queue_reactive_flow_composition_matrix,
     executable_research_composition_matrix,
     executable_simple_flow_composition_matrix,
+    restorable_execution_algorithm_composition_matrix,
+    restorable_multivenue_hidden_composition_matrix,
 )
 from .events import (
     FullDayEventPayloadV1,
@@ -78,17 +83,26 @@ from .models import (
     parse_canonical_json_object,
     validate_strict_json,
 )
+from .participants import ParticipantScheduleRuntimeV1
+from .scheduled import ScheduledEventRuntimeV1
+from .shocks import (
+    SHOCK_RUNTIME_ABSENT_REASON,
+    ShockQuantityDistributionV1,
+    UnscheduledShockRuntimeV1,
+)
 from .transitions import (
     DayStateAnchorEmissionV1,
+    FullDayParameterSnapshotV1,
     HierarchicalStateRuntimeStateV1,
     HierarchicalStateRuntimeV1,
     StateTransitionEmissionV1,
+    full_day_parameter_snapshot_v1,
 )
 from .states import DurationExhaustionBehaviorV1
 
 
 FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION = 1
-FULL_DAY_RUNTIME_IMPLEMENTATION_VERSION = 1
+FULL_DAY_RUNTIME_IMPLEMENTATION_VERSION = 2
 FULL_DAY_RUNTIME_PROFILE_ID = INITIAL_PROFILE_ID
 FULL_DAY_RUNTIME_PROFILE_VERSION = 2
 MECHANICS_NATIVE_LEDGER_ID = "MARKET_MECHANICS_EVENTS_V1"
@@ -101,6 +115,7 @@ RESEARCH_NATIVE_LEDGER_ID = "FEATURE_STRATEGY_PLAYER_EVENTS_V1"
 
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
+_WORK_SHOCK_CANDIDATE = "SHOCK_CANDIDATE"
 _WORK_STATE_EMISSION = "STATE_EMISSION"
 _WORK_PARTICIPANT_SCHEDULE = "PARTICIPANT_SCHEDULE"
 _WORK_AGENT_ARRIVAL = "AGENT_ARRIVAL"
@@ -140,6 +155,7 @@ _WORK_TYPES = frozenset(
         _WORK_RESEARCH_PLAYER_DECISION,
         _WORK_RESEARCH_STRATEGY_DEADLINE,
         _WORK_SCHEDULED_INFORMATION,
+        _WORK_SHOCK_CANDIDATE,
         _WORK_SIMPLE_FLOW_PROPOSAL,
         _WORK_STATE_EMISSION,
     }
@@ -243,6 +259,11 @@ _WORK_CONTRACTS: Mapping[
             FULL_DAY_RUNTIME_COMPONENT,
             frozenset({WorkStageV1.SCHEDULED_INFORMATION}),
             frozenset({"scheduled_event_id"}),
+        ),
+        _WORK_SHOCK_CANDIDATE: (
+            FULL_DAY_RUNTIME_COMPONENT,
+            frozenset({WorkStageV1.SCHEDULED_INFORMATION}),
+            frozenset({"candidate_id"}),
         ),
         _WORK_SIMPLE_FLOW_PROPOSAL: (
             FLOW_SIMPLE_COMPONENT,
@@ -552,12 +573,119 @@ def _validate_plan_work_inventory(
         elif (
             len(pending_matches) != 1
             or pending_matches[0].key.simulation_time_us != time_us
-            or pending_matches[0].key.microstep != 0
             or time_us < current_time_us
+            or (
+                time_us > current_time_us
+                and pending_matches[0].key.microstep != 0
+            )
         ):
             raise ValueError(
                 "resolved checkpoint policy differs from pending work"
             )
+
+
+def _validate_shock_runtime_reconciliation(
+    *,
+    shock_runtime: UnscheduledShockRuntimeV1 | None,
+    pending: Sequence[RuntimeWorkItemV1],
+    executed: Sequence[RuntimeWorkItemV1],
+    events: Sequence[FullDayEventV1],
+) -> None:
+    """Cross-bind shock owner state, work lifecycle, and outer evidence."""
+
+    pending_shock = tuple(
+        item for item in pending if item.work_type == _WORK_SHOCK_CANDIDATE
+    )
+    executed_shock = tuple(
+        sorted(
+            (item for item in executed if item.work_type == _WORK_SHOCK_CANDIDATE),
+            key=lambda item: item.key.ordering_key,
+        )
+    )
+    shock_event_types = {
+        FullDayEventTypeV1.SHOCK_CANDIDATE,
+        FullDayEventTypeV1.SHOCK_ACCEPTED,
+        FullDayEventTypeV1.SHOCK_REJECTED,
+    }
+    shock_events = tuple(
+        event for event in events if event.event_type in shock_event_types
+    )
+    if shock_runtime is None:
+        if pending_shock or executed_shock or shock_events:
+            raise ValueError("absent shock runtime retains work or outer evidence")
+        return
+    shock_runtime.assert_invariants()
+    outcomes = tuple(shock_runtime.outcomes)
+    if len(executed_shock) != len(outcomes):
+        raise ValueError("executed shock work differs from outcome history")
+    for work, outcome in zip(executed_shock, outcomes, strict=True):
+        candidate = outcome.candidate
+        if (
+            work.key.simulation_time_us != candidate.scheduled_time_us
+            or work.key.source_component_id != FULL_DAY_RUNTIME_COMPONENT
+            or work.key.stage_ordinal is not WorkStageV1.SCHEDULED_INFORMATION
+            or work.payload.get("candidate_id") != candidate.candidate_id
+        ):
+            raise ValueError("executed shock work differs from its candidate")
+    expected_events: list[
+        tuple[FullDayEventTypeV1, Mapping[str, object]]
+    ] = []
+    for outcome in outcomes:
+        candidate = outcome.candidate
+        expected_events.append(
+            (
+                FullDayEventTypeV1.SHOCK_CANDIDATE,
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "information_cutoff_us": candidate.information_cutoff_us,
+                    "quantity_shares": candidate.quantity_shares,
+                    "side": candidate.side.value,
+                },
+            )
+        )
+        if outcome.accepted:
+            expected_events.append(
+                (
+                    FullDayEventTypeV1.SHOCK_ACCEPTED,
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "information_cutoff_us": candidate.information_cutoff_us,
+                        "quantity_shares": candidate.quantity_shares,
+                        "side": candidate.side.value,
+                    },
+                )
+            )
+        else:
+            expected_events.append(
+                (
+                    FullDayEventTypeV1.SHOCK_REJECTED,
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "information_cutoff_us": candidate.information_cutoff_us,
+                        "reason_code": outcome.reason_code,
+                    },
+                )
+            )
+    if len(shock_events) != len(expected_events):
+        raise ValueError("shock outer evidence count differs from outcomes")
+    for event, (event_type, data) in zip(
+        shock_events, expected_events, strict=True
+    ):
+        if event.event_type is not event_type or _plain(event.payload.data) != data:
+            raise ValueError("shock outer evidence differs from outcome history")
+    candidate = shock_runtime.pending_candidate
+    if candidate is None:
+        if pending_shock or not shock_runtime.exhausted:
+            raise ValueError("shock runtime omitted its next bounded candidate")
+    elif (
+        len(pending_shock) != 1
+        or pending_shock[0].key.simulation_time_us != candidate.scheduled_time_us
+        or pending_shock[0].key.source_component_id != FULL_DAY_RUNTIME_COMPONENT
+        or pending_shock[0].key.stage_ordinal
+        is not WorkStageV1.SCHEDULED_INFORMATION
+        or pending_shock[0].payload.get("candidate_id") != candidate.candidate_id
+    ):
+        raise ValueError("pending shock work differs from owner state")
 
 
 def _validate_checkpoint_cut_inventory(
@@ -1166,6 +1294,25 @@ def _runtime_composition_matrix(plan: FullDayPlanV1):
     elif profile_id == RESEARCH_PROFILE_ID:
         matrix = executable_research_composition_matrix()
         expected_version = 1
+    elif profile_id == MULTIVENUE_HIDDEN_PROFILE_ID:
+        matrix = restorable_multivenue_hidden_composition_matrix()
+        profile = matrix.profile(MULTIVENUE_HIDDEN_PROFILE_ID, 1)
+        raise ValueError(
+            "FullDayRuntime refuses the multivenue profile: "
+            f"{profile.implementation_reason_code}"
+        )
+    elif profile_id == EXECUTION_ALGORITHM_PROFILE_ID:
+        matrix = restorable_execution_algorithm_composition_matrix()
+        profile = matrix.profile(EXECUTION_ALGORITHM_PROFILE_ID, 1)
+        raise ValueError(
+            "FullDayRuntime refuses the standalone algorithm profile: "
+            f"{profile.implementation_reason_code}"
+        )
+    elif profile_id in {"HISTORICAL_REPLAY", "HISTORICAL_REPLAY_V1"}:
+        raise ValueError(
+            "FullDayRuntime refuses historical replay: "
+            f"{ABSENT_REASON_SYNTHETIC_NO_HISTORICAL_CURSOR}"
+        )
     else:
         raise ValueError("FullDayRuntime does not implement this composition profile")
     if (
@@ -1195,6 +1342,9 @@ class FullDayRuntime:
         queue_reactive_flow: object | None,
         delivery: object | None,
         research: object | None,
+        participant_runtime: ParticipantScheduleRuntimeV1,
+        scheduled_runtime: ScheduledEventRuntimeV1,
+        shock_runtime: UnscheduledShockRuntimeV1 | None,
         order_id_allocator: RuntimeOrderIdAllocatorV1,
         bootstrap: bool,
         restoring: bool = False,
@@ -1210,6 +1360,22 @@ class FullDayRuntime:
         self.queue_reactive_flow = queue_reactive_flow
         self.delivery = delivery
         self.research = research
+        if type(participant_runtime) is not ParticipantScheduleRuntimeV1:
+            raise TypeError(
+                "full-day participant orchestration uses the wrong runtime"
+            )
+        if type(scheduled_runtime) is not ScheduledEventRuntimeV1:
+            raise TypeError(
+                "full-day scheduled orchestration uses the wrong runtime"
+            )
+        if (
+            shock_runtime is not None
+            and type(shock_runtime) is not UnscheduledShockRuntimeV1
+        ):
+            raise TypeError("full-day shock orchestration uses the wrong runtime")
+        self.participant_runtime = participant_runtime
+        self.scheduled_runtime = scheduled_runtime
+        self.shock_runtime = shock_runtime
         self._order_id_allocator = order_id_allocator
         self._validate_profile_and_core_owners(restoring=restoring)
 
@@ -1304,6 +1470,7 @@ class FullDayRuntime:
                     "_handle_research_strategy_deadline"
                 ),
                 _WORK_SCHEDULED_INFORMATION: "_handle_scheduled_information",
+                _WORK_SHOCK_CANDIDATE: "_handle_shock_candidate",
                 _WORK_SIMPLE_FLOW_PROPOSAL: "_handle_simple_flow_proposal",
                 _WORK_STATE_EMISSION: "_handle_state_emission",
             }
@@ -1315,6 +1482,7 @@ class FullDayRuntime:
                 )
             self._mechanics_event_cursor = 0
             self._bootstrap_plan_work()
+            self._schedule_next_shock_candidate()
             self._schedule_initial_simple_flow()
             self._schedule_initial_hawkes_flow()
             self._schedule_initial_queue_reactive_flow()
@@ -1336,6 +1504,8 @@ class FullDayRuntime:
         queue_reactive_flow: object | None = None,
         delivery: object | None = None,
         research: object | None = None,
+        participant_specifications: Sequence[object] = (),
+        shock_quantity_distribution: ShockQuantityDistributionV1 | None = None,
         order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
     ) -> FullDayRuntime:
         if type(plan) is not FullDayPlanV1:
@@ -1351,6 +1521,27 @@ class FullDayRuntime:
             raise TypeError("full-day engine must be MarketMechanicsEngine")
         selected_clock = selected_engine.clock if clock is None else clock
         allocator = order_id_allocator or RuntimeOrderIdAllocatorV1()
+        participant_runtime = ParticipantScheduleRuntimeV1.create(
+            plan,
+            scheduler=agent_scheduler,
+            additional_specifications=participant_specifications,
+        )
+        scheduled_runtime = ScheduledEventRuntimeV1.create(plan)
+        shock_runtime = None
+        if shock_quantity_distribution is not None:
+            matrix = _runtime_composition_matrix(plan)
+            profile = matrix.profile(
+                plan.composition_profile.reference_id,
+                plan.composition_profile.version,
+            )
+            if profile.implementation_status != "EXECUTABLE":
+                raise ValueError(
+                    "full-day composition requires an EXECUTABLE profile"
+                )
+            shock_runtime = UnscheduledShockRuntimeV1.create(
+                plan,
+                shock_quantity_distribution,
+            )
         return cls(
             plan,
             engine=selected_engine,
@@ -1361,6 +1552,9 @@ class FullDayRuntime:
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
             research=research,
+            participant_runtime=participant_runtime,
+            scheduled_runtime=scheduled_runtime,
+            shock_runtime=shock_runtime,
             order_id_allocator=allocator,
             bootstrap=True,
         )
@@ -1378,6 +1572,8 @@ class FullDayRuntime:
         queue_reactive_flow_configuration: object | None = None,
         delivery_configuration: object | None = None,
         research_configuration: object | None = None,
+        participant_specifications: Sequence[object] = (),
+        shock_quantity_distribution: ShockQuantityDistributionV1 | None = None,
     ) -> FullDayRuntime:
         """Construct the scheduler only after the sole owners exist."""
 
@@ -1509,7 +1705,83 @@ class FullDayRuntime:
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
             research=research,
+            participant_specifications=participant_specifications,
+            shock_quantity_distribution=shock_quantity_distribution,
             order_id_allocator=allocator,
+        )
+
+    @classmethod
+    def compose(
+        cls,
+        plan: FullDayPlanV1,
+        *,
+        shock_quantity_distribution: ShockQuantityDistributionV1,
+        engine: MarketMechanicsEngine | None = None,
+        clock: SimulationClock | None = None,
+        agent_scheduler: object | None = None,
+        simple_flow: object | None = None,
+        hawkes_flow: object | None = None,
+        queue_reactive_flow: object | None = None,
+        delivery: object | None = None,
+        research: object | None = None,
+        participant_specifications: Sequence[object] = (),
+        order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
+    ) -> FullDayRuntime:
+        """Construct the complete WO31-F orchestration over one executable profile."""
+
+        if type(shock_quantity_distribution) is not ShockQuantityDistributionV1:
+            raise TypeError(
+                "full-day composition requires ShockQuantityDistributionV1"
+            )
+        return cls.create(
+            plan,
+            engine=engine,
+            clock=clock,
+            agent_scheduler=agent_scheduler,
+            simple_flow=simple_flow,
+            hawkes_flow=hawkes_flow,
+            queue_reactive_flow=queue_reactive_flow,
+            delivery=delivery,
+            research=research,
+            participant_specifications=participant_specifications,
+            shock_quantity_distribution=shock_quantity_distribution,
+            order_id_allocator=order_id_allocator,
+        )
+
+    @classmethod
+    def compose_with_agent_scheduler(
+        cls,
+        plan: FullDayPlanV1,
+        definition: object,
+        *,
+        shock_quantity_distribution: ShockQuantityDistributionV1,
+        participant_specifications: Sequence[object] = (),
+        seed: int | None = None,
+        engine: MarketMechanicsEngine | None = None,
+        simple_flow_configuration: object | None = None,
+        hawkes_flow_configuration: object | None = None,
+        queue_reactive_flow_configuration: object | None = None,
+        delivery_configuration: object | None = None,
+        research_configuration: object | None = None,
+    ) -> FullDayRuntime:
+        """Compose a complete day while preserving the scheduler injection boundary."""
+
+        if type(shock_quantity_distribution) is not ShockQuantityDistributionV1:
+            raise TypeError(
+                "full-day composition requires ShockQuantityDistributionV1"
+            )
+        return cls.create_with_agent_scheduler(
+            plan,
+            definition,
+            seed=seed,
+            engine=engine,
+            simple_flow_configuration=simple_flow_configuration,
+            hawkes_flow_configuration=hawkes_flow_configuration,
+            queue_reactive_flow_configuration=queue_reactive_flow_configuration,
+            delivery_configuration=delivery_configuration,
+            research_configuration=research_configuration,
+            participant_specifications=participant_specifications,
+            shock_quantity_distribution=shock_quantity_distribution,
         )
 
     @property
@@ -1542,6 +1814,27 @@ class FullDayRuntime:
     @property
     def latest_quiescent_cut(self) -> QuiescentCutV1 | None:
         return None if not self._quiescent_cuts else self._quiescent_cuts[-1]
+
+    @property
+    def is_full_day_composition(self) -> bool:
+        """Whether the runtime includes the executable shock/composition layer."""
+
+        return self.shock_runtime is not None
+
+    def parameter_snapshot(self) -> FullDayParameterSnapshotV1:
+        """Return the current exact pressure/state/shock control projection."""
+
+        batches = (
+            ()
+            if self.shock_runtime is None
+            else self.shock_runtime.accepted_parameter_effect_batches
+        )
+        return full_day_parameter_snapshot_v1(
+            self.plan,
+            self._state_runtime,
+            simulation_time_us=self.clock.current_time_us,
+            accepted_shock_effect_batches=batches,
+        )
 
     def _validate_profile_and_core_owners(self, *, restoring: bool) -> None:
         matrix = _runtime_composition_matrix(self.plan)
@@ -1643,7 +1936,7 @@ class FullDayRuntime:
                     raise ValueError("retune schedule omits a replacement specification")
                 resolved = tuple(
                     spec
-                    for spec in definition_agents
+                    for spec in self.participant_runtime.specification_registry
                     if getattr(spec, "agent_id", None) == entry.participant_id
                     and callable(getattr(spec, "identity_dict", None))
                     and canonical_sha256(spec.identity_dict())
@@ -1652,7 +1945,7 @@ class FullDayRuntime:
                 if len(resolved) != 1:
                     raise ValueError(
                         "retune specification is not uniquely resolved by the "
-                        "injected population definition"
+                        "plan-bound participant registry"
                     )
             if getattr(self.agent_scheduler, "seed", None) != self.plan.seed_policy.root_seed:
                 raise ValueError("scheduler seed differs from the plan root seed")
@@ -1752,6 +2045,30 @@ class FullDayRuntime:
                 owner_label="research component",
                 allow_authoritative_borrows=False,
             )
+        self.participant_runtime.assert_invariants(
+            scheduler=self.agent_scheduler
+        )
+        self.scheduled_runtime.assert_invariants()
+        if self.shock_runtime is not None:
+            self.shock_runtime.assert_invariants()
+            if profile.implementation_status != "EXECUTABLE":
+                raise ValueError(
+                    "full-day shock orchestration requires an executable profile"
+                )
+            owned_rng = self.shock_runtime.rng
+            if self.agent_scheduler is not None and any(
+                getattr(agent, "rng", None) is owned_rng
+                for agent in getattr(self.agent_scheduler, "agents", {}).values()
+            ):
+                raise ValueError("shock runtime shares a participant RNG object")
+            for flow in (
+                self.simple_flow,
+                self.hawkes_flow,
+                self.queue_reactive_flow,
+                self.delivery,
+            ):
+                if flow is not None and getattr(flow, "rng", None) is owned_rng:
+                    raise ValueError("shock runtime shares another component RNG object")
         self.engine.assert_invariants()
 
     def _reject_smuggled_core_owner(
@@ -1897,6 +2214,31 @@ class FullDayRuntime:
         for time_us in self.plan.resolved_checkpoint_times_us:
             request_id = self._allocate_checkpoint_request_id()
             self._enqueue_checkpoint(time_us, request_id)
+
+    def _schedule_next_shock_candidate(self) -> None:
+        """Keep at most one bounded runtime-owned shock proposal in the heap."""
+
+        owner = self.shock_runtime
+        if owner is None or owner.pending_candidate is not None:
+            return
+        candidate = owner.plan_next(not_before_us=self.clock.current_time_us)
+        if candidate is None:
+            return
+        microstep = 0
+        if (
+            self._executing is not None
+            and candidate.scheduled_time_us
+            == self._executing.key.simulation_time_us
+        ):
+            microstep = self._executing.key.microstep + 1
+        self._enqueue_new(
+            simulation_time_us=candidate.scheduled_time_us,
+            microstep=microstep,
+            stage=WorkStageV1.SCHEDULED_INFORMATION,
+            source_component_id=FULL_DAY_RUNTIME_COMPONENT,
+            work_type=_WORK_SHOCK_CANDIDATE,
+            payload={"candidate_id": candidate.candidate_id},
+        )
 
     def _flow_observation_cut(self):
         """Detach the public price/order cut visible to background flow."""
@@ -2362,6 +2704,7 @@ class FullDayRuntime:
                 else self.hawkes_flow.checkpoint_state()
             ),
             "order_id_allocator": self._order_id_allocator.checkpoint_state(),
+            "participant_runtime": self.participant_runtime.checkpoint_state(),
             "queue_reactive_flow": (
                 None
                 if self.queue_reactive_flow is None
@@ -2371,6 +2714,12 @@ class FullDayRuntime:
                 None
                 if self.research is None
                 else self.research.checkpoint_state()
+            ),
+            "scheduled_runtime": self.scheduled_runtime.checkpoint_state(),
+            "shock_runtime": (
+                None
+                if self.shock_runtime is None
+                else self.shock_runtime.checkpoint_state()
             ),
             "simple_flow": (
                 None
@@ -2427,6 +2776,9 @@ class FullDayRuntime:
                 self.queue_reactive_flow,
                 self.delivery,
                 self.research,
+                self.participant_runtime,
+                self.scheduled_runtime,
+                self.shock_runtime,
                 self._state_runtime,
                 self._order_id_allocator,
             ),
@@ -2464,6 +2816,9 @@ class FullDayRuntime:
             queue_reactive_flow,
             delivery,
             research,
+            participant_runtime,
+            scheduled_runtime,
+            shock_runtime,
             state_runtime,
             order_allocator,
         ) = snapshot["owner_identities"]
@@ -2604,6 +2959,42 @@ class FullDayRuntime:
                 )
             research.__dict__.clear()
             research.__dict__.update(restored_research.__dict__)
+        restored_participant_runtime = (
+            ParticipantScheduleRuntimeV1.from_checkpoint_state(
+                owner_bundle["participant_runtime"],
+                plan=self.plan,
+                scheduler=scheduler,
+            )
+        )
+        participant_runtime.__dict__.clear()
+        participant_runtime.__dict__.update(
+            restored_participant_runtime.__dict__
+        )
+        restored_scheduled_runtime = ScheduledEventRuntimeV1.from_checkpoint_state(
+            owner_bundle["scheduled_runtime"],
+            plan=self.plan,
+        )
+        scheduled_runtime.__dict__.clear()
+        scheduled_runtime.__dict__.update(restored_scheduled_runtime.__dict__)
+        raw_shock_runtime = owner_bundle["shock_runtime"]
+        if raw_shock_runtime is None:
+            if shock_runtime is not None:
+                raise RuntimeError(
+                    "transaction snapshot shock identity is inconsistent"
+                )
+        else:
+            restored_shock_runtime = (
+                UnscheduledShockRuntimeV1.from_checkpoint_state(
+                    raw_shock_runtime,
+                    plan=self.plan,
+                )
+            )
+            if shock_runtime is None:
+                raise RuntimeError(
+                    "transaction snapshot shock identity is inconsistent"
+                )
+            shock_runtime.__dict__.clear()
+            shock_runtime.__dict__.update(restored_shock_runtime.__dict__)
         state_runtime_state = HierarchicalStateRuntimeStateV1.from_dict(
             owner_bundle["state_runtime"]
         )
@@ -2624,6 +3015,9 @@ class FullDayRuntime:
         self.queue_reactive_flow = queue_reactive_flow
         self.delivery = delivery
         self.research = research
+        self.participant_runtime = participant_runtime
+        self.scheduled_runtime = scheduled_runtime
+        self.shock_runtime = shock_runtime
         self._state_runtime = state_runtime
         self._order_id_allocator = order_allocator
         self._heap = snapshot["heap"]
@@ -2699,6 +3093,7 @@ class FullDayRuntime:
                 self._executing = item
                 self._executing_event_count = 0
                 self._executing_zero_delay_children = 0
+                checkpoint_completed_before = self._checkpoint_completed_count
                 handler = getattr(self, self._handler_names[item.work_type])
                 handler(item)
                 self._executing = None
@@ -2729,7 +3124,16 @@ class FullDayRuntime:
                         self._state_runtime.component_local_sequence
                     )
                     self.assert_invariants()
-                    self.checkpoint_state()
+                    completed_delta = (
+                        self._checkpoint_completed_count
+                        - checkpoint_completed_before
+                    )
+                    if completed_delta not in {0, 1}:
+                        raise RuntimeError(
+                            "checkpoint work completed an invalid number of cuts"
+                        )
+                    if completed_delta == 1:
+                        self.checkpoint_state()
             self.clock.advance_to(target_time_us)
             state_emissions = self._state_runtime.advance_to(target_time_us)
             if state_emissions:
@@ -4107,9 +4511,10 @@ class FullDayRuntime:
             scheduled = by_id[event_id]
         except KeyError as error:
             raise ValueError("scheduled work cites an unknown plan event") from error
-        ordered_ids = [event.event_id for event in self.plan.scheduled_events]
-        if self._scheduled_event_index >= len(ordered_ids) or ordered_ids[self._scheduled_event_index] != event_id:
-            raise RuntimeError("scheduled information cursor is not canonical")
+        application = self.scheduled_runtime.apply_due(
+            event_id,
+            simulation_time_us=self.clock.current_time_us,
+        )
         outer = self._emit_outer(
             FullDayEventTypeV1.SCHEDULED_INFORMATION,
             source_component_id=FULL_DAY_RUNTIME_COMPONENT,
@@ -4120,15 +4525,60 @@ class FullDayRuntime:
                 "side": scheduled.side.value,
             },
         )
-        transition_handlers = {
-            ScheduledEventTypeV1.HALT: self._enter_halt,
-            ScheduledEventTypeV1.VOLATILITY_INTERRUPTION: self._enter_halt,
-            ScheduledEventTypeV1.REOPENING: self._begin_reopening,
-        }
-        handler = transition_handlers.get(scheduled.event_type)
-        if handler is not None:
-            handler(scheduled, parent_id=outer.event_id)
-        self._scheduled_event_index += 1
+        if application.mechanics_action == "ENTER_HALT":
+            self._enter_halt(scheduled, parent_id=outer.event_id)
+        elif application.mechanics_action == "BEGIN_REOPENING":
+            self._begin_reopening(scheduled, parent_id=outer.event_id)
+        self._scheduled_event_index = self.scheduled_runtime.next_index
+
+    def _handle_shock_candidate(self, item: RuntimeWorkItemV1) -> None:
+        owner = self.shock_runtime
+        if owner is None:
+            raise RuntimeError("shock work has no active full-day composition owner")
+        candidate_id = _identifier(
+            item.payload.get("candidate_id"), "shock candidate ID"
+        )
+        outcome = owner.resolve_due(
+            candidate_id,
+            simulation_time_us=self.clock.current_time_us,
+        )
+        candidate = outcome.candidate
+        candidate_event = self._emit_outer(
+            FullDayEventTypeV1.SHOCK_CANDIDATE,
+            source_component_id=FULL_DAY_RUNTIME_COMPONENT,
+            data={
+                "candidate_id": candidate.candidate_id,
+                "information_cutoff_us": candidate.information_cutoff_us,
+                "quantity_shares": candidate.quantity_shares,
+                "side": candidate.side.value,
+            },
+        )
+        if outcome.accepted:
+            self._emit_outer(
+                FullDayEventTypeV1.SHOCK_ACCEPTED,
+                source_component_id=FULL_DAY_RUNTIME_COMPONENT,
+                parent_id=candidate_event.event_id,
+                data={
+                    "candidate_id": candidate.candidate_id,
+                    "information_cutoff_us": candidate.information_cutoff_us,
+                    "quantity_shares": candidate.quantity_shares,
+                    "side": candidate.side.value,
+                },
+            )
+        else:
+            if outcome.reason_code is None:  # pragma: no cover - typed outcome
+                raise RuntimeError("rejected shock omits its reason")
+            self._emit_outer(
+                FullDayEventTypeV1.SHOCK_REJECTED,
+                source_component_id=FULL_DAY_RUNTIME_COMPONENT,
+                parent_id=candidate_event.event_id,
+                data={
+                    "candidate_id": candidate.candidate_id,
+                    "information_cutoff_us": candidate.information_cutoff_us,
+                    "reason_code": outcome.reason_code,
+                },
+            )
+        self._schedule_next_shock_candidate()
 
     @staticmethod
     def _scheduled_parameters(scheduled: object) -> dict[str, int]:
@@ -4226,68 +4676,20 @@ class FullDayRuntime:
         if not callable(synchronize):
             raise RuntimeError("active scheduler omits mechanics synchronization")
         synchronize(scheduler_book_before)
-        by_id = {entry.schedule_id: entry for entry in self.plan.participant_schedule}
-        try:
-            entry = by_id[schedule_id]
-        except KeyError as error:
-            raise ValueError("participant work cites an unknown schedule row") from error
-        ordered_ids = [row.schedule_id for row in self.plan.participant_schedule]
-        if self._participant_schedule_index >= len(ordered_ids) or ordered_ids[self._participant_schedule_index] != schedule_id:
-            raise RuntimeError("participant schedule cursor is not canonical")
-        method_by_action = {
-            ParticipantScheduleActionV1.ACTIVATE: "activate_agent",
-            ParticipantScheduleActionV1.DEACTIVATE: "deactivate_agent",
-            ParticipantScheduleActionV1.RETUNE: "retune_agent",
-        }
-        method = getattr(self.agent_scheduler, method_by_action[entry.action], None)
-        if not callable(method):
-            raise RuntimeError("scheduler omits its participant lifecycle hook")
-        pending_before = {
-            int(getattr(row, "sequence"))
-            for row in getattr(self.agent_scheduler, "_pending", ())
-            if getattr(row, "agent_id", None) == entry.participant_id
-        }
-        if entry.action is ParticipantScheduleActionV1.RETUNE:
-            if entry.replacement_specification is None:
-                raise RuntimeError("retune schedule omits its replacement specification")
-            candidates = tuple(
-                spec
-                for spec in getattr(
-                    getattr(self.agent_scheduler, "definition", None), "agents", ()
-                )
-                if getattr(spec, "agent_id", None) == entry.participant_id
-                and canonical_sha256(spec.identity_dict())
-                == entry.replacement_specification.sha256
-            )
-            if len(candidates) != 1:
-                raise RuntimeError(
-                    "retune specification is not uniquely resolved by the injected definition"
-                )
-            method(
-                entry.participant_id,
-                candidates[0],
-                simulation_time_us=self.clock.current_time_us,
-            )
-        else:
-            method(
-                entry.participant_id,
-                simulation_time_us=self.clock.current_time_us,
-            )
-        pending_after = {
-            int(getattr(row, "sequence"))
-            for row in getattr(self.agent_scheduler, "_pending", ())
-            if getattr(row, "agent_id", None) == entry.participant_id
-        }
-        discarded_pending_sequences = tuple(sorted(pending_before - pending_after))
-        if (
-            entry.action is not ParticipantScheduleActionV1.DEACTIVATE
-            and discarded_pending_sequences
-        ):
-            raise RuntimeError("non-deactivation lifecycle discarded pending intents")
+        record = self.participant_runtime.apply_due(
+            schedule_id,
+            simulation_time_us=self.clock.current_time_us,
+            scheduler=self.agent_scheduler,
+        )
+        entry = self.plan.participant_schedule[
+            self.participant_runtime.next_index - 1
+        ]
         native_sequence = self._next_agent_native_sequence()
         native_payload: dict[str, object] = {
             "action": entry.action.value,
-            "discarded_pending_sequences": list(discarded_pending_sequences),
+            "discarded_pending_sequences": list(
+                record.discarded_pending_sequences
+            ),
             "participant_id": entry.participant_id,
             "schedule_id": entry.schedule_id,
             "simulation_time_us": self.clock.current_time_us,
@@ -4319,7 +4721,7 @@ class FullDayRuntime:
             parent_id=lifecycle_event.event_id,
             scheduler_book_before=scheduler_book_before,
         )
-        self._participant_schedule_index += 1
+        self._participant_schedule_index = self.participant_runtime.next_index
         self._schedule_agent_work()
 
     def _handle_agent_work(self, item: RuntimeWorkItemV1) -> None:
@@ -5028,6 +5430,19 @@ class FullDayRuntime:
             "status": "PRESERVED",
         }
 
+    def _shock_checkpoint_union(self) -> dict[str, object]:
+        if self.shock_runtime is None:
+            return {
+                "absent_reason": SHOCK_RUNTIME_ABSENT_REASON,
+                "status": "ABSENT",
+            }
+        state = self.shock_runtime.checkpoint_state()
+        return {
+            "state": _plain(state),
+            "state_sha256": canonical_sha256(state),
+            "status": "PRESERVED",
+        }
+
     def _simple_flow_checkpoint_union(self) -> dict[str, object]:
         if self.simple_flow is None:
             return {
@@ -5272,6 +5687,7 @@ class FullDayRuntime:
             ],
             "native_sequences": dict(sorted(self._native_sequences.items())),
             "order_id_allocator": self._order_id_allocator.checkpoint_state(),
+            "participant_runtime": self.participant_runtime.checkpoint_state(),
             "participant_schedule_index": self._participant_schedule_index,
             "pending_work": [item.as_dict() for item in self.pending_work],
             "plan": self.plan.as_dict(),
@@ -5285,8 +5701,10 @@ class FullDayRuntime:
                     key=lambda value: value.key.ordering_key,
                 )
             ],
+            "scheduled_runtime": self.scheduled_runtime.checkpoint_state(),
             "scheduled_event_index": self._scheduled_event_index,
             "schema_version": FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION,
+            "shock_runtime": self._shock_checkpoint_union(),
             "state_runtime": self._state_runtime.state().as_dict(),
             "state_scheduled_time": self._state_scheduled_time,
         }
@@ -5359,6 +5777,7 @@ class FullDayRuntime:
             "native_ledger",
             "native_sequences",
             "order_id_allocator",
+            "participant_runtime",
             "participant_schedule_index",
             "pending_work",
             "plan",
@@ -5366,8 +5785,10 @@ class FullDayRuntime:
             "profile_id",
             "profile_version",
             "retired_work",
+            "scheduled_runtime",
             "scheduled_event_index",
             "schema_version",
+            "shock_runtime",
             "state_runtime",
             "state_scheduled_time",
         }
@@ -5422,6 +5843,53 @@ class FullDayRuntime:
         )
         if state_runtime.current_time_us != clock.current_time_us:
             raise ValueError("runtime-owner state time differs from its sole clock")
+        participant_runtime = ParticipantScheduleRuntimeV1.from_checkpoint_state(
+            _plain_object(
+                payload["participant_runtime"],
+                "runtime-owner participant runtime",
+            ),
+            plan=plan,
+        )
+        scheduled_runtime = ScheduledEventRuntimeV1.from_checkpoint_state(
+            _plain_object(
+                payload["scheduled_runtime"],
+                "runtime-owner scheduled runtime",
+            ),
+            plan=plan,
+        )
+        raw_shock_union = _plain_object(
+            payload["shock_runtime"], "runtime-owner shock union"
+        )
+        shock_status = raw_shock_union.get("status")
+        shock_runtime: UnscheduledShockRuntimeV1 | None
+        if shock_status == "ABSENT":
+            _require_exact_fields(
+                raw_shock_union,
+                {"absent_reason", "status"},
+                "absent runtime-owner shock",
+            )
+            if raw_shock_union["absent_reason"] != SHOCK_RUNTIME_ABSENT_REASON:
+                raise ValueError("runtime-owner shock absence reason is invalid")
+            shock_runtime = None
+        elif shock_status == "PRESERVED":
+            _require_exact_fields(
+                raw_shock_union,
+                {"state", "state_sha256", "status"},
+                "preserved runtime-owner shock",
+            )
+            raw_shock_state = _plain_object(
+                raw_shock_union["state"], "runtime-owner shock state"
+            )
+            if raw_shock_union["state_sha256"] != canonical_sha256(
+                raw_shock_state
+            ):
+                raise ValueError("runtime-owner shock state digest mismatch")
+            shock_runtime = UnscheduledShockRuntimeV1.from_checkpoint_state(
+                raw_shock_state,
+                plan=plan,
+            )
+        else:
+            raise ValueError("runtime-owner shock union status is unsupported")
         raw_pending = payload["pending_work"]
         raw_executed = payload["executed_work"]
         raw_retired = payload["retired_work"]
@@ -5708,6 +6176,19 @@ class FullDayRuntime:
             cursor = _exact_int(payload[field], f"runtime-owner {field}")
             if observed_prefix != complete_inventory[:cursor]:
                 raise ValueError(f"runtime-owner {field} differs from emitted rows")
+        if (
+            participant_runtime.next_index
+            != _exact_int(
+                payload["participant_schedule_index"],
+                "runtime-owner participant schedule index",
+            )
+            or scheduled_runtime.next_index
+            != _exact_int(
+                payload["scheduled_event_index"],
+                "runtime-owner scheduled event index",
+            )
+        ):
+            raise ValueError("runtime-owner coordinator cursors differ")
         _validate_halt_reopen_snapshot(
             plan=plan,
             scheduled_event_index=_exact_int(
@@ -5740,6 +6221,12 @@ class FullDayRuntime:
                 "runtime-owner participant schedule index",
             ),
             pending=pending,
+            events=events,
+        )
+        _validate_shock_runtime_reconciliation(
+            shock_runtime=shock_runtime,
+            pending=pending,
+            executed=executed,
             events=events,
         )
 
@@ -5865,6 +6352,7 @@ class FullDayRuntime:
 
     def result_projection(self) -> dict[str, object]:
         scheduler = self._scheduler_checkpoint_union()
+        shock = self._shock_checkpoint_union()
         result: dict[str, object] = {
             "clock_time_us": self.clock.current_time_us,
             "engine_state_sha256": canonical_sha256(self.engine.checkpoint_state()),
@@ -5877,10 +6365,21 @@ class FullDayRuntime:
             "pending_work_sha256": canonical_sha256(
                 [item.as_dict() for item in self.pending_work]
             ),
+            "participant_runtime_sha256": canonical_sha256(
+                self.participant_runtime.checkpoint_state()
+            ),
+            "parameter_snapshot_sha256": canonical_sha256(
+                self.parameter_snapshot().as_dict()
+            ),
             "profile_id": self.plan.composition_profile.reference_id,
             "profile_version": self.plan.composition_profile.version,
             "scheduler_state_sha256": scheduler.get("state_sha256"),
             "scheduler_status": scheduler["status"],
+            "scheduled_runtime_sha256": canonical_sha256(
+                self.scheduled_runtime.checkpoint_state()
+            ),
+            "shock_state_sha256": shock.get("state_sha256"),
+            "shock_status": shock["status"],
         }
         if self.simple_flow is not None:
             simple_flow = self._simple_flow_checkpoint_union()
@@ -5937,6 +6436,7 @@ class FullDayRuntime:
             "native_ledger",
             "native_sequences",
             "order_id_allocator",
+            "participant_runtime",
             "participant_schedule_index",
             "pending_work",
             "plan",
@@ -5944,8 +6444,10 @@ class FullDayRuntime:
             "profile_id",
             "profile_version",
             "retired_work",
+            "scheduled_runtime",
             "scheduled_event_index",
             "schema_version",
+            "shock_runtime",
             "state_runtime",
             "state_scheduled_time",
         }
@@ -6167,6 +6669,48 @@ class FullDayRuntime:
                 plan=plan,
                 delivery=delivery,
             )
+        participant_runtime = ParticipantScheduleRuntimeV1.from_checkpoint_state(
+            _plain_object(
+                payload["participant_runtime"], "participant runtime"
+            ),
+            plan=plan,
+            scheduler=scheduler,
+        )
+        scheduled_runtime = ScheduledEventRuntimeV1.from_checkpoint_state(
+            _plain_object(payload["scheduled_runtime"], "scheduled runtime"),
+            plan=plan,
+        )
+        raw_shock_union = _plain_object(payload["shock_runtime"], "shock union")
+        shock_status = raw_shock_union.get("status")
+        shock_runtime: UnscheduledShockRuntimeV1 | None
+        if shock_status == "ABSENT":
+            _require_exact_fields(
+                raw_shock_union,
+                {"absent_reason", "status"},
+                "absent shock runtime",
+            )
+            if raw_shock_union["absent_reason"] != SHOCK_RUNTIME_ABSENT_REASON:
+                raise ValueError("shock runtime absence reason is unsupported")
+            shock_runtime = None
+        elif shock_status == "PRESERVED":
+            _require_exact_fields(
+                raw_shock_union,
+                {"state", "state_sha256", "status"},
+                "preserved shock runtime",
+            )
+            raw_shock_state = _plain_object(
+                raw_shock_union["state"], "shock runtime state"
+            )
+            if raw_shock_union["state_sha256"] != canonical_sha256(
+                raw_shock_state
+            ):
+                raise ValueError("shock runtime state digest mismatch")
+            shock_runtime = UnscheduledShockRuntimeV1.from_checkpoint_state(
+                raw_shock_state,
+                plan=plan,
+            )
+        else:
+            raise ValueError("shock runtime union status is unsupported")
         if payload["component_presence"] != cls._component_presence_inventory(
             plan,
             scheduler_present=scheduler is not None,
@@ -6189,6 +6733,9 @@ class FullDayRuntime:
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
             research=research,
+            participant_runtime=participant_runtime,
+            scheduled_runtime=scheduled_runtime,
+            shock_runtime=shock_runtime,
             order_id_allocator=allocator,
             bootstrap=False,
             restoring=True,
@@ -6587,6 +7134,14 @@ class FullDayRuntime:
             raise RuntimeError("participant cursor exceeds the plan")
         if self._scheduled_event_index > len(self.plan.scheduled_events):
             raise RuntimeError("scheduled-event cursor exceeds the plan")
+        if (
+            self._participant_schedule_index
+            != self.participant_runtime.next_index
+            or self._scheduled_event_index != self.scheduled_runtime.next_index
+        ):
+            raise RuntimeError(
+                "runtime plan cursors differ from their orchestration owners"
+            )
         calendar_prefix = tuple(
             int(event.payload.data["boundary_operation_index"])
             for event in self._events
@@ -6711,6 +7266,15 @@ class FullDayRuntime:
                 scheduled_event_index=self._scheduled_event_index,
                 participant_schedule_index=self._participant_schedule_index,
                 pending=tuple(self._pending.values()),
+                events=tuple(self._events),
+            )
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(str(error)) from error
+        try:
+            _validate_shock_runtime_reconciliation(
+                shock_runtime=self.shock_runtime,
+                pending=tuple(self._pending.values()),
+                executed=tuple(self._executed_work.values()),
                 events=tuple(self._events),
             )
         except (TypeError, ValueError) as error:

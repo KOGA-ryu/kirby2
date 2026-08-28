@@ -15255,6 +15255,1309 @@ def audit_wo31e6_execution_algorithm_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31f_specifications():
+    """Return the six initial and two immutable retuned participant specs."""
+
+    from kirby2.agents.models import AgentFamily
+    from kirby2.agents.populations import _spec
+
+    end_us = _sample_calendar().end_time_us
+    maker = _spec(
+        "F_MAKER",
+        AgentFamily.PASSIVE_MARKET_MAKER,
+        end_us,
+        budget=80,
+        working=40,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=2_000_000_000,
+    )
+    noise = _spec(
+        "F_NOISE",
+        AgentFamily.NOISE_TRADER,
+        end_us,
+        budget=40,
+        working=20,
+        max_order=5,
+        clip=5,
+        rate=1,
+        latency_us=5,
+        interval_us=700_000_000,
+    )
+    metaorder = _spec(
+        "F_METAORDER",
+        AgentFamily.SCHEDULED_METAORDER,
+        end_us,
+        side=Side.BUY,
+        activation_us=1_400_000_000,
+        budget=30,
+        working=30,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    distressed = _spec(
+        "F_DISTRESSED",
+        AgentFamily.DISTRESSED_LIQUIDATOR,
+        end_us,
+        side=Side.SELL,
+        activation_us=2_800_000_001,
+        budget=30,
+        working=30,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    liquidity = _spec(
+        "F_LIQUIDITY",
+        AgentFamily.LIQUIDITY_WITHDRAWER,
+        end_us,
+        withdrawal_us=3_000_000_000,
+        budget=60,
+        working=40,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    auction = _spec(
+        "F_AUCTION",
+        AgentFamily.AUCTION_PARTICIPANT,
+        end_us,
+        side=Side.BUY,
+        activation_us=4_799_000_000,
+        budget=20,
+        working=20,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    maker_near_open = _spec(
+        "F_MAKER",
+        AgentFamily.PASSIVE_MARKET_MAKER,
+        end_us,
+        budget=80,
+        working=40,
+        max_order=10,
+        clip=10,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    noise_midday = _spec(
+        "F_NOISE",
+        AgentFamily.NOISE_TRADER,
+        end_us,
+        budget=40,
+        working=20,
+        max_order=5,
+        clip=5,
+        rate=1,
+        latency_us=5,
+        interval_us=1_400_000_000,
+    )
+    initial = tuple(
+        sorted(
+            (auction, distressed, liquidity, maker, metaorder, noise),
+            key=lambda specification: specification.agent_id,
+        )
+    )
+    replacements = (maker_near_open, noise_midday)
+    return initial, replacements
+
+
+def _wo31f_specification_reference(specification, version: int):
+    from kirby2.full_day.models import VersionedReferenceV1, canonical_sha256
+
+    return VersionedReferenceV1(
+        f"WO31_F_{specification.agent_id}_SPEC_V1",
+        version,
+        canonical_sha256(specification.identity_dict()),
+    )
+
+
+def _wo31f_plan():
+    """Build the complete bounded E4 full-day orchestration fixture."""
+
+    from kirby2.full_day.composition import AGENT_SCHEDULER_COMPONENT
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        FlowSideV1,
+        IntegerParameterUnitV1,
+        NamedIntegerParameterV1,
+        ParticipantDefinitionV1,
+        ParticipantKindV1,
+        ParticipantScheduleActionV1,
+        ParticipantScheduleEntryV1,
+        ScheduledEventTypeV1,
+        ScheduledEventV1,
+        SubstreamDeclarationV1,
+        UnscheduledShockPolicyV1,
+        VersionedReferenceV1,
+        canonical_sha256,
+        derive_substream_seed,
+    )
+    from kirby2.full_day.states import ParameterEffectV1, ParameterTargetV1
+
+    base = _wo31e4_plan()
+    initial, replacements = _wo31f_specifications()
+    initial_by_id = {row.agent_id: row for row in initial}
+    replacement_by_id = {row.agent_id: row for row in replacements}
+    initial_references = {
+        participant_id: _wo31f_specification_reference(specification, 1)
+        for participant_id, specification in initial_by_id.items()
+    }
+    replacement_references = {
+        participant_id: _wo31f_specification_reference(specification, 2)
+        for participant_id, specification in replacement_by_id.items()
+    }
+    kind_by_id = {
+        "F_AUCTION": ParticipantKindV1.AUCTION_PARTICIPANT,
+        "F_DISTRESSED": ParticipantKindV1.DISTRESSED_FLOW,
+        "F_LIQUIDITY": ParticipantKindV1.LIQUIDITY_PROVIDER,
+        "F_MAKER": ParticipantKindV1.MARKET_MAKER,
+        "F_METAORDER": ParticipantKindV1.METAORDER,
+        "F_NOISE": ParticipantKindV1.NOISE_FLOW,
+    }
+    labels = {
+        participant_id: (
+            f"full_day/participant/wo31f/{participant_id.lower()}/decision"
+        )
+        for participant_id in initial_by_id
+    }
+    participant_definitions = tuple(
+        ParticipantDefinitionV1(
+            participant_id,
+            kind_by_id[participant_id],
+            initial_references[participant_id],
+            labels[participant_id],
+            False,
+        )
+        for participant_id in sorted(initial_by_id)
+    )
+
+    opening_start = 600_000_000
+    continuous_start = 1_200_000_000
+    news_time = 2_800_000_000
+    midday = 3_000_000_000
+    participant_schedule = tuple(
+        sorted(
+            (
+                ParticipantScheduleEntryV1(
+                    "F_MAKER_INITIAL_ACTIVATION",
+                    100,
+                    "F_MAKER",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_MAKER_01_DEACTIVATE",
+                    opening_start + 1,
+                    "F_MAKER",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_MAKER_02_RETUNE",
+                    opening_start + 1,
+                    "F_MAKER",
+                    ParticipantScheduleActionV1.RETUNE,
+                    replacement_references["F_MAKER"],
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_MAKER_03_REACTIVATE",
+                    opening_start + 1,
+                    "F_MAKER",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_NOISE_ACTIVATE",
+                    continuous_start + 1,
+                    "F_NOISE",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_LIQUIDITY_ACTIVATE",
+                    continuous_start + 2,
+                    "F_LIQUIDITY",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_METAORDER_ACTIVATE",
+                    1_400_000_000,
+                    "F_METAORDER",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_METAORDER_DEACTIVATE",
+                    1_800_000_000,
+                    "F_METAORDER",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_LIQUIDITY_WITHDRAW",
+                    news_time,
+                    "F_LIQUIDITY",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_DISTRESSED_ACTIVATE",
+                    news_time + 1,
+                    "F_DISTRESSED",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_NOISE_01_DEACTIVATE",
+                    midday,
+                    "F_NOISE",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_NOISE_02_RETUNE",
+                    midday,
+                    "F_NOISE",
+                    ParticipantScheduleActionV1.RETUNE,
+                    replacement_references["F_NOISE"],
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_NOISE_03_REACTIVATE",
+                    midday,
+                    "F_NOISE",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_AUCTION_ACTIVATE",
+                    4_799_000_000,
+                    "F_AUCTION",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_AUCTION_DEACTIVATE",
+                    5_400_000_001,
+                    "F_AUCTION",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_DISTRESSED_DEACTIVATE",
+                    5_800_000_000,
+                    "F_DISTRESSED",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_MAKER_FINAL_DEACTIVATE",
+                    5_800_000_000,
+                    "F_MAKER",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "F_NOISE_FINAL_DEACTIVATE",
+                    5_800_000_000,
+                    "F_NOISE",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+            ),
+            key=lambda entry: (
+                entry.simulation_time_us,
+                entry.participant_id,
+                entry.schedule_id,
+            ),
+        )
+    )
+
+    parameter = NamedIntegerParameterV1
+    halt_reference = base.halt_reopen_rules.halt_trigger_reference
+    resume_reference = base.halt_reopen_rules.resume_trigger_reference
+    scheduled_events = tuple(
+        sorted(
+            (
+                ScheduledEventV1(
+                    "F_ECONOMIC_ANNOUNCEMENT",
+                    100_000_000,
+                    ScheduledEventTypeV1.ECONOMIC_ANNOUNCEMENT,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "impact_ppm", IntegerParameterUnitV1.PPM, 50_000
+                        ),
+                    ),
+                    None,
+                    None,
+                ),
+                ScheduledEventV1(
+                    "F_OPENING_IMBALANCE",
+                    700_000_000,
+                    ScheduledEventTypeV1.AUCTION_IMBALANCE_PUBLICATION,
+                    1,
+                    FlowSideV1.BUY,
+                    (
+                        parameter(
+                            "imbalance_shares",
+                            IntegerParameterUnitV1.SHARES,
+                            20,
+                        ),
+                    ),
+                    None,
+                    halt_reference,
+                ),
+                ScheduledEventV1(
+                    "F_SCHEDULED_METAORDER",
+                    1_400_000_000,
+                    ScheduledEventTypeV1.LARGE_SCHEDULED_METAORDER,
+                    1,
+                    FlowSideV1.BUY,
+                    (
+                        parameter(
+                            "duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            400_000_000,
+                        ),
+                        parameter(
+                            "participation_ppm",
+                            IntegerParameterUnitV1.PPM,
+                            250_000,
+                        ),
+                        parameter(
+                            "quantity_shares",
+                            IntegerParameterUnitV1.SHARES,
+                            30,
+                        ),
+                    ),
+                    initial_references["F_METAORDER"],
+                    None,
+                ),
+                ScheduledEventV1(
+                    "F_VOLATILITY_INTERRUPTION",
+                    2_000_000_000,
+                    ScheduledEventTypeV1.VOLATILITY_INTERRUPTION,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "halt_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            20,
+                        ),
+                    ),
+                    None,
+                    halt_reference,
+                ),
+                ScheduledEventV1(
+                    "F_VOLATILITY_REOPEN",
+                    2_000_000_020,
+                    ScheduledEventTypeV1.REOPENING,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "reopening_auction_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            10,
+                        ),
+                    ),
+                    None,
+                    resume_reference,
+                ),
+                ScheduledEventV1(
+                    "F_NEWS_SHOCK",
+                    news_time,
+                    ScheduledEventTypeV1.NEWS_SHOCK,
+                    1,
+                    FlowSideV1.SELL,
+                    (
+                        parameter(
+                            "duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            100_000_000,
+                        ),
+                        parameter(
+                            "impact_ppm", IntegerParameterUnitV1.PPM, 100_000
+                        ),
+                    ),
+                    None,
+                    None,
+                ),
+                ScheduledEventV1(
+                    "F_DECLARED_HALT",
+                    3_600_000_000,
+                    ScheduledEventTypeV1.HALT,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "halt_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            20,
+                        ),
+                    ),
+                    None,
+                    halt_reference,
+                ),
+                ScheduledEventV1(
+                    "F_DECLARED_REOPEN",
+                    3_600_000_020,
+                    ScheduledEventTypeV1.REOPENING,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "reopening_auction_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            10,
+                        ),
+                    ),
+                    None,
+                    resume_reference,
+                ),
+                ScheduledEventV1(
+                    "F_EARNINGS_RELEASE",
+                    5_500_000_000,
+                    ScheduledEventTypeV1.EARNINGS_LIKE_RELEASE,
+                    1,
+                    FlowSideV1.SELL,
+                    (
+                        parameter(
+                            "impact_ppm", IntegerParameterUnitV1.PPM, 75_000
+                        ),
+                    ),
+                    None,
+                    None,
+                ),
+            ),
+            key=lambda event: (event.simulation_time_us, event.event_id),
+        )
+    )
+
+    quantity_reference = VersionedReferenceV1(
+        "WO31_F_SHOCK_QUANTITY_UNIFORM_V1",
+        1,
+        canonical_sha256(
+            {
+                "distribution": "UNIFORM_INTEGER_INCLUSIVE",
+                "maximum_quantity": 5,
+                "minimum_quantity": 1,
+            }
+        ),
+    )
+    shock_policy = UnscheduledShockPolicyV1(
+        "WO31_F_BOUNDED_SHOCK_POLICY_V1",
+        1,
+        True,
+        2_600_000_000,
+        3_200_000_000,
+        3,
+        2,
+        10,
+        1,
+        1,
+        base.unscheduled_shock_policy.substream_label,
+        (FlowSideV1.BUY, FlowSideV1.SELL),
+        quantity_reference,
+        (
+            ParameterEffectV1(
+                ParameterTargetV1.LIQUIDITY_PROVISION_SCALE,
+                1,
+                2,
+                1,
+                4,
+                1,
+                1,
+            ),
+            ParameterEffectV1(
+                ParameterTargetV1.ORDER_SIZE_SCALE,
+                3,
+                2,
+                1,
+                1,
+                2,
+                1,
+            ),
+        ),
+    )
+    bindings = [
+        binding
+        for binding in base.component_configurations
+        if binding.component_id != AGENT_SCHEDULER_COMPONENT
+    ]
+    bindings = [
+        replace(binding, configuration=quantity_reference)
+        if binding.configuration
+        == base.unscheduled_shock_policy.quantity_distribution_reference
+        else binding
+        for binding in bindings
+    ]
+    bindings.extend(
+        ComponentConfigurationBindingV1(
+            AGENT_SCHEDULER_COMPONENT,
+            reference,
+        )
+        for reference in (
+            *initial_references.values(),
+            *replacement_references.values(),
+        )
+    )
+    retained_substreams = tuple(
+        declaration
+        for declaration in base.seed_policy.substreams
+        if not declaration.semantic_path.startswith("full_day/participant/")
+    )
+    participant_substreams = tuple(
+        SubstreamDeclarationV1(
+            label,
+            derive_substream_seed(
+                base.seed_policy.root_seed,
+                base.seed_policy.policy_version,
+                label,
+            ),
+        )
+        for label in labels.values()
+    )
+    return replace(
+        base,
+        plan_id="WO31_F_COMPLETE_DAY_AUDIT_V1",
+        participant_definitions=participant_definitions,
+        participant_schedule=participant_schedule,
+        scheduled_events=scheduled_events,
+        unscheduled_shock_policy=shock_policy,
+        halt_reopen_rules=replace(
+            base.halt_reopen_rules,
+            minimum_halt_duration_us=10,
+            maximum_halt_duration_us=100,
+            reopening_auction_duration_us=10,
+            maximum_halts=2,
+        ),
+        component_configurations=tuple(
+            sorted(bindings, key=lambda binding: binding.sort_key)
+        ),
+        seed_policy=replace(
+            base.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (*retained_substreams, *participant_substreams),
+                    key=lambda declaration: declaration.semantic_path,
+                )
+            ),
+        ),
+    )
+
+
+def _wo31f_population(plan):
+    from kirby2.agents.models import PopulationDefinition
+
+    initial, _replacements = _wo31f_specifications()
+    return PopulationDefinition(
+        "WO31_F_COMPLETE_DAY_POPULATION_V1",
+        "Six bounded participant roles for complete full-day composition evidence.",
+        initial,
+        plan.calendar.end_time_us,
+        initial_mid_ticks=10_000,
+        initial_depth_levels=1,
+        initial_level_quantity=20,
+    )
+
+
+def _wo31f_distribution(plan):
+    from kirby2.full_day.shocks import ShockQuantityDistributionV1
+
+    return ShockQuantityDistributionV1(
+        plan.unscheduled_shock_policy.quantity_distribution_reference,
+        1,
+        5,
+    )
+
+
+def _wo31f_runtime():
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31f_plan()
+    _initial, replacements = _wo31f_specifications()
+    return FullDayRuntime.compose_with_agent_scheduler(
+        plan,
+        _wo31f_population(plan),
+        shock_quantity_distribution=_wo31f_distribution(plan),
+        participant_specifications=replacements,
+        simple_flow_configuration=_wo31e3_flow_configuration(),
+        delivery_configuration=_wo31e3_delivery_configuration(),
+        research_configuration=_wo31e4_research_configuration(),
+    )
+
+
+def _wo31f_bind_short_distribution(plan):
+    """Replace a contract-only quantity reference with executable uniform bytes."""
+
+    from kirby2.full_day.models import canonical_sha256
+
+    prior = plan.unscheduled_shock_policy.quantity_distribution_reference
+    reference = replace(
+        prior,
+        sha256=canonical_sha256(
+            {
+                "distribution": "UNIFORM_INTEGER_INCLUSIVE",
+                "maximum_quantity": 5,
+                "minimum_quantity": 1,
+            }
+        ),
+    )
+    return replace(
+        plan,
+        unscheduled_shock_policy=replace(
+            plan.unscheduled_shock_policy,
+            quantity_distribution_reference=reference,
+        ),
+        component_configurations=tuple(
+            replace(binding, configuration=reference)
+            if binding.configuration == prior
+            else binding
+            for binding in plan.component_configurations
+        ),
+    )
+
+
+def _wo31f_short_profile_runtimes():
+    """Compose a bounded shock slice under every earlier executable profile."""
+
+    from kirby2.full_day.components_delivery import DeliveryOwnerV1
+    from kirby2.full_day.components_flow import SimpleFlowOwnerV1
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.full_day.shocks import ShockQuantityDistributionV1
+
+    rows = []
+    scheduler_fixtures = (
+        (_wo31e1_plan(), {}),
+        (
+            _wo31e2_simple_plan(),
+            {"simple_flow_configuration": _wo31e2_simple_configuration()},
+        ),
+        (
+            _wo31e2_hawkes_plan(),
+            {"hawkes_flow_configuration": _wo31e2_hawkes_configuration()},
+        ),
+        (
+            _wo31e2_queue_plan(),
+            {
+                "queue_reactive_flow_configuration": (
+                    _wo31e2_queue_configuration()
+                )
+            },
+        ),
+    )
+    for plan, configurations in scheduler_fixtures:
+        plan = _wo31f_bind_short_distribution(plan)
+        distribution = ShockQuantityDistributionV1(
+            plan.unscheduled_shock_policy.quantity_distribution_reference,
+            1,
+            5,
+        )
+        runtime = FullDayRuntime.compose_with_agent_scheduler(
+            plan,
+            _wo31e1_population(plan),
+            shock_quantity_distribution=distribution,
+            **configurations,
+        )
+        runtime.advance_to(500)
+        rows.append(runtime)
+
+    delivery_plan = _wo31f_bind_short_distribution(_wo31e3_plan())
+    delivery_distribution = ShockQuantityDistributionV1(
+        delivery_plan.unscheduled_shock_policy.quantity_distribution_reference,
+        1,
+        5,
+    )
+    delivery_runtime = FullDayRuntime.compose(
+        delivery_plan,
+        shock_quantity_distribution=delivery_distribution,
+        simple_flow=SimpleFlowOwnerV1(
+            delivery_plan,
+            _wo31e3_flow_configuration(),
+        ),
+        delivery=DeliveryOwnerV1(
+            delivery_plan,
+            _wo31e3_delivery_configuration(),
+        ),
+    )
+    delivery_runtime.advance_to(500)
+    rows.append(delivery_runtime)
+    return tuple(rows)
+
+
+def _wo31f_composition_and_pilot_case() -> FullDayAuditCase:
+    from kirby2.full_day.checkpoint_contract import load_pilot_limits
+    from kirby2.full_day.composition import (
+        RESEARCH_PROFILE_ID,
+        executable_research_composition_matrix,
+    )
+    from kirby2.full_day.models import canonical_json_bytes
+
+    failures = list(_pilot_limits_case().failures)
+    pilot = load_pilot_limits()
+    runtime = _wo31f_runtime()
+    expected_pilot_reference = (
+        pilot.manifest_id,
+        pilot.semantic_version,
+        pilot.semantic_sha256,
+    )
+    actual_pilot_reference = (
+        runtime.plan.pilot_limits_reference.reference_id,
+        runtime.plan.pilot_limits_reference.version,
+        runtime.plan.pilot_limits_reference.sha256,
+    )
+    if actual_pilot_reference != expected_pilot_reference:
+        failures.append("complete-day plan does not bind the packaged pilot digest")
+    matrix = executable_research_composition_matrix()
+    profile = matrix.profile(RESEARCH_PROFILE_ID, 1)
+    if (
+        runtime.plan.composition_profile.sha256 != matrix.sha256
+        or profile.implementation_status != "EXECUTABLE"
+        or not runtime.is_full_day_composition
+    ):
+        failures.append("complete-day workload is not bound to executable E4")
+
+    runtime.advance_to(pilot.pilot_duration_us)
+    runtime.capture_quiescent_cut(
+        "WO31-F-PILOT-CUT",
+        at_time_us=pilot.pilot_duration_us,
+    )
+    limits = runtime.plan.deterministic_limits
+    deterministic_pairs = (
+        (len(runtime.events), pilot.max_outer_events, "outer events"),
+        (len(runtime.pending_work), pilot.max_pending_work_items, "pending work"),
+        (
+            max((len(rows) for rows in runtime._microsteps_at_time.values()), default=0),
+            pilot.max_microsteps_per_timestamp,
+            "microsteps per timestamp",
+        ),
+        (
+            max(runtime._events_at_time.values(), default=0),
+            pilot.max_events_per_timestamp,
+            "events per timestamp",
+        ),
+        (
+            len(runtime.canonical_state_bytes()),
+            pilot.max_checkpoint_bytes,
+            "checkpoint bytes",
+        ),
+    )
+    for observed, maximum, label in deterministic_pairs:
+        if observed > maximum:
+            failures.append(f"pilot {label} exceeded its deterministic limit")
+    bottleneck = deterministic_pairs[0]
+    for candidate in deterministic_pairs[1:]:
+        if candidate[0] * bottleneck[1] > bottleneck[0] * candidate[1]:
+            bottleneck = candidate
+    if (
+        limits.maximum_outer_events != pilot.max_outer_events
+        or limits.maximum_pending_work_items != pilot.max_pending_work_items
+        or limits.maximum_microsteps_per_timestamp
+        != pilot.max_microsteps_per_timestamp
+        or limits.maximum_events_per_timestamp != pilot.max_events_per_timestamp
+        or limits.maximum_checkpoint_bytes != pilot.max_checkpoint_bytes
+    ):
+        failures.append("runtime deterministic gates differ from the pilot manifest")
+
+    short_runtimes = _wo31f_short_profile_runtimes()
+    observed_profiles = tuple(
+        (
+            row.plan.composition_profile.reference_id,
+            row.plan.composition_profile.version,
+        )
+        for row in short_runtimes
+    )
+    expected_profiles = (
+        ("SINGLE_VENUE_AGENT_MECHANICS_V1", 2),
+        ("SINGLE_VENUE_AGENT_FLOW_V1", 1),
+        ("SINGLE_VENUE_AGENT_FLOW_V1", 2),
+        ("SINGLE_VENUE_AGENT_FLOW_V1", 3),
+        ("SINGLE_VENUE_AGENT_FLOW_DELIVERY_V1", 1),
+    )
+    if observed_profiles != expected_profiles:
+        failures.append("short cases do not cover every earlier executable profile")
+    for short in short_runtimes:
+        if (
+            not short.is_full_day_composition
+            or short.shock_runtime is None
+            or len(short.shock_runtime.outcomes) != 1
+        ):
+            failures.append(
+                "an earlier executable profile did not run the composed shock slice"
+            )
+    pilot_checkpoint_bytes = len(canonical_json_bytes(runtime.checkpoint_state()))
+    return FullDayAuditCase(
+        "full_day_composition_profile_and_pilot",
+        (
+            f"pilot_semantic_sha256={pilot.semantic_sha256} "
+            f"pilot_events={len(runtime.events)} "
+            f"pilot_checkpoint_bytes={pilot_checkpoint_bytes} "
+            f"deterministic_bottleneck={bottleneck[2]} "
+            f"bottleneck_usage={bottleneck[0]}/{bottleneck[1]} "
+            f"short_profiles={observed_profiles} full_profile={RESEARCH_PROFILE_ID} "
+            "operational_diagnostics_excluded=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31f_orchestration_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+    from kirby2.full_day.models import ParticipantKindV1, ScheduledEventTypeV1
+    from kirby2.full_day.states import ParameterTargetV1
+
+    failures: list[str] = []
+    runtime = _wo31f_runtime()
+    runtime.advance_to(runtime.plan.calendar.end_time_us)
+    if runtime.engine.session_state is not SessionState.CLOSED:
+        failures.append("complete calendar did not leave market mechanics CLOSED")
+    if runtime.pending_work:
+        failures.append("complete day retained pending work past the calendar")
+    if runtime._calendar_boundary_index != len(
+        runtime.plan.calendar.boundary_operations
+    ):
+        failures.append("calendar cursor did not consume all six boundaries")
+
+    participant_ids = tuple(
+        definition.participant_id
+        for definition in runtime.plan.participant_definitions
+    )
+    participant_kinds = {
+        definition.participant_kind
+        for definition in runtime.plan.participant_definitions
+    }
+    if participant_kinds != set(ParticipantKindV1):
+        failures.append("complete day does not cover all six participant kinds")
+    if runtime.participant_runtime.completed_schedule_ids != tuple(
+        entry.schedule_id for entry in runtime.plan.participant_schedule
+    ):
+        failures.append("participant lifecycle history differs from the plan")
+    if any(runtime.participant_runtime.active.values()):
+        failures.append("complete participant schedule did not finish inactive")
+    expected_generations = {
+        participant_id: (1 if participant_id in {"F_MAKER", "F_NOISE"} else 0)
+        for participant_id in participant_ids
+    }
+    if runtime.participant_runtime.replacement_generations != expected_generations:
+        failures.append("participant immutable retune generations are incorrect")
+    retune_records = tuple(
+        record
+        for record in runtime.participant_runtime.history
+        if record.action.value == "RETUNE"
+    )
+    if len(retune_records) != 2 or any(
+        record.prior_specification == record.resulting_specification
+        for record in retune_records
+    ):
+        failures.append("maker/noise retunes did not preserve immutable history")
+
+    scheduled_types = {
+        application.event_type
+        for application in runtime.scheduled_runtime.history
+    }
+    if scheduled_types != set(ScheduledEventTypeV1):
+        failures.append("scheduled orchestration does not cover all eight types")
+    if runtime.scheduled_runtime.next_index != len(runtime.plan.scheduled_events):
+        failures.append("scheduled event cursor did not consume its exact plan")
+    if runtime._halt_count != 2 or any(
+        value is not None
+        for value in (
+            runtime._halt_entered_time_us,
+            runtime._minimum_resume_eligible_time_us,
+            runtime._maximum_resume_deadline_us,
+            runtime._reopening_auction_end_time_us,
+        )
+    ):
+        failures.append("halt/reopen state did not finish its two bounded cycles")
+
+    shock = runtime.shock_runtime
+    if shock is None:
+        failures.append("complete composition omitted its shock owner")
+        accepted = rejected = 0
+    else:
+        accepted = shock.accepted_count
+        rejected = shock.rejected_count
+        if (
+            shock.candidate_draw_count != 3
+            or accepted != 2
+            or rejected != 1
+            or not shock.exhausted
+            or shock.outcomes[-1].reason_code
+            != "MAXIMUM_ACCEPTED_SHOCKS_REACHED"
+        ):
+            failures.append("bounded shock candidate lifecycle is not exact")
+    event_counts = {
+        event_type: sum(event.event_type is event_type for event in runtime.events)
+        for event_type in (
+            FullDayEventTypeV1.SHOCK_CANDIDATE,
+            FullDayEventTypeV1.SHOCK_ACCEPTED,
+            FullDayEventTypeV1.SHOCK_REJECTED,
+        )
+    }
+    if event_counts != {
+        FullDayEventTypeV1.SHOCK_CANDIDATE: 3,
+        FullDayEventTypeV1.SHOCK_ACCEPTED: 2,
+        FullDayEventTypeV1.SHOCK_REJECTED: 1,
+    }:
+        failures.append("outer shock evidence differs from owner history")
+    candidates_by_id = {
+        str(event.payload.data["candidate_id"]): event
+        for event in runtime.events
+        if event.event_type is FullDayEventTypeV1.SHOCK_CANDIDATE
+    }
+    for event in runtime.events:
+        if event.event_type not in {
+            FullDayEventTypeV1.SHOCK_ACCEPTED,
+            FullDayEventTypeV1.SHOCK_REJECTED,
+        }:
+            continue
+        candidate_id = str(event.payload.data["candidate_id"])
+        candidate = candidates_by_id.get(candidate_id)
+        if candidate is None or event.causal_parent_ids != (candidate.event_id,):
+            failures.append("shock terminal event lost its candidate parent")
+
+    snapshot = runtime.parameter_snapshot()
+    if (
+        len(snapshot.shock_modifier_batches) != accepted
+        or set(snapshot.effective_values) != set(ParameterTargetV1)
+        or any("PRICE" in target.value for target in snapshot.effective_values)
+    ):
+        failures.append("bounded parameter projection is incomplete or imperative")
+    if [event.global_event_sequence for event in runtime.events] != list(
+        range(1, len(runtime.events) + 1)
+    ):
+        failures.append("outer global event sequence is not exact")
+    native_groups: dict[tuple[str, str], list[int]] = {}
+    for entry in runtime.native_event_ledger.values():
+        key = (
+            entry.reference.owner_component_id,
+            entry.reference.native_ledger_id,
+        )
+        native_groups.setdefault(key, []).append(entry.reference.local_sequence)
+    for sequences in native_groups.values():
+        ordered = sorted(sequences)
+        if ordered != list(range(1, len(ordered) + 1)):
+            failures.append("a native subsystem ledger was renumbered or gapped")
+    cut = runtime.latest_quiescent_cut
+    if (
+        cut is None
+        or cut.simulation_time_us != runtime.plan.calendar.end_time_us
+        or not cut.checkpoint_stage_complete
+        or cut.due_work_at_or_before_cut != 0
+    ):
+        failures.append("terminal built-in checkpoint is not quiescent")
+    return FullDayAuditCase(
+        "full_day_participant_scheduled_shock_orchestration",
+        (
+            f"participants={len(participant_ids)} lifecycle_rows="
+            f"{len(runtime.participant_runtime.history)} "
+            f"scheduled_types={len(scheduled_types)} halts={runtime._halt_count} "
+            f"shock_candidates={accepted + rejected} accepted={accepted} "
+            f"rejected={rejected} outer_events={len(runtime.events)} "
+            f"native_ledgers={len(native_groups)} final_session=CLOSED"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31f_replay_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import (
+        canonical_json_bytes,
+        parse_canonical_json_object,
+    )
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    end_us = _sample_calendar().end_time_us
+    one_shot = _wo31f_runtime()
+    one_shot.advance_to(end_us)
+    one_shot.capture_quiescent_cut("WO31-F-FINAL")
+    subdivided = _wo31f_runtime()
+    for target in (
+        300_000_000,
+        600_000_001,
+        1_200_000_000,
+        2_800_000_000,
+        3_300_000_000,
+        4_800_000_000,
+        5_400_000_000,
+        end_us,
+    ):
+        subdivided.advance_to(target)
+    subdivided.capture_quiescent_cut("WO31-F-FINAL")
+    if one_shot.event_stream_bytes() != subdivided.event_stream_bytes():
+        failures.append("one-shot and subdivided outer event bytes differ")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("one-shot and subdivided complete runtime states differ")
+
+    source = _wo31f_runtime()
+    source.advance_to(3_300_000_000)
+    source.capture_quiescent_cut("WO31-F-FRESH-CUT")
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        source,
+        suffix_targets_us=(end_us,),
+        final_checkpoint_request_id="WO31-F-FRESH-FINAL",
+    )
+    returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+        request.canonical_bytes()
+    )
+    expected = execute_uninterrupted_full_day_runtime_suffix(source, request)
+    actual = None
+    if returncode != 0:
+        failures.append(
+            "fresh complete-day worker returned "
+            f"{returncode}: {stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    else:
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"fresh complete-day worker emitted invalid JSON: {error}")
+    if stderr:
+        failures.append("successful fresh complete-day worker wrote stderr")
+    if wrote_files:
+        failures.append("fresh complete-day worker wrote into its empty directory")
+    if actual is not None and (
+        canonical_json_bytes(actual) != stdout or actual != expected
+    ):
+        failures.append("fresh-process suffix differs from uninterrupted execution")
+    invariant = "ABSENT" if actual is None else str(actual["invariant_sha256"])
+    return FullDayAuditCase(
+        "full_day_complete_bounded_day_replay_restore",
+        (
+            f"one_shot_events={len(one_shot.events)} subdivided_events="
+            f"{len(subdivided.events)} final_state_sha256={one_shot.state_sha256()} "
+            f"fresh_process=true invariant_sha256={invariant} "
+            "quiescent_suffix=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31f_refusal_case() -> FullDayAuditCase:
+    from kirby2.full_day.composition import (
+        EXECUTION_ALGORITHM_PROFILE_ID,
+        MULTIVENUE_HIDDEN_PROFILE_ID,
+        restorable_execution_algorithm_composition_matrix,
+        restorable_multivenue_hidden_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        IntegerParameterUnitV1,
+        NamedIntegerParameterV1,
+        VersionedReferenceV1,
+        canonical_sha256,
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.full_day.states import ParameterTargetV1
+
+    failures: list[str] = []
+    refused = 0
+    plan = _wo31f_plan()
+    multivenue_matrix = restorable_multivenue_hidden_composition_matrix()
+    algorithm_matrix = restorable_execution_algorithm_composition_matrix()
+    unsupported_profiles = (
+        (
+            MULTIVENUE_HIDDEN_PROFILE_ID,
+            1,
+            multivenue_matrix.sha256,
+            multivenue_matrix.profile(
+                MULTIVENUE_HIDDEN_PROFILE_ID, 1
+            ).implementation_reason_code,
+        ),
+        (
+            EXECUTION_ALGORITHM_PROFILE_ID,
+            1,
+            algorithm_matrix.sha256,
+            algorithm_matrix.profile(
+                EXECUTION_ALGORITHM_PROFILE_ID, 1
+            ).implementation_reason_code,
+        ),
+        (
+            "HISTORICAL_REPLAY_V1",
+            1,
+            "0" * 64,
+            "SYNTHETIC_PLAN_HAS_NO_HISTORICAL_CURSOR",
+        ),
+    )
+    refusal_reasons: list[str] = []
+    for profile_id, version, digest, reason in unsupported_profiles:
+        hostile_plan = replace(
+            plan,
+            composition_profile=VersionedReferenceV1(
+                profile_id,
+                version,
+                digest,
+            ),
+        )
+        try:
+            FullDayRuntime.compose(
+                hostile_plan,
+                shock_quantity_distribution=_wo31f_distribution(hostile_plan),
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            refused += 1
+            refusal_reasons.append(reason)
+            if reason not in str(error):
+                failures.append(
+                    f"nonexecutable profile {profile_id} omitted matrix reason {reason}"
+                )
+        else:
+            failures.append(f"nonexecutable profile {profile_id} was accepted")
+
+    runtime = _wo31f_runtime()
+    runtime.advance_to(3_300_000_000)
+    runtime.capture_quiescent_cut("WO31-F-HOSTILE-CUT")
+    before = runtime.canonical_state_bytes()
+    state = runtime.checkpoint_state()
+    probes: list[tuple[str, dict[str, object]]] = []
+
+    shock_counter = copy.deepcopy(state)
+    shock_union = shock_counter["shock_runtime"]
+    assert isinstance(shock_union, dict)
+    shock_state = shock_union["state"]
+    assert isinstance(shock_state, dict)
+    shock_state["candidate_draw_count"] += 1
+    shock_union["state_sha256"] = canonical_sha256(shock_state)
+    probes.append(("forged shock counter", shock_counter))
+
+    participant_cursor = copy.deepcopy(state)
+    participant_state = participant_cursor["participant_runtime"]
+    assert isinstance(participant_state, dict)
+    participant_state["next_index"] -= 1
+    probes.append(("forged participant cursor", participant_cursor))
+
+    scheduled_cursor = copy.deepcopy(state)
+    scheduled_state = scheduled_cursor["scheduled_runtime"]
+    assert isinstance(scheduled_state, dict)
+    scheduled_state["next_index"] -= 1
+    probes.append(("forged scheduled-event cursor", scheduled_cursor))
+
+    shock_rng = copy.deepcopy(state)
+    shock_rng_union = shock_rng["shock_runtime"]
+    assert isinstance(shock_rng_union, dict)
+    shock_rng_state = shock_rng_union["state"]
+    assert isinstance(shock_rng_state, dict)
+    rng_state = shock_rng_state["rng_state"]
+    assert isinstance(rng_state, dict)
+    internal_state = rng_state["internal_state"]
+    assert isinstance(internal_state, list)
+    internal_state[0] = (internal_state[0] + 1) % (2**32)
+    shock_rng_union["state_sha256"] = canonical_sha256(shock_rng_state)
+    probes.append(("forged shock RNG highwater", shock_rng))
+
+    for label, hostile in probes:
+        failure = _expect_refusal(
+            lambda hostile=hostile: FullDayRuntime.from_checkpoint_state(hostile),
+            label,
+        )
+        if failure:
+            failures.append(failure)
+        else:
+            refused += 1
+    if runtime.canonical_state_bytes() != before:
+        failures.append("hostile restores mutated the authoritative runtime")
+
+    for label, operation in (
+        (
+            "quantity distribution digest mismatch",
+            lambda: replace(
+                _wo31f_distribution(plan),
+                maximum_quantity=4,
+            ),
+        ),
+        (
+            "target-price parameter enum",
+            lambda: ParameterTargetV1("TARGET_PRICE"),
+        ),
+        (
+            "target-price scheduled parameter",
+            lambda: NamedIntegerParameterV1(
+                "target_price_ticks",
+                IntegerParameterUnitV1.TICKS,
+                10_000,
+            ),
+        ),
+    ):
+        failure = _expect_refusal(operation, label)
+        if failure:
+            failures.append(failure)
+        else:
+            refused += 1
+    bounded_payloads = (
+        runtime.parameter_snapshot().as_dict(),
+        runtime.shock_runtime.checkpoint_state()
+        if runtime.shock_runtime is not None
+        else {},
+        runtime.scheduled_runtime.checkpoint_state(),
+    )
+
+    def forbidden_key(value: object) -> bool:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                lowered = str(key).lower()
+                if any(
+                    token in lowered
+                    for token in (
+                        "target_price",
+                        "desired_return",
+                        "force_trade",
+                        "book_write",
+                        "forced_close",
+                    )
+                ):
+                    return True
+                if forbidden_key(child):
+                    return True
+        elif type(value) in {list, tuple}:
+            return any(forbidden_key(child) for child in value)
+        return False
+
+    if any(forbidden_key(payload) for payload in bounded_payloads):
+        failures.append("scheduled/shock parameter state exposes an imperative target")
+    return FullDayAuditCase(
+        "full_day_nonexecutable_and_hostile_refusals",
+        (
+            f"refusals={refused} profile_reasons={tuple(refusal_reasons)} "
+            "multivenue=NOT_EXERCISED algorithm=NOT_EXERCISED "
+            "historical=NOT_EXERCISED failure_atomicity=true "
+            "target_price=unrepresentable"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31f_composition() -> tuple[FullDayAuditCase, ...]:
+    """Exercise complete deterministic orchestration over executable profiles."""
+
+    return (
+        _wo31f_composition_and_pilot_case(),
+        _wo31f_orchestration_case(),
+        _wo31f_replay_restore_case(),
+        _wo31f_refusal_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -15273,4 +16576,5 @@ __all__ = [
     "audit_wo31e4_research_restore",
     "audit_wo31e5_multivenue_restore",
     "audit_wo31e6_execution_algorithm_restore",
+    "audit_wo31f_composition",
 ]
