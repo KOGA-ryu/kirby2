@@ -16558,8 +16558,661 @@ def audit_wo31f_composition() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31g_committed_plan():
+    """Load the exact canonical machine-IR plan shipped for the storage audit."""
+
+    from pathlib import Path
+
+    from kirby2.full_day.models import FullDayPlanV1
+
+    path = Path(
+        str(files("kirby2.full_day").joinpath("examples/audit_full_day_plan.json"))
+    )
+    raw = path.read_bytes()
+    plan = FullDayPlanV1.from_json_bytes(raw)
+    if plan.to_json_bytes() != raw:
+        raise ValueError("committed WO31-G plan is not canonical JSON")
+    return plan
+
+
+def _wo31g_crossing_runtime():
+    """Compose a complete rich day containing a real continuous-session fill."""
+
+    from dataclasses import replace
+
+    from kirby2.agents.models import PopulationDefinition
+    from kirby2.exchange.models import Side
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31f_plan()
+    initial, replacements = _wo31f_specifications()
+    initial_maker = next(row for row in initial if row.agent_id == "F_MAKER")
+    replacement_maker = next(
+        row for row in replacements if row.agent_id == "F_MAKER"
+    )
+    crossing_initial = tuple(
+        replace(
+            row,
+            policy=replace(
+                row.policy,
+                preferred_side=Side.SELL,
+                reserve_price_ticks=10_001,
+            ),
+        )
+        if row.agent_id == "F_MAKER"
+        else row
+        for row in initial
+    )
+    crossing_replacements = tuple(
+        replace(
+            row,
+            policy=replace(
+                row.policy,
+                preferred_side=Side.SELL,
+                reserve_price_ticks=10_001,
+            ),
+        )
+        if row.agent_id == "F_MAKER"
+        else row
+        for row in replacements
+    )
+    new_initial_maker = next(
+        row for row in crossing_initial if row.agent_id == "F_MAKER"
+    )
+    new_replacement_maker = next(
+        row for row in crossing_replacements if row.agent_id == "F_MAKER"
+    )
+    old_initial_reference = _wo31f_specification_reference(initial_maker, 1)
+    old_replacement_reference = _wo31f_specification_reference(
+        replacement_maker, 2
+    )
+    new_initial_reference = _wo31f_specification_reference(new_initial_maker, 1)
+    new_replacement_reference = _wo31f_specification_reference(
+        new_replacement_maker, 2
+    )
+    schedule = []
+    for entry in plan.participant_schedule:
+        if entry.replacement_specification == old_replacement_reference:
+            entry = replace(
+                entry, replacement_specification=new_replacement_reference
+            )
+        # The crossing maker is withdrawn after its first matched interval so later
+        # halt cancellation cannot obscure the fill-boundary storage assertion.
+        if entry.schedule_id == "F_MAKER_FINAL_DEACTIVATE":
+            entry = replace(entry, simulation_time_us=2_500_000_000)
+        schedule.append(entry)
+    plan = replace(
+        plan,
+        plan_id="WO31_G_STORAGE_BOUNDARY_AUDIT_V1",
+        participant_definitions=tuple(
+            replace(definition, specification=new_initial_reference)
+            if definition.participant_id == "F_MAKER"
+            else definition
+            for definition in plan.participant_definitions
+        ),
+        participant_schedule=tuple(
+            sorted(
+                schedule,
+                key=lambda entry: (
+                    entry.simulation_time_us,
+                    entry.participant_id,
+                    entry.schedule_id,
+                ),
+            )
+        ),
+        component_configurations=tuple(
+            replace(binding, configuration=new_initial_reference)
+            if binding.configuration == old_initial_reference
+            else replace(binding, configuration=new_replacement_reference)
+            if binding.configuration == old_replacement_reference
+            else binding
+            for binding in plan.component_configurations
+        ),
+    )
+    population = PopulationDefinition(
+        "WO31_G_STORAGE_POPULATION_V1",
+        "Crossing maker fixture for durable full-day boundary evidence.",
+        crossing_initial,
+        plan.calendar.end_time_us,
+        initial_mid_ticks=10_000,
+        initial_depth_levels=1,
+        initial_level_quantity=20,
+    )
+    runtime = FullDayRuntime.compose_with_agent_scheduler(
+        plan,
+        population,
+        shock_quantity_distribution=_wo31f_distribution(plan),
+        participant_specifications=crossing_replacements,
+        simple_flow_configuration=_wo31e3_flow_configuration(),
+        delivery_configuration=_wo31e3_delivery_configuration(),
+        research_configuration=_wo31e4_research_configuration(),
+    )
+    return plan, runtime
+
+
+def _wo31g_store_reopen_case() -> FullDayAuditCase:
+    import json
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.full_day.store import FullDayStore
+    from kirby2.research.models import ArtifactType, RunType
+
+    failures: list[str] = []
+    run_id = "UNAVAILABLE"
+    artifact_count = 0
+    try:
+        plan = _wo31g_committed_plan()
+        with tempfile.TemporaryDirectory(prefix="kirby2-wo31g-reopen-") as temporary:
+            root = Path(temporary).resolve()
+            store = FullDayStore(root)
+            manifest = store.generate_day(plan, FullDayRuntime.create(plan))
+            run_id = manifest.run_id
+            artifact_count = len(manifest.artifacts)
+            if manifest.run_type is not RunType.FULL_DAY:
+                failures.append("stored manifest does not use RunType.FULL_DAY")
+            required_types = {
+                ArtifactType.FULL_DAY_PLAN,
+                ArtifactType.FULL_DAY_OUTER_EVENT_LEDGER,
+                ArtifactType.FULL_DAY_SUBSYSTEM_LEDGER,
+                ArtifactType.FULL_DAY_CHECKPOINT_INDEX,
+                ArtifactType.FULL_DAY_CHECKPOINT,
+                ArtifactType.FULL_DAY_SUMMARY,
+                ArtifactType.FULL_DAY_QUALIFICATION,
+                ArtifactType.FULL_DAY_DIAGNOSTICS,
+            }
+            actual_types = {row.artifact_type for row in manifest.artifacts}
+            if not required_types <= actual_types:
+                failures.append("full-day typed artifact inventory is incomplete")
+
+            repeated = store.generate_day(plan, FullDayRuntime.create(plan))
+            if repeated.as_dict() != manifest.as_dict():
+                failures.append("idempotent generation changed immutable manifest bytes")
+            if len(tuple(store.runs_directory.glob("run-*"))) != 1:
+                failures.append("idempotent generation exposed another canonical run")
+
+            environment = dict(os.environ)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    "-m",
+                    "kirby2",
+                    "inspect-day",
+                    run_id,
+                    "--data-root",
+                    str(root),
+                ),
+                cwd=Path(__file__).resolve().parents[2],
+                env=environment,
+                capture_output=True,
+                check=False,
+                timeout=120,
+            )
+            if completed.returncode != 0:
+                failures.append(
+                    "fresh-process inspection failed: "
+                    + completed.stderr.decode("utf-8", errors="replace").strip()
+                )
+            else:
+                inspected = json.loads(completed.stdout)
+                if (
+                    inspected.get("run_id") != run_id
+                    or inspected.get("verification", {}).get("status") != "PASS"
+                ):
+                    failures.append("fresh-process inspection did not verify the captured run")
+    except Exception as error:
+        failures.append(f"unexpected close/reopen failure: {error}")
+    return FullDayAuditCase(
+        "full_day_store_close_reopen_identity",
+        (
+            f"run_id={run_id} artifacts={artifact_count} atomic_activation=true "
+            "idempotent=true fresh_process=true latest_pointer=absent"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31g_seek_extract_case() -> FullDayAuditCase:
+    import tempfile
+    from pathlib import Path
+
+    from kirby2.full_day.events import (
+        FullDayEventTypeV1,
+        canonical_event_prefix_sha256,
+    )
+    from kirby2.full_day.store import FullDayStore, FullDayWindowV1
+
+    failures: list[str] = []
+    run_id = "UNAVAILABLE"
+    child_run_id = "UNAVAILABLE"
+    boundary_count = 0
+    try:
+        plan, runtime = _wo31g_crossing_runtime()
+        with tempfile.TemporaryDirectory(prefix="kirby2-wo31g-seek-") as temporary:
+            root = Path(temporary).resolve()
+            store = FullDayStore(root)
+            manifest = store.generate_day(plan, runtime)
+            run_id = manifest.run_id
+            loaded = store._load_complete_run(store.load_manifest(run_id))
+
+            def native_boundary(event_type: str) -> int:
+                return next(
+                    event.simulation_time_us
+                    for event in loaded.events
+                    if event.payload.native_event is not None
+                    and event.payload.native_event.event_type == event_type
+                )
+
+            phase_time = plan.calendar.phases[2].start.simulation_time_us
+            microstep_time = next(
+                event.simulation_time_us
+                for event in loaded.events
+                if event.microstep > 0
+            )
+            fill_time = native_boundary("TRADE")
+            halt_time = native_boundary("HALT")
+            delivery_time = next(
+                event.simulation_time_us
+                for event in loaded.events
+                if event.event_type is FullDayEventTypeV1.OBSERVABLE_DELIVERY
+            )
+            boundaries = {
+                "delivery": delivery_time,
+                "fill": fill_time,
+                "halt": halt_time,
+                "microstep": microstep_time,
+                "phase": phase_time,
+            }
+            if (
+                loaded.summary.session_state_occupancy_us.get("HALTED") != 40
+                or loaded.summary.session_state_occupancy_us.get(
+                    "REOPENING_AUCTION"
+                )
+                != 20
+            ):
+                failures.append("summary session occupancy omitted halt/reopen intervals")
+            observed: dict[tuple[str, str], str] = {}
+            for label, boundary_time in boundaries.items():
+                for relation, target in (
+                    ("before", boundary_time - 1),
+                    ("at", boundary_time),
+                    ("after", boundary_time + 1),
+                ):
+                    target = max(0, min(target, plan.calendar.end_time_us))
+                    result = store._seek_loaded(loaded, target)
+                    boundary_count += 1
+                    if result.quiescent_cut.simulation_time_us != target:
+                        failures.append(f"{label}/{relation} seek did not end at target")
+                    expected = tuple(
+                        event
+                        for event in loaded.events
+                        if event.simulation_time_us <= target
+                    )
+                    digest = canonical_event_prefix_sha256(expected)
+                    if (
+                        result.uninterrupted_event_count != len(expected)
+                        or result.uninterrupted_event_prefix_sha256 != digest
+                        or tuple(
+                            row.as_dict()
+                            for row in result.runtime.events
+                        )
+                        != tuple(row.as_dict() for row in expected)
+                    ):
+                        failures.append(f"{label}/{relation} seek prefix differs")
+                    observed[(label, relation)] = digest
+
+            public_seek = store.seek(run_id, fill_time)
+            repeated_seek = store._seek_loaded(loaded, fill_time)
+            if public_seek.as_dict() != repeated_seek.as_dict():
+                failures.append("public fill seek differs from repeated verified seek")
+
+            window_start = min(fill_time + 1, plan.calendar.end_time_us - 2)
+            window_end = min(window_start + 100_000_000, plan.calendar.end_time_us)
+            child = store.extract_window(run_id, window_start, window_end)
+            child_run_id = child.run_id
+            reference = child.artifacts[0]
+            window = FullDayWindowV1.from_json_bytes(
+                (store.run_directory(child.run_id) / reference.relative_path).read_bytes()
+            )
+            context = window.observable_context
+            if (
+                context.get("prior_trade_count") != 1
+                or context.get("prior_traded_volume_shares") != 2
+                or context.get("prior_volatility_ticks_fixed") != "UNAVAILABLE"
+            ):
+                failures.append("window prior trade/volume/volatility context is incoherent")
+            if not isinstance(context.get("active_participant_ids"), list):
+                failures.append("window participant context is absent")
+            inventory = context.get("participant_inventory_shares")
+            if not isinstance(inventory, (dict, str)):
+                failures.append("window inventory context is malformed")
+            public_bytes = window.canonical_bytes()
+            if any(
+                token in public_bytes
+                for token in (
+                    b'"checkpoint_state"',
+                    b'"rng_state"',
+                    b'"scheduled_events"',
+                    b'"seed_policy"',
+                )
+            ):
+                failures.append("window leaked sealed schedule or RNG state")
+            if not store.verify_day(child.run_id).passed:
+                failures.append("extracted child did not survive independent verification")
+            if len(observed) != 15:
+                failures.append("seek evidence did not cover all boundary relations")
+    except Exception as error:
+        failures.append(f"unexpected seek/extract failure: {error}")
+    return FullDayAuditCase(
+        "full_day_seek_boundaries_and_window_lineage",
+        (
+            f"run_id={run_id} child_run_id={child_run_id} "
+            f"boundary_seeks={boundary_count} phase=true microstep=true fill=true "
+            "halt=true delivery=true sealed_state_leaked=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31g_summary_catalog_case() -> FullDayAuditCase:
+    import json
+    import tempfile
+    from math import isqrt
+    from pathlib import Path
+
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.full_day.store import FullDayStore
+    from kirby2.full_day.summary import (
+        FIXED_POINT_SCALE,
+        UNAVAILABLE,
+        _maximum_absolute_move,
+        _period_summary,
+    )
+    from kirby2.research.store import RunStore, _duckdb
+
+    failures: list[str] = []
+    registry_rows = 0
+    try:
+        plan = _wo31g_committed_plan()
+        with tempfile.TemporaryDirectory(prefix="kirby2-wo31g-summary-") as temporary:
+            root = Path(temporary).resolve()
+            store = FullDayStore(root)
+            manifest = store.generate_day(plan, FullDayRuntime.create(plan))
+            loaded = store._load_complete_run(store.load_manifest(manifest.run_id))
+            no_trade = loaded.summary.day
+            if (
+                no_trade.trade_count != 0
+                or no_trade.volume_shares != 0
+                or {
+                    no_trade.open_price_ticks,
+                    no_trade.high_price_ticks,
+                    no_trade.low_price_ticks,
+                    no_trade.close_price_ticks,
+                }
+                != {UNAVAILABLE}
+            ):
+                failures.append("no-trade day did not report exact UNAVAILABLE OHLC")
+            if any(
+                phase.trade_count != 0
+                or phase.volume_shares != 0
+                or {
+                    phase.open_price_ticks,
+                    phase.high_price_ticks,
+                    phase.low_price_ticks,
+                    phase.close_price_ticks,
+                }
+                != {UNAVAILABLE}
+                for phase in loaded.summary.phases
+            ):
+                failures.append("a no-trade phase did not report exact UNAVAILABLE OHLC")
+
+            trades = (
+                {"global_event_sequence": 1, "price_ticks": 100, "quantity": 2, "simulation_time_us": 10},
+                {"global_event_sequence": 2, "price_ticks": 110, "quantity": 3, "simulation_time_us": 20},
+                {"global_event_sequence": 3, "price_ticks": 90, "quantity": 4, "simulation_time_us": 30},
+                {"global_event_sequence": 4, "price_ticks": 110, "quantity": 5, "simulation_time_us": 40},
+            )
+            quotes = (
+                {
+                    "ask_levels": [{"quantity": 7}],
+                    "best_ask_ticks": 101,
+                    "best_bid_ticks": 99,
+                    "bid_levels": [{"quantity": 5}],
+                    "time_us": 0,
+                },
+                {
+                    "ask_levels": [{"quantity": 20}],
+                    "best_ask_ticks": 103,
+                    "best_bid_ticks": 100,
+                    "bid_levels": [{"quantity": 10}],
+                    "time_us": 50,
+                },
+            )
+            fixture = _period_summary(
+                "TIE_FIXTURE",
+                0,
+                100,
+                trades=trades,
+                quotes=quotes,
+                horizon_end_us=100,
+            )
+            expected_volatility = isqrt(300 * FIXED_POINT_SCALE**2)
+            if (
+                (
+                    fixture.open_price_ticks,
+                    fixture.high_price_ticks,
+                    fixture.low_price_ticks,
+                    fixture.close_price_ticks,
+                )
+                != (100, 110, 90, 110)
+                or fixture.volume_shares != 14
+                or fixture.trade_count != 4
+                or fixture.volatility_ticks_fixed != expected_volatility
+                or fixture.time_weighted_spread_ticks_fixed != 2_500_000
+                or fixture.time_weighted_n_level_depth_shares_fixed != 21_000_000
+            ):
+                failures.append("summary arithmetic tie fixture differs from V1 formulas")
+            if _maximum_absolute_move(trades) != (20, 3):
+                failures.append("absolute-move tie did not select earliest global sequence")
+
+            inspected = store._inspect_complete(loaded)
+            serialized = json.dumps(inspected, sort_keys=True)
+            if any(
+                token in serialized
+                for token in ("checkpoint_state", "rng_state", "scheduled_events", "seed_policy")
+            ):
+                failures.append("ordinary inspection leaked sealed schedule or RNG state")
+            for artifact in inspected["artifacts"]:
+                if artifact["sealed"] and "relative_path" in artifact:
+                    failures.append("ordinary inspection revealed a sealed artifact path")
+
+            research = RunStore(root)
+            report = research.verify_run(manifest.run_id)
+            if not report.passed:
+                failures.append("generic run-store verification rejected a FULL_DAY run")
+            research.refresh_catalog()
+            connection = _duckdb().connect(str(research.catalog_path), read_only=True)
+            try:
+                registry_rows = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM run_artifact_registry WHERE run_id = ?",
+                        [manifest.run_id],
+                    ).fetchone()[0]
+                )
+                typed = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT artifact_type FROM run_artifact_registry WHERE run_id = ?",
+                        [manifest.run_id],
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+            if registry_rows != len(manifest.artifacts) or "FULL_DAY_PLAN" not in typed:
+                failures.append("rebuildable catalog lost typed full-day artifacts")
+    except Exception as error:
+        failures.append(f"unexpected summary/catalog failure: {error}")
+    return FullDayAuditCase(
+        "full_day_summary_privacy_and_typed_catalog",
+        (
+            f"artifact_registry_rows={registry_rows} no_trade=UNAVAILABLE "
+            "ohlc_tie=true move_tie=EARLIEST_GLOBAL_EVENT_SEQUENCE "
+            "spread_depth_half_open=true privacy=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31g_hostile_storage_case() -> FullDayAuditCase:
+    import shutil
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.full_day.store import FullDayStore
+    from kirby2.research.models import ArtifactReference, ArtifactType
+
+    failures: list[str] = []
+    refusals = 0
+    try:
+        plan = _wo31g_committed_plan()
+        with tempfile.TemporaryDirectory(prefix="kirby2-wo31g-hostile-") as temporary:
+            workspace = Path(temporary).resolve()
+            base_root = workspace / "base"
+            base = FullDayStore(base_root)
+            manifest = base.generate_day(plan, FullDayRuntime.create(plan))
+
+            corrupt_root = workspace / "corrupt"
+            shutil.copytree(base_root, corrupt_root)
+            corrupt_summary = (
+                corrupt_root / "runs" / manifest.run_id / "summary.json"
+            )
+            corrupt_summary.write_bytes(corrupt_summary.read_bytes() + b"\n")
+            if FullDayStore(corrupt_root).verify_day(manifest.run_id).passed:
+                failures.append("corrupt artifact bytes were accepted")
+            else:
+                refusals += 1
+
+            symlink_root = workspace / "symlink"
+            shutil.copytree(base_root, symlink_root)
+            symlink_summary = (
+                symlink_root / "runs" / manifest.run_id / "summary.json"
+            )
+            outside = workspace / "outside-summary.json"
+            outside.write_bytes(symlink_summary.read_bytes())
+            symlink_summary.unlink()
+            symlink_summary.symlink_to(outside)
+            if FullDayStore(symlink_root).verify_day(manifest.run_id).passed:
+                failures.append("symlink artifact escape was accepted")
+            else:
+                refusals += 1
+
+            for escaped_path in (
+                "../outside",
+                "/absolute/outside",
+                "C:\\outside",
+                "safe/./outside",
+            ):
+                try:
+                    ArtifactReference(
+                        name="escaped",
+                        relative_path=escaped_path,
+                        sha256="0" * 64,
+                        schema_version=1,
+                        row_count=None,
+                        media_type="application/octet-stream",
+                        artifact_type=ArtifactType.FULL_DAY_DIAGNOSTICS,
+                    )
+                except (TypeError, ValueError):
+                    refusals += 1
+                else:
+                    failures.append(
+                        f"escaped typed artifact reference was accepted: {escaped_path}"
+                    )
+
+            partial_root = workspace / "partial"
+            original_write = FullDayStore._write_file
+            calls = 0
+
+            def interrupted_write(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise OSError("injected staging interruption")
+                original_write(path, payload)
+
+            interrupted = False
+            with patch.object(
+                FullDayStore,
+                "_write_file",
+                new=staticmethod(interrupted_write),
+            ):
+                try:
+                    FullDayStore(partial_root).generate_day(
+                        plan, FullDayRuntime.create(plan)
+                    )
+                except OSError as error:
+                    interrupted = "injected staging interruption" in str(error)
+            runs = partial_root / "runs"
+            staging = partial_root / "staging"
+            if (
+                not interrupted
+                or (runs.exists() and any(runs.iterdir()))
+                or (staging.exists() and any(staging.iterdir()))
+            ):
+                failures.append("interrupted staging exposed a partial immutable run")
+            else:
+                refusals += 1
+    except Exception as error:
+        failures.append(f"unexpected hostile-storage failure: {error}")
+    return FullDayAuditCase(
+        "full_day_corrupt_escape_and_partial_refusals",
+        (
+            f"refusals={refusals} corrupt=true symlink_escape=true "
+            "relative_escape=true interrupted_activation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31g_storage() -> tuple[FullDayAuditCase, ...]:
+    """Exercise durable close/reopen/seek/extract and hostile storage boundaries."""
+
+    return (
+        _wo31g_store_reopen_case(),
+        _wo31g_seek_extract_case(),
+        _wo31g_summary_catalog_case(),
+        _wo31g_hostile_storage_case(),
+    )
+
+
+def audit_full_day() -> tuple[FullDayAuditCase, ...]:
+    """Run every implemented WO31 full-day gate without persistent output."""
+
+    return (
+        *audit_wo31a_contracts(),
+        *audit_wo31b_transitions(),
+        *audit_wo31c_checkpoints(),
+        *audit_wo31d_core_restore(),
+        *audit_wo31e1_runtime_restore(),
+        *audit_wo31e2_flow_restore(),
+        *audit_wo31e3_delivery_restore(),
+        *audit_wo31e4_research_restore(),
+        *audit_wo31e5_multivenue_restore(),
+        *audit_wo31e6_execution_algorithm_restore(),
+        *audit_wo31f_composition(),
+        *audit_wo31g_storage(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
+    "audit_full_day",
     "audit_dev0002_anchor_transition_ordering",
     "audit_dev0003_state_checkpoint_inventory",
     "audit_dev0004_atomic_boundary_replay",
@@ -16577,4 +17230,5 @@ __all__ = [
     "audit_wo31e5_multivenue_restore",
     "audit_wo31e6_execution_algorithm_restore",
     "audit_wo31f_composition",
+    "audit_wo31g_storage",
 ]

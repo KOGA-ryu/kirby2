@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import TABLE_SCHEMA_VERSION
+from .models import TABLE_SCHEMA_VERSION, RunManifest
 from .toml_codec import encode_payload
 
 
@@ -211,6 +211,42 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
 )
 
 TABLE_SPEC_BY_NAME = {spec.name: spec for spec in TABLE_SPECS}
+
+
+RUN_ARTIFACT_REGISTRY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("run_id", "VARCHAR"),
+    ("artifact_type", "VARCHAR"),
+    ("artifact_name", "VARCHAR"),
+    ("relative_path", "VARCHAR"),
+    ("sha256", "VARCHAR"),
+    ("schema_version", "BIGINT"),
+    ("row_count", "BIGINT"),
+    ("media_type", "VARCHAR"),
+)
+
+
+def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
+    """Project typed immutable artifacts into the rebuildable research catalog."""
+
+    if any(type(manifest) is not RunManifest for manifest in manifests):
+        raise TypeError("artifact registry projection requires RunManifest values")
+    return [
+        (
+            manifest.run_id,
+            artifact.artifact_type.value,
+            artifact.name,
+            artifact.relative_path,
+            artifact.sha256,
+            artifact.schema_version,
+            artifact.row_count,
+            artifact.media_type,
+        )
+        for manifest in sorted(manifests, key=lambda item: item.run_id)
+        for artifact in sorted(
+            manifest.artifacts,
+            key=lambda item: (item.artifact_type.value, item.name),
+        )
+    ]
 
 
 def attach_run_id(

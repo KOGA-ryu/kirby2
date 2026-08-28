@@ -113,6 +113,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0004",
     "WO31-E6",
     "WO31-F",
+    "WO31-G",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1894,6 +1895,62 @@ def _audit_wo31f() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31g() -> ExpansionGateReport:
+    """Run durable full-day storage, seek, extraction, and refusal evidence."""
+
+    from kirby2.audit.full_day import audit_wo31g_storage
+
+    cases = audit_wo31g_storage()
+    expected_names = (
+        "full_day_store_close_reopen_identity",
+        "full_day_seek_boundaries_and_window_lineage",
+        "full_day_summary_privacy_and_typed_catalog",
+        "full_day_corrupt_escape_and_partial_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-G cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-G cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-G cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO31-G",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("artifact_ledger", "RUN_MANIFEST_V2_TYPED_ARTIFACTS"),
+            ("boundary_relation_count", "15"),
+            ("public_latest_pointer", "ABSENT"),
+            ("storage_activation", "FSYNC_THEN_ATOMIC_RENAME"),
+            ("window_reveal_policy", "OBSERVABLE_CONTEXT_V1"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2086,6 +2143,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0004", _audit_dev0004),
     ("WO31-E6", _audit_wo31e6),
     ("WO31-F", _audit_wo31f),
+    ("WO31-G", _audit_wo31g),
 )
 
 

@@ -6,12 +6,13 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 from .toml_codec import canonical_digest, canonical_toml
 
 
-RUN_MANIFEST_SCHEMA_VERSION = 1
+RUN_MANIFEST_SCHEMA_VERSION = 2
+SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS = frozenset({1, 2})
 RUN_CONFIGURATION_SCHEMA_VERSION = 1
 TABLE_SCHEMA_VERSION = 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -24,6 +25,27 @@ class RunType(str, Enum):
     LESSON = "LESSON"
     CALIBRATION = "CALIBRATION"
     EXPERIMENT = "EXPERIMENT"
+    FULL_DAY = "FULL_DAY"
+
+
+class ArtifactType(str, Enum):
+    """Stable semantic role for an immutable run artifact.
+
+    ``GENERIC`` preserves the schema-v1 research-run surface.  Full-day roles are
+    deliberately explicit so inspection, export, and privacy policy never infer
+    meaning from a filename.
+    """
+
+    GENERIC = "GENERIC"
+    FULL_DAY_PLAN = "FULL_DAY_PLAN"
+    FULL_DAY_OUTER_EVENT_LEDGER = "FULL_DAY_OUTER_EVENT_LEDGER"
+    FULL_DAY_SUBSYSTEM_LEDGER = "FULL_DAY_SUBSYSTEM_LEDGER"
+    FULL_DAY_CHECKPOINT_INDEX = "FULL_DAY_CHECKPOINT_INDEX"
+    FULL_DAY_CHECKPOINT = "FULL_DAY_CHECKPOINT"
+    FULL_DAY_SUMMARY = "FULL_DAY_SUMMARY"
+    FULL_DAY_QUALIFICATION = "FULL_DAY_QUALIFICATION"
+    FULL_DAY_DIAGNOSTICS = "FULL_DAY_DIAGNOSTICS"
+    FULL_DAY_WINDOW = "FULL_DAY_WINDOW"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,13 +56,21 @@ class ArtifactReference:
     schema_version: int
     row_count: int | None
     media_type: str
+    artifact_type: ArtifactType = ArtifactType.GENERIC
 
     def __post_init__(self) -> None:
         path = PurePosixPath(self.relative_path)
+        windows_path = PureWindowsPath(self.relative_path)
         if (
             not self.name
+            or type(self.relative_path) is not str
+            or not self.relative_path
+            or "\\" in self.relative_path
             or path.is_absolute()
-            or ".." in path.parts
+            or windows_path.is_absolute()
+            or windows_path.drive
+            or self.relative_path != path.as_posix()
+            or any(part in {"", ".", ".."} for part in path.parts)
             or not _SHA256.fullmatch(self.sha256)
         ):
             raise ValueError("artifact reference identity or digest is invalid")
@@ -52,8 +82,10 @@ class ArtifactReference:
             raise ValueError("artifact row count must be nonnegative or absent")
         if not self.media_type:
             raise ValueError("artifact media type is required")
+        if not isinstance(self.artifact_type, ArtifactType):
+            raise TypeError("artifact type must use ArtifactType")
 
-    def as_dict(self) -> dict[str, object]:
+    def as_dict(self, *, include_type: bool = True) -> dict[str, object]:
         payload: dict[str, object] = {
             "media_type": self.media_type,
             "name": self.name,
@@ -61,6 +93,8 @@ class ArtifactReference:
             "schema_version": self.schema_version,
             "sha256": self.sha256,
         }
+        if include_type:
+            payload["artifact_type"] = self.artifact_type.value
         if self.row_count is not None:
             payload["row_count"] = self.row_count
         return payload
@@ -75,6 +109,9 @@ class ArtifactReference:
             schema_version=int(payload["schema_version"]),
             row_count=None if row_count is None else int(row_count),
             media_type=str(payload["media_type"]),
+            artifact_type=ArtifactType(
+                str(payload.get("artifact_type", ArtifactType.GENERIC.value))
+            ),
         )
 
 
@@ -136,8 +173,12 @@ class RunManifest:
             datetime.fromisoformat(self.creation_timestamp_utc.replace("Z", "+00:00"))
         except ValueError as error:
             raise ValueError("manifest creation timestamp must be ISO-8601") from error
-        if self.schema_version != RUN_MANIFEST_SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS:
             raise ValueError("unsupported run manifest schema version")
+        if self.schema_version == 1 and any(
+            item.artifact_type is not ArtifactType.GENERIC for item in self.artifacts
+        ):
+            raise ValueError("schema-v1 manifests cannot carry typed artifacts")
         if not self.schema_versions or any(
             not key or type(value) is not int or value <= 0
             for key, value in self.schema_versions.items()
@@ -253,7 +294,10 @@ class RunManifest:
 
     def _base_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
-            "artifacts": [item.as_dict() for item in self.artifacts],
+            "artifacts": [
+                item.as_dict(include_type=self.schema_version >= 2)
+                for item in self.artifacts
+            ],
             "configuration_digest": self.configuration_digest,
             "creation_timestamp_utc": self.creation_timestamp_utc,
             "evidence_digest": self.evidence_digest,

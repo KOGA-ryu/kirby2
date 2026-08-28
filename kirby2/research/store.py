@@ -33,7 +33,9 @@ from .runtime import (
     strategy_id,
 )
 from .tables import (
+    RUN_ARTIFACT_REGISTRY_COLUMNS,
     TABLE_SPECS,
+    artifact_registry_rows,
     attach_run_id,
     evidence_digest,
     read_parquet_table,
@@ -323,6 +325,25 @@ class RunStore:
                 run_identity_match,
                 tuple(failures),
             )
+        if manifest.run_type is RunType.FULL_DAY:
+            from kirby2.full_day.store import FullDayStore
+
+            report = FullDayStore(self.root.resolve()).verify_day(run_id)
+            return VerificationReport(
+                run_id=run_id,
+                manifest_loaded=report.manifest_valid,
+                references_exist=report.artifact_inventory_valid,
+                artifact_digests_match=report.artifact_digests_valid,
+                artifact_row_counts_match=report.canonical_payloads_valid,
+                event_sequence_complete=report.replay_valid,
+                replay_configuration_available=report.checkpoints_valid,
+                replay_passed=report.replay_valid,
+                result_digest_match=report.replay_valid,
+                evidence_digest_match=report.summary_valid,
+                schema_versions_supported=report.canonical_payloads_valid,
+                run_identity_match=manifest.run_id == run_id,
+                failures=report.failures,
+            )
         directory = self.run_directory(run_id)
         expected_artifact_schemas = {
             "configuration": RUN_CONFIGURATION_SCHEMA_VERSION,
@@ -331,8 +352,12 @@ class RunStore:
         actual_artifact_schemas = {
             item.name: item.schema_version for item in manifest.artifacts
         }
+        expected_schema_versions = {
+            **SUPPORTED_SCHEMA_VERSIONS,
+            "run_manifest": manifest.schema_version,
+        }
         schema_versions_supported = (
-            manifest.schema_versions == SUPPORTED_SCHEMA_VERSIONS
+            manifest.schema_versions == expected_schema_versions
             and actual_artifact_schemas == expected_artifact_schemas
         )
         if not schema_versions_supported:
@@ -514,6 +539,25 @@ class RunStore:
                             for item, manifest_sha256 in manifests
                         ],
                     )
+                connection.execute("DROP TABLE IF EXISTS run_artifact_registry")
+                artifact_columns_sql = ", ".join(
+                    f'"{name}" {sql_type}'
+                    for name, sql_type in RUN_ARTIFACT_REGISTRY_COLUMNS
+                )
+                connection.execute(
+                    f"CREATE TABLE run_artifact_registry ({artifact_columns_sql})"
+                )
+                artifact_rows = artifact_registry_rows(
+                    [item for item, _manifest_sha256 in manifests]
+                )
+                if artifact_rows:
+                    placeholders = ", ".join(
+                        "?" for _ in RUN_ARTIFACT_REGISTRY_COLUMNS
+                    )
+                    connection.executemany(
+                        f"INSERT INTO run_artifact_registry VALUES ({placeholders})",
+                        artifact_rows,
+                    )
                 connection.execute("DROP TABLE IF EXISTS dataset_registry")
                 connection.execute(
                     """
@@ -569,7 +613,7 @@ class RunStore:
                             for item, manifest_sha256 in dataset_manifests
                         ],
                     )
-                _create_fact_views(connection, self.runs_directory, bool(manifests))
+                _create_fact_views(connection, self.runs_directory)
                 _create_summary_views(connection)
             finally:
                 connection.close()
@@ -595,6 +639,16 @@ class RunStore:
                 "dataset-*/dataset_manifest.toml"
             )
         }
+        expected_artifacts = tuple(
+            artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -611,11 +665,23 @@ class RunStore:
                         "SELECT dataset_id, manifest_sha256 FROM dataset_registry"
                     ).fetchall()
                 }
+                actual_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM run_artifact_registry "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
             return False
-        return actual == expected and actual_datasets == expected_datasets
+        return (
+            actual == expected
+            and actual_datasets == expected_datasets
+            and actual_artifacts == expected_artifacts
+        )
 
     @contextmanager
     def _catalog_lock(self):
@@ -717,16 +783,20 @@ def _drop_catalog_views(connection) -> None:
         connection.execute(f'DROP VIEW IF EXISTS "{name}"')
 
 
-def _create_fact_views(connection, runs_directory: Path, has_runs: bool) -> None:
+def _create_fact_views(connection, runs_directory: Path) -> None:
     for spec in TABLE_SPECS:
         view_name = f"all_{spec.name}"
-        if has_runs:
-            pattern = str(
-                (runs_directory / "*" / "tables" / f"{spec.name}.parquet").resolve()
-            ).replace("'", "''")
+        paths = tuple(
+            sorted(runs_directory.glob(f"run-*/tables/{spec.name}.parquet"))
+        )
+        if paths:
+            path_rows = ",".join(
+                "'" + str(path.resolve()).replace("'", "''") + "'"
+                for path in paths
+            )
             connection.execute(
                 f'CREATE VIEW "{view_name}" AS '
-                f"SELECT * FROM read_parquet('{pattern}', union_by_name = true)"
+                f"SELECT * FROM read_parquet([{path_rows}], union_by_name = true)"
             )
         else:
             expressions = ", ".join(

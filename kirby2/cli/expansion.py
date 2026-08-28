@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 
+from kirby2.full_day.commands import FULL_DAY_COMMAND_MODULE
+
 from .registry import (
     CommandModule,
     CommandRegistry,
@@ -40,6 +42,7 @@ EXPANSION_COMMAND_MODULES = (
             ),
         ),
     ),
+    FULL_DAY_COMMAND_MODULE,
 )
 
 
