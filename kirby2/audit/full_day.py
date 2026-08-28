@@ -696,6 +696,1603 @@ def audit_dev0002_anchor_transition_ordering() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def audit_wo31b_transitions() -> tuple[FullDayAuditCase, ...]:
+    """Exercise duration-aware state runtime truth without composing Hawkes."""
+
+    return (
+        _wo31b_frozen_state_contract_case(),
+        _wo31b_partition_wire_seed_case(),
+        _wo31b_trigger_causality_stage_age_case(),
+        _wo31b_macro_anchor_authority_case(),
+        _wo31b_runtime_limits_restore_and_allocator_case(),
+        _wo31b_modifier_and_price_boundary_case(),
+        _wo31b_hawkes_regression_case(),
+        FullDayAuditCase(
+            "hawkes_flow_composition_capability",
+            "Hawkes remains outside the initial composition until WO31-E2",
+            (),
+            status_override="NOT_EXERCISED",
+            reason_code="HAWKES_COMPOSITION_DEFERRED_TO_WO31_E2",
+            required=False,
+        ),
+    )
+
+
+def _wo31b_frozen_state_contract_case() -> FullDayAuditCase:
+    """Prove the runtime's immutable duration/graph/effect inputs fail closed."""
+
+    from kirby2.full_day.states import (
+        DayStateV1,
+        DurationExhaustionBehaviorV1,
+        DurationLawV1,
+        DurationMassV1,
+        ParameterEffectV1,
+        ParameterTargetV1,
+    )
+
+    failures: list[str] = []
+    law = DurationLawV1(
+        3,
+        11,
+        (
+            DurationMassV1(3, 1),
+            DurationMassV1(7, 2),
+            DurationMassV1(11, 3),
+        ),
+    )
+    restored_law = DurationLawV1.from_dict(law.as_dict())
+    if restored_law != law:
+        failures.append("finite duration-law strict wire round trip changed values")
+    if (
+        law.expected_duration_numerator,
+        law.expected_duration_denominator,
+    ) != (25, 3):
+        failures.append("finite integer-weight duration expectation is not reduced")
+    if tuple(item.duration_us for item in law.masses) != (3, 7, 11):
+        failures.append("finite duration support changed declared integer bounds")
+    if any(
+        type(item.duration_us) is not int
+        or type(item.weight) is not int
+        or item.weight <= 0
+        for item in law.masses
+    ):
+        failures.append("duration law contains a noninteger or nonpositive mass")
+
+    model = _sample_state_model()
+    zero_law = DurationLawV1(0, 0, (DurationMassV1(0, 1),))
+    first = model.day_definitions[0]
+    try:
+        replace(
+            model,
+            day_definitions=(
+                replace(
+                    first,
+                    duration_law=zero_law,
+                    transitions=(
+                        replace(
+                            first.transitions[0],
+                            minimum_age_us=0,
+                            duration_exhaustion_behavior=(
+                                DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+                            ),
+                        ),
+                    ),
+                ),
+                *model.day_definitions[1:],
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        failures.append(f"acyclic zero-duration state path was refused: {error}")
+
+    forced_cycle = tuple(
+        replace(
+            definition,
+            duration_law=zero_law,
+            transitions=tuple(
+                replace(
+                    transition,
+                    minimum_age_us=0,
+                    duration_exhaustion_behavior=(
+                        DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+                    ),
+                )
+                for transition in definition.transitions
+            ),
+        )
+        for definition in model.day_definitions
+    )
+    graph_breaker = replace(
+        model.day_definitions[-1],
+        transitions=(
+            replace(
+                model.day_definitions[-1].transitions[0],
+                successor_state=DayStateV1.NORMAL.value,
+            ),
+        ),
+    )
+    probes: tuple[tuple[str, Callable[[], object]], ...] = (
+        (
+            "duration mass with floating microseconds",
+            lambda: DurationMassV1(3.0, 1),  # type: ignore[arg-type]
+        ),
+        ("duration mass with zero weight", lambda: DurationMassV1(3, 0)),
+        (
+            "duration law whose maximum differs from its support",
+            lambda: DurationLawV1(3, 12, law.masses),
+        ),
+        (
+            "state graph with no predecessor for its initial state",
+            lambda: replace(
+                model,
+                day_definitions=(*model.day_definitions[:-1], graph_breaker),
+            ),
+        ),
+        (
+            "forced zero-time state cycle",
+            lambda: replace(model, day_definitions=forced_cycle),
+        ),
+        (
+            "parameter modifier above its declared maximum",
+            lambda: ParameterEffectV1(
+                ParameterTargetV1.ORDER_SIZE_SCALE,
+                3,
+                1,
+                1,
+                1,
+                2,
+                1,
+            ),
+        ),
+    )
+    for label, operation in probes:
+        failure = _expect_refusal(operation, label)
+        if failure:
+            failures.append(failure)
+    return FullDayAuditCase(
+        "duration_graph_and_modifier_contracts",
+        (
+            "finite_support=(3,7,11) integer_weights=(1,2,3) "
+            "expected_duration=25/3; zero_time_acyclic=accepted; "
+            f"hostile_refusals={len(probes)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_hawkes_regression_case() -> FullDayAuditCase:
+    """Keep Hawkes scientifically green without claiming it in composition."""
+
+    from kirby2.audit.hawkes import audit_hawkes_stability
+    from kirby2.full_day.composition import initial_composition_matrix
+
+    cases = audit_hawkes_stability()
+    profile = initial_composition_matrix().profiles[0]
+    failures = [
+        f"Hawkes regression failed: {case.name}"
+        for case in cases
+        if not case.passed
+    ]
+    if "FLOW_HAWKES" not in profile.refused_component_ids:
+        failures.append("initial composition no longer refuses FLOW_HAWKES")
+    if any(component.component_id == "FLOW_HAWKES" for component in profile.components):
+        failures.append("FLOW_HAWKES appeared in the executable component set")
+    status, reason = profile.component_status_and_reason("FLOW_HAWKES")
+    if (status, reason) != (
+        "REFUSED",
+        "COMPOSITION_PROFILE_REFUSES_COMPONENT",
+    ):
+        failures.append("Hawkes composition refusal lost its stable capability reason")
+    classifications = tuple(
+        sorted({case.certification.classification for case in cases})
+    )
+    return FullDayAuditCase(
+        "hawkes_stability_regression_boundary",
+        (
+            f"regression_cases={len(cases)} classifications={classifications}; "
+            "composition=NOT_EXERCISED"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_runtime_plan(
+    *,
+    root_seed: int = 42,
+    transition_on_exhaustion: bool = True,
+    parallel_edges: bool = True,
+    ground_truth_triggers: bool = False,
+    include_effects: bool = True,
+):
+    """Return a compact authoritative plan that exercises the WO31-B runtime."""
+
+    from kirby2.full_day.models import (
+        FULL_DAY_SUBSTREAM_POLICY_VERSION,
+        SeedPolicyV1,
+        SubstreamDeclarationV1,
+        derive_substream_seed,
+    )
+    from kirby2.full_day.states import (
+        DurationExhaustionBehaviorV1,
+        DurationLawV1,
+        DurationMassV1,
+        ParameterEffectV1,
+        ParameterTargetV1,
+        TriggerInformationClassV1,
+    )
+
+    plan = _sample_plan()
+    law = DurationLawV1(
+        5,
+        11,
+        (
+            DurationMassV1(5, 1),
+            DurationMassV1(7, 2),
+            DurationMassV1(11, 3),
+        ),
+    )
+    state_effects = (
+        ParameterEffectV1(
+            ParameterTargetV1.ORDER_SIZE_SCALE,
+            3,
+            2,
+            1,
+            1,
+            2,
+            1,
+        ),
+        ParameterEffectV1(
+            ParameterTargetV1.PARTICIPANT_ACTIVITY_SCALE,
+            3,
+            4,
+            1,
+            2,
+            3,
+            2,
+        ),
+    ) if include_effects else ()
+    transition_effects = (
+        ParameterEffectV1(
+            ParameterTargetV1.MARKET_BUY_INTENSITY,
+            2,
+            1,
+            1,
+            2,
+            3,
+            1,
+        ),
+    ) if include_effects else ()
+    information_class = (
+        TriggerInformationClassV1.SYNTHETIC_GROUND_TRUTH
+        if ground_truth_triggers
+        else TriggerInformationClassV1.OBSERVABLE_AT_TIME
+    )
+    trigger_id = (
+        "AUDIT_GROUND_TRUTH_TRIGGER_V1"
+        if ground_truth_triggers
+        else "AGE_ELIGIBLE_V1"
+    )
+    exhaustion_behavior = (
+        DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+        if transition_on_exhaustion
+        else DurationExhaustionBehaviorV1.WAIT_FOR_TRIGGER
+    )
+
+    def definitions(rows):
+        states = tuple(item.state for item in rows)
+        result = []
+        for index, definition in enumerate(rows):
+            primary = replace(
+                definition.transitions[0],
+                minimum_age_us=5,
+                duration_exhaustion_behavior=exhaustion_behavior,
+                weight=1,
+                trigger_id=trigger_id,
+                trigger_information_class=information_class,
+                parameter_effects=transition_effects,
+            )
+            transitions = [primary]
+            if parallel_edges:
+                transitions.append(
+                    replace(
+                        primary,
+                        transition_id=f"{primary.transition_id}_ALT",
+                        successor_state=states[(index + 2) % len(states)].value,
+                        weight=3,
+                    )
+                )
+            result.append(
+                replace(
+                    definition,
+                    duration_law=law,
+                    parameter_effects=state_effects,
+                    transitions=tuple(
+                        sorted(transitions, key=lambda item: item.transition_id)
+                    ),
+                )
+            )
+        return tuple(result)
+
+    state_model = replace(
+        plan.state_model,
+        day_definitions=definitions(plan.state_model.day_definitions),
+        local_definitions=definitions(plan.state_model.local_definitions),
+    )
+    substreams = tuple(
+        SubstreamDeclarationV1(
+            declaration.semantic_path,
+            derive_substream_seed(
+                root_seed,
+                FULL_DAY_SUBSTREAM_POLICY_VERSION,
+                declaration.semantic_path,
+            ),
+        )
+        for declaration in plan.seed_policy.substreams
+    )
+    seed_policy = SeedPolicyV1(
+        1,
+        FULL_DAY_SUBSTREAM_POLICY_VERSION,
+        root_seed,
+        substreams,
+    )
+    return replace(plan, state_model=state_model, seed_policy=seed_policy)
+
+
+def _wo31b_check_runtime_wire(
+    runtime,
+    plan,
+    label: str,
+    failures: list[str],
+) -> None:
+    from kirby2.full_day.transitions import (
+        HierarchicalStateRuntimeStateV1,
+        HierarchicalStateRuntimeV1,
+    )
+
+    state = runtime.state()
+    wire = state.canonical_bytes()
+    try:
+        restored_state = HierarchicalStateRuntimeStateV1.from_json_bytes(wire)
+        restored_runtime = HierarchicalStateRuntimeV1.from_state(
+            plan,
+            restored_state,
+            verified_component_local_sequence_floor=(
+                state.component_local_sequence
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        failures.append(f"{label} runtime wire was refused: {error}")
+        return
+    if restored_state.canonical_bytes() != wire:
+        failures.append(f"{label} runtime state changed canonical bytes")
+    if restored_runtime.state().canonical_bytes() != wire:
+        failures.append(f"{label} restored runtime changed canonical state")
+
+
+def _wo31b_trigger_observation(
+    plan,
+    runtime,
+    level,
+    *,
+    observation_id: str,
+    observation_time_us: int,
+    available_time_us: int | None = None,
+    information_cutoff_us: int | None = None,
+    phase=None,
+    triggered: bool = True,
+    information_class=None,
+):
+    from kirby2.full_day.models import canonical_sha256
+    from kirby2.full_day.transitions import (
+        StateLevelV1,
+        TriggerObservationPhaseV1,
+        TriggerObservationV1,
+        trigger_parameter_set_sha256_v1,
+    )
+
+    snapshot = runtime.state()
+    if level is StateLevelV1.DAY:
+        selected_id = snapshot.day.next_eligible_transition_id
+        definitions = plan.state_model.day_definitions
+    elif level is StateLevelV1.LOCAL:
+        selected_id = snapshot.local.next_eligible_transition_id
+        definitions = plan.state_model.local_definitions
+    else:
+        raise TypeError("audit trigger observation requires StateLevelV1")
+    transition = next(
+        item
+        for definition in definitions
+        for item in definition.transitions
+        if item.transition_id == selected_id
+    )
+    return TriggerObservationV1(
+        1,
+        observation_id,
+        transition.transition_id,
+        transition.trigger_id,
+        transition.trigger_version,
+        trigger_parameter_set_sha256_v1(transition),
+        transition.trigger_information_class
+        if information_class is None
+        else information_class,
+        observation_time_us,
+        observation_time_us
+        if information_cutoff_us is None
+        else information_cutoff_us,
+        observation_time_us if available_time_us is None else available_time_us,
+        TriggerObservationPhaseV1.PRE_TRANSITION if phase is None else phase,
+        triggered,
+        canonical_sha256(
+            {
+                "audit_observation_id": observation_id,
+                "selected_transition_id": transition.transition_id,
+            }
+        ),
+    )
+
+
+def _wo31b_partition_wire_seed_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes
+    from kirby2.full_day.transitions import (
+        HierarchicalStateRuntimeStateV1,
+        HierarchicalStateRuntimeV1,
+        StateLevelV1,
+        StateTransitionEmissionV1,
+    )
+
+    failures: list[str] = []
+    plan = _wo31b_runtime_plan()
+    large = HierarchicalStateRuntimeV1.create(plan)
+    large_emissions = large.advance_to(40)
+    runtime_state = large.state()
+    expected_top_level_keys = {
+        "component_local_sequence",
+        "component_sequence_offset",
+        "current_time_us",
+        "day",
+        "day_rng",
+        "day_transition_count",
+        "day_transitions_since_macro_anchor",
+        "input_closed_through_time_us",
+        "local",
+        "local_rng",
+        "local_transition_count",
+        "next_macro_segment_index",
+        "observation_ids_seen",
+        "plan_sha256",
+        "runtime_emission_count",
+        "schema_version",
+        "state_model_sha256",
+    }
+    expected_level_keys = {
+        "as_of_time_us",
+        "current_state",
+        "deadline_time_us",
+        "elapsed_age_us",
+        "entered_time_us",
+        "level",
+        "next_eligible_transition_id",
+        "next_eligible_transition_time_us",
+        "sampled_duration_us",
+        "trigger_memory",
+    }
+    runtime_payload = runtime_state.as_dict()
+    if set(runtime_payload) != expected_top_level_keys:
+        failures.append("runtime state top-level authority/delegation shape changed")
+    for level_name in ("day", "local"):
+        level_payload = runtime_payload[level_name]
+        if type(level_payload) is not dict or set(level_payload) != expected_level_keys:
+            failures.append(f"runtime {level_name} state wire shape changed")
+    checkpoint_semantic_state = {
+        "state.component_local_sequence": runtime_state.component_local_sequence,
+        "state.component_sequence_offset": runtime_state.component_sequence_offset,
+        "state.current_day": runtime_state.day.current_state,
+        "state.current_local": runtime_state.local.current_state,
+        "state.day_elapsed_age_us": runtime_state.day.elapsed_age_us,
+        "state.day_entered_time_us": runtime_state.day.entered_time_us,
+        "state.day_next_eligible_transition_id": (
+            runtime_state.day.next_eligible_transition_id
+        ),
+        "state.day_next_eligible_transition_time_us": (
+            runtime_state.day.next_eligible_transition_time_us
+        ),
+        "state.day_sampled_deadline_us": runtime_state.day.deadline_time_us,
+        "state.day_sampled_duration_us": runtime_state.day.sampled_duration_us,
+        "state.day_transition_count": runtime_state.day_transition_count,
+        "state.day_transitions_since_macro_anchor": (
+            runtime_state.day_transitions_since_macro_anchor
+        ),
+        "state.day_trigger_memory": runtime_state.day.trigger_memory,
+        "state.input_closed_through_time_us": (
+            runtime_state.input_closed_through_time_us
+        ),
+        "state.local_elapsed_age_us": runtime_state.local.elapsed_age_us,
+        "state.local_entered_time_us": runtime_state.local.entered_time_us,
+        "state.local_next_eligible_transition_id": (
+            runtime_state.local.next_eligible_transition_id
+        ),
+        "state.local_next_eligible_transition_time_us": (
+            runtime_state.local.next_eligible_transition_time_us
+        ),
+        "state.local_sampled_deadline_us": runtime_state.local.deadline_time_us,
+        "state.local_sampled_duration_us": runtime_state.local.sampled_duration_us,
+        "state.local_transition_count": runtime_state.local_transition_count,
+        "state.local_trigger_memory": runtime_state.local.trigger_memory,
+        "state.next_macro_segment_index": runtime_state.next_macro_segment_index,
+        "state.observation_ids_seen": runtime_state.observation_ids_seen,
+        "state.plan_sha256": runtime_state.plan_sha256,
+        "state.runtime_emission_count": runtime_state.runtime_emission_count,
+        "state.state_model_sha256": runtime_state.state_model_sha256,
+    }
+    if set(checkpoint_semantic_state) != _dev0003_state_checkpoint_fields():
+        failures.append("runtime state does not project the amended checkpoint inventory")
+    boundary_times = tuple(
+        sorted({item.simulation_time_us for item in large_emissions} | {40})
+    )
+    subdivided = HierarchicalStateRuntimeV1.create(plan)
+    subdivided_emissions = tuple(
+        emission
+        for boundary_time in boundary_times
+        for emission in subdivided.advance_to(boundary_time)
+    )
+    large_bytes = tuple(
+        canonical_json_bytes(item.as_dict()) for item in large_emissions
+    )
+    subdivided_bytes = tuple(
+        canonical_json_bytes(item.as_dict()) for item in subdivided_emissions
+    )
+    if large_bytes != subdivided_bytes:
+        failures.append("large and exact-boundary subdivided advances changed emissions")
+    if tuple(item.event_key for item in large_emissions) != tuple(
+        item.event_key for item in subdivided_emissions
+    ):
+        failures.append("large and subdivided advances changed event keys")
+    if large.state().canonical_bytes() != subdivided.state().canonical_bytes():
+        failures.append("large and subdivided advances changed terminal runtime state")
+    support = {5, 7, 11}
+    sampled = {
+        large.state().day.sampled_duration_us,
+        large.state().local.sampled_duration_us,
+        *(item.sampled_duration_us for item in large_emissions),
+    }
+    if not sampled.issubset(support):
+        failures.append("runtime duration sampling escaped finite integer support")
+
+    same_seed = HierarchicalStateRuntimeV1.create(plan)
+    same_seed_emissions = same_seed.advance_to(40)
+    if tuple(canonical_json_bytes(item.as_dict()) for item in same_seed_emissions) != large_bytes:
+        failures.append("same seed did not reproduce transition event identity")
+    if same_seed.state().canonical_bytes() != large.state().canonical_bytes():
+        failures.append("same seed did not reproduce terminal state identity")
+    different_plan = _wo31b_runtime_plan(root_seed=43)
+    different_seed = HierarchicalStateRuntimeV1.create(different_plan)
+    same_start = (
+        different_seed.state().day.current_state,
+        different_seed.state().local.current_state,
+    ) == (
+        HierarchicalStateRuntimeV1.create(plan).state().day.current_state,
+        HierarchicalStateRuntimeV1.create(plan).state().local.current_state,
+    )
+    different_emissions = different_seed.advance_to(40)
+    if not same_start:
+        failures.append("different-seed comparison did not begin from the same states")
+    different_transitions = tuple(
+        item
+        for item in different_emissions
+        if type(item) is StateTransitionEmissionV1
+    )
+    large_transitions = tuple(
+        item for item in large_emissions if type(item) is StateTransitionEmissionV1
+    )
+    if tuple(
+        (
+            item.level.value,
+            item.simulation_time_us,
+            item.transition_id,
+            item.new_state,
+            item.sampled_duration_us,
+        )
+        for item in different_transitions
+    ) == tuple(
+        (
+            item.level.value,
+            item.simulation_time_us,
+            item.transition_id,
+            item.new_state,
+            item.sampled_duration_us,
+        )
+        for item in large_transitions
+    ):
+        failures.append("different seeds did not produce a divergent state path")
+
+    trigger_plan = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=False,
+        include_effects=False,
+    )
+    pre_eligibility = HierarchicalStateRuntimeV1.create(trigger_plan)
+    if any(
+        type(item) is StateTransitionEmissionV1
+        for item in pre_eligibility.advance_to(4)
+    ):
+        failures.append("state transitioned before minimum-age eligibility")
+    _wo31b_check_runtime_wire(
+        pre_eligibility, trigger_plan, "pre-eligibility", failures
+    )
+    trigger_runtime = HierarchicalStateRuntimeV1.create(trigger_plan)
+    trigger_observations = tuple(
+        _wo31b_trigger_observation(
+            trigger_plan,
+            trigger_runtime,
+            level,
+            observation_id=f"AUDIT_EXACT_TRIGGER_{level.value}",
+            observation_time_us=5,
+        )
+        for level in (StateLevelV1.DAY, StateLevelV1.LOCAL)
+    )
+    exact_trigger_emissions = trigger_runtime.advance_to(5, trigger_observations)
+    if sum(
+        type(item) is StateTransitionEmissionV1
+        for item in exact_trigger_emissions
+    ) != 2:
+        failures.append("exact trigger boundary did not transition both state levels")
+    _wo31b_check_runtime_wire(trigger_runtime, trigger_plan, "exact-trigger", failures)
+    deadline_runtime = HierarchicalStateRuntimeV1.create(plan)
+    exact_deadline = min(
+        deadline_runtime.state().day.deadline_time_us,
+        deadline_runtime.state().local.deadline_time_us,
+    )
+    if not any(
+        type(item) is StateTransitionEmissionV1
+        for item in deadline_runtime.advance_to(exact_deadline)
+    ):
+        failures.append("exact sampled deadline did not emit a transition")
+    _wo31b_check_runtime_wire(deadline_runtime, plan, "exact-deadline", failures)
+
+    hostile_state = copy.deepcopy(pre_eligibility.state().as_dict())
+    extra = copy.deepcopy(hostile_state)
+    extra["ambient_runtime_default"] = 1
+    missing = copy.deepcopy(hostile_state)
+    del missing["day_rng"]
+    wrong_scalar = copy.deepcopy(hostile_state)
+    wrong_scalar["day"]["elapsed_age_us"] = True  # type: ignore[index]
+    inconsistent_age = copy.deepcopy(hostile_state)
+    inconsistent_age["local"]["elapsed_age_us"] = 3  # type: ignore[index]
+    for label, payload in (
+        ("runtime state with an extra field", extra),
+        ("runtime state missing day RNG", missing),
+        ("runtime state with Boolean elapsed age", wrong_scalar),
+        ("runtime state with unreconciled elapsed age", inconsistent_age),
+    ):
+        failure = _expect_refusal(
+            lambda payload=payload: HierarchicalStateRuntimeStateV1.from_dict(payload),
+            label,
+        )
+        if failure:
+            failures.append(failure)
+    return FullDayAuditCase(
+        "state_partition_seed_duration_and_wire",
+        (
+            f"emissions={len(large_emissions)} exact_boundaries={boundary_times}; "
+            f"event_keys={tuple(item.event_key for item in large_emissions)}; "
+            f"sampled_support={tuple(sorted(sampled))}; strict_wire_boundaries=3; "
+            "checkpoint_owned_fields=27; different_seed=43"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_trigger_causality_stage_age_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import WorkStageV1
+    from kirby2.full_day.states import TriggerInformationClassV1
+    from kirby2.full_day.transitions import (
+        HierarchicalStateRuntimeV1,
+        StateLevelV1,
+        StateTransitionEmissionV1,
+        TriggerObservationPhaseV1,
+    )
+
+    failures: list[str] = []
+    plan = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=False,
+        include_effects=False,
+    )
+    runtime = HierarchicalStateRuntimeV1.create(plan)
+    initial_states = (
+        runtime.state().day.current_state,
+        runtime.state().local.current_state,
+    )
+    observation_count = 0
+    for simulation_time_us in range(1, 5):
+        observations = tuple(
+            _wo31b_trigger_observation(
+                plan,
+                runtime,
+                level,
+                observation_id=(
+                    f"AUDIT_AGE_{simulation_time_us}_{level.value}"
+                ),
+                observation_time_us=simulation_time_us,
+                triggered=False,
+            )
+            for level in (StateLevelV1.DAY, StateLevelV1.LOCAL)
+        )
+        observation_count += len(observations)
+        if any(
+            type(item) is StateTransitionEmissionV1
+            for item in runtime.advance_to(simulation_time_us, observations)
+        ):
+            failures.append("untriggered event changed hierarchical state")
+        state = runtime.state()
+        if (
+            state.day.elapsed_age_us,
+            state.local.elapsed_age_us,
+        ) != (simulation_time_us, simulation_time_us):
+            failures.append(
+                f"state age did not survive event time {simulation_time_us}"
+            )
+        if (state.day.current_state, state.local.current_state) != initial_states:
+            failures.append("untriggered observations changed current state")
+
+    triggered_observations = tuple(
+        _wo31b_trigger_observation(
+            plan,
+            runtime,
+            level,
+            observation_id=f"AUDIT_OBSERVABLE_TRIGGER_{level.value}",
+            observation_time_us=5,
+        )
+        for level in (StateLevelV1.DAY, StateLevelV1.LOCAL)
+    )
+    emissions = tuple(
+        item
+        for item in runtime.advance_to(5, triggered_observations)
+        if type(item) is StateTransitionEmissionV1
+    )
+    if tuple(item.level for item in emissions) != (
+        StateLevelV1.DAY,
+        StateLevelV1.LOCAL,
+    ):
+        failures.append("equal-time state emissions did not order day before local")
+    if tuple(item.stage for item in emissions) != (
+        WorkStageV1.DAY_STATE_TRANSITION,
+        WorkStageV1.LOCAL_STATE_TRANSITION,
+    ):
+        failures.append("equal-time state emissions used the wrong frozen stages")
+    if tuple(item.event_key for item in emissions) != tuple(
+        sorted(item.event_key for item in emissions)
+    ):
+        failures.append("equal-time state event keys are not chronologically ordered")
+    if emissions and not all(
+        int(item.stage)
+        < int(WorkStageV1.PARTICIPANT_ACTIVATION_DEACTIVATION_RETUNE)
+        for item in emissions
+    ):
+        failures.append("state emissions do not precede newly parameterized actions")
+    if (
+        runtime.state().day.elapsed_age_us,
+        runtime.state().local.elapsed_age_us,
+    ) != (0, 0):
+        failures.append("state age did not reset exactly on transition")
+    runtime.advance_to(7)
+    if (
+        runtime.state().day.elapsed_age_us,
+        runtime.state().local.elapsed_age_us,
+    ) != (2, 2):
+        failures.append("state age did not continue across a post-transition event")
+
+    ground_plan = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=False,
+        ground_truth_triggers=True,
+        include_effects=False,
+    )
+    ground_runtime = HierarchicalStateRuntimeV1.create(ground_plan)
+    ground_observations = tuple(
+        _wo31b_trigger_observation(
+            ground_plan,
+            ground_runtime,
+            level,
+            observation_id=f"AUDIT_GROUND_TRIGGER_{level.value}",
+            observation_time_us=5,
+        )
+        for level in (StateLevelV1.DAY, StateLevelV1.LOCAL)
+    )
+    if sum(
+        type(item) is StateTransitionEmissionV1
+        for item in ground_runtime.advance_to(5, ground_observations)
+    ) != 2:
+        failures.append("synthetic-ground-truth trigger boundary did not transition")
+
+    probes: list[tuple[str, Callable[[], object]]] = []
+    future_runtime = HierarchicalStateRuntimeV1.create(plan)
+    probes.append(
+        (
+            "future observation whose availability precedes its observation time",
+            lambda: _wo31b_trigger_observation(
+                plan,
+                future_runtime,
+                StateLevelV1.DAY,
+                observation_id="AUDIT_FUTURE_READ",
+                observation_time_us=6,
+                available_time_us=5,
+            ),
+        )
+    )
+
+    beyond_runtime = HierarchicalStateRuntimeV1.create(plan)
+    beyond_observation = _wo31b_trigger_observation(
+        plan,
+        beyond_runtime,
+        StateLevelV1.DAY,
+        observation_id="AUDIT_BEYOND_TARGET",
+        observation_time_us=5,
+        available_time_us=6,
+    )
+    probes.append(
+        (
+            "observation beyond the advance target",
+            lambda: beyond_runtime.advance_to(5, (beyond_observation,)),
+        )
+    )
+    for phase in (
+        TriggerObservationPhaseV1.REVEAL_ONLY,
+        TriggerObservationPhaseV1.POST_TRANSITION,
+    ):
+        phase_runtime = HierarchicalStateRuntimeV1.create(plan)
+        phase_observation = _wo31b_trigger_observation(
+            plan,
+            phase_runtime,
+            StateLevelV1.DAY,
+            observation_id=f"AUDIT_FORBIDDEN_{phase.value}",
+            observation_time_us=5,
+            phase=phase,
+        )
+        probes.append(
+            (
+                f"{phase.value} trigger observation",
+                lambda phase_runtime=phase_runtime,
+                phase_observation=phase_observation: phase_runtime.advance_to(
+                    5, (phase_observation,)
+                ),
+            )
+        )
+
+    unmatched_runtime = HierarchicalStateRuntimeV1.create(plan)
+    unmatched = replace(
+        _wo31b_trigger_observation(
+            plan,
+            unmatched_runtime,
+            StateLevelV1.DAY,
+            observation_id="AUDIT_UNMATCHED_TRANSITION",
+            observation_time_us=5,
+        ),
+        transition_id="INVENTED_TRANSITION_V1",
+    )
+    probes.append(
+        (
+            "observation for an unmatched transition",
+            lambda: unmatched_runtime.advance_to(5, (unmatched,)),
+        )
+    )
+    wrong_class_runtime = HierarchicalStateRuntimeV1.create(plan)
+    wrong_class = _wo31b_trigger_observation(
+        plan,
+        wrong_class_runtime,
+        StateLevelV1.DAY,
+        observation_id="AUDIT_WRONG_INFORMATION_CLASS",
+        observation_time_us=5,
+        information_class=TriggerInformationClassV1.SYNTHETIC_GROUND_TRUTH,
+    )
+    probes.append(
+        (
+            "observable transition evaluated with ground-truth information",
+            lambda: wrong_class_runtime.advance_to(5, (wrong_class,)),
+        )
+    )
+    wrong_digest_runtime = HierarchicalStateRuntimeV1.create(plan)
+    wrong_digest = replace(
+        _wo31b_trigger_observation(
+            plan,
+            wrong_digest_runtime,
+            StateLevelV1.DAY,
+            observation_id="AUDIT_WRONG_TRIGGER_PARAMETERS",
+            observation_time_us=5,
+        ),
+        trigger_parameter_set_sha256="f" * 64,
+    )
+    probes.append(
+        (
+            "observation with a forged trigger-parameter digest",
+            lambda: wrong_digest_runtime.advance_to(5, (wrong_digest,)),
+        )
+    )
+    for label, operation in probes:
+        failure = _expect_refusal(operation, label)
+        if failure:
+            failures.append(failure)
+    return FullDayAuditCase(
+        "trigger_causality_stage_order_and_age",
+        (
+            f"age_event_observations={observation_count}; equal_time_keys="
+            f"{tuple(item.event_key for item in emissions)}; "
+            "observable=accepted ground_truth=accepted; "
+            f"causal_refusals={len(probes)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_macro_anchor_authority_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import WorkStageV1
+    from kirby2.full_day.models import MacroRegimeSegmentV1, canonical_sha256
+    from kirby2.full_day.states import DayStateV1
+    from kirby2.full_day.transitions import (
+        DayStateAnchorEmissionV1,
+        HierarchicalStateRuntimeStateV1,
+        HierarchicalStateRuntimeV1,
+        StateLevelV1,
+        project_anchor_payload_v1,
+    )
+
+    failures: list[str] = []
+    base = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=True,
+        include_effects=True,
+    )
+    plan = replace(
+        base,
+        macro_regime_schedule=(
+            MacroRegimeSegmentV1(0, 15, DayStateV1.QUIET),
+            MacroRegimeSegmentV1(
+                15,
+                base.calendar.end_time_us,
+                DayStateV1.RISK_OFF,
+            ),
+        ),
+    )
+    runtime = HierarchicalStateRuntimeV1.create(plan)
+    prepared = runtime.state()
+    first_rows = runtime.advance_to(0)
+    first_anchors = tuple(
+        item for item in first_rows if type(item) is DayStateAnchorEmissionV1
+    )
+    if len(first_anchors) != 1 or first_anchors[0].macro_segment_index != 0:
+        failures.append("t=0 macro segment did not emit exactly one anchor")
+    after_first = runtime.state()
+    if after_first.next_macro_segment_index != 1:
+        failures.append("t=0 anchor did not advance the macro cursor exactly once")
+    if (
+        after_first.day_rng != prepared.day_rng
+        or after_first.local_rng != prepared.local_rng
+    ):
+        failures.append("prepared t=0 anchor consumed duplicate RNG draws")
+    if runtime.advance_to(0):
+        failures.append("repeated t=0 advance re-emitted the initial macro anchor")
+    runtime.advance_to(14)
+    before_later = runtime.state()
+    later_rows = runtime.advance_to(15)
+    later_anchors = tuple(
+        item for item in later_rows if type(item) is DayStateAnchorEmissionV1
+    )
+    if len(later_anchors) != 1 or later_anchors[0].macro_segment_index != 1:
+        failures.append("later plan macro segment did not emit exactly one anchor")
+    after_later = runtime.state()
+    if (
+        after_later.day.current_state != DayStateV1.RISK_OFF.value
+        or after_later.day.entered_time_us != 15
+        or after_later.day.elapsed_age_us != 0
+        or after_later.next_macro_segment_index != 2
+    ):
+        failures.append("later macro anchor did not hard-reset day state/cursor")
+    if after_later.day_rng.draw_count != before_later.day_rng.draw_count + 2:
+        failures.append("later macro anchor did not resample exactly duration and edge")
+    local_before_projection = (
+        before_later.local.current_state,
+        before_later.local.entered_time_us,
+        before_later.local.sampled_duration_us,
+        before_later.local.deadline_time_us,
+        before_later.local.next_eligible_transition_id,
+        before_later.local.trigger_memory,
+        before_later.local_rng,
+    )
+    local_after_projection = (
+        after_later.local.current_state,
+        after_later.local.entered_time_us,
+        after_later.local.sampled_duration_us,
+        after_later.local.deadline_time_us,
+        after_later.local.next_eligible_transition_id,
+        after_later.local.trigger_memory,
+        after_later.local_rng,
+    )
+    if local_before_projection != local_after_projection:
+        failures.append("day macro reset perturbed local-state identity or RNG")
+    if after_later.local.elapsed_age_us != before_later.local.elapsed_age_us + 1:
+        failures.append("local state age did not independently survive the day reset")
+
+    if later_anchors:
+        anchor = later_anchors[0]
+        payload = project_anchor_payload_v1(anchor, plan=plan)
+        segment = plan.macro_regime_schedule[1]
+        if (
+            anchor.stage is not WorkStageV1.DAY_STATE_TRANSITION
+            or anchor.plan_sha256 != canonical_sha256(plan.as_dict())
+            or anchor.macro_segment_sha256 != canonical_sha256(segment.as_dict())
+            or payload.data["macro_segment_index"] != 1
+            or payload.data["anchored_state"] != DayStateV1.RISK_OFF.value
+        ):
+            failures.append("later anchor lost plan/stage/payload authority")
+        anchor_hostile = (
+            (
+                "anchor with a forged state-model digest",
+                replace(anchor, state_model_sha256="f" * 64),
+            ),
+            (
+                "anchor with modifiers removed from its plan definition",
+                replace(anchor, state_modifiers=()),
+            ),
+        )
+        for label, forged_anchor in anchor_hostile:
+            refusal = _expect_refusal(
+                lambda forged_anchor=forged_anchor: project_anchor_payload_v1(
+                    forged_anchor, plan=plan
+                ),
+                label,
+            )
+            if refusal:
+                failures.append(refusal)
+    _wo31b_check_runtime_wire(runtime, plan, "post-macro-anchor", failures)
+
+    stale_runtime = HierarchicalStateRuntimeV1.create(plan)
+    stale_runtime.advance_to(14)
+    stale_observation = _wo31b_trigger_observation(
+        plan,
+        stale_runtime,
+        StateLevelV1.DAY,
+        observation_id="AUDIT_STALE_PRE_ANCHOR_DAY_EDGE",
+        observation_time_us=15,
+    )
+    stale_transition_id = stale_observation.transition_id
+    try:
+        stale_rows = stale_runtime.advance_to(15, (stale_observation,))
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"obsolete pre-anchor day observation aborted anchor: {error}")
+        stale_rows = ()
+    if not any(type(item) is DayStateAnchorEmissionV1 for item in stale_rows):
+        failures.append("obsolete pre-anchor input suppressed the authoritative anchor")
+    if any(
+        getattr(item, "transition_id", None) == stale_transition_id
+        for item in stale_rows
+    ):
+        failures.append("obsolete pre-anchor day transition was emitted")
+    if (
+        stale_observation.observation_id
+        not in stale_runtime.state().observation_ids_seen
+    ):
+        failures.append("suppressed obsolete observation was not consumed exactly once")
+
+    cursor_payload = copy.deepcopy(after_later.as_dict())
+    cursor_payload["next_macro_segment_index"] = 1
+    plan_payload = copy.deepcopy(after_later.as_dict())
+    plan_payload["plan_sha256"] = "f" * 64
+    for label, payload in (
+        ("restored runtime with a backstepped macro cursor", cursor_payload),
+        ("restored runtime bound to a forged plan digest", plan_payload),
+    ):
+        failure = _expect_refusal(
+            lambda payload=payload: HierarchicalStateRuntimeV1.from_state(
+                plan,
+                HierarchicalStateRuntimeStateV1.from_dict(payload),
+                verified_component_local_sequence_floor=(
+                    after_later.component_local_sequence
+                ),
+            ),
+            label,
+        )
+        if failure:
+            failures.append(failure)
+    return FullDayAuditCase(
+        "macro_anchor_cursor_and_day_only_reset",
+        (
+            "anchors=((0,QUIET),(15,RISK_OFF)); t0_duplicate_rng_draws=0; "
+            "later_day_rng_draws="
+            f"{after_later.day_rng.draw_count - before_later.day_rng.draw_count}; "
+            "local_identity_preserved=true; stale_pre_anchor=suppressed; cursor=2"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_runtime_limits_restore_and_allocator_case() -> FullDayAuditCase:
+    """Prove shared allocation, quiescent restore, and hard runtime bounds."""
+
+    from kirby2.full_day.models import MacroRegimeSegmentV1
+    from kirby2.full_day.states import (
+        DayStateV1,
+        DurationExhaustionBehaviorV1,
+        DurationLawV1,
+        DurationMassV1,
+    )
+    from kirby2.full_day.transitions import (
+        HierarchicalStateRuntimeStateV1,
+        HierarchicalStateRuntimeV1,
+        StateLevelV1,
+        StateTransitionEmissionV1,
+        StateTriggerMemoryV1,
+    )
+
+    failures: list[str] = []
+    refusal_count = 0
+    plan = _wo31b_runtime_plan(
+        transition_on_exhaustion=True,
+        parallel_edges=False,
+        include_effects=False,
+    )
+
+    shared = HierarchicalStateRuntimeV1.create(
+        plan, component_local_sequence=0
+    )
+    t0_rows = shared.advance_to(0)
+    t0_sequences = tuple(item.component_local_sequence for item in t0_rows)
+    scheduled_information_sequence = shared.reserve_component_local_sequence()
+    next_deadline = min(
+        shared.state().day.deadline_time_us,
+        shared.state().local.deadline_time_us,
+    )
+    later_rows = shared.advance_to(next_deadline)
+    later_sequences = tuple(item.component_local_sequence for item in later_rows)
+    shared_trace = (0, *t0_sequences, scheduled_information_sequence, *later_sequences)
+    if (
+        t0_sequences != (1,)
+        or scheduled_information_sequence != 2
+        or not later_sequences
+        or later_sequences[0] != 3
+        or shared_trace != tuple(sorted(set(shared_trace)))
+    ):
+        failures.append(
+            "shared FULL_DAY_RUNTIME component allocation produced a collision"
+        )
+    _wo31b_check_runtime_wire(shared, plan, "shared-allocator", failures)
+
+    high_water_runtime = HierarchicalStateRuntimeV1.create(
+        plan, component_local_sequence=5
+    )
+    high_water_anchor = high_water_runtime.advance_to(0)
+    reserved_first_runtime = HierarchicalStateRuntimeV1.create(plan)
+    reserved_first = reserved_first_runtime.reserve_component_local_sequence()
+    reserved_first_anchor = reserved_first_runtime.advance_to(0)
+    if (
+        tuple(item.component_local_sequence for item in high_water_anchor) != (6,)
+        or reserved_first != 1
+        or tuple(
+            item.component_local_sequence for item in reserved_first_anchor
+        )
+        != (2,)
+    ):
+        failures.append(
+            "t=0 cloning lost a legitimate shared-owner high-water reservation"
+        )
+
+    anchored = HierarchicalStateRuntimeV1.create(plan)
+    anchored.advance_to(0)
+    allocator_backstep = copy.deepcopy(anchored.state().as_dict())
+    allocator_backstep["component_local_sequence"] = 0
+    coordinated_allocator = HierarchicalStateRuntimeV1.create(plan)
+    coordinated_allocator.advance_to(0)
+    coordinated_floor = coordinated_allocator.reserve_component_local_sequence()
+    coordinated_backstep = copy.deepcopy(
+        coordinated_allocator.state().as_dict()
+    )
+    coordinated_backstep["component_local_sequence"] -= 1
+    coordinated_backstep["component_sequence_offset"] -= 1
+
+    trigger_plan = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=False,
+        include_effects=False,
+    )
+    unclosed = HierarchicalStateRuntimeV1.create(trigger_plan)
+    unclosed.advance_to(4)
+    unclosed_payload = copy.deepcopy(unclosed.state().as_dict())
+    unclosed_payload["input_closed_through_time_us"] = None
+    unclosed_payload["next_macro_segment_index"] = 0
+
+    due = HierarchicalStateRuntimeV1.create(plan)
+    due_time = min(
+        due.state().day.deadline_time_us,
+        due.state().local.deadline_time_us,
+    )
+    due.advance_to(due_time - 1)
+    due_payload = copy.deepcopy(due.state().as_dict())
+    due_payload["current_time_us"] = due_time
+    due_payload["input_closed_through_time_us"] = due_time
+    for level_name in ("day", "local"):
+        row = due_payload[level_name]
+        row["as_of_time_us"] = due_time
+        row["elapsed_age_us"] = due_time - row["entered_time_us"]
+
+    trigger_due = HierarchicalStateRuntimeV1.create(trigger_plan)
+    trigger_due.advance_to(4)
+    trigger_observation = _wo31b_trigger_observation(
+        trigger_plan,
+        trigger_due,
+        StateLevelV1.DAY,
+        observation_id="AUDIT_RESTORED_DUE_TRIGGER",
+        observation_time_us=5,
+    )
+    trigger_due_payload = copy.deepcopy(trigger_due.state().as_dict())
+    trigger_due_payload["current_time_us"] = 5
+    trigger_due_payload["input_closed_through_time_us"] = 5
+    for level_name in ("day", "local"):
+        row = trigger_due_payload[level_name]
+        row["as_of_time_us"] = 5
+        row["elapsed_age_us"] = 5 - row["entered_time_us"]
+    trigger_due_payload["observation_ids_seen"] = [
+        trigger_observation.observation_id
+    ]
+    trigger_due_payload["day"]["trigger_memory"] = [
+        StateTriggerMemoryV1(
+            trigger_due.state().day.current_state,
+            trigger_due.state().day.entered_time_us,
+            trigger_observation,
+        ).as_dict()
+    ]
+
+    horizon_payload = copy.deepcopy(unclosed.state().as_dict())
+    beyond_horizon = trigger_plan.calendar.end_time_us + 1
+    horizon_payload["current_time_us"] = beyond_horizon
+    horizon_payload["input_closed_through_time_us"] = beyond_horizon
+    for level_name in ("day", "local"):
+        row = horizon_payload[level_name]
+        row["as_of_time_us"] = beyond_horizon
+        row["elapsed_age_us"] = beyond_horizon - row["entered_time_us"]
+
+    macro_base = _wo31b_runtime_plan(
+        transition_on_exhaustion=False,
+        parallel_edges=False,
+        include_effects=False,
+    )
+    macro_plan = replace(
+        macro_base,
+        macro_regime_schedule=(
+            MacroRegimeSegmentV1(0, 15, DayStateV1.QUIET),
+            MacroRegimeSegmentV1(
+                15,
+                macro_base.calendar.end_time_us,
+                DayStateV1.RISK_OFF,
+            ),
+        ),
+    )
+    macro_runtime = HierarchicalStateRuntimeV1.create(macro_plan)
+    macro_runtime.advance_to(15)
+    forged_macro = copy.deepcopy(macro_runtime.state().as_dict())
+    quiet_definition = next(
+        item
+        for item in macro_plan.state_model.day_definitions
+        if item.state is DayStateV1.QUIET
+    )
+    quiet_duration = quiet_definition.duration_law.masses[0].duration_us
+    quiet_transition = quiet_definition.transitions[0]
+    forged_macro["day"].update(
+        {
+            "current_state": DayStateV1.QUIET.value,
+            "deadline_time_us": 15 + quiet_duration,
+            "elapsed_age_us": 0,
+            "entered_time_us": 15,
+            "next_eligible_transition_id": quiet_transition.transition_id,
+            "next_eligible_transition_time_us": (
+                15 + quiet_transition.minimum_age_us
+            ),
+            "sampled_duration_us": quiet_duration,
+            "trigger_memory": [],
+        }
+    )
+    forged_macro_counters = copy.deepcopy(forged_macro)
+    forged_macro_counters["day_transitions_since_macro_anchor"] = 1
+    forged_macro_counters["day_transition_count"] += 1
+    forged_macro_counters["runtime_emission_count"] += 1
+    forged_macro_counters["component_local_sequence"] += 1
+
+    restore_probes: tuple[
+        tuple[str, dict[str, object], object, int], ...
+    ] = (
+        (
+            "backstepped shared component allocator",
+            allocator_backstep,
+            plan,
+            anchored.state().component_local_sequence,
+        ),
+        (
+            "coordinated shared component allocator rollback",
+            coordinated_backstep,
+            plan,
+            coordinated_floor,
+        ),
+        (
+            "non-pristine unclosed lifecycle state",
+            unclosed_payload,
+            trigger_plan,
+            unclosed.state().component_local_sequence,
+        ),
+        (
+            "closed exhaustion transition left due",
+            due_payload,
+            plan,
+            due.state().component_local_sequence,
+        ),
+        (
+            "closed triggered transition left due",
+            trigger_due_payload,
+            trigger_plan,
+            trigger_due.state().component_local_sequence,
+        ),
+        (
+            "runtime state beyond the plan horizon",
+            horizon_payload,
+            trigger_plan,
+            unclosed.state().component_local_sequence,
+        ),
+        (
+            "day state inconsistent with latest macro authority",
+            forged_macro,
+            macro_plan,
+            macro_runtime.state().component_local_sequence,
+        ),
+        (
+            "invented macro transition with coordinated counters but no RNG samples",
+            forged_macro_counters,
+            macro_plan,
+            macro_runtime.state().component_local_sequence + 1,
+        ),
+    )
+    for label, payload, restore_plan, verified_floor in restore_probes:
+        refusal = _expect_refusal(
+            lambda payload=payload, restore_plan=restore_plan, verified_floor=verified_floor: (
+                HierarchicalStateRuntimeV1.from_state(
+                    restore_plan,
+                    HierarchicalStateRuntimeStateV1.from_dict(payload),
+                    verified_component_local_sequence_floor=verified_floor,
+                )
+            ),
+            label,
+        )
+        refusal_count += 1
+        if refusal:
+            failures.append(refusal)
+
+    horizon_runtime = HierarchicalStateRuntimeV1.create(trigger_plan)
+    horizon_before = horizon_runtime.state().canonical_bytes()
+    refusal = _expect_refusal(
+        lambda: horizon_runtime.advance_to(beyond_horizon),
+        "advance beyond the plan horizon",
+    )
+    refusal_count += 1
+    if refusal:
+        failures.append(refusal)
+    if horizon_runtime.state().canonical_bytes() != horizon_before:
+        failures.append("horizon refusal was not atomic")
+
+    zero_law = DurationLawV1(0, 0, (DurationMassV1(0, 1),))
+    day_definitions = list(plan.state_model.day_definitions)
+    for index in (0, 1):
+        definition = day_definitions[index]
+        forced_edge = replace(
+            definition.transitions[0],
+            minimum_age_us=0,
+            duration_exhaustion_behavior=(
+                DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+            ),
+        )
+        day_definitions[index] = replace(
+            definition,
+            duration_law=zero_law,
+            transitions=(forced_edge,),
+        )
+    microstep_plan = replace(
+        plan,
+        state_model=replace(
+            plan.state_model,
+            day_definitions=tuple(day_definitions),
+        ),
+        deterministic_limits=replace(
+            plan.deterministic_limits,
+            maximum_microsteps_per_timestamp=2,
+        ),
+    )
+    microstep_runtime = HierarchicalStateRuntimeV1.create(microstep_plan)
+    microstep_before = microstep_runtime.state().canonical_bytes()
+    refusal = _expect_refusal(
+        lambda: microstep_runtime.advance_to(0),
+        "zero-duration chain at the forbidden microstep index",
+    )
+    refusal_count += 1
+    if refusal:
+        failures.append(refusal)
+    if microstep_runtime.state().canonical_bytes() != microstep_before:
+        failures.append("microstep-limit refusal was not atomic")
+
+    return FullDayAuditCase(
+        "runtime_allocator_limits_and_restore_refusals",
+        (
+            f"shared_component_sequences={shared_trace}; "
+            "initial_high_water=(5->6) reserved_first=(1->2); "
+            f"hostile_refusals={refusal_count}; horizon={beyond_horizon - 1}; "
+            "closed_cut_due_work=0; atomic_limit_refusals=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31b_modifier_and_price_boundary_case() -> FullDayAuditCase:
+    from kirby2.full_day.transitions import (
+        FixedPointValueV1,
+        HierarchicalStateRuntimeV1,
+        StateTransitionEmissionV1,
+        apply_bounded_modifiers_v1,
+        project_transition_payload_v1,
+    )
+    from kirby2.full_day.states import ParameterTargetV1
+
+    failures: list[str] = []
+    plan = _wo31b_runtime_plan(include_effects=True)
+    runtime = HierarchicalStateRuntimeV1.create(plan)
+    transitions = tuple(
+        item
+        for item in runtime.advance_to(12)
+        if type(item) is StateTransitionEmissionV1
+    )
+    if not transitions:
+        return FullDayAuditCase(
+            "bounded_modifier_consumers_and_exchange_price_boundary",
+            "no transition emission was available for modifier projection",
+            ("duration-aware runtime emitted no transition by t=12",),
+        )
+    emission = transitions[0]
+    modifiers = (*emission.state_modifiers, *emission.transition_modifiers)
+    base_values = {
+        ParameterTargetV1.MARKET_BUY_INTENSITY: FixedPointValueV1(10, 1),
+        ParameterTargetV1.ORDER_SIZE_SCALE: FixedPointValueV1(100, 1),
+        ParameterTargetV1.PARTICIPANT_ACTIVITY_SCALE: FixedPointValueV1(80, 1),
+    }
+    consumed = apply_bounded_modifiers_v1(base_values, modifiers)
+    expected = {
+        ParameterTargetV1.MARKET_BUY_INTENSITY: FixedPointValueV1(20, 1),
+        ParameterTargetV1.ORDER_SIZE_SCALE: FixedPointValueV1(150, 1),
+        ParameterTargetV1.PARTICIPANT_ACTIVITY_SCALE: FixedPointValueV1(60, 1),
+    }
+    if dict(consumed) != expected:
+        failures.append("bounded mock consumers did not receive exact fixed-point values")
+    if runtime.active_modifiers(emission.level) != emission.state_modifiers:
+        failures.append("emitted state modifiers differ from the active state projection")
+    for modifier in modifiers:
+        if (
+            modifier.minimum.numerator * modifier.modifier.denominator
+            > modifier.modifier.numerator * modifier.minimum.denominator
+            or modifier.modifier.numerator * modifier.maximum.denominator
+            > modifier.maximum.numerator * modifier.modifier.denominator
+        ):
+            failures.append(f"modifier {modifier.target.value} escaped exact bounds")
+    payload = project_transition_payload_v1(emission, plan=plan)
+    projection_probes = (
+        (
+            "transition emission projected through a different full-day plan",
+            emission,
+            _wo31b_runtime_plan(root_seed=43, include_effects=True),
+        ),
+        (
+            "transition emission with forged successor-state modifiers",
+            replace(emission, state_modifiers=()),
+            plan,
+        ),
+        (
+            "transition emission with forged edge modifiers",
+            replace(emission, transition_modifiers=()),
+            plan,
+        ),
+        (
+            "transition emission beyond the full-day plan horizon",
+            replace(
+                emission,
+                simulation_time_us=plan.calendar.end_time_us + 1,
+            ),
+            plan,
+        ),
+    )
+    for label, forged_emission, projection_plan in projection_probes:
+        refusal = _expect_refusal(
+            lambda forged_emission=forged_emission, projection_plan=projection_plan: (
+                project_transition_payload_v1(
+                    forged_emission,
+                    plan=projection_plan,
+                )
+            ),
+            label,
+        )
+        if refusal:
+            failures.append(refusal)
+
+    forbidden_keys = {
+        "book_mutation",
+        "desired_return",
+        "forced_close",
+        "forced_order",
+        "forced_trade",
+        "order_command",
+        "price_ticks",
+        "target_price",
+    }
+    observed_keys: set[str] = set()
+    observed_values: set[str] = set()
+
+    def inspect_output(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                observed_keys.add(str(key).lower())
+                inspect_output(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                inspect_output(item)
+        elif isinstance(value, str):
+            observed_values.add(value.lower())
+
+    inspect_output(emission.as_dict())
+    inspect_output(payload.as_dict())
+    inspect_output(
+        {
+            target.value: value.as_dict()
+            for target, value in consumed.items()
+        }
+    )
+    forbidden_present = forbidden_keys.intersection(observed_keys | observed_values)
+    if forbidden_present:
+        failures.append(
+            "state output contains imperative/price keys: "
+            + ",".join(sorted(forbidden_present))
+        )
+
+    engine = _continuous_engine()
+    engine.submit(_limit("WO31B-BID", Side.BUY, 10, 99))
+    engine.submit(_limit("WO31B-ASK-1", Side.SELL, 10, 101))
+    engine.submit(_limit("WO31B-ASK-2", Side.SELL, 10, 102))
+    before_runtime_digest = engine.book.state_sha256()
+    before_best_ask = engine.book.best_ask
+    # Consuming state outputs is intentionally disconnected from venue truth.
+    apply_bounded_modifiers_v1(base_values, modifiers)
+    if engine.book.state_sha256() != before_runtime_digest:
+        failures.append("state transition/modifier consumption mutated the order book")
+    engine.submit(
+        AdvancedOrderRequest(
+            "WO31B-MARKET-BUY",
+            Side.BUY,
+            10,
+            OrderInstruction.MARKET,
+            OrderOwner.SIMULATED,
+            "ACCOUNT-WO31B-MARKET-BUY",
+        )
+    )
+    if (
+        before_best_ask != 101
+        or engine.book.best_ask != 102
+        or engine.last_trade_price_ticks != 101
+    ):
+        failures.append("ordinary exchange activity did not produce the price boundary")
+    try:
+        engine.assert_invariants()
+    except RuntimeError as error:
+        failures.append(f"exchange-only price boundary broke invariants: {error}")
+    return FullDayAuditCase(
+        "bounded_modifier_consumers_and_exchange_price_boundary",
+        (
+            "mock_outputs={MARKET_BUY_INTENSITY:20/1,ORDER_SIZE_SCALE:150/1,"
+            "PARTICIPANT_ACTIVITY_SCALE:60/1}; forbidden_output_keys=0; "
+            "projection_refusals=4; state_book_mutations=0; "
+            "exchange_best_ask=101->102; last_trade=101"
+        ),
+        tuple(failures),
+    )
+
+
 def _canonical_plan_case() -> FullDayAuditCase:
     from kirby2.full_day.models import (
         MACRO_REGIME_SCHEDULE_SEMANTICS_V1,
@@ -5505,4 +7102,5 @@ __all__ = [
     "audit_dev0002_anchor_transition_ordering",
     "audit_dev0003_state_checkpoint_inventory",
     "audit_wo31a_contracts",
+    "audit_wo31b_transitions",
 ]

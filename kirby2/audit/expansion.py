@@ -101,6 +101,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-A",
     "DEV-0002",
     "DEV-0003",
+    "WO31-B",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1277,6 +1278,70 @@ def _audit_wo31a() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31b() -> ExpansionGateReport:
+    """Run the duration-aware state runtime audit without composing Hawkes."""
+
+    from kirby2.audit.full_day import audit_wo31b_transitions
+
+    cases = audit_wo31b_transitions()
+    checks: list[ExpansionGateCheck] = []
+    failures: list[str] = []
+    for case in cases:
+        if case.status_override is not None:
+            status = ExpansionGateStatus(case.status_override)
+        else:
+            status = (
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            )
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=status,
+                detail=(
+                    case.detail
+                    if case.reason_code is None
+                    else f"{case.detail}; reason_code={case.reason_code}"
+                ),
+                required=case.required,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+    optional_cases = tuple(
+        case
+        for case in cases
+        if case.status_override == ExpansionGateStatus.NOT_EXERCISED.value
+    )
+    if (
+        len(optional_cases) != 1
+        or optional_cases[0].required
+        or optional_cases[0].reason_code
+        != "HAWKES_COMPOSITION_DEFERRED_TO_WO31_E2"
+    ):
+        failures.append(
+            "WO31-B requires exactly one optional NOT_EXERCISED Hawkes-composition "
+            "case deferred to WO31-E2"
+        )
+    hawkes_reason = (
+        optional_cases[0].reason_code
+        if len(optional_cases) == 1
+        else "INVALID_HAWKES_CAPABILITY_CASE"
+    )
+    return ExpansionGateReport(
+        card_id="WO31-B",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("transition_runtime", "EXECUTED"),
+            ("transition_case_count", str(len(cases) - len(optional_cases))),
+            ("hawkes_composition", ExpansionGateStatus.NOT_EXERCISED.value),
+            ("hawkes_reason_code", hawkes_reason or "MISSING_HAWKES_REASON"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1357,6 +1422,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-A", _audit_wo31a),
     ("DEV-0002", _audit_dev0002),
     ("DEV-0003", _audit_dev0003),
+    ("WO31-B", _audit_wo31b),
 )
 
 
