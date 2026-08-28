@@ -90,8 +90,11 @@ CANONICAL_IMPLEMENTATION_CARD_IDS = (
     "WO40-I",
     "WO40-J",
 )
-RECORDED_DEVIATIONS = (("DEV-0001", "K2X-02"),)
-REGISTERABLE_GATE_IDS = ("DEV-0001", "K2X-02", "WO31-A")
+RECORDED_DEVIATIONS = (
+    ("DEV-0001", "K2X-02"),
+    ("DEV-0002", "WO31-B"),
+)
+REGISTERABLE_GATE_IDS = ("DEV-0001", "K2X-02", "WO31-A", "DEV-0002")
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
 )
@@ -1267,10 +1270,48 @@ def _audit_wo31a() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0002() -> ExpansionGateReport:
+    """Prove the sealed macro-anchor ordering repair remains fail closed."""
+
+    from kirby2.audit.full_day import audit_dev0002_anchor_transition_ordering
+
+    cases = audit_dev0002_anchor_transition_ordering()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=case.required,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0002",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("accepted_trace_count", "4"),
+            ("hostile_refusal_count", "5"),
+            ("repaired_owner", "FULL_DAY_EVENT_VALIDATOR_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
     ("WO31-A", _audit_wo31a),
+    ("DEV-0002", _audit_dev0002),
 )
 
 

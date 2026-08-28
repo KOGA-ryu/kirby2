@@ -43,3 +43,51 @@ K2X-02 CLI source files are byte-bound by the generic implementation manifest;
 loaded-module binding passes without exclusion or unloading; the model-risk command
 returns zero with `MODEL_RISK_LAB_AUDIT PASS cases=21 failures=0`; and no `.kirby2`
 artifact changes.
+
+## DEV-0002 — Reconcile zero-time macro anchor transitions
+
+- Interrupted canonical card: `WO31-B`
+- Exact first-parent predecessor: `e50f43c596482e0b91ccddb63b10a38e4d3db09c`
+- Reproducer: construct a valid acyclic day-state path whose macro-anchored state
+  samples duration zero, then validate its plan-bound anchor at `(0,0,stage 2)` and
+  forced successor at `(0,1,stage 2)` with `validate_full_day_event_stream`.
+- Observed terminal result:
+  `ValueError: macro anchor replacement forbids a same-time day graph transition`
+- Root cause: the sealed WO31-A validator reduced anchor and graph-transition
+  ordering to intersecting timestamp sets. That discarded the frozen microstep
+  distinction even though zero-duration acyclic paths are legal and same-time child
+  work is required to execute at a strictly later microstep.
+- Repair: retain exact plan edge, state-continuity, duration-support, and canonical
+  ordering checks; require anchors at microstep zero; require an anchor to precede
+  graph transitions at its timestamp; reconcile each observed day-state entry with
+  the selected edge's minimum age; seed suffix reconciliation from the already
+  verified prefix's terminal day/local state and day-entry time; and permit a
+  same-time successor only at a strictly later microstep. The validator does not
+  infer an unrecorded transition cause: both forced exhaustion and a cutoff-safe
+  trigger remain legal for a minimum-age-zero edge.
+- Owned repair paths: `kirby2/full_day/events.py`, `kirby2/audit/full_day.py`,
+  `kirby2/audit/expansion.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0002` through the existing K2X-02 expansion seam,
+  immediately before resumed `WO31-B`.
+- Inherited gates: `WO31-A`, `K2X-02`, market mechanics, and agent ecology remain
+  unchanged.
+- Exact commit subject: `Reconcile zero-time macro anchor transitions`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0002
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO31-A
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-market-mechanics
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-agent-ecology
+git diff --check
+```
+
+Acceptance: a zero-duration macro anchor followed by one forced successor and a
+two-hop acyclic chain validate at strictly increasing microsteps; a same-time
+minimum-age-zero triggered successor remains representable without inventing an
+outer-event cause field; same-microstep successors, nonzero-microstep anchors, and
+minimum-age violations fail closed; a checkpoint suffix must continue the verified
+prefix's state and entry age; the repair changes no V1 wire schema and no unrelated
+runtime capability claim.

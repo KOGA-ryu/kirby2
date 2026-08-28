@@ -1341,6 +1341,7 @@ def _validate_full_day_plan_bindings(
     full_day_plan: FullDayPlanV1,
     horizon_key: tuple[int, int, int] | None,
     suffix_cut_time_us: int | None,
+    verified_prefix_events: Sequence[FullDayEventV1] = (),
 ) -> None:
     if type(full_day_plan) is not FullDayPlanV1:
         raise TypeError("full_day_plan must use FullDayPlanV1")
@@ -1349,7 +1350,6 @@ def _validate_full_day_plan_bindings(
     scheduled_information_ids: list[str] = []
     participant_schedule_ids: list[str] = []
     day_state_events: list[FullDayEventV1] = []
-    anchor_times: set[int] = set()
     graph_day_transition_times: set[int] = set()
 
     day_definitions = {
@@ -1386,16 +1386,30 @@ def _validate_full_day_plan_bindings(
         ParticipantScheduleActionV1.RETUNE: FullDayEventTypeV1.PARTICIPANT_RETUNED,
     }
 
-    current_day_state = (
-        None
-        if suffix_cut_time_us is not None
-        else full_day_plan.state_model.initial_day_state.value
+    if suffix_cut_time_us is None and verified_prefix_events:
+        raise ValueError("a full stream cannot carry separate verified-prefix events")
+    current_day_state = full_day_plan.state_model.initial_day_state.value
+    current_local_state = full_day_plan.state_model.initial_local_state.value
+    current_day_entry_time_us: int | None = (
+        0 if suffix_cut_time_us is not None else None
     )
-    current_local_state = (
-        None
-        if suffix_cut_time_us is not None
-        else full_day_plan.state_model.initial_local_state.value
+    current_day_entry_microstep: int | None = (
+        0 if suffix_cut_time_us is not None else None
     )
+    for prefix_event in verified_prefix_events:
+        if type(prefix_event) is not FullDayEventV1:
+            raise TypeError("verified prefix must contain FullDayEventV1")
+        prefix_data = prefix_event.payload.data
+        if prefix_event.event_type is FullDayEventTypeV1.DAY_STATE_ANCHOR_RESET:
+            current_day_state = prefix_data["anchored_state"]
+            current_day_entry_time_us = prefix_event.simulation_time_us
+            current_day_entry_microstep = prefix_event.microstep
+        elif prefix_event.event_type is FullDayEventTypeV1.DAY_STATE_TRANSITION:
+            current_day_state = prefix_data["new_state"]
+            current_day_entry_time_us = prefix_event.simulation_time_us
+            current_day_entry_microstep = prefix_event.microstep
+        elif prefix_event.event_type is FullDayEventTypeV1.LOCAL_STATE_TRANSITION:
+            current_local_state = prefix_data["new_state"]
 
     for event in events:
         data = event.payload.data
@@ -1454,6 +1468,12 @@ def _validate_full_day_plan_bindings(
             segment = full_day_plan.macro_regime_schedule[macro_index]
             if event.simulation_time_us != segment.start_us:
                 raise ValueError("macro anchor time differs from its plan segment")
+            if event.microstep != 0:
+                raise ValueError("macro anchor must execute at microstep zero")
+            if event.simulation_time_us in graph_day_transition_times:
+                raise ValueError(
+                    "macro anchor must precede day graph transitions at its timestamp"
+                )
             if data["anchored_state"] != segment.day_state.value:
                 raise ValueError("macro anchor state differs from its plan segment")
             if data["macro_segment_sha256"] != canonical_sha256(segment.as_dict()):
@@ -1470,8 +1490,9 @@ def _validate_full_day_plan_bindings(
             ):
                 raise ValueError("day-state continuity breaks at a macro anchor")
             current_day_state = data["anchored_state"]
+            current_day_entry_time_us = event.simulation_time_us
+            current_day_entry_microstep = event.microstep
             anchor_indices.append(macro_index)
-            anchor_times.add(event.simulation_time_us)
             day_state_events.append(event)
             continue
 
@@ -1501,7 +1522,25 @@ def _validate_full_day_plan_bindings(
                 and data["previous_state"] != current_day_state
             ):
                 raise ValueError("day-state transition breaks stream continuity")
+            if current_day_entry_time_us is not None:
+                earliest_time_us = (
+                    current_day_entry_time_us + transition.minimum_age_us
+                )
+                if event.simulation_time_us < earliest_time_us:
+                    raise ValueError(
+                        "day-state transition precedes its minimum-age eligibility"
+                    )
+                if (
+                    event.simulation_time_us == current_day_entry_time_us
+                    and current_day_entry_microstep is not None
+                    and event.microstep <= current_day_entry_microstep
+                ):
+                    raise ValueError(
+                        "same-time day-state transitions require a later microstep"
+                    )
             current_day_state = data["new_state"]
+            current_day_entry_time_us = event.simulation_time_us
+            current_day_entry_microstep = event.microstep
             graph_day_transition_times.add(event.simulation_time_us)
             day_state_events.append(event)
             continue
@@ -1580,10 +1619,6 @@ def _validate_full_day_plan_bindings(
         raise ValueError("macro anchor index is duplicated within the segment")
     if anchor_indices != sorted(anchor_indices):
         raise ValueError("macro anchors are not in canonical segment order")
-    if anchor_times.intersection(graph_day_transition_times):
-        raise ValueError(
-            "macro anchor replacement forbids a same-time day graph transition"
-        )
     if len(scheduled_information_ids) != len(set(scheduled_information_ids)):
         raise ValueError("scheduled-information ID is duplicated in the outer segment")
     if len(participant_schedule_ids) != len(set(participant_schedule_ids)):
@@ -1803,6 +1838,7 @@ def _validate_full_day_event_segment(
         full_day_plan,
         horizon_key,
         suffix_cut_time_us,
+        verified_prefix_events,
     )
     _validate_shock_lifecycle(events)
     previous_chronological_key = chronological_lower_bound

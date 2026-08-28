@@ -106,6 +106,463 @@ def _expect_refusal(operation: Callable[[], object], label: str) -> str | None:
     return f"{label} was accepted"
 
 
+def audit_dev0002_anchor_transition_ordering() -> tuple[FullDayAuditCase, ...]:
+    """Exercise the repaired causal ordering at a macro-state anchor."""
+
+    from kirby2.full_day.events import (
+        FullDayEventPayloadV1,
+        FullDayEventTypeV1,
+        FullDayEventV1,
+        ScheduledWorkKeyV1,
+        WorkStageV1,
+        canonical_event_prefix_sha256,
+        validate_full_day_event_suffix,
+        validate_full_day_event_stream,
+    )
+    from kirby2.full_day.checkpoint_contract import QuiescentCutV1
+    from kirby2.full_day.models import canonical_sha256
+    from kirby2.full_day.states import (
+        DurationExhaustionBehaviorV1,
+        DurationLawV1,
+        DurationMassV1,
+    )
+
+    failures: list[str] = []
+    base = replace(_sample_plan(), participant_schedule=(), scheduled_events=())
+
+    def plan_with_first_two_states(
+        *,
+        quiet_duration_us: int,
+        quiet_minimum_age_us: int,
+        quiet_exhaustion: DurationExhaustionBehaviorV1,
+        normal_duration_us: int = 10,
+        normal_minimum_age_us: int = 10,
+        normal_exhaustion: DurationExhaustionBehaviorV1 = (
+            DurationExhaustionBehaviorV1.WAIT_FOR_TRIGGER
+        ),
+    ):
+        day_rows = base.state_model.day_definitions
+        quiet = day_rows[0]
+        normal = day_rows[1]
+
+        def fixed_law(duration_us: int) -> DurationLawV1:
+            return DurationLawV1(
+                duration_us,
+                duration_us,
+                (DurationMassV1(duration_us, 1),),
+            )
+
+        quiet_edge = replace(
+            quiet.transitions[0],
+            minimum_age_us=quiet_minimum_age_us,
+            duration_exhaustion_behavior=quiet_exhaustion,
+        )
+        normal_edge = replace(
+            normal.transitions[0],
+            minimum_age_us=normal_minimum_age_us,
+            duration_exhaustion_behavior=normal_exhaustion,
+        )
+        model = replace(
+            base.state_model,
+            day_definitions=(
+                replace(
+                    quiet,
+                    duration_law=fixed_law(quiet_duration_us),
+                    transitions=(quiet_edge,),
+                ),
+                replace(
+                    normal,
+                    duration_law=fixed_law(normal_duration_us),
+                    transitions=(normal_edge,),
+                ),
+                *day_rows[2:],
+            ),
+        )
+        return replace(base, state_model=model)
+
+    def work(
+        microstep: int,
+        stage: WorkStageV1,
+        local_sequence: int,
+    ) -> ScheduledWorkKeyV1:
+        return ScheduledWorkKeyV1(
+            0,
+            microstep,
+            stage,
+            "FULL_DAY_RUNTIME_V1",
+            local_sequence,
+        )
+
+    def event(
+        event_type: FullDayEventTypeV1,
+        item: ScheduledWorkKeyV1,
+        sequence: int,
+        data: dict[str, object],
+    ) -> FullDayEventV1:
+        return FullDayEventV1(
+            1,
+            sequence,
+            item.simulation_time_us,
+            item.microstep,
+            item.stage_ordinal,
+            "FULL_DAY_RUNTIME_V1",
+            sequence,
+            event_type,
+            (item.work_id,),
+            FullDayEventPayloadV1(1, event_type.value, 1, None, data),
+        )
+
+    def trace(
+        plan,
+        *,
+        anchor_microstep: int = 0,
+        first_transition_microstep: int = 1,
+        include_second_transition: bool = False,
+    ) -> tuple[tuple[FullDayEventV1, ...], dict[str, ScheduledWorkKeyV1]]:
+        boundary_work = work(0, WorkStageV1.ATOMIC_CALENDAR_BOUNDARY, 1)
+        anchor_work = work(
+            anchor_microstep,
+            WorkStageV1.DAY_STATE_TRANSITION,
+            2,
+        )
+        transition_work = work(
+            first_transition_microstep,
+            WorkStageV1.DAY_STATE_TRANSITION,
+            3,
+        )
+        operation = plan.calendar.boundary_operations[0]
+        segment = plan.macro_regime_schedule[0]
+        quiet = plan.state_model.day_definitions[0]
+        quiet_edge = quiet.transitions[0]
+        normal = plan.state_model.day_definitions[1]
+        rows = [
+            event(
+                FullDayEventTypeV1.CALENDAR_BOUNDARY,
+                boundary_work,
+                1,
+                {
+                    "boundary_operation_index": 0,
+                    "destination_session_state": (
+                        operation.destination_session_state.value
+                    ),
+                    "uncross_before": operation.uncross_before,
+                },
+            ),
+            event(
+                FullDayEventTypeV1.DAY_STATE_ANCHOR_RESET,
+                anchor_work,
+                2,
+                {
+                    "anchored_state": segment.day_state.value,
+                    "entered_time_us": 0,
+                    "macro_segment_index": 0,
+                    "macro_segment_sha256": canonical_sha256(segment.as_dict()),
+                    "previous_state": plan.state_model.initial_day_state.value,
+                    "sampled_duration_us": quiet.duration_law.masses[0].duration_us,
+                },
+            ),
+            event(
+                FullDayEventTypeV1.DAY_STATE_TRANSITION,
+                transition_work,
+                3,
+                {
+                    "entered_time_us": 0,
+                    "new_state": quiet_edge.successor_state,
+                    "previous_state": quiet_edge.source_state,
+                    "sampled_duration_us": normal.duration_law.masses[0].duration_us,
+                    "transition_id": quiet_edge.transition_id,
+                    "trigger_id": quiet_edge.trigger_id,
+                    "trigger_version": quiet_edge.trigger_version,
+                },
+            ),
+        ]
+        works = [boundary_work, anchor_work, transition_work]
+        if include_second_transition:
+            second_work = work(
+                first_transition_microstep + 1,
+                WorkStageV1.DAY_STATE_TRANSITION,
+                4,
+            )
+            second_edge = normal.transitions[0]
+            successor = next(
+                definition
+                for definition in plan.state_model.day_definitions
+                if definition.state.value == second_edge.successor_state
+            )
+            rows.append(
+                event(
+                    FullDayEventTypeV1.DAY_STATE_TRANSITION,
+                    second_work,
+                    4,
+                    {
+                        "entered_time_us": 0,
+                        "new_state": second_edge.successor_state,
+                        "previous_state": second_edge.source_state,
+                        "sampled_duration_us": (
+                            successor.duration_law.masses[0].duration_us
+                        ),
+                        "transition_id": second_edge.transition_id,
+                        "trigger_id": second_edge.trigger_id,
+                        "trigger_version": second_edge.trigger_version,
+                    },
+                )
+            )
+            works.append(second_work)
+        return tuple(rows), {item.work_id: item for item in works}
+
+    forced_plan = plan_with_first_two_states(
+        quiet_duration_us=0,
+        quiet_minimum_age_us=0,
+        quiet_exhaustion=(
+            DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+        ),
+    )
+    trigger_plan = plan_with_first_two_states(
+        quiet_duration_us=10,
+        quiet_minimum_age_us=0,
+        quiet_exhaustion=DurationExhaustionBehaviorV1.WAIT_FOR_TRIGGER,
+    )
+    chain_plan = plan_with_first_two_states(
+        quiet_duration_us=0,
+        quiet_minimum_age_us=0,
+        quiet_exhaustion=(
+            DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+        ),
+        normal_duration_us=0,
+        normal_minimum_age_us=0,
+        normal_exhaustion=(
+            DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+        ),
+    )
+
+    accepted_traces = (
+        ("forced post-anchor successor", forced_plan, trace(forced_plan)),
+        ("triggered post-anchor successor", trigger_plan, trace(trigger_plan)),
+        (
+            "two-hop acyclic post-anchor chain",
+            chain_plan,
+            trace(chain_plan, include_second_transition=True),
+        ),
+    )
+    accepted_keys: list[tuple[tuple[int, int, int], ...]] = []
+    for label, plan, (events, executed) in accepted_traces:
+        try:
+            validate_full_day_event_stream(
+                events,
+                executed_work_items=executed,
+                native_event_ledger={},
+                scheduled_event_ledger={},
+                full_day_plan=plan,
+            )
+        except (TypeError, ValueError) as error:
+            failures.append(f"valid {label} was refused: {error}")
+        accepted_keys.append(tuple(item.chronological_key for item in events))
+
+    late_age_plan = plan_with_first_two_states(
+        quiet_duration_us=0,
+        quiet_minimum_age_us=1,
+        quiet_exhaustion=(
+            DurationExhaustionBehaviorV1.TRANSITION_ON_EXHAUSTION
+        ),
+    )
+    hostile = (
+        (
+            "same-microstep post-anchor successor",
+            forced_plan,
+            trace(forced_plan, first_transition_microstep=0),
+        ),
+        (
+            "nonzero-microstep macro anchor",
+            forced_plan,
+            trace(
+                forced_plan,
+                anchor_microstep=1,
+                first_transition_microstep=2,
+            ),
+        ),
+        (
+            "same-time successor before minimum-age eligibility",
+            late_age_plan,
+            trace(late_age_plan),
+        ),
+    )
+    for label, plan, (events, executed) in hostile:
+        refusal = _expect_refusal(
+            lambda events=events, executed=executed, plan=plan: (
+                validate_full_day_event_stream(
+                    events,
+                    executed_work_items=executed,
+                    native_event_ledger={},
+                    scheduled_event_ledger={},
+                    full_day_plan=plan,
+                )
+            ),
+            label,
+        )
+        if refusal:
+            failures.append(refusal)
+
+    suffix_plan = base
+    boundary_work = work(0, WorkStageV1.ATOMIC_CALENDAR_BOUNDARY, 1)
+    anchor_work = work(0, WorkStageV1.DAY_STATE_TRANSITION, 2)
+    marker_work = work(0, WorkStageV1.CHECKPOINT_CAPTURE, 3)
+    operation = suffix_plan.calendar.boundary_operations[0]
+    segment = suffix_plan.macro_regime_schedule[0]
+    quiet = suffix_plan.state_model.day_definitions[0]
+    prefix_events = (
+        event(
+            FullDayEventTypeV1.CALENDAR_BOUNDARY,
+            boundary_work,
+            1,
+            {
+                "boundary_operation_index": 0,
+                "destination_session_state": operation.destination_session_state.value,
+                "uncross_before": operation.uncross_before,
+            },
+        ),
+        event(
+            FullDayEventTypeV1.DAY_STATE_ANCHOR_RESET,
+            anchor_work,
+            2,
+            {
+                "anchored_state": segment.day_state.value,
+                "entered_time_us": 0,
+                "macro_segment_index": 0,
+                "macro_segment_sha256": canonical_sha256(segment.as_dict()),
+                "previous_state": suffix_plan.state_model.initial_day_state.value,
+                "sampled_duration_us": quiet.duration_law.masses[0].duration_us,
+            },
+        ),
+        event(
+            FullDayEventTypeV1.CHECKPOINT_CAPTURE_MARKER,
+            marker_work,
+            3,
+            {"checkpoint_request_id": "DEV_0002_PREFIX_CUT"},
+        ),
+    )
+    prefix_cut = QuiescentCutV1(
+        schema_version=1,
+        simulation_time_us=0,
+        microstep=0,
+        checkpoint_stage_ordinal=int(WorkStageV1.CHECKPOINT_CAPTURE),
+        last_global_event_sequence=3,
+        event_prefix_last_global_sequence=3,
+        event_prefix_sha256=canonical_event_prefix_sha256(prefix_events),
+        pending_work_count=1,
+        next_pending_time_us=10,
+        next_pending_microstep=0,
+        due_work_at_or_before_cut=0,
+        generated_microsteps_complete=True,
+        checkpoint_stage_complete=True,
+        boundary_complete_at_cut=True,
+    )
+
+    def suffix_transition(
+        *,
+        simulation_time_us: int,
+        transition,
+    ) -> tuple[FullDayEventV1, ScheduledWorkKeyV1]:
+        item = ScheduledWorkKeyV1(
+            simulation_time_us,
+            0,
+            WorkStageV1.DAY_STATE_TRANSITION,
+            "FULL_DAY_RUNTIME_V1",
+            4,
+        )
+        successor = next(
+            definition
+            for definition in suffix_plan.state_model.day_definitions
+            if definition.state.value == transition.successor_state
+        )
+        return (
+            event(
+                FullDayEventTypeV1.DAY_STATE_TRANSITION,
+                item,
+                4,
+                {
+                    "entered_time_us": simulation_time_us,
+                    "new_state": transition.successor_state,
+                    "previous_state": transition.source_state,
+                    "sampled_duration_us": (
+                        successor.duration_law.masses[0].duration_us
+                    ),
+                    "transition_id": transition.transition_id,
+                    "trigger_id": transition.trigger_id,
+                    "trigger_version": transition.trigger_version,
+                },
+            ),
+            item,
+        )
+
+    def validate_suffix(
+        suffix_event: FullDayEventV1,
+        suffix_work: ScheduledWorkKeyV1,
+    ) -> None:
+        validate_full_day_event_suffix(
+            (suffix_event,),
+            executed_work_items={suffix_work.work_id: suffix_work},
+            native_event_ledger={},
+            scheduled_event_ledger={},
+            full_day_plan=suffix_plan,
+            verified_prefix_cut=prefix_cut,
+            verified_prefix_events=prefix_events,
+        )
+
+    quiet_edge = quiet.transitions[0]
+    valid_suffix_event, valid_suffix_work = suffix_transition(
+        simulation_time_us=10,
+        transition=quiet_edge,
+    )
+    try:
+        validate_suffix(valid_suffix_event, valid_suffix_work)
+    except (TypeError, ValueError) as error:
+        failures.append(f"valid prefix-bound day-state suffix was refused: {error}")
+
+    normal_edge = suffix_plan.state_model.day_definitions[1].transitions[0]
+    wrong_state_event, wrong_state_work = suffix_transition(
+        simulation_time_us=1,
+        transition=normal_edge,
+    )
+    early_event, early_work = suffix_transition(
+        simulation_time_us=1,
+        transition=quiet_edge,
+    )
+    suffix_hostile = (
+        (
+            "suffix transition whose previous state differs from its verified prefix",
+            wrong_state_event,
+            wrong_state_work,
+        ),
+        (
+            "suffix transition before verified-prefix minimum-age eligibility",
+            early_event,
+            early_work,
+        ),
+    )
+    for label, suffix_event, suffix_work in suffix_hostile:
+        refusal = _expect_refusal(
+            lambda suffix_event=suffix_event, suffix_work=suffix_work: validate_suffix(
+                suffix_event,
+                suffix_work,
+            ),
+            label,
+        )
+        if refusal:
+            failures.append(refusal)
+
+    return (
+        FullDayAuditCase(
+            "macro_anchor_later_microstep_transition_reconciliation",
+            (
+                f"accepted_traces={len(accepted_traces) + 1} "
+                f"hostile_refusals={len(hostile) + len(suffix_hostile)} "
+                f"prefix_bound_suffix=true keys={tuple(accepted_keys)}"
+            ),
+            tuple(failures),
+        ),
+    )
+
+
 def _canonical_plan_case() -> FullDayAuditCase:
     from kirby2.full_day.models import (
         MACRO_REGIME_SCHEDULE_SEMANTICS_V1,
