@@ -19,6 +19,7 @@ COMPOSITION_SCHEMA_VERSION = 1
 INITIAL_PROFILE_ID = "SINGLE_VENUE_AGENT_MECHANICS_V1"
 FLOW_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_V1"
 DELIVERY_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_V1"
+RESEARCH_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1"
 INITIAL_MATRIX_ID = "COMPOSITION_MATRIX_V1"
 
 FULL_DAY_RUNTIME_COMPONENT = "FULL_DAY_RUNTIME_V1"
@@ -28,6 +29,7 @@ FLOW_SIMPLE_COMPONENT = "FLOW_SIMPLE_V1"
 FLOW_HAWKES_COMPONENT = "FLOW_HAWKES_V1"
 FLOW_QUEUE_REACTIVE_COMPONENT = "FLOW_QUEUE_REACTIVE_V1"
 DELIVERY_ASYNC_COMPONENT = "DELIVERY_ASYNC_V1"
+FEATURE_STRATEGY_PLAYER_COMPONENT = "FEATURE_STRATEGY_PLAYER_V1"
 
 FLOW_COMPONENT_IDS = (
     FLOW_HAWKES_COMPONENT,
@@ -1378,6 +1380,93 @@ def executable_delivery_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def executable_research_composition_matrix() -> CompositionMatrixV1:
+    """Append the passive observable research profile for WO31-E4.
+
+    The component borrows only the authoritative runtime gateway/clock and the
+    already-delivered client projection.  It owns no exchange, book, calendar,
+    cash ledger, or RNG stream.
+    """
+
+    previous = executable_delivery_composition_matrix()
+    delivery_profile = previous.profile(DELIVERY_PROFILE_ID, 1)
+    research_spec = ComponentSpecV1(
+        schema_version=1,
+        component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+        component_version=1,
+        implementation_status="EXECUTABLE",
+        active_predicate=component_configured_predicate(
+            FEATURE_STRATEGY_PLAYER_COMPONENT
+        ),
+        dependencies=tuple(
+            sorted(
+                {
+                    DELIVERY_ASYNC_COMPONENT,
+                    FULL_DAY_RUNTIME_COMPONENT,
+                    MECHANICS_COMPONENT,
+                }
+            )
+        ),
+        owned_resources=tuple(
+            sorted(
+                {
+                    "FEATURE_WINDOWS",
+                    "PLAYER_DECISION_STATE",
+                    "PLAYER_POSITION_PROJECTION",
+                    "STRATEGY_TIMER_STATE",
+                }
+            )
+        ),
+        borrowed_resources=tuple(
+            sorted(
+                {
+                    "CLIENT_KNOWN_WORKING_ORDER_STATE",
+                    "ORDER_GATEWAY",
+                    "SIMULATION_CLOCK",
+                }
+            )
+        ),
+        rng_label_prefixes=(),
+        checkpoint_state_ids=tuple(
+            sorted(
+                {
+                    "FEATURES_V1",
+                    "PLAYER_OVERLAY_WORKING_ORDERS_V1",
+                    "STRATEGIES_V1",
+                }
+            )
+        ),
+    )
+    profile = CompositionProfileV1(
+        schema_version=1,
+        profile_id=RESEARCH_PROFILE_ID,
+        profile_version=1,
+        implementation_status="EXECUTABLE",
+        runtime_owner_component_id=FULL_DAY_RUNTIME_COMPONENT,
+        components=tuple(
+            sorted(
+                (*delivery_profile.components, research_spec),
+                key=lambda item: item.component_id,
+            )
+        ),
+        refused_component_ids=tuple(
+            component_id
+            for component_id in delivery_profile.refused_component_ids
+            if component_id not in {"FEATURES", "PLAYER_OVERLAY", "STRATEGIES"}
+        ),
+        exactly_one_component_groups=(FLOW_COMPONENT_IDS,),
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1387,6 +1476,7 @@ __all__ = [
     "COMPOSITION_SCHEMA_VERSION",
     "DELIVERY_ASYNC_COMPONENT",
     "DELIVERY_PROFILE_ID",
+    "FEATURE_STRATEGY_PLAYER_COMPONENT",
     "ComponentSpecV1",
     "CompositionMatrixV1",
     "CompositionProfileV1",
@@ -1399,12 +1489,14 @@ __all__ = [
     "INITIAL_MATRIX_ID",
     "INITIAL_PROFILE_ID",
     "MECHANICS_COMPONENT",
+    "RESEARCH_PROFILE_ID",
     "agent_scheduler_is_active",
     "component_configured_predicate",
     "executable_agent_mechanics_composition_matrix",
     "executable_delivery_composition_matrix",
     "executable_hawkes_flow_composition_matrix",
     "executable_queue_reactive_flow_composition_matrix",
+    "executable_research_composition_matrix",
     "executable_simple_flow_composition_matrix",
     "initial_composition_matrix",
 ]

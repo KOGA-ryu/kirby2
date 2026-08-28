@@ -153,6 +153,43 @@ class PlayerPosition:
             self.sold_quantity += fill.quantity
         self.position += fill.side.sign * fill.quantity
 
+    def apply_reported_fill(
+        self,
+        *,
+        trade_id: str,
+        order_id: str,
+        side: Side,
+        price_ticks: int,
+        quantity: int,
+        liquidity: str,
+    ) -> Fill:
+        """Apply one client-delivered player fill using the ordinary fill ledger."""
+
+        if type(trade_id) is not str or not trade_id:
+            raise ValueError("reported player fill requires a trade ID")
+        if type(order_id) is not str or not order_id:
+            raise ValueError("reported player fill requires an order ID")
+        if not isinstance(side, Side):
+            raise TypeError("reported player fill side must use Side")
+        if type(price_ticks) is not int or price_ticks <= 0:
+            raise ValueError("reported player fill price must be positive ticks")
+        if type(quantity) is not int or quantity <= 0:
+            raise ValueError("reported player fill quantity must be positive")
+        if type(liquidity) is not str or liquidity not in {"maker", "taker"}:
+            raise ValueError("reported player fill liquidity must be maker or taker")
+        fill = Fill(
+            trade_id=trade_id,
+            order_id=order_id,
+            owner=OrderOwner.PLAYER,
+            side=side,
+            price_ticks=price_ticks,
+            quantity=quantity,
+            liquidity=liquidity,
+        )
+        self.apply(fill)
+        self.assert_invariants()
+        return fill
+
     def snapshot(self) -> dict[str, int]:
         payload: dict[str, object] = {
             "bought_quantity": self.bought_quantity,

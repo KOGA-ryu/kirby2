@@ -13792,6 +13792,520 @@ def audit_wo31e3_delivery_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e4_research_configuration():
+    from kirby2.full_day.components_research import ResearchConfigurationV1
+
+    source = """\
+machine full_day_research
+window 1s
+initial WATCH
+state WATCH signal WAIT entry DENY exit ALLOW
+state GO signal GREEN entry ALLOW exit ALLOW
+transition WATCH -> GO when for 500ms
+    working_order_count >= 1
+transition GO -> WATCH when
+    working_order_count < 1
+"""
+    return ResearchConfigurationV1.create(
+        configuration_id="AUDIT_FEATURE_STRATEGY_PLAYER_V1",
+        configuration_version=1,
+        strategy_source=source,
+        feature_windows_us=(500_000, 1_000_000),
+        depth_levels=5,
+    )
+
+
+def _wo31e4_plan():
+    from kirby2.full_day.composition import (
+        FEATURE_STRATEGY_PLAYER_COMPONENT,
+        RESEARCH_PROFILE_ID,
+        executable_research_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        VersionedReferenceV1,
+    )
+
+    base = _wo31e3_plan()
+    configuration = _wo31e4_research_configuration()
+    matrix = executable_research_composition_matrix()
+    bindings = tuple(
+        sorted(
+            (
+                *base.component_configurations,
+                ComponentConfigurationBindingV1(
+                    FEATURE_STRATEGY_PLAYER_COMPONENT,
+                    configuration.reference,
+                ),
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            RESEARCH_PROFILE_ID,
+            1,
+            matrix.sha256,
+        ),
+        component_configurations=bindings,
+    )
+
+
+def _wo31e4_runtime():
+    from kirby2.full_day.components_delivery import DeliveryOwnerV1
+    from kirby2.full_day.components_flow import SimpleFlowOwnerV1
+    from kirby2.full_day.components_research import ResearchOwnerV1
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e4_plan()
+    return FullDayRuntime.create(
+        plan,
+        simple_flow=SimpleFlowOwnerV1(plan, _wo31e3_flow_configuration()),
+        delivery=DeliveryOwnerV1(plan, _wo31e3_delivery_configuration()),
+        research=ResearchOwnerV1(plan, _wo31e4_research_configuration()),
+    )
+
+
+def _wo31e4_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_delivery import DeliveryComponentAdapterV1
+    from kirby2.full_day.components_flow import (
+        HawkesFlowComponentAdapterV2,
+        QueueReactiveFlowComponentAdapterV2,
+        SimpleFlowComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import MarketMechanicsComponentAdapterV1
+    from kirby2.full_day.components_research import ResearchComponentAdapterV1
+    from kirby2.full_day.composition import (
+        FEATURE_STRATEGY_PLAYER_COMPONENT,
+        RESEARCH_PROFILE_ID,
+        executable_delivery_composition_matrix,
+        executable_research_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_delivery_composition_matrix()
+    matrix = executable_research_composition_matrix()
+    if tuple(row.canonical_bytes() for row in matrix.profiles[:-1]) != tuple(
+        row.canonical_bytes() for row in previous.profiles
+    ):
+        failures.append("research matrix rewrote a published E1/E2/E3 profile")
+    profile = matrix.profile(RESEARCH_PROFILE_ID, 1)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+            HawkesFlowComponentAdapterV2(),
+            QueueReactiveFlowComponentAdapterV2(),
+            SimpleFlowComponentAdapterV1(),
+            DeliveryComponentAdapterV1(),
+            ResearchComponentAdapterV1(),
+        ),
+        plan=_wo31e4_plan(),
+        profile=profile,
+    )
+    if FEATURE_STRATEGY_PLAYER_COMPONENT not in graph.active_component_ids:
+        failures.append("configured research adapter did not activate")
+    research_spec = next(
+        item
+        for item in profile.components
+        if item.component_id == FEATURE_STRATEGY_PLAYER_COMPONENT
+    )
+    forbidden = {"ORDER_BOOK", "AUCTION_BOOK", "MARKET_MECHANICS_ENGINE", "CASH_LEDGER"}
+    if forbidden.intersection(research_spec.owned_resources):
+        failures.append("research component claims venue truth or cash ownership")
+    runtime = _wo31e4_runtime()
+    if (
+        runtime.research is None
+        or runtime.delivery is None
+        or runtime.research.client_view() is runtime.engine.book
+    ):
+        failures.append("research owner is not detached from venue truth")
+    return FullDayAuditCase(
+        "full_day_research_composition",
+        (
+            f"matrix_v6_sha256={previous.sha256} matrix_v7_sha256={matrix.sha256} "
+            f"active_components={graph.active_component_ids} "
+            "passive_client_cut=true cash_ledger=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e4_observable_decisions_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+
+    failures: list[str] = []
+    runtime = _wo31e4_runtime()
+    runtime.advance_to(1_200_000_000)
+    route = runtime.submit_request(
+        _wo31e3_limit_request(
+            runtime,
+            "E4-WORKING-ORDER",
+            side=Side.SELL,
+            quantity=10,
+        )
+    )
+    runtime.advance_to(route.key.simulation_time_us)
+    _wo31e3_drain_delivery(runtime)
+    if (
+        runtime.research.processed_message_ids
+        != [row["message_id"] for row in runtime.delivery.delivered_messages]
+        or len(runtime.research.feature_batches)
+        != len(runtime.delivery.delivered_messages)
+    ):
+        failures.append("research features do not exactly cover delivered messages")
+    if any(
+        row["information_cutoff_us"] > row["delivery_time_us"]
+        for row in runtime.research.feature_batches
+    ):
+        failures.append("research feature evidence sees beyond client delivery time")
+    deadline = runtime.research.next_strategy_deadline_us
+    if deadline is None:
+        failures.append("observable working order did not schedule TRUE_FOR deadline")
+    else:
+        runtime.advance_to(deadline - 1)
+        if runtime.research.strategy.current.machine_state != "WATCH":
+            failures.append("strategy transitioned before its exact timer")
+        runtime.advance_to(deadline)
+        if runtime.research.strategy.current.machine_state != "GO":
+            failures.append("strategy did not transition on its exact timer")
+
+    request = _wo31e3_limit_request(
+        runtime,
+        "E4-PLAYER-DECISION",
+        side=Side.BUY,
+        quantity=2,
+    )
+    decision = runtime.schedule_player_decision(
+        action="SUBMIT",
+        action_payload={"request": request.as_dict()},
+        at_time_us=runtime.clock.current_time_us + 1_000,
+    )
+    if decision.information_cutoff_us != runtime.research.last_information_cutoff_us:
+        failures.append("player decision did not bind the current observable cutoff")
+    runtime.advance_to(decision.scheduled_time_us)
+    completed = runtime.research.completed_decisions[-1]
+    route_work_id = completed["route_work_id"]
+    routed = runtime._pending.get(route_work_id)
+    if routed is None or routed.key.source_component_id != "DELIVERY_ASYNC_V1":
+        failures.append("player decision bypassed the ordinary delivery route")
+
+    fill_route = runtime.submit_request(
+        _wo31e3_market_request(
+            "E4-PLAYER-FILL",
+            side=Side.BUY,
+            quantity=4,
+        )
+    )
+    runtime.advance_to(fill_route.key.simulation_time_us)
+    _wo31e3_drain_delivery(runtime)
+    if (
+        runtime.research.fill_report_cursor
+        != len(runtime.delivery.client_fill_reports)
+        or runtime.research.player_position.position
+        != runtime.delivery.client_position
+        or not runtime.research.player_position.fills
+    ):
+        failures.append("player fill/position projection differs from client reports")
+    feature_events = sum(
+        event.event_type is FullDayEventTypeV1.FEATURE_UPDATED
+        for event in runtime.events
+    )
+    deadline_events = sum(
+        event.event_type is FullDayEventTypeV1.STRATEGY_ALGORITHM_DEADLINE
+        for event in runtime.events
+    )
+    if feature_events != len(runtime.research.feature_batches):
+        failures.append("feature outer events differ from feature batches")
+    return FullDayAuditCase(
+        "full_day_research_observable_decisions",
+        (
+            f"features={feature_events} deadlines_and_decisions={deadline_events} "
+            f"fill_reports={runtime.research.fill_report_cursor} "
+            "cutoff_bound=true routed_actions=true timer_exact=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e4_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes, parse_canonical_json_object
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    digests: list[str] = []
+
+    def verify(runtime, label: str, target: int) -> None:
+        runtime.capture_quiescent_cut(f"WO31-E4-{label}-CUT")
+        request = FullDayRuntimeRestoreRequestV1.capture(
+            runtime,
+            suffix_targets_us=(target,),
+            final_checkpoint_request_id=f"WO31-E4-{label}-FINAL",
+        )
+        returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+            request.canonical_bytes()
+        )
+        expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+        if returncode != 0:
+            failures.append(
+                f"{label} fresh worker returned {returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            return
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"{label} fresh worker emitted invalid JSON: {error}")
+            return
+        if stderr or wrote_files:
+            failures.append(f"{label} fresh worker produced side effects")
+        if canonical_json_bytes(actual) != stdout or actual != expected:
+            failures.append(f"{label} fresh suffix differs from uninterrupted suffix")
+        digests.append(str(actual["invariant_sha256"]))
+
+    pending_feature = _wo31e4_runtime()
+    pending_feature.advance_to(1_200_000_000)
+    route = pending_feature.submit_request(
+        _wo31e3_limit_request(
+            pending_feature,
+            "E4-RESTORE-FEATURE",
+            side=Side.SELL,
+            quantity=5,
+        )
+    )
+    pending_feature.advance_to(route.key.simulation_time_us)
+    feature_target = max(
+        message.delivery_time_us
+        for message in pending_feature.delivery.pending_messages.values()
+    )
+    verify(pending_feature, "PENDING-FEATURE", feature_target)
+
+    pending_deadline = _wo31e4_runtime()
+    pending_deadline.advance_to(1_200_000_000)
+    route = pending_deadline.submit_request(
+        _wo31e3_limit_request(
+            pending_deadline,
+            "E4-RESTORE-DEADLINE",
+            side=Side.SELL,
+            quantity=5,
+        )
+    )
+    pending_deadline.advance_to(route.key.simulation_time_us)
+    _wo31e3_drain_delivery(pending_deadline)
+    deadline_target = pending_deadline.research.next_strategy_deadline_us
+    if deadline_target is None:
+        failures.append("deadline restore setup did not create a timer")
+    else:
+        verify(pending_deadline, "PENDING-DEADLINE", deadline_target)
+
+    pending_decision = _wo31e4_runtime()
+    pending_decision.advance_to(1_200_000_000)
+    request = _wo31e3_limit_request(
+        pending_decision,
+        "E4-RESTORE-DECISION",
+        side=Side.BUY,
+        quantity=2,
+    )
+    decision = pending_decision.schedule_player_decision(
+        action="SUBMIT",
+        action_payload={"request": request.as_dict()},
+        at_time_us=pending_decision.clock.current_time_us + 1_000,
+    )
+    verify(pending_decision, "PENDING-DECISION", decision.scheduled_time_us)
+
+    return FullDayAuditCase(
+        "full_day_research_fresh_process_restore",
+        (
+            f"fresh_process_boundaries={len(digests)} "
+            f"invariant_sha256={','.join(digests)} "
+            "pending_feature=true pending_timer=true pending_decision=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e4_ownership_case() -> FullDayAuditCase:
+    from kirby2.full_day.components_research import ResearchOwnerV1
+    from kirby2.full_day.composition import ABSENT_REASON_SYNTHETIC_NO_HISTORICAL_CURSOR
+
+    failures: list[str] = []
+    refused = 0
+    runtime = _wo31e4_runtime()
+    runtime.advance_to(1_200_000_000)
+    route = runtime.submit_request(
+        _wo31e3_limit_request(
+            runtime,
+            "E4-HOSTILE",
+            side=Side.SELL,
+            quantity=5,
+        )
+    )
+    runtime.advance_to(route.key.simulation_time_us)
+    _wo31e3_drain_delivery(runtime)
+    runtime.capture_quiescent_cut("WO31-E4-HOSTILE-PREFIX")
+    research_state = runtime.research.checkpoint_state()
+
+    probes: list[tuple[str, Callable[[], object]]] = []
+    unknown_version = copy.deepcopy(research_state)
+    unknown_version["configuration"]["strategy_version"] = 999
+    probes.append(
+        (
+            "unknown strategy version",
+            lambda: ResearchOwnerV1.from_checkpoint_state(
+                unknown_version,
+                plan=runtime.plan,
+                delivery=runtime.delivery,
+            ),
+        )
+    )
+    future_cutoff = copy.deepcopy(research_state)
+    future_cutoff["last_information_cutoff_us"] = (
+        future_cutoff["last_observation_time_us"] + 1
+    )
+    probes.append(
+        (
+            "future information cutoff",
+            lambda: ResearchOwnerV1.from_checkpoint_state(
+                future_cutoff,
+                plan=runtime.plan,
+                delivery=runtime.delivery,
+            ),
+        )
+    )
+    cash = copy.deepcopy(research_state)
+    cash["cash_ledger"] = {"balance": 0}
+    probes.append(
+        (
+            "cash ledger smuggling",
+            lambda: ResearchOwnerV1.from_checkpoint_state(
+                cash,
+                plan=runtime.plan,
+                delivery=runtime.delivery,
+            ),
+        )
+    )
+    orphan = copy.deepcopy(research_state)
+    orphan["working_order_ids"] = [*orphan["working_order_ids"], "ORPHAN"]
+    orphan["working_order_ids"].sort()
+    probes.append(
+        (
+            "orphan working order",
+            lambda: ResearchOwnerV1.from_checkpoint_state(
+                orphan,
+                plan=runtime.plan,
+                delivery=runtime.delivery,
+            ),
+        )
+    )
+    conservation = copy.deepcopy(research_state)
+    conservation["player_position"]["position"] += 1
+    probes.append(
+        (
+            "player position conservation",
+            lambda: ResearchOwnerV1.from_checkpoint_state(
+                conservation,
+                plan=runtime.plan,
+                delivery=runtime.delivery,
+            ),
+        )
+    )
+    for label, probe in probes:
+        refusal = _expect_refusal(probe, label)
+        if refusal is None:
+            refused += 1
+        else:
+            failures.append(refusal)
+
+    runtime.research.book = runtime.engine.book
+    try:
+        runtime.assert_invariants()
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("direct authoritative-book access was accepted")
+    finally:
+        del runtime.research.book
+
+    atomic = _wo31e4_runtime()
+    atomic.advance_to(1_200_000_000)
+    route = atomic.submit_request(
+        _wo31e3_limit_request(
+            atomic,
+            "E4-ATOMIC",
+            side=Side.SELL,
+            quantity=2,
+        )
+    )
+    atomic.advance_to(route.key.simulation_time_us)
+    atomic.capture_quiescent_cut("WO31-E4-ATOMIC-PREFIX")
+    before = atomic.canonical_state_bytes()
+    due = min(
+        message.delivery_time_us
+        for message in atomic.delivery.pending_messages.values()
+    )
+    original_emit = atomic._emit_native
+
+    def refuse_research_native(**kwargs):
+        if kwargs.get("owner_component_id") == "FEATURE_STRATEGY_PLAYER_V1":
+            raise RuntimeError("AUDIT_FORCED_RESEARCH_NATIVE_FAILURE")
+        return original_emit(**kwargs)
+
+    atomic._emit_native = refuse_research_native
+    try:
+        atomic.advance_to(due)
+    except RuntimeError as error:
+        if "AUDIT_FORCED_RESEARCH_NATIVE_FAILURE" in str(error):
+            refused += 1
+        else:
+            failures.append("research atomicity probe raised the wrong error")
+    else:
+        failures.append("research native failure was not propagated")
+    finally:
+        del atomic._emit_native
+    if atomic.canonical_state_bytes() != before:
+        failures.append("research failure changed runtime or component state")
+
+    presence = runtime.checkpoint_state()["component_presence"]
+    historical = next(
+        row for row in presence if row["component_id"] == "HISTORICAL_REPLAY"
+    )
+    if (
+        historical["status"] != "ABSENT"
+        or historical["reason"] != ABSENT_REASON_SYNTHETIC_NO_HISTORICAL_CURSOR
+    ):
+        failures.append("synthetic research checkpoint gained a historical cursor")
+    return FullDayAuditCase(
+        "full_day_research_ownership_refusals",
+        (
+            f"refusals={refused} second_book=true unknown_version=true "
+            "future_cutoff=true orphan_work=true conservation=true cash_absent=true "
+            "failure_atomicity=true historical_cursor_absent=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e4_research_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise client-cut features, strategy timers, and player state."""
+
+    return (
+        _wo31e4_composition_case(),
+        _wo31e4_observable_decisions_case(),
+        _wo31e4_fresh_restore_case(),
+        _wo31e4_ownership_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -13806,4 +14320,5 @@ __all__ = [
     "audit_wo31e2_simple_flow_slice",
     "audit_wo31e2_flow_restore",
     "audit_wo31e3_delivery_restore",
+    "audit_wo31e4_research_restore",
 ]

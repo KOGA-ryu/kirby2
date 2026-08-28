@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Protocol
 
-from kirby2.exchange import OrderBook, OrderOwner, OrderType, Side
+from kirby2.exchange import OrderOwner, OrderType, Side
+from kirby2.features import MarketDepthView
 from kirby2.session.events import EventType, SimulationEvent
 
 from .features import FeatureSnapshot, ObservableFeatureTracker
@@ -43,6 +45,27 @@ class TimeQualifier(str, Enum):
     EVENTS_WITHIN = "EVENTS_WITHIN"
     OCCURRED_WITHIN = "OCCURRED_WITHIN"
     AFTER_ENTRY = "AFTER_ENTRY"
+
+
+class _PositionLedgerView(Protocol):
+    position: int
+    bought_quantity: int
+    sold_quantity: int
+
+
+class _StrategyOrderView(Protocol):
+    owner: OrderOwner
+    order_type: OrderType
+
+
+class StatefulMarketView(MarketDepthView, Protocol):
+    """Observable market plus client-known player state used by strategies."""
+
+    @property
+    def player_position(self) -> _PositionLedgerView: ...
+
+    @property
+    def active_orders(self) -> Mapping[str, _StrategyOrderView]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +313,7 @@ class StateMachineRuntime:
         self._matched_events: dict[int, deque[int]] = {}
         self._last_occurred: dict[tuple[str, str, str], int] = {}
 
-    def reset(self, simulation_time_us: int, book: OrderBook) -> StateMachineTransition:
+    def reset(self, simulation_time_us: int, book: StatefulMarketView) -> StateMachineTransition:
         features = self.tracker.reset(simulation_time_us, book)
         self._state_entered_us = simulation_time_us
         self._last_occurred.clear()
@@ -348,7 +371,7 @@ class StateMachineRuntime:
         self,
         simulation_time_us: int,
         events: Iterable[SimulationEvent],
-        book: OrderBook,
+        book: StatefulMarketView,
     ) -> tuple[StateMachineBoundaryStep, ...]:
         """Consume one event batch once, then settle zero-time transitions."""
 
@@ -386,7 +409,7 @@ class StateMachineRuntime:
         self,
         simulation_time_us: int,
         events: Iterable[SimulationEvent],
-        book: OrderBook,
+        book: StatefulMarketView,
     ) -> StateMachineTransition | None:
         captured = tuple(events)
         features = self.tracker.observe(simulation_time_us, captured, book)
@@ -490,6 +513,110 @@ class StateMachineRuntime:
             },
         }
 
+    @classmethod
+    def from_runtime_state(
+        cls,
+        definition: StateMachineDefinition,
+        relative_volume: Decimal,
+        payload: Mapping[str, object],
+    ) -> StateMachineRuntime:
+        """Restore timers and causal windows without postmortem reevaluation."""
+
+        expected = {
+            "current",
+            "definition",
+            "feature_windows",
+            "last_occurred",
+            "matched_events",
+            "runtime",
+            "state_entered_us",
+            "true_since",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != expected:
+            raise ValueError("state-machine runtime state fields are not exact")
+        if payload["runtime"] != "STATE_MACHINE":
+            raise ValueError("state-machine runtime kind is unsupported")
+        if payload["definition"] != definition.as_dict():
+            raise ValueError("state-machine definition differs from configuration")
+        runtime = cls(definition, relative_volume)
+        from kirby2.features import MicrostructureFeatureEngine
+
+        feature_state = payload["feature_windows"]
+        if not isinstance(feature_state, Mapping):
+            raise TypeError("state-machine feature state must be an object")
+        runtime.tracker.engine = MicrostructureFeatureEngine.from_runtime_state(
+            feature_state
+        )
+        if runtime.tracker.engine.windows_us != (definition.window_us,):
+            raise ValueError("state-machine feature window differs from its definition")
+        current_payload = payload["current"]
+        runtime.current = (
+            None
+            if current_payload is None
+            else _state_machine_evaluation_from_dict(current_payload, definition)
+        )
+        state_entered_us = payload["state_entered_us"]
+        if type(state_entered_us) is not int or state_entered_us < 0:
+            raise ValueError("state-machine entered time must be nonnegative")
+        runtime._state_entered_us = state_entered_us
+        current_time_us = (
+            0 if runtime.current is None else runtime.current.simulation_time_us
+        )
+        if runtime.current is not None and (
+            state_entered_us > current_time_us
+            or current_time_us
+            != runtime.tracker.engine.runtime_state()["last_time_us"]
+        ):
+            raise ValueError("state-machine timers differ from feature cutoff")
+        runtime._true_since = _indexed_time_map(
+            payload["true_since"],
+            definition=definition,
+            field="true_since",
+            maximum_time_us=current_time_us,
+        )
+        matched = payload["matched_events"]
+        if not isinstance(matched, Mapping):
+            raise TypeError("state-machine matched events must be an object")
+        runtime._matched_events = {}
+        for raw_index, raw_times in matched.items():
+            index = _transition_index(
+                raw_index,
+                definition=definition,
+                field="matched_events",
+            )
+            if type(raw_times) is not list or any(
+                type(value) is not int or value < 0 or value > current_time_us
+                for value in raw_times
+            ):
+                raise ValueError("state-machine matched event times are invalid")
+            if raw_times != sorted(raw_times):
+                raise ValueError("state-machine matched event times move backward")
+            runtime._matched_events[index] = deque(raw_times)
+        last_occurred = payload["last_occurred"]
+        if type(last_occurred) is not list:
+            raise TypeError("state-machine occurrence memory must be an array")
+        runtime._last_occurred = {}
+        for row in last_occurred:
+            if not isinstance(row, Mapping) or set(row) != {"condition", "time_us"}:
+                raise ValueError("state-machine occurrence fields are not exact")
+            condition = row["condition"]
+            time_us = row["time_us"]
+            if (
+                type(condition) is not list
+                or len(condition) != 3
+                or any(type(value) is not str or not value for value in condition)
+            ):
+                raise ValueError("state-machine occurrence condition is invalid")
+            if type(time_us) is not int or time_us < 0 or time_us > current_time_us:
+                raise ValueError("state-machine occurrence time is invalid")
+            key = tuple(condition)
+            if key in runtime._last_occurred:
+                raise ValueError("state-machine occurrence memory is duplicated")
+            runtime._last_occurred[key] = time_us
+        if runtime.runtime_state() != dict(payload):
+            raise ValueError("state-machine runtime state is not a canonical fixed point")
+        return runtime
+
     def _transition_matches(
         self,
         index: int,
@@ -497,7 +624,7 @@ class StateMachineRuntime:
         simulation_time_us: int,
         events: tuple[SimulationEvent, ...],
         features: FeatureSnapshot,
-        book: OrderBook,
+        book: StatefulMarketView,
     ) -> tuple[bool, tuple[StatefulConditionResult, ...]]:
         if transition.qualifier is TimeQualifier.AFTER_ENTRY:
             return _contains_player_entry(events, book), ()
@@ -548,7 +675,7 @@ class StateMachineRuntime:
         simulation_time_us: int,
         events: tuple[SimulationEvent, ...],
         features: FeatureSnapshot,
-        book: OrderBook,
+        book: StatefulMarketView,
     ) -> None:
         if not events:
             return
@@ -563,7 +690,7 @@ class StateMachineRuntime:
         self,
         simulation_time_us: int,
         features: FeatureSnapshot,
-        book: OrderBook,
+        book: StatefulMarketView,
     ) -> None:
         if self.current is None:
             return
@@ -806,7 +933,7 @@ def _parse_stateful_condition(line_number: int, text: str) -> StatefulCondition:
 def _condition_result(
     condition: StatefulCondition,
     features: FeatureSnapshot,
-    book: OrderBook,
+    book: StatefulMarketView,
 ) -> StatefulConditionResult:
     try:
         market_feature = FeatureName(condition.feature)
@@ -845,7 +972,7 @@ def _condition_key(condition: StatefulCondition) -> tuple[str, str, str]:
 
 def _contains_player_entry(
     events: tuple[SimulationEvent, ...],
-    book: OrderBook,
+    book: StatefulMarketView,
 ) -> bool:
     position_before = book.player_position.position
     for event in reversed(events):
@@ -890,3 +1017,177 @@ def _valid_name(value: str) -> bool:
         )
         and len(value) <= 64
     )
+
+
+def _transition_index(
+    value: object,
+    *,
+    definition: StateMachineDefinition,
+    field: str,
+) -> int:
+    if type(value) is not str or not value.isdigit() or str(int(value)) != value:
+        raise ValueError(f"state-machine {field} index is not canonical")
+    index = int(value)
+    if index >= len(definition.transitions):
+        raise ValueError(f"state-machine {field} index exceeds the definition")
+    return index
+
+
+def _indexed_time_map(
+    payload: object,
+    *,
+    definition: StateMachineDefinition,
+    field: str,
+    maximum_time_us: int,
+) -> dict[int, int]:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"state-machine {field} must be an object")
+    result: dict[int, int] = {}
+    for raw_index, time_us in payload.items():
+        index = _transition_index(raw_index, definition=definition, field=field)
+        if type(time_us) is not int or time_us < 0 or time_us > maximum_time_us:
+            raise ValueError(f"state-machine {field} time is invalid")
+        result[index] = time_us
+    return result
+
+
+def _stateful_result_from_dict(payload: object) -> StatefulConditionResult:
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "actual",
+        "evidence_simulation_timestamp",
+        "expression",
+        "line",
+        "matched",
+    }:
+        raise ValueError("state-machine condition result fields are not exact")
+    line = payload["line"]
+    expression = payload["expression"]
+    actual = payload["actual"]
+    matched = payload["matched"]
+    evidence_time = payload["evidence_simulation_timestamp"]
+    if type(line) is not int or line <= 0:
+        raise ValueError("state-machine condition line must be positive")
+    if type(expression) is not str or not expression:
+        raise ValueError("state-machine condition expression must be nonempty")
+    if actual is not None and type(actual) is not str:
+        raise TypeError("state-machine condition actual must be decimal text or null")
+    if type(matched) is not bool:
+        raise TypeError("state-machine condition match flag must be boolean")
+    if evidence_time is not None and (
+        type(evidence_time) is not int or evidence_time < 0
+    ):
+        raise ValueError("state-machine evidence time must be nonnegative or null")
+    try:
+        decoded = None if actual is None else Decimal(actual)
+    except InvalidOperation as error:
+        raise ValueError("state-machine condition actual is invalid") from error
+    if decoded is not None and not decoded.is_finite():
+        raise ValueError("state-machine condition actual must be finite")
+    return StatefulConditionResult(line, expression, decoded, matched, evidence_time)
+
+
+def _state_machine_evaluation_from_dict(
+    payload: object,
+    definition: StateMachineDefinition,
+) -> StateMachineEvaluation:
+    from .runtime import _feature_snapshot_from_dict
+
+    expected = {
+        "condition_results",
+        "entry_permission",
+        "exit_permission",
+        "features",
+        "kind",
+        "machine_state",
+        "reason",
+        "setup_name",
+        "simulation_timestamp",
+        "state",
+        "state_entered_us",
+        "transition_qualifier",
+        "transition_source",
+        "window_us",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected:
+        raise ValueError("state-machine evaluation fields are not exact")
+    if payload["kind"] != "state_machine" or payload["setup_name"] != definition.name:
+        raise ValueError("state-machine evaluation identity is invalid")
+    simulation_time_us = payload["simulation_timestamp"]
+    entered_time_us = payload["state_entered_us"]
+    if (
+        type(simulation_time_us) is not int
+        or simulation_time_us < 0
+        or type(entered_time_us) is not int
+        or entered_time_us < 0
+        or entered_time_us > simulation_time_us
+    ):
+        raise ValueError("state-machine evaluation times are invalid")
+    if payload["window_us"] != definition.window_us:
+        raise ValueError("state-machine evaluation window differs from definition")
+    machine_state = payload["machine_state"]
+    if type(machine_state) is not str:
+        raise TypeError("state-machine evaluation state must be text")
+    state_definition = definition.state(machine_state)
+    raw_results = payload["condition_results"]
+    if type(raw_results) is not list:
+        raise TypeError("state-machine condition results must be an array")
+    transition_source = payload["transition_source"]
+    qualifier = payload["transition_qualifier"]
+    if transition_source is not None and type(transition_source) is not str:
+        raise TypeError("state-machine transition source must be text or null")
+    evaluation = StateMachineEvaluation(
+        setup_name=definition.name,
+        simulation_time_us=simulation_time_us,
+        state=TrafficState(str(payload["state"])),
+        reason=str(payload["reason"]),
+        features=_feature_snapshot_from_dict(
+            payload["features"],
+            expected_window_us=definition.window_us,
+            simulation_time_us=simulation_time_us,
+        ),
+        machine_state=state_definition.name,
+        state_entered_us=entered_time_us,
+        entry_permission=StrategyPermission(str(payload["entry_permission"])),
+        exit_permission=StrategyPermission(str(payload["exit_permission"])),
+        transition_source=transition_source,
+        transition_qualifier=(
+            None if qualifier is None else TimeQualifier(str(qualifier))
+        ),
+        condition_results=tuple(
+            _stateful_result_from_dict(row) for row in raw_results
+        ),
+    )
+    if (
+        evaluation.state is not state_definition.signal
+        or evaluation.entry_permission is not state_definition.entry_permission
+        or evaluation.exit_permission is not state_definition.exit_permission
+    ):
+        raise ValueError(
+            "state-machine evaluation permissions differ from its named state"
+        )
+    if transition_source is None:
+        if qualifier is not None or evaluation.condition_results:
+            raise ValueError(
+                "state-machine nontransition evaluation retains transition evidence"
+            )
+    else:
+        matches = tuple(
+            transition
+            for transition in definition.transitions
+            if transition.source_state == transition_source
+            and transition.target_state == state_definition.name
+            and transition.qualifier is evaluation.transition_qualifier
+            and evaluation.reason
+            == (
+                f"{transition.source_state} -> {transition.target_state} "
+                f"via {transition.qualifier.value} at line "
+                f"{transition.line_number}"
+            )
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                "state-machine transition evidence differs from its definition"
+            )
+    if evaluation.as_dict() != dict(payload):
+        raise ValueError("state-machine evaluation is not canonical")
+    return evaluation

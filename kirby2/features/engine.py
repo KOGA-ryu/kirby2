@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Iterable, Mapping, Protocol
 
 from kirby2.exchange import Side
@@ -188,6 +188,113 @@ class MicrostructureFeatureEngine:
             "relative_volume": str(self.relative_volume),
             "windows_us": list(self.windows_us),
         }
+
+    @classmethod
+    def from_runtime_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> MicrostructureFeatureEngine:
+        """Restore the exact retained causal windows without replaying later truth."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("feature runtime state must be an object")
+        expected = {
+            "activities",
+            "depth_levels",
+            "initialized",
+            "last_time_us",
+            "midpoints",
+            "relative_volume",
+            "windows_us",
+        }
+        if set(payload) != expected:
+            raise ValueError("feature runtime state fields are not exact")
+        raw_windows = payload["windows_us"]
+        if type(raw_windows) is not list:
+            raise TypeError("feature runtime windows must be an array")
+        windows = tuple(raw_windows)
+        if any(type(value) is not int for value in windows):
+            raise TypeError("feature runtime windows must be integers")
+        relative_volume_raw = payload["relative_volume"]
+        if type(relative_volume_raw) is not str:
+            raise TypeError("feature runtime relative volume must be decimal text")
+        try:
+            relative_volume = Decimal(relative_volume_raw)
+        except InvalidOperation as error:
+            raise ValueError("feature runtime relative volume is invalid") from error
+        depth_levels = payload["depth_levels"]
+        if type(depth_levels) is not int:
+            raise TypeError("feature runtime depth level count must be an integer")
+        engine = cls(
+            windows_us=windows,
+            relative_volume=relative_volume,
+            depth_levels=depth_levels,
+        )
+        initialized = payload["initialized"]
+        last_time_us = payload["last_time_us"]
+        if type(initialized) is not bool:
+            raise TypeError("feature initialized flag must be a boolean")
+        if type(last_time_us) is not int or last_time_us < 0:
+            raise ValueError("feature last observation time must be nonnegative")
+        raw_activities = payload["activities"]
+        raw_midpoints = payload["midpoints"]
+        if type(raw_activities) is not list or type(raw_midpoints) is not list:
+            raise TypeError("feature retained windows must be arrays")
+        activity_fields = {
+            "aggressive_buy",
+            "aggressive_sell",
+            "cancel_ask",
+            "cancel_bid",
+            "depletion_ask",
+            "depletion_bid",
+            "replenishment_ask",
+            "replenishment_bid",
+            "time_us",
+            "trades",
+        }
+        activities: list[_Activity] = []
+        for row in raw_activities:
+            if not isinstance(row, Mapping) or set(row) != activity_fields:
+                raise ValueError("feature activity fields are not exact")
+            if any(type(row[field]) is not int for field in activity_fields):
+                raise TypeError("feature activity values must be integers")
+            if any(row[field] < 0 for field in activity_fields):
+                raise ValueError("feature activity values must be nonnegative")
+            activities.append(_Activity(**{field: row[field] for field in activity_fields}))
+        midpoints: list[_Midpoint] = []
+        for row in raw_midpoints:
+            if not isinstance(row, Mapping) or set(row) != {"time_us", "value"}:
+                raise ValueError("feature midpoint fields are not exact")
+            time_us = row["time_us"]
+            value = row["value"]
+            if type(time_us) is not int or time_us < 0:
+                raise ValueError("feature midpoint time must be nonnegative")
+            if value is not None and type(value) is not str:
+                raise TypeError("feature midpoint value must be decimal text or null")
+            try:
+                decimal_value = None if value is None else Decimal(value)
+            except InvalidOperation as error:
+                raise ValueError("feature midpoint value is invalid") from error
+            if decimal_value is not None and not decimal_value.is_finite():
+                raise ValueError("feature midpoint value must be finite")
+            midpoints.append(_Midpoint(time_us, decimal_value))
+        activity_times = [item.time_us for item in activities]
+        midpoint_times = [item.time_us for item in midpoints]
+        if activity_times != sorted(activity_times) or midpoint_times != sorted(midpoint_times):
+            raise ValueError("feature retained windows move backward")
+        if any(value > last_time_us for value in (*activity_times, *midpoint_times)):
+            raise ValueError("feature retained window exceeds its observation cutoff")
+        if initialized and not midpoints:
+            raise ValueError("initialized feature state requires a midpoint anchor")
+        if not initialized and (activities or midpoints or last_time_us != 0):
+            raise ValueError("uninitialized feature state retains observations")
+        engine._activities = deque(activities, maxlen=100_000)
+        engine._midpoints = deque(midpoints, maxlen=100_000)
+        engine._last_time_us = last_time_us
+        engine._initialized = initialized
+        if engine.runtime_state() != dict(payload):
+            raise ValueError("feature runtime state is not a canonical fixed point")
+        return engine
 
     def snapshot(self, simulation_time_us: int, book: MarketDepthView) -> FeatureFrame:
         if not self._initialized:

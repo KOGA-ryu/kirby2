@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 from kirby2.features import MarketDepthView
 from kirby2.session.events import SimulationEvent
 
 from .features import FeatureSnapshot, ObservableFeatureTracker
-from .language import RuleCondition, StrategyDefinition, TrafficState
+from .language import FeatureName, RuleCondition, StrategyDefinition, TrafficState
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,53 @@ class TrafficLightRuntime:
             "runtime": "TRAFFIC_LIGHT",
         }
 
+    @classmethod
+    def from_runtime_state(
+        cls,
+        definition: StrategyDefinition,
+        relative_volume: Decimal,
+        payload: Mapping[str, object],
+    ) -> TrafficLightRuntime:
+        """Restore the recorded decision cut instead of evaluating future state."""
+
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "current",
+            "definition",
+            "feature_windows",
+            "runtime",
+        }:
+            raise ValueError("traffic-light runtime state fields are not exact")
+        if payload["runtime"] != "TRAFFIC_LIGHT":
+            raise ValueError("traffic-light runtime kind is unsupported")
+        if payload["definition"] != definition.as_dict():
+            raise ValueError("traffic-light definition differs from configuration")
+        runtime = cls(definition, relative_volume)
+        from kirby2.features import MicrostructureFeatureEngine
+
+        feature_state = payload["feature_windows"]
+        if not isinstance(feature_state, Mapping):
+            raise TypeError("traffic-light feature state must be an object")
+        runtime.tracker.engine = MicrostructureFeatureEngine.from_runtime_state(
+            feature_state
+        )
+        if runtime.tracker.engine.windows_us != (definition.window_us,):
+            raise ValueError("traffic-light feature window differs from its definition")
+        raw_current = payload["current"]
+        runtime.current = (
+            None
+            if raw_current is None
+            else _evaluation_from_dict(raw_current, definition)
+        )
+        if runtime.current is not None and (
+            not runtime.tracker.engine.runtime_state()["initialized"]
+            or runtime.current.simulation_time_us
+            != runtime.tracker.engine.runtime_state()["last_time_us"]
+        ):
+            raise ValueError("traffic-light evaluation differs from feature cutoff")
+        if runtime.runtime_state() != dict(payload):
+            raise ValueError("traffic-light runtime state is not a canonical fixed point")
+        return runtime
+
     def _evaluate(self, features: FeatureSnapshot) -> EvaluationResult:
         green = self._condition_results(self.definition.green_conditions, features)
         wait = self._condition_results(self.definition.wait_conditions, features)
@@ -173,3 +221,112 @@ class TrafficLightRuntime:
             return "none"
         actual = "unavailable" if failed.actual is None else str(failed.actual)
         return f"at line {failed.line_number} ({failed.expression}; actual={actual})"
+
+
+def _feature_snapshot_from_dict(
+    payload: object,
+    *,
+    expected_window_us: int,
+    simulation_time_us: int,
+) -> FeatureSnapshot:
+    if not isinstance(payload, Mapping) or set(payload) != {
+        feature.value for feature in FeatureName
+    }:
+        raise ValueError("traffic-light feature snapshot fields are not exact")
+    values: dict[FeatureName, Decimal | None] = {}
+    for feature in FeatureName:
+        value = payload[feature.value]
+        if value is not None and type(value) is not str:
+            raise TypeError("traffic-light feature values must be decimal text or null")
+        try:
+            decoded = None if value is None else Decimal(value)
+        except InvalidOperation as error:
+            raise ValueError("traffic-light feature value is invalid") from error
+        if decoded is not None and not decoded.is_finite():
+            raise ValueError("traffic-light feature value must be finite")
+        values[feature] = decoded
+    return FeatureSnapshot(simulation_time_us, expected_window_us, values)
+
+
+def _condition_result_from_dict(payload: object) -> ConditionResult:
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "actual",
+        "expression",
+        "line",
+        "matched",
+    }:
+        raise ValueError("traffic-light condition result fields are not exact")
+    line = payload["line"]
+    expression = payload["expression"]
+    actual = payload["actual"]
+    matched = payload["matched"]
+    if type(line) is not int or line <= 0:
+        raise ValueError("traffic-light condition line must be positive")
+    if type(expression) is not str or not expression:
+        raise ValueError("traffic-light condition expression must be nonempty")
+    if actual is not None and type(actual) is not str:
+        raise TypeError("traffic-light condition actual must be decimal text or null")
+    if type(matched) is not bool:
+        raise TypeError("traffic-light condition match flag must be boolean")
+    try:
+        decoded = None if actual is None else Decimal(actual)
+    except InvalidOperation as error:
+        raise ValueError("traffic-light condition actual is invalid") from error
+    if decoded is not None and not decoded.is_finite():
+        raise ValueError("traffic-light condition actual must be finite")
+    return ConditionResult(line, expression, decoded, matched)
+
+
+def _evaluation_from_dict(
+    payload: object,
+    definition: StrategyDefinition,
+) -> EvaluationResult:
+    if not isinstance(payload, Mapping) or set(payload) != {
+        "features",
+        "green_conditions",
+        "reason",
+        "setup_name",
+        "simulation_timestamp",
+        "state",
+        "wait_conditions",
+        "window_us",
+    }:
+        raise ValueError("traffic-light evaluation fields are not exact")
+    simulation_time_us = payload["simulation_timestamp"]
+    window_us = payload["window_us"]
+    if type(simulation_time_us) is not int or simulation_time_us < 0:
+        raise ValueError("traffic-light evaluation time must be nonnegative")
+    if window_us != definition.window_us:
+        raise ValueError("traffic-light evaluation window differs from definition")
+    if payload["setup_name"] != definition.name:
+        raise ValueError("traffic-light evaluation setup differs from definition")
+    if type(payload["reason"]) is not str or not payload["reason"]:
+        raise ValueError("traffic-light evaluation reason must be nonempty")
+    raw_green = payload["green_conditions"]
+    raw_wait = payload["wait_conditions"]
+    if type(raw_green) is not list or type(raw_wait) is not list:
+        raise TypeError("traffic-light condition results must be arrays")
+    features = _feature_snapshot_from_dict(
+        payload["features"],
+        expected_window_us=definition.window_us,
+        simulation_time_us=simulation_time_us,
+    )
+    evaluation = EvaluationResult(
+        setup_name=definition.name,
+        simulation_time_us=simulation_time_us,
+        state=TrafficState(str(payload["state"])),
+        reason=str(payload["reason"]),
+        features=features,
+        green_conditions=tuple(
+            _condition_result_from_dict(row) for row in raw_green
+        ),
+        wait_conditions=tuple(
+            _condition_result_from_dict(row) for row in raw_wait
+        ),
+    )
+    expected = TrafficLightRuntime(definition, Decimal(1))._evaluate(features)
+    if evaluation.as_dict() != expected.as_dict():
+        raise ValueError("traffic-light evaluation differs from observable features")
+    if evaluation.as_dict() != dict(payload):
+        raise ValueError("traffic-light evaluation is not canonical")
+    return evaluation

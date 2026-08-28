@@ -1,6 +1,7 @@
 """Authoritative deterministic scheduling kernel for one synthetic full day.
 
-The E1 mechanics, E2 flow, and E3 passive-delivery profiles execute here.  The runtime owns
+The E1 mechanics, E2 flow, E3 passive-delivery, and E4 observable-research
+profiles execute here.  The runtime owns
 the calendar, simulation clock, scheduling heap, global/event/order allocators,
 quiescent-cut controller, and the one market-mechanics engine.  Optional agent
 code is an injected scheduler over those owners; it cannot advance time or
@@ -39,6 +40,7 @@ from .composition import (
     AGENT_SCHEDULER_COMPONENT,
     DELIVERY_ASYNC_COMPONENT,
     DELIVERY_PROFILE_ID,
+    FEATURE_STRATEGY_PLAYER_COMPONENT,
     FLOW_HAWKES_COMPONENT,
     FLOW_PROFILE_ID,
     FLOW_QUEUE_REACTIVE_COMPONENT,
@@ -46,11 +48,13 @@ from .composition import (
     FULL_DAY_RUNTIME_COMPONENT,
     INITIAL_PROFILE_ID,
     MECHANICS_COMPONENT,
+    RESEARCH_PROFILE_ID,
     agent_scheduler_is_active,
     executable_agent_mechanics_composition_matrix,
     executable_delivery_composition_matrix,
     executable_hawkes_flow_composition_matrix,
     executable_queue_reactive_flow_composition_matrix,
+    executable_research_composition_matrix,
     executable_simple_flow_composition_matrix,
 )
 from .events import (
@@ -93,6 +97,7 @@ SIMPLE_FLOW_NATIVE_LEDGER_ID = "SIMPLE_FLOW_PROPOSALS_V1"
 HAWKES_FLOW_NATIVE_LEDGER_ID = "HAWKES_FLOW_PROPOSALS_V1"
 QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID = "QUEUE_REACTIVE_FLOW_PROPOSALS_V1"
 DELIVERY_NATIVE_LEDGER_ID = "DELIVERY_ASYNC_EVENTS_V1"
+RESEARCH_NATIVE_LEDGER_ID = "FEATURE_STRATEGY_PLAYER_EVENTS_V1"
 
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
@@ -111,6 +116,9 @@ _WORK_HAWKES_FLOW_PROPOSAL = "HAWKES_FLOW_PROPOSAL"
 _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL = "QUEUE_REACTIVE_FLOW_PROPOSAL"
 _WORK_DELIVERY_VENUE_RECEIPT = "DELIVERY_VENUE_RECEIPT"
 _WORK_DELIVERY_CLIENT_MESSAGE = "DELIVERY_CLIENT_MESSAGE"
+_WORK_RESEARCH_FEATURE_UPDATE = "RESEARCH_FEATURE_UPDATE"
+_WORK_RESEARCH_PLAYER_DECISION = "RESEARCH_PLAYER_DECISION"
+_WORK_RESEARCH_STRATEGY_DEADLINE = "RESEARCH_STRATEGY_DEADLINE"
 
 _WORK_TYPES = frozenset(
     {
@@ -128,6 +136,9 @@ _WORK_TYPES = frozenset(
         _WORK_MECHANICS_SUBMIT,
         _WORK_PARTICIPANT_SCHEDULE,
         _WORK_REOPEN_COMPLETE,
+        _WORK_RESEARCH_FEATURE_UPDATE,
+        _WORK_RESEARCH_PLAYER_DECISION,
+        _WORK_RESEARCH_STRATEGY_DEADLINE,
         _WORK_SCHEDULED_INFORMATION,
         _WORK_SIMPLE_FLOW_PROPOSAL,
         _WORK_STATE_EMISSION,
@@ -212,6 +223,21 @@ _WORK_CONTRACTS: Mapping[
             FULL_DAY_RUNTIME_COMPONENT,
             frozenset({WorkStageV1.PENDING_VENUE_ARRIVAL}),
             frozenset({"scheduled_event_id"}),
+        ),
+        _WORK_RESEARCH_FEATURE_UPDATE: (
+            FEATURE_STRATEGY_PLAYER_COMPONENT,
+            frozenset({WorkStageV1.FEATURE_UPDATE}),
+            frozenset({"message_id"}),
+        ),
+        _WORK_RESEARCH_PLAYER_DECISION: (
+            FEATURE_STRATEGY_PLAYER_COMPONENT,
+            frozenset({WorkStageV1.STRATEGY_ALGORITHM_DEADLINE}),
+            frozenset({"decision_id"}),
+        ),
+        _WORK_RESEARCH_STRATEGY_DEADLINE: (
+            FEATURE_STRATEGY_PLAYER_COMPONENT,
+            frozenset({WorkStageV1.STRATEGY_ALGORITHM_DEADLINE}),
+            frozenset({"deadline_id"}),
         ),
         _WORK_SCHEDULED_INFORMATION: (
             FULL_DAY_RUNTIME_COMPONENT,
@@ -1137,6 +1163,9 @@ def _runtime_composition_matrix(plan: FullDayPlanV1):
     elif profile_id == DELIVERY_PROFILE_ID:
         matrix = executable_delivery_composition_matrix()
         expected_version = 1
+    elif profile_id == RESEARCH_PROFILE_ID:
+        matrix = executable_research_composition_matrix()
+        expected_version = 1
     else:
         raise ValueError("FullDayRuntime does not implement this composition profile")
     if (
@@ -1165,6 +1194,7 @@ class FullDayRuntime:
         hawkes_flow: object | None,
         queue_reactive_flow: object | None,
         delivery: object | None,
+        research: object | None,
         order_id_allocator: RuntimeOrderIdAllocatorV1,
         bootstrap: bool,
         restoring: bool = False,
@@ -1179,6 +1209,7 @@ class FullDayRuntime:
         self.hawkes_flow = hawkes_flow
         self.queue_reactive_flow = queue_reactive_flow
         self.delivery = delivery
+        self.research = research
         self._order_id_allocator = order_id_allocator
         self._validate_profile_and_core_owners(restoring=restoring)
 
@@ -1209,6 +1240,8 @@ class FullDayRuntime:
             self._component_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
         if self.delivery is not None:
             self._component_sequences[DELIVERY_ASYNC_COMPONENT] = 0
+        if self.research is not None:
+            self._component_sequences[FEATURE_STRATEGY_PLAYER_COMPONENT] = 0
         self._native_sequences: dict[str, int] = {}
         if self.agent_scheduler is not None:
             self._native_sequences[AGENT_SCHEDULER_COMPONENT] = 0
@@ -1220,6 +1253,8 @@ class FullDayRuntime:
             self._native_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
         if self.delivery is not None:
             self._native_sequences[DELIVERY_ASYNC_COMPONENT] = 0
+        if self.research is not None:
+            self._native_sequences[FEATURE_STRATEGY_PLAYER_COMPONENT] = 0
         self._mechanics_event_cursor = len(self.engine.events)
         self._calendar_boundary_index = 0
         self._participant_schedule_index = 0
@@ -1263,6 +1298,11 @@ class FullDayRuntime:
                 _WORK_MECHANICS_SUBMIT: "_handle_mechanics_submit",
                 _WORK_PARTICIPANT_SCHEDULE: "_handle_participant_schedule",
                 _WORK_REOPEN_COMPLETE: "_handle_reopen_complete",
+                _WORK_RESEARCH_FEATURE_UPDATE: "_handle_research_feature_update",
+                _WORK_RESEARCH_PLAYER_DECISION: "_handle_research_player_decision",
+                _WORK_RESEARCH_STRATEGY_DEADLINE: (
+                    "_handle_research_strategy_deadline"
+                ),
                 _WORK_SCHEDULED_INFORMATION: "_handle_scheduled_information",
                 _WORK_SIMPLE_FLOW_PROPOSAL: "_handle_simple_flow_proposal",
                 _WORK_STATE_EMISSION: "_handle_state_emission",
@@ -1280,6 +1320,7 @@ class FullDayRuntime:
             self._schedule_initial_queue_reactive_flow()
             self._schedule_agent_work()
             self._schedule_next_state_batch()
+            self._synchronize_research_deadline()
             self.assert_invariants()
 
     @classmethod
@@ -1294,6 +1335,7 @@ class FullDayRuntime:
         hawkes_flow: object | None = None,
         queue_reactive_flow: object | None = None,
         delivery: object | None = None,
+        research: object | None = None,
         order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
     ) -> FullDayRuntime:
         if type(plan) is not FullDayPlanV1:
@@ -1318,6 +1360,7 @@ class FullDayRuntime:
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
+            research=research,
             order_id_allocator=allocator,
             bootstrap=True,
         )
@@ -1334,6 +1377,7 @@ class FullDayRuntime:
         hawkes_flow_configuration: object | None = None,
         queue_reactive_flow_configuration: object | None = None,
         delivery_configuration: object | None = None,
+        research_configuration: object | None = None,
     ) -> FullDayRuntime:
         """Construct the scheduler only after the sole owners exist."""
 
@@ -1441,6 +1485,20 @@ class FullDayRuntime:
                     "delivery configuration must use DeliveryConfigurationV1"
                 )
             delivery = DeliveryOwnerV1(plan, delivery_configuration)
+        research = None
+        if research_configuration is not None:
+            from .components_research import (
+                ResearchConfigurationV1,
+                ResearchOwnerV1,
+            )
+
+            if type(research_configuration) is not ResearchConfigurationV1:
+                raise TypeError(
+                    "research configuration must use ResearchConfigurationV1"
+                )
+            if delivery is None:
+                raise ValueError("research requires the passive delivery owner")
+            research = ResearchOwnerV1(plan, research_configuration)
         return cls.create(
             plan,
             engine=selected_engine,
@@ -1450,6 +1508,7 @@ class FullDayRuntime:
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
+            research=research,
             order_id_allocator=allocator,
         )
 
@@ -1677,10 +1736,30 @@ class FullDayRuntime:
                 self.delivery,
                 owner_label="delivery component",
             )
+        research_required = FEATURE_STRATEGY_PLAYER_COMPONENT in active_components
+        if research_required != (self.research is not None):
+            raise ValueError("research presence differs from its active predicate")
+        if self.research is not None:
+            from .components_research import ResearchOwnerV1
+
+            if type(self.research) is not ResearchOwnerV1:
+                raise ValueError("runtime requires the exact ResearchOwnerV1")
+            if self.delivery is None:
+                raise ValueError("research requires passive delivery")
+            self.research.assert_invariants(self.plan, delivery=self.delivery)
+            self._reject_smuggled_core_owner(
+                self.research,
+                owner_label="research component",
+                allow_authoritative_borrows=False,
+            )
         self.engine.assert_invariants()
 
     def _reject_smuggled_core_owner(
-        self, owner: object, *, owner_label: str
+        self,
+        owner: object,
+        *,
+        owner_label: str,
+        allow_authoritative_borrows: bool = True,
     ) -> None:
         values: list[object] = []
         namespace = getattr(owner, "__dict__", None)
@@ -1700,20 +1779,28 @@ class FullDayRuntime:
                 raise ValueError(
                     f"{owner_label} owner graph exceeds the bounded ownership scan"
                 )
-            if isinstance(value, MarketMechanicsEngine) and value is not self.engine:
-                raise ValueError(f"{owner_label} smuggles a second mechanics engine")
+            if isinstance(value, MarketMechanicsEngine) and (
+                value is not self.engine or not allow_authoritative_borrows
+            ):
+                raise ValueError(f"{owner_label} smuggles a mechanics engine")
             if isinstance(value, MarketMechanicsEngine):
                 return
-            if isinstance(value, SimulationClock) and value is not self.clock:
-                raise ValueError(f"{owner_label} smuggles a second simulation clock")
+            if isinstance(value, SimulationClock) and (
+                value is not self.clock or not allow_authoritative_borrows
+            ):
+                raise ValueError(f"{owner_label} smuggles a simulation clock")
             if isinstance(value, SimulationClock):
                 return
-            if isinstance(value, OrderBook) and value is not self.engine.book:
-                raise ValueError(f"{owner_label} smuggles a second order book")
+            if isinstance(value, OrderBook) and (
+                value is not self.engine.book or not allow_authoritative_borrows
+            ):
+                raise ValueError(f"{owner_label} smuggles an order book")
             if isinstance(value, OrderBook):
                 return
-            if isinstance(value, AuctionBook) and value is not self.engine.auction:
-                raise ValueError(f"{owner_label} smuggles a second auction book")
+            if isinstance(value, AuctionBook) and (
+                value is not self.engine.auction or not allow_authoritative_borrows
+            ):
+                raise ValueError(f"{owner_label} smuggles an auction book")
             if isinstance(value, AuctionBook):
                 return
             if isinstance(value, TradingDayCalendarV1):
@@ -2196,6 +2283,64 @@ class FullDayRuntime:
             )
             self._agent_tokens.add(token)
 
+    def _synchronize_research_deadline(self) -> None:
+        """Keep exactly one pending work item for the research timer frontier."""
+
+        if self.research is None:
+            return
+        desired_time = self.research.next_strategy_deadline_us
+        if (
+            desired_time is not None
+            and desired_time > self.plan.calendar.end_time_us
+        ):
+            desired_time = None
+        expected_id = f"RESEARCH-DEADLINE-{len(self.research.strategy_deadlines) + 1:010d}"
+        pending = tuple(
+            item
+            for item in self._pending.values()
+            if item.work_type == _WORK_RESEARCH_STRATEGY_DEADLINE
+        )
+        stale_ids = {
+            item.work_id
+            for item in pending
+            if desired_time is None
+            or item.key.simulation_time_us != desired_time
+            or item.payload["deadline_id"] != expected_id
+        }
+        if stale_ids:
+            for work_id in stale_ids:
+                retired = self._pending.pop(work_id)
+                if work_id in self._retired_work:
+                    raise RuntimeError("retired research deadline is duplicated")
+                self._retired_work[work_id] = retired
+            self._heap = [
+                (ordering, work_id)
+                for ordering, work_id in self._heap
+                if work_id not in stale_ids
+            ]
+            heapq.heapify(self._heap)
+        current = tuple(
+            item
+            for item in self._pending.values()
+            if item.work_type == _WORK_RESEARCH_STRATEGY_DEADLINE
+        )
+        if desired_time is None or current:
+            return
+        microstep = 0
+        if (
+            self._executing is not None
+            and self._executing.key.simulation_time_us == desired_time
+        ):
+            microstep = self._executing.key.microstep + 1
+        self._enqueue_new(
+            simulation_time_us=desired_time,
+            microstep=microstep,
+            stage=WorkStageV1.STRATEGY_ALGORITHM_DEADLINE,
+            source_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+            work_type=_WORK_RESEARCH_STRATEGY_DEADLINE,
+            payload={"deadline_id": expected_id},
+        )
+
     def _capture_transaction_state(self) -> dict[str, object]:
         """Capture every mutable owner field for failure-atomic public advance."""
 
@@ -2221,6 +2366,11 @@ class FullDayRuntime:
                 None
                 if self.queue_reactive_flow is None
                 else self.queue_reactive_flow.checkpoint_state()
+            ),
+            "research": (
+                None
+                if self.research is None
+                else self.research.checkpoint_state()
             ),
             "simple_flow": (
                 None
@@ -2276,6 +2426,7 @@ class FullDayRuntime:
                 self.hawkes_flow,
                 self.queue_reactive_flow,
                 self.delivery,
+                self.research,
                 self._state_runtime,
                 self._order_id_allocator,
             ),
@@ -2312,6 +2463,7 @@ class FullDayRuntime:
             hawkes_flow,
             queue_reactive_flow,
             delivery,
+            research,
             state_runtime,
             order_allocator,
         ) = snapshot["owner_identities"]
@@ -2430,6 +2582,28 @@ class FullDayRuntime:
                 )
             delivery.__dict__.clear()
             delivery.__dict__.update(restored_delivery.__dict__)
+        raw_research = owner_bundle["research"]
+        if raw_research is None:
+            if research is not None:
+                raise RuntimeError(
+                    "transaction snapshot research identity is inconsistent"
+                )
+        else:
+            from .components_research import ResearchOwnerV1
+
+            if delivery is None:
+                raise RuntimeError("transaction research restore requires delivery")
+            restored_research = ResearchOwnerV1.from_checkpoint_state(
+                raw_research,
+                plan=self.plan,
+                delivery=delivery,
+            )
+            if research is None:
+                raise RuntimeError(
+                    "transaction snapshot research identity is inconsistent"
+                )
+            research.__dict__.clear()
+            research.__dict__.update(restored_research.__dict__)
         state_runtime_state = HierarchicalStateRuntimeStateV1.from_dict(
             owner_bundle["state_runtime"]
         )
@@ -2449,6 +2623,7 @@ class FullDayRuntime:
         self.hawkes_flow = hawkes_flow
         self.queue_reactive_flow = queue_reactive_flow
         self.delivery = delivery
+        self.research = research
         self._state_runtime = state_runtime
         self._order_id_allocator = order_allocator
         self._heap = snapshot["heap"]
@@ -2658,6 +2833,49 @@ class FullDayRuntime:
         if marker is None or not matching_cuts:
             raise RuntimeError("checkpoint marker did not reach a quiescent cut")
         return matching_cuts[-1]
+
+    def schedule_player_decision(
+        self,
+        *,
+        action: str,
+        action_payload: Mapping[str, object],
+        at_time_us: int | None = None,
+    ):
+        """Schedule one observable-cut-bound player action through the gateway."""
+
+        if self.research is None:
+            raise RuntimeError("player decisions require the active research owner")
+        if self._executing is not None:
+            raise RuntimeError("player decision scheduling is not reentrant")
+        scheduled_time = (
+            self.clock.current_time_us if at_time_us is None else at_time_us
+        )
+        self._next_external_microstep(scheduled_time)
+        transaction = self._capture_transaction_state()
+        try:
+            decision = self.research.queue_player_decision(
+                action=action,
+                action_payload=action_payload,
+                decided_at_us=self.research.last_observation_time_us,
+                scheduled_time_us=scheduled_time,
+            )
+            item = self._enqueue_new(
+                simulation_time_us=scheduled_time,
+                microstep=self._next_external_microstep(scheduled_time),
+                stage=WorkStageV1.STRATEGY_ALGORITHM_DEADLINE,
+                source_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+                work_type=_WORK_RESEARCH_PLAYER_DECISION,
+                payload={"decision_id": decision.decision_id},
+            )
+            decision = self.research.bind_decision_work(
+                decision.decision_id,
+                item.work_id,
+            )
+            self.assert_invariants()
+            return decision
+        except BaseException:
+            self._restore_transaction_state(transaction)
+            raise
 
     def submit_request(
         self,
@@ -3631,6 +3849,113 @@ class FullDayRuntime:
         if executed_messages != len(self.delivery.delivered_messages):
             raise RuntimeError("delivered client messages differ from executed work")
 
+    def _assert_research_reconciliation(self) -> None:
+        research_types = {
+            _WORK_RESEARCH_FEATURE_UPDATE,
+            _WORK_RESEARCH_PLAYER_DECISION,
+            _WORK_RESEARCH_STRATEGY_DEADLINE,
+        }
+        work = tuple(
+            item
+            for item in (*self._executed_work.values(), *self._pending.values())
+            if item.work_type in research_types
+        )
+        entries = tuple(
+            sorted(
+                (
+                    entry
+                    for entry in self._native_ledger.values()
+                    if entry.reference.owner_component_id
+                    == FEATURE_STRATEGY_PLAYER_COMPONENT
+                ),
+                key=lambda entry: entry.reference.local_sequence,
+            )
+        )
+        if self.research is None:
+            if work or entries:
+                raise RuntimeError("inactive research retains work or native evidence")
+            return
+        if self.delivery is None:  # pragma: no cover - profile validation owns this
+            raise RuntimeError("active research lacks delivery")
+        self.research.assert_invariants(self.plan, delivery=self.delivery)
+        for sequence, entry in enumerate(entries, start=1):
+            reference = entry.reference
+            if (
+                reference.native_ledger_id != RESEARCH_NATIVE_LEDGER_ID
+                or reference.local_sequence != sequence
+                or reference.event_id
+                != f"FEATURE_STRATEGY_PLAYER_EVENT_{sequence:012d}"
+                or reference.event_type
+                not in {"FEATURE_UPDATED", "STRATEGY_ALGORITHM_DEADLINE"}
+            ):
+                raise RuntimeError("research native identity sequence is invalid")
+        if self.research.native_sequence != len(entries):
+            raise RuntimeError("research native cursor differs from native evidence")
+        pending_feature_ids = {
+            item.payload["message_id"]
+            for item in self._pending.values()
+            if item.work_type == _WORK_RESEARCH_FEATURE_UPDATE
+        }
+        delivered_ids = {
+            row["message_id"] for row in self.delivery.delivered_messages
+        }
+        processed_ids = set(self.research.processed_message_ids)
+        if (
+            processed_ids & pending_feature_ids
+            or processed_ids | pending_feature_ids != delivered_ids
+            or len(processed_ids) + len(pending_feature_ids) != len(delivered_ids)
+        ):
+            raise RuntimeError(
+                "research feature work does not partition delivered messages"
+            )
+        pending_decisions = {
+            item.payload["decision_id"]: item
+            for item in self._pending.values()
+            if item.work_type == _WORK_RESEARCH_PLAYER_DECISION
+        }
+        if set(pending_decisions) != set(self.research.pending_decisions):
+            raise RuntimeError("research pending decisions differ from runtime work")
+        for decision_id, decision in self.research.pending_decisions.items():
+            item = pending_decisions[decision_id]
+            if (
+                decision.work_id != item.work_id
+                or decision.scheduled_time_us != item.key.simulation_time_us
+            ):
+                raise RuntimeError("research decision differs from exact pending work")
+        route_work = {
+            item.work_id: item
+            for item in (*self._pending.values(), *self._executed_work.values())
+            if item.work_type == _WORK_DELIVERY_VENUE_RECEIPT
+        }
+        for row in self.research.completed_decisions:
+            route_work_id = row["route_work_id"]
+            if route_work_id not in route_work:
+                raise RuntimeError("completed research decision has an orphan route")
+        pending_deadlines = tuple(
+            item
+            for item in self._pending.values()
+            if item.work_type == _WORK_RESEARCH_STRATEGY_DEADLINE
+        )
+        expected_deadline = self.research.next_strategy_deadline_us
+        if expected_deadline is not None and expected_deadline > self.plan.calendar.end_time_us:
+            expected_deadline = None
+        if expected_deadline is None:
+            if pending_deadlines:
+                raise RuntimeError("research retains a deadline with no active timer")
+        elif (
+            len(pending_deadlines) != 1
+            or pending_deadlines[0].key.simulation_time_us != expected_deadline
+            or pending_deadlines[0].payload["deadline_id"]
+            != f"RESEARCH-DEADLINE-{len(self.research.strategy_deadlines) + 1:010d}"
+        ):
+            raise RuntimeError("research timer differs from pending deadline work")
+        executed_count = sum(
+            item.work_type in research_types
+            for item in self._executed_work.values()
+        )
+        if executed_count != len(entries):
+            raise RuntimeError("executed research work differs from native evidence")
+
     def _wrap_new_mechanics(
         self,
         *,
@@ -4219,6 +4544,159 @@ class FullDayRuntime:
                 "message_id": message.message_id,
             },
         )
+        if self.research is not None:
+            self._enqueue_new(
+                simulation_time_us=self.clock.current_time_us,
+                microstep=item.key.microstep + 1,
+                stage=WorkStageV1.FEATURE_UPDATE,
+                source_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+                work_type=_WORK_RESEARCH_FEATURE_UPDATE,
+                payload={"message_id": message.message_id},
+            )
+
+    def _next_research_native_sequence(self) -> int:
+        sequence = self._native_sequences[FEATURE_STRATEGY_PLAYER_COMPONENT] + 1
+        self._native_sequences[FEATURE_STRATEGY_PLAYER_COMPONENT] = sequence
+        self.research.native_sequence = sequence
+        return sequence
+
+    def _handle_research_feature_update(self, item: RuntimeWorkItemV1) -> None:
+        if self.research is None or self.delivery is None:
+            raise RuntimeError("research feature work has no active delivery owner")
+        from .components_delivery import DeliveryMessageV1
+
+        message_id = _identifier(item.payload.get("message_id"), "message_id")
+        messages = tuple(
+            DeliveryMessageV1.from_dict(row)
+            for row in self.delivery.delivered_messages
+            if row.get("message_id") == message_id
+        )
+        if len(messages) != 1:
+            raise RuntimeError("research feature work has no unique delivered message")
+        result = self.research.observe_delivery(
+            messages[0],
+            now_us=self.clock.current_time_us,
+        )
+        sequence = self._next_research_native_sequence()
+        self._emit_native(
+            owner_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+            native_ledger_id=RESEARCH_NATIVE_LEDGER_ID,
+            native_event_type="FEATURE_UPDATED",
+            native_local_sequence=sequence,
+            native_event_id=f"FEATURE_STRATEGY_PLAYER_EVENT_{sequence:012d}",
+            native_payload=result,
+            outer_event_type=FullDayEventTypeV1.FEATURE_UPDATED,
+            outer_data={
+                "feature_batch_id": result["feature_batch_id"],
+                "information_cutoff_us": result["information_cutoff_us"],
+            },
+        )
+        self._synchronize_research_deadline()
+
+    def _handle_research_strategy_deadline(
+        self, item: RuntimeWorkItemV1
+    ) -> None:
+        if self.research is None:
+            raise RuntimeError("research deadline work has no active owner")
+        expected_id = f"RESEARCH-DEADLINE-{len(self.research.strategy_deadlines) + 1:010d}"
+        deadline_id = _identifier(
+            item.payload.get("deadline_id"), "deadline_id"
+        )
+        if deadline_id != expected_id:
+            raise RuntimeError("research deadline identity differs from timer state")
+        result = self.research.observe_strategy_deadline(
+            now_us=self.clock.current_time_us
+        )
+        sequence = self._next_research_native_sequence()
+        self._emit_native(
+            owner_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+            native_ledger_id=RESEARCH_NATIVE_LEDGER_ID,
+            native_event_type="STRATEGY_ALGORITHM_DEADLINE",
+            native_local_sequence=sequence,
+            native_event_id=f"FEATURE_STRATEGY_PLAYER_EVENT_{sequence:012d}",
+            native_payload=result,
+            outer_event_type=FullDayEventTypeV1.STRATEGY_ALGORITHM_DEADLINE,
+            outer_data={
+                "deadline_id": deadline_id,
+                "information_cutoff_us": result["information_cutoff_us"],
+            },
+        )
+        self._synchronize_research_deadline()
+
+    def _handle_research_player_decision(
+        self, item: RuntimeWorkItemV1
+    ) -> None:
+        if self.research is None or self.delivery is None:
+            raise RuntimeError("research decision work has no active delivery route")
+        decision = self.research.take_due_decision(
+            _identifier(item.payload.get("decision_id"), "decision_id"),
+            work_id=item.work_id,
+            now_us=self.clock.current_time_us,
+        )
+        payload = dict(decision.action_payload)
+        if decision.action == "SUBMIT":
+            _require_exact_fields(payload, {"request"}, "player SUBMIT")
+            request_payload = payload["request"]
+            if not isinstance(request_payload, Mapping):
+                raise TypeError("player submit request must be an object")
+            route = self.submit_request(
+                AdvancedOrderRequest.from_dict(dict(request_payload)),
+                at_time_us=self.clock.current_time_us,
+            )
+        elif decision.action == "CANCEL":
+            _require_exact_fields(
+                payload, {"order_id", "reason"}, "player CANCEL"
+            )
+            route = self.cancel_order(
+                _identifier(payload.get("order_id"), "order_id"),
+                reason=_identifier(payload.get("reason"), "reason"),
+                at_time_us=self.clock.current_time_us,
+            )
+        elif decision.action == "REPLACE":
+            _require_exact_fields(
+                payload,
+                {"new_order_id", "new_price_ticks", "new_quantity", "order_id"},
+                "player REPLACE",
+            )
+            route = self.replace_order(
+                _identifier(payload.get("order_id"), "order_id"),
+                new_order_id=_identifier(
+                    payload.get("new_order_id"), "new_order_id"
+                ),
+                new_quantity=_exact_int(
+                    payload.get("new_quantity"), "new_quantity", minimum=1
+                ),
+                new_price_ticks=_exact_optional_int(
+                    payload.get("new_price_ticks"),
+                    "new_price_ticks",
+                    minimum=1,
+                ),
+                at_time_us=self.clock.current_time_us,
+            )
+        else:  # pragma: no cover - PlayerDecisionV1 closes the action enum
+            raise RuntimeError("research decision action is unsupported")
+        completed = self.research.complete_decision(
+            decision,
+            route_work_id=route.work_id,
+        )
+        sequence = self._next_research_native_sequence()
+        native_payload = {
+            **completed.as_dict(),
+            "deadline_id": completed.decision_id,
+        }
+        self._emit_native(
+            owner_component_id=FEATURE_STRATEGY_PLAYER_COMPONENT,
+            native_ledger_id=RESEARCH_NATIVE_LEDGER_ID,
+            native_event_type="STRATEGY_ALGORITHM_DEADLINE",
+            native_local_sequence=sequence,
+            native_event_id=f"FEATURE_STRATEGY_PLAYER_EVENT_{sequence:012d}",
+            native_payload=native_payload,
+            outer_event_type=FullDayEventTypeV1.STRATEGY_ALGORITHM_DEADLINE,
+            outer_data={
+                "deadline_id": completed.decision_id,
+                "information_cutoff_us": completed.information_cutoff_us,
+            },
+        )
 
     def _handle_mechanics_cancel(self, item: RuntimeWorkItemV1) -> None:
         scheduler_book_before = self._scheduler_market_snapshot()
@@ -4602,6 +5080,19 @@ class FullDayRuntime:
             "status": "PRESERVED",
         }
 
+    def _research_checkpoint_union(self) -> dict[str, object]:
+        if self.research is None:
+            return {
+                "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
+                "status": "ABSENT",
+            }
+        state = self.research.checkpoint_state()
+        return {
+            "state": _plain(state),
+            "state_sha256": canonical_sha256(state),
+            "status": "PRESERVED",
+        }
+
     @staticmethod
     def _component_presence_inventory(
         plan: FullDayPlanV1,
@@ -4611,6 +5102,7 @@ class FullDayRuntime:
         hawkes_flow_present: bool,
         queue_reactive_flow_present: bool,
         delivery_present: bool,
+        research_present: bool,
     ) -> list[dict[str, object]]:
         matrix = _runtime_composition_matrix(plan)
         profile = matrix.profile(
@@ -4654,6 +5146,10 @@ class FullDayRuntime:
         if (DELIVERY_ASYNC_COMPONENT in active) != delivery_present:
             raise ValueError(
                 "delivery presence differs from the composition active predicate"
+            )
+        if (FEATURE_STRATEGY_PLAYER_COMPONENT in active) != research_present:
+            raise ValueError(
+                "research presence differs from the composition active predicate"
             )
         rows: list[dict[str, object]] = []
         for component in profile.components:
@@ -4740,6 +5236,7 @@ class FullDayRuntime:
                     self.queue_reactive_flow is not None
                 ),
                 delivery_present=self.delivery is not None,
+                research_present=self.research is not None,
             ),
             "dequeued_count": self._dequeued_count,
             "engine": self.engine.checkpoint_state(),
@@ -4803,6 +5300,8 @@ class FullDayRuntime:
             )
         if self.delivery is not None:
             state["delivery"] = self._delivery_checkpoint_union()
+        if self.research is not None:
+            state["research"] = self._research_checkpoint_union()
         validate_strict_json(state)
         if (
             len(canonical_json_bytes(state))
@@ -4830,6 +5329,7 @@ class FullDayRuntime:
         state.pop("hawkes_flow", None)
         state.pop("queue_reactive_flow", None)
         state.pop("delivery", None)
+        state.pop("research", None)
         validate_strict_json(state)
         return state
 
@@ -4902,6 +5402,9 @@ class FullDayRuntime:
                 FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids
             ),
             delivery_present=DELIVERY_ASYNC_COMPONENT in plan.selected_component_ids,
+            research_present=(
+                FEATURE_STRATEGY_PLAYER_COMPONENT in plan.selected_component_ids
+            ),
         )
         if payload["component_presence"] != expected_presence:
             raise ValueError(
@@ -5049,6 +5552,7 @@ class FullDayRuntime:
                 FLOW_HAWKES_COMPONENT,
                 FLOW_QUEUE_REACTIVE_COMPONENT,
                 DELIVERY_ASYNC_COMPONENT,
+                FEATURE_STRATEGY_PLAYER_COMPONENT,
             ) if component_id in plan.selected_component_ids),
         }
         expected_component_sequences = {
@@ -5396,6 +5900,10 @@ class FullDayRuntime:
             delivery = self._delivery_checkpoint_union()
             result["delivery_state_sha256"] = delivery.get("state_sha256")
             result["delivery_status"] = delivery["status"]
+        if self.research is not None:
+            research = self._research_checkpoint_union()
+            result["research_state_sha256"] = research.get("state_sha256")
+            result["research_status"] = research["status"]
         return result
 
     @classmethod
@@ -5449,6 +5957,8 @@ class FullDayRuntime:
             expected.add("queue_reactive_flow")
         if DELIVERY_ASYNC_COMPONENT in plan.selected_component_ids:
             expected.add("delivery")
+        if FEATURE_STRATEGY_PLAYER_COMPONENT in plan.selected_component_ids:
+            expected.add("research")
         _require_exact_fields(payload, expected, "FullDayRuntime checkpoint")
         if (
             payload["schema_version"] != FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION
@@ -5516,6 +6026,7 @@ class FullDayRuntime:
         hawkes_flow: object | None = None
         queue_reactive_flow: object | None = None
         delivery: object | None = None
+        research: object | None = None
         if FLOW_SIMPLE_COMPONENT in plan.selected_component_ids:
             raw_simple_flow = _plain_object(
                 payload["simple_flow"], "simple-flow union"
@@ -5629,6 +6140,33 @@ class FullDayRuntime:
                 raw_delivery_state,
                 plan=plan,
             )
+        if FEATURE_STRATEGY_PLAYER_COMPONENT in plan.selected_component_ids:
+            if delivery is None:
+                raise ValueError("research checkpoint requires delivery state")
+            raw_research = _plain_object(payload["research"], "research union")
+            if raw_research.get("status") != "PRESERVED":
+                raise ValueError(
+                    "executable research profile requires preserved research state"
+                )
+            _require_exact_fields(
+                raw_research,
+                {"state", "state_sha256", "status"},
+                "preserved research",
+            )
+            raw_research_state = _plain_object(
+                raw_research["state"], "research state"
+            )
+            if raw_research["state_sha256"] != canonical_sha256(
+                raw_research_state
+            ):
+                raise ValueError("research state digest mismatch")
+            from .components_research import ResearchOwnerV1
+
+            research = ResearchOwnerV1.from_checkpoint_state(
+                raw_research_state,
+                plan=plan,
+                delivery=delivery,
+            )
         if payload["component_presence"] != cls._component_presence_inventory(
             plan,
             scheduler_present=scheduler is not None,
@@ -5636,6 +6174,7 @@ class FullDayRuntime:
             hawkes_flow_present=hawkes_flow is not None,
             queue_reactive_flow_present=queue_reactive_flow is not None,
             delivery_present=delivery is not None,
+            research_present=research is not None,
         ):
             raise ValueError(
                 "runtime checkpoint component presence differs from composition"
@@ -5649,6 +6188,7 @@ class FullDayRuntime:
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
             delivery=delivery,
+            research=research,
             order_id_allocator=allocator,
             bootstrap=False,
             restoring=True,
@@ -5846,6 +6386,8 @@ class FullDayRuntime:
             active_component_ids.add(FLOW_QUEUE_REACTIVE_COMPONENT)
         if self.delivery is not None:
             active_component_ids.add(DELIVERY_ASYNC_COMPONENT)
+        if self.research is not None:
+            active_component_ids.add(FEATURE_STRATEGY_PLAYER_COMPONENT)
         if set(self._component_sequences) != active_component_ids:
             raise RuntimeError(
                 "component allocator owners differ from the exact active profile"
@@ -5921,6 +6463,7 @@ class FullDayRuntime:
         self._assert_hawkes_flow_native_reconciliation()
         self._assert_queue_reactive_flow_native_reconciliation()
         self._assert_delivery_reconciliation()
+        self._assert_research_reconciliation()
         published_scheduled_ids = {
             str(event.payload.data["scheduled_event_id"])
             for event in self._events
@@ -6220,6 +6763,10 @@ class FullDayRuntime:
                 self.queue_reactive_flow is not None,
             ),
             (DELIVERY_ASYNC_COMPONENT, self.delivery is not None),
+            (
+                FEATURE_STRATEGY_PLAYER_COMPONENT,
+                self.research is not None,
+            ),
         ):
             if present:
                 expected_native_sequences[component_id] = max(

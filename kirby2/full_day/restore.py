@@ -861,7 +861,7 @@ def _full_day_runtime_prefix_counts(
         )
     elif scheduler_status != "ABSENT":
         raise ValueError("full-day scheduler union has an unsupported status")
-    return {
+    result: dict[str, object] = {
         "agent_public_event_count": public_count,
         "agent_truth_event_count": truth_count,
         "mechanics_event_count": len(mechanics_events),
@@ -874,6 +874,38 @@ def _full_day_runtime_prefix_counts(
             canonical_json_bytes(events)
         ).hexdigest(),
     }
+    if "research" in checkpoint_state:
+        research_union = _wire_object(
+            checkpoint_state["research"], "research checkpoint union"
+        )
+        if research_union.get("status") != "PRESERVED":
+            raise ValueError("research checkpoint union is not preserved")
+        research = _wire_object(
+            research_union["state"], "research checkpoint state"
+        )
+        result.update(
+            {
+                "research_completed_decision_count": len(
+                    _wire_array(
+                        research["completed_decisions"],
+                        "research completed decisions",
+                    )
+                ),
+                "research_feature_batch_count": len(
+                    _wire_array(
+                        research["feature_batches"],
+                        "research feature batches",
+                    )
+                ),
+                "research_strategy_deadline_count": len(
+                    _wire_array(
+                        research["strategy_deadlines"],
+                        "research strategy deadlines",
+                    )
+                ),
+            }
+        )
+    return result
 
 
 def _full_day_native_ledger_key(
@@ -1183,6 +1215,50 @@ def _full_day_runtime_result(
         ).hexdigest(),
         "outer_events": outer_suffix,
     }
+    if "research" in final_state:
+        final_research_union = _wire_object(
+            final_state["research"], "final research union"
+        )
+        if final_research_union.get("status") != "PRESERVED":
+            raise RuntimeError("final research state is not preserved")
+        final_research = _wire_object(
+            final_research_union["state"], "final research state"
+        )
+        feature_start = int(prefix["research_feature_batch_count"])
+        deadline_start = int(prefix["research_strategy_deadline_count"])
+        decision_start = int(prefix["research_completed_decision_count"])
+        feature_batches = _wire_array(
+            final_research["feature_batches"], "final research feature batches"
+        )
+        deadlines = _wire_array(
+            final_research["strategy_deadlines"],
+            "final research strategy deadlines",
+        )
+        decisions = _wire_array(
+            final_research["completed_decisions"],
+            "final research completed decisions",
+        )
+        if (
+            feature_start > len(feature_batches)
+            or deadline_start > len(deadlines)
+            or decision_start > len(decisions)
+        ):
+            raise RuntimeError("restored research ledger lost checkpoint rows")
+        research_suffix = {
+            "completed_decisions": decisions[decision_start:],
+            "feature_batches": feature_batches[feature_start:],
+            "final_information_cutoff_us": final_research[
+                "last_information_cutoff_us"
+            ],
+            "final_player_position": final_research["player_position"],
+            "final_state_sha256": final_research_union["state_sha256"],
+            "final_working_order_ids": final_research["working_order_ids"],
+            "strategy_deadlines": deadlines[deadline_start:],
+        }
+        research_suffix["suffix_sha256"] = hashlib.sha256(
+            canonical_json_bytes(research_suffix)
+        ).hexdigest()
+        suffix["research"] = research_suffix
     final = {
         "projection": runtime.result_projection(),
         "restorable_state_sha256": canonical_sha256(final_state),
