@@ -18,6 +18,7 @@ from .models import (
 COMPOSITION_SCHEMA_VERSION = 1
 INITIAL_PROFILE_ID = "SINGLE_VENUE_AGENT_MECHANICS_V1"
 FLOW_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_V1"
+DELIVERY_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_V1"
 INITIAL_MATRIX_ID = "COMPOSITION_MATRIX_V1"
 
 FULL_DAY_RUNTIME_COMPONENT = "FULL_DAY_RUNTIME_V1"
@@ -26,6 +27,7 @@ AGENT_SCHEDULER_COMPONENT = "AGENT_SCHEDULER_V1"
 FLOW_SIMPLE_COMPONENT = "FLOW_SIMPLE_V1"
 FLOW_HAWKES_COMPONENT = "FLOW_HAWKES_V1"
 FLOW_QUEUE_REACTIVE_COMPONENT = "FLOW_QUEUE_REACTIVE_V1"
+DELIVERY_ASYNC_COMPONENT = "DELIVERY_ASYNC_V1"
 
 FLOW_COMPONENT_IDS = (
     FLOW_HAWKES_COMPONENT,
@@ -1321,6 +1323,61 @@ def executable_queue_reactive_flow_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def executable_delivery_composition_matrix() -> CompositionMatrixV1:
+    """Append the bounded passive-delivery profile without changing E1/E2 rows."""
+
+    previous = executable_queue_reactive_flow_composition_matrix()
+    flow_profile = previous.profile(FLOW_PROFILE_ID, 3)
+    delivery_spec = ComponentSpecV1(
+        schema_version=1,
+        component_id=DELIVERY_ASYNC_COMPONENT,
+        component_version=1,
+        implementation_status="EXECUTABLE",
+        active_predicate=component_configured_predicate(DELIVERY_ASYNC_COMPONENT),
+        dependencies=tuple(
+            sorted({FULL_DAY_RUNTIME_COMPONENT, MECHANICS_COMPONENT})
+        ),
+        owned_resources=tuple(
+            sorted(
+                {
+                    "CLIENT_DELIVERY_QUEUE",
+                    "CLIENT_KNOWN_WORKING_ORDER_STATE",
+                    "DELIVERY_MESSAGE_ALLOCATOR",
+                    "DELIVERY_RNG_SUBSTREAM",
+                    "VENUE_RECEIPT_QUEUE",
+                }
+            )
+        ),
+        borrowed_resources=tuple(sorted({"ORDER_GATEWAY", "SIMULATION_CLOCK"})),
+        rng_label_prefixes=("full_day/delivery",),
+        checkpoint_state_ids=("PENDING_LATENCY_CLIENT_DELIVERY_V1",),
+    )
+    profile = CompositionProfileV1(
+        schema_version=1,
+        profile_id=DELIVERY_PROFILE_ID,
+        profile_version=1,
+        implementation_status="EXECUTABLE",
+        runtime_owner_component_id=FULL_DAY_RUNTIME_COMPONENT,
+        components=tuple(
+            sorted(
+                (*flow_profile.components, delivery_spec),
+                key=lambda item: item.component_id,
+            )
+        ),
+        refused_component_ids=flow_profile.refused_component_ids,
+        exactly_one_component_groups=flow_profile.exactly_one_component_groups,
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1328,6 +1385,8 @@ __all__ = [
     "AGENT_SCHEDULER_ACTIVE_PREDICATE",
     "AGENT_SCHEDULER_COMPONENT",
     "COMPOSITION_SCHEMA_VERSION",
+    "DELIVERY_ASYNC_COMPONENT",
+    "DELIVERY_PROFILE_ID",
     "ComponentSpecV1",
     "CompositionMatrixV1",
     "CompositionProfileV1",
@@ -1343,6 +1402,7 @@ __all__ = [
     "agent_scheduler_is_active",
     "component_configured_predicate",
     "executable_agent_mechanics_composition_matrix",
+    "executable_delivery_composition_matrix",
     "executable_hawkes_flow_composition_matrix",
     "executable_queue_reactive_flow_composition_matrix",
     "executable_simple_flow_composition_matrix",

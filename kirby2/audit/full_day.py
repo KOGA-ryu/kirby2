@@ -13206,6 +13206,592 @@ def audit_wo31e2_flow_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e3_delivery_configuration():
+    from kirby2.full_day.components_delivery import DeliveryConfigurationV1
+
+    return DeliveryConfigurationV1.from_builtin(
+        configuration_id="AUDIT_DELIVERY_ASYNC_V1",
+        configuration_version=1,
+        latency_profile_name="NORMAL",
+    )
+
+
+def _wo31e3_flow_configuration():
+    """Keep the required flow adapter active without crowding delivery probes."""
+
+    return replace(
+        _wo31e2_simple_configuration(),
+        configuration_id="AUDIT_DELIVERY_BACKGROUND_FLOW_V1",
+        limit_buy_microevents_per_second=1,
+        limit_sell_microevents_per_second=1,
+        market_buy_microevents_per_second=1,
+        market_sell_microevents_per_second=1,
+        cancel_bid_microevents_per_second=1,
+        cancel_ask_microevents_per_second=1,
+    )
+
+
+def _wo31e3_plan():
+    from kirby2.full_day.components_delivery import DELIVERY_RNG_LABEL
+    from kirby2.full_day.composition import (
+        DELIVERY_ASYNC_COMPONENT,
+        DELIVERY_PROFILE_ID,
+        FLOW_SIMPLE_COMPONENT,
+        executable_delivery_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        VersionedReferenceV1,
+        derive_substream_seed,
+    )
+
+    base = _wo31e2_simple_plan()
+    flow = _wo31e3_flow_configuration()
+    delivery = _wo31e3_delivery_configuration()
+    matrix = executable_delivery_composition_matrix()
+    bindings = tuple(
+        replace(binding, configuration=flow.reference)
+        if binding.component_id == FLOW_SIMPLE_COMPONENT
+        else binding
+        for binding in base.component_configurations
+    )
+    bindings = tuple(
+        sorted(
+            (
+                *bindings,
+                ComponentConfigurationBindingV1(
+                    DELIVERY_ASYNC_COMPONENT,
+                    delivery.reference,
+                ),
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    declaration = SubstreamDeclarationV1(
+        DELIVERY_RNG_LABEL,
+        derive_substream_seed(
+            base.seed_policy.root_seed,
+            base.seed_policy.policy_version,
+            DELIVERY_RNG_LABEL,
+        ),
+    )
+    return replace(
+        base,
+        # All participants remain declared but inactive.  This leaves exactly
+        # one flow selected while removing agent timing noise from delivery cuts.
+        participant_schedule=(),
+        composition_profile=VersionedReferenceV1(
+            DELIVERY_PROFILE_ID,
+            1,
+            matrix.sha256,
+        ),
+        component_configurations=bindings,
+        seed_policy=replace(
+            base.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (*base.seed_policy.substreams, declaration),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+
+
+def _wo31e3_runtime():
+    from kirby2.full_day.components_delivery import DeliveryOwnerV1
+    from kirby2.full_day.components_flow import SimpleFlowOwnerV1
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e3_plan()
+    return FullDayRuntime.create(
+        plan,
+        simple_flow=SimpleFlowOwnerV1(plan, _wo31e3_flow_configuration()),
+        delivery=DeliveryOwnerV1(plan, _wo31e3_delivery_configuration()),
+    )
+
+
+def _wo31e3_limit_request(
+    runtime,
+    order_id: str,
+    *,
+    side: Side,
+    quantity: int,
+) -> AdvancedOrderRequest:
+    price = (
+        runtime.engine.rules.upper_price_band_ticks
+        if side is Side.SELL
+        else runtime.engine.rules.lower_price_band_ticks
+    )
+    return AdvancedOrderRequest(
+        order_id=order_id,
+        side=side,
+        quantity=quantity,
+        instruction=OrderInstruction.LIMIT,
+        owner=OrderOwner.PLAYER,
+        account_id="WO31-E3-CLIENT",
+        price_ticks=price,
+        time_in_force=OrderInstruction.DAY,
+    )
+
+
+def _wo31e3_market_request(
+    order_id: str,
+    *,
+    side: Side,
+    quantity: int,
+) -> AdvancedOrderRequest:
+    return AdvancedOrderRequest(
+        order_id=order_id,
+        side=side,
+        quantity=quantity,
+        instruction=OrderInstruction.MARKET,
+        owner=OrderOwner.PLAYER,
+        account_id="WO31-E3-CLIENT",
+        time_in_force=OrderInstruction.DAY,
+    )
+
+
+def _wo31e3_drain_delivery(runtime) -> None:
+    while runtime.delivery.pending_messages:
+        runtime.advance_to(
+            min(
+                message.delivery_time_us
+                for message in runtime.delivery.pending_messages.values()
+            )
+        )
+
+
+def _wo31e3_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_delivery import DeliveryComponentAdapterV1
+    from kirby2.full_day.components_flow import (
+        HawkesFlowComponentAdapterV2,
+        QueueReactiveFlowComponentAdapterV2,
+        SimpleFlowComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import MarketMechanicsComponentAdapterV1
+    from kirby2.full_day.composition import (
+        DELIVERY_ASYNC_COMPONENT,
+        DELIVERY_PROFILE_ID,
+        FLOW_SIMPLE_COMPONENT,
+        executable_delivery_composition_matrix,
+        executable_queue_reactive_flow_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_queue_reactive_flow_composition_matrix()
+    matrix = executable_delivery_composition_matrix()
+    if tuple(row.canonical_bytes() for row in matrix.profiles[:-1]) != tuple(
+        row.canonical_bytes() for row in previous.profiles
+    ):
+        failures.append("delivery matrix rewrote a published E1/E2 profile")
+    profile = matrix.profile(DELIVERY_PROFILE_ID, 1)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+            HawkesFlowComponentAdapterV2(),
+            QueueReactiveFlowComponentAdapterV2(),
+            SimpleFlowComponentAdapterV1(),
+            DeliveryComponentAdapterV1(),
+        ),
+        plan=_wo31e3_plan(),
+        profile=profile,
+    )
+    if DELIVERY_ASYNC_COMPONENT not in graph.active_component_ids:
+        failures.append("configured delivery adapter did not activate")
+    active_flows = set(graph.active_component_ids).intersection(
+        {"FLOW_HAWKES_V1", "FLOW_QUEUE_REACTIVE_V1", "FLOW_SIMPLE_V1"}
+    )
+    if active_flows != {FLOW_SIMPLE_COMPONENT}:
+        failures.append("delivery profile does not retain exactly one active flow")
+    if "ASYNCHRONOUS_EXECUTION_SESSION" not in profile.refused_component_ids:
+        failures.append("legacy second-session owner is no longer refused")
+    runtime = _wo31e3_runtime()
+    if runtime.agent_scheduler is not None or runtime.delivery is None:
+        failures.append("delivery audit plan activated an unexpected scheduler owner")
+    latency_free = _wo31e2_simple_runtime()
+    latency_free.advance_to(0)
+    latency_free.capture_quiescent_cut("WO31-E3-LATENCY-FREE-ABSENCE")
+    if "delivery" in latency_free.checkpoint_state():
+        failures.append("latency-free flow profile serialized delivery state")
+    return FullDayAuditCase(
+        "full_day_delivery_composition",
+        (
+            f"matrix_v5_sha256={previous.sha256} matrix_v6_sha256={matrix.sha256} "
+            f"active_components={graph.active_component_ids} "
+            "one_runtime=true one_clock=true one_book=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e3_timeline_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+    from kirby2.simulation.rng import SeededRng
+
+    failures: list[str] = []
+    one_shot = _wo31e3_runtime()
+    subdivided = _wo31e3_runtime()
+    target = 1_300_000_000
+    one_shot.advance_to(target)
+    for time_us in (0, 600_000_000, 1_200_000_000, 1_250_000_000, target):
+        subdivided.advance_to(time_us)
+    one_shot.capture_quiescent_cut("WO31-E3-EQUIVALENCE")
+    subdivided.capture_quiescent_cut("WO31-E3-EQUIVALENCE")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("delivery differs under one-shot and subdivided advance")
+
+    runtime = _wo31e3_runtime()
+    runtime.advance_to(1_200_000_000)
+    maker = _wo31e3_limit_request(
+        runtime,
+        "E3-MAKER",
+        side=Side.SELL,
+        quantity=10,
+    )
+    route_work = runtime.submit_request(maker)
+    if "E3-MAKER" in {order.request.order_id for order in runtime.engine.orders}:
+        failures.append("client submission reached venue before its route work")
+    runtime.advance_to(route_work.key.simulation_time_us)
+    pending_kinds = {message.kind for message in runtime.delivery.pending_messages.values()}
+    if "ORDER_ACK" not in pending_kinds or runtime.engine.get_order("E3-MAKER").status != "WORKING":
+        failures.append("venue truth and pending acknowledgement were not separated")
+    _wo31e3_drain_delivery(runtime)
+    if runtime.delivery.client_known_orders.get("E3-MAKER", {}).get("status") != "WORKING":
+        failures.append("delivered acknowledgement did not establish client working state")
+
+    partial = runtime.submit_request(
+        _wo31e3_market_request("E3-PARTIAL", side=Side.BUY, quantity=4)
+    )
+    runtime.advance_to(partial.key.simulation_time_us)
+    venue_status = runtime.engine.get_order("E3-MAKER").status
+    client_status = runtime.delivery.client_known_orders["E3-MAKER"]["status"]
+    if venue_status != "PARTIALLY_FILLED" or client_status != "WORKING":
+        failures.append("partial fill did not produce a stale client-known order state")
+    latest_market = runtime.delivery.latest_market_state
+    if (
+        not isinstance(latest_market, Mapping)
+        or type(latest_market.get("simulation_time_us")) is not int
+        or latest_market["simulation_time_us"] >= runtime.clock.current_time_us
+    ):
+        failures.append("client market projection was not stale while venue truth advanced")
+    if not any(message.kind == "FILL_REPORT" for message in runtime.delivery.pending_messages.values()):
+        failures.append("partial fill did not schedule a delayed fill report")
+    _wo31e3_drain_delivery(runtime)
+    if runtime.delivery.client_known_orders["E3-MAKER"]["status"] != "PARTIALLY_FILLED":
+        failures.append("partial-fill delivery did not update client order state")
+
+    cancel = runtime.cancel_order("E3-MAKER", reason="AUDIT_CANCEL_WINS")
+    racing_fill = runtime.submit_request(
+        _wo31e3_market_request("E3-RACE-FILL", side=Side.BUY, quantity=6)
+    )
+    if cancel.key.simulation_time_us != racing_fill.key.simulation_time_us:
+        failures.append("cancel/fill race did not share one venue timestamp")
+    runtime.advance_to(cancel.key.simulation_time_us)
+    if runtime.engine.get_order("E3-MAKER").status != "CANCELLED":
+        failures.append("deterministic cancel-wins route ordering changed")
+    _wo31e3_drain_delivery(runtime)
+    if runtime.delivery.client_known_orders["E3-MAKER"]["status"] != "CANCELLED":
+        failures.append("cancel acknowledgement did not reach client state")
+
+    # Force one real acknowledgement onto the closing calendar timestamp.  The
+    # NORMAL route path is fixed; cloning the owned RNG predicts only the next
+    # bounded downlink draw and does not mutate authoritative state.
+    simultaneous = _wo31e3_runtime()
+    boundary = 4_800_000_000
+    simultaneous.advance_to(boundary - 4_000)
+    clone = SeededRng.from_runtime_state(simultaneous.delivery.rng.runtime_state())
+    acknowledgement_delay = clone.integer(300, 700)
+    source = boundary - 2_700 - acknowledgement_delay
+    simultaneous.advance_to(source)
+    work = simultaneous.submit_request(
+        _wo31e3_limit_request(
+            simultaneous,
+            "E3-BOUNDARY",
+            side=Side.BUY,
+            quantity=1,
+        )
+    )
+    simultaneous.advance_to(work.key.simulation_time_us)
+    boundary_ack = tuple(
+        message
+        for message in simultaneous.delivery.pending_messages.values()
+        if message.kind == "ORDER_ACK" and message.delivery_time_us == boundary
+    )
+    if len(boundary_ack) != 1:
+        failures.append("acknowledgement was not scheduled on the calendar boundary")
+    simultaneous.advance_to(boundary)
+    boundary_events = tuple(
+        event.event_type
+        for event in simultaneous.events
+        if event.simulation_time_us == boundary
+    )
+    if (
+        FullDayEventTypeV1.CALENDAR_BOUNDARY not in boundary_events
+        or FullDayEventTypeV1.OBSERVABLE_DELIVERY not in boundary_events
+        or boundary_events.index(FullDayEventTypeV1.CALENDAR_BOUNDARY)
+        > boundary_events.index(FullDayEventTypeV1.OBSERVABLE_DELIVERY)
+    ):
+        failures.append("calendar/delivery stage ordering is not deterministic")
+
+    return FullDayAuditCase(
+        "full_day_delivery_timelines_and_races",
+        (
+            f"equivalence_target_us={target} routes={runtime.delivery.route_sequence} "
+            f"messages={runtime.delivery.message_sequence} pending_ack=true "
+            "partial_fill=true cancel_fill_race=cancel_wins stale_quote=true "
+            "calendar_delivery_same_time=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e3_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes, parse_canonical_json_object
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    digests: list[str] = []
+
+    def verify(runtime, label: str, target: int) -> None:
+        runtime.capture_quiescent_cut(f"WO31-E3-{label}-CUT")
+        request = FullDayRuntimeRestoreRequestV1.capture(
+            runtime,
+            suffix_targets_us=(target,),
+            final_checkpoint_request_id=f"WO31-E3-{label}-FINAL",
+        )
+        returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+            request.canonical_bytes()
+        )
+        expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+        if returncode != 0:
+            failures.append(
+                f"{label} fresh worker returned {returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            return
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"{label} fresh worker emitted invalid JSON: {error}")
+            return
+        if stderr or wrote_files:
+            failures.append(f"{label} fresh worker produced side effects")
+        if canonical_json_bytes(actual) != stdout or actual != expected:
+            failures.append(f"{label} fresh suffix differs from uninterrupted suffix")
+        digests.append(str(actual["invariant_sha256"]))
+
+    pending_route = _wo31e3_runtime()
+    pending_route.advance_to(1_200_000_000)
+    route = pending_route.submit_request(
+        _wo31e3_limit_request(
+            pending_route,
+            "E3-RESTORE-ROUTE",
+            side=Side.SELL,
+            quantity=10,
+        )
+    )
+    verify(pending_route, "PENDING-ROUTE", route.key.simulation_time_us + 2_000)
+
+    pending_ack = _wo31e3_runtime()
+    pending_ack.advance_to(1_200_000_000)
+    route = pending_ack.submit_request(
+        _wo31e3_limit_request(
+            pending_ack,
+            "E3-RESTORE-ACK",
+            side=Side.SELL,
+            quantity=10,
+        )
+    )
+    pending_ack.advance_to(route.key.simulation_time_us)
+    ack_target = max(
+        message.delivery_time_us
+        for message in pending_ack.delivery.pending_messages.values()
+    )
+    verify(pending_ack, "PENDING-ACK", ack_target)
+
+    partial_race = _wo31e3_runtime()
+    partial_race.advance_to(1_200_000_000)
+    route = partial_race.submit_request(
+        _wo31e3_limit_request(
+            partial_race,
+            "E3-RESTORE-RACE",
+            side=Side.SELL,
+            quantity=10,
+        )
+    )
+    partial_race.advance_to(route.key.simulation_time_us)
+    _wo31e3_drain_delivery(partial_race)
+    route = partial_race.submit_request(
+        _wo31e3_market_request("E3-RESTORE-PARTIAL", side=Side.BUY, quantity=4)
+    )
+    partial_race.advance_to(route.key.simulation_time_us)
+    cancel = partial_race.cancel_order("E3-RESTORE-RACE", reason="RESTORE_RACE")
+    verify(partial_race, "PARTIAL-CANCEL-RACE", cancel.key.simulation_time_us + 5_000)
+
+    return FullDayAuditCase(
+        "full_day_delivery_fresh_process_restore",
+        (
+            f"fresh_process_boundaries=3 invariant_sha256={','.join(digests)} "
+            "pending_route=true pending_ack=true partial_cancel_race=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e3_ownership_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import ComponentSnapshotV1
+    from kirby2.full_day.components_delivery import (
+        DeliveryComponentAdapterV1,
+        DeliveryConfigurationV1,
+        DeliveryMessageV1,
+        DeliveryOwnerV1,
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+    from kirby2.simulation.clock import SimulationClock
+
+    failures: list[str] = []
+    refused = 0
+    runtime = _wo31e3_runtime()
+    runtime.advance_to(1_200_000_000)
+    route = runtime.submit_request(
+        _wo31e3_limit_request(runtime, "E3-HOSTILE", side=Side.SELL, quantity=5)
+    )
+    runtime.capture_quiescent_cut("WO31-E3-HOSTILE-PREFIX")
+    adapter = DeliveryComponentAdapterV1()
+    snapshot = adapter.snapshot(runtime.delivery)
+    restored = adapter.restore(snapshot, plan=runtime.plan)
+    if restored.canonical_state_bytes() != runtime.delivery.canonical_state_bytes():
+        failures.append("delivery adapter restore is not a fixed point")
+
+    runtime.delivery.clock = SimulationClock()
+    try:
+        runtime.assert_invariants()
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("delivery component smuggled a second clock")
+    finally:
+        del runtime.delivery.clock
+
+    forged = copy.deepcopy(snapshot.as_dict())
+    forged["state"]["route_sequence"] += 1
+    try:
+        ComponentSnapshotV1.from_dict(forged)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("forged delivery snapshot digest was accepted")
+
+    unknown_kind = copy.deepcopy(runtime.delivery.checkpoint_state())
+    if unknown_kind["pending_messages"]:
+        unknown_kind["pending_messages"][0]["kind"] = "UNKNOWN_CLIENT_KIND"
+    else:
+        runtime.advance_to(route.key.simulation_time_us)
+        unknown_kind = copy.deepcopy(runtime.delivery.checkpoint_state())
+        unknown_kind["pending_messages"][0]["kind"] = "UNKNOWN_CLIENT_KIND"
+    try:
+        DeliveryOwnerV1.from_checkpoint_state(unknown_kind, plan=runtime.plan)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("unknown delivery message kind was restored")
+
+    runtime.advance_to(route.key.simulation_time_us)
+    if runtime.delivery.pending_messages:
+        message_id = next(iter(runtime.delivery.pending_messages))
+        original = runtime.delivery.pending_messages[message_id]
+        payload = original.as_dict()
+        payload["causal_outer_event_ids"] = ["event:999999999"]
+        runtime.delivery.pending_messages[message_id] = DeliveryMessageV1.from_dict(payload)
+        try:
+            runtime.assert_invariants()
+        except (TypeError, ValueError, RuntimeError):
+            refused += 1
+        else:
+            failures.append("orphan delivery causal ID was accepted")
+        runtime.delivery.pending_messages[message_id] = original
+
+    atomic = _wo31e3_runtime()
+    atomic.advance_to(1_200_000_000)
+    due = atomic.submit_request(
+        _wo31e3_limit_request(atomic, "E3-ATOMIC", side=Side.BUY, quantity=1)
+    )
+    atomic.capture_quiescent_cut("WO31-E3-ATOMIC-PREFIX")
+    atomic_before = atomic.canonical_state_bytes()
+    atomic_original_emit = atomic._emit_native
+
+    def refuse_atomic_delivery(**kwargs):
+        if kwargs.get("owner_component_id") == "DELIVERY_ASYNC_V1":
+            raise RuntimeError("AUDIT_FORCED_DELIVERY_NATIVE_FAILURE")
+        return atomic_original_emit(**kwargs)
+
+    atomic._emit_native = refuse_atomic_delivery
+    try:
+        atomic.advance_to(due.key.simulation_time_us)
+    except RuntimeError as error:
+        if "AUDIT_FORCED_DELIVERY_NATIVE_FAILURE" in str(error):
+            refused += 1
+        else:
+            failures.append("delivery atomicity probe raised the wrong error")
+    else:
+        failures.append("delivery native failure was not propagated")
+    finally:
+        del atomic._emit_native
+    if atomic.canonical_state_bytes() != atomic_before:
+        failures.append("delivery failure changed runtime, queue, RNG, or allocator state")
+
+    try:
+        DeliveryConfigurationV1.from_builtin(
+            configuration_id="ZERO_DELIVERY_IS_ABSENT",
+            configuration_version=1,
+            latency_profile_name="ZERO_LATENCY",
+        )
+    except (TypeError, ValueError):
+        refused += 1
+    else:
+        failures.append("zero-latency active delivery configuration was accepted")
+
+    _wo31e3_drain_delivery(runtime)
+    runtime.capture_quiescent_cut("WO31-E3-EMPTY-ACTIVE")
+    union = runtime.checkpoint_state()["delivery"]
+    if union.get("status") != "PRESERVED" or union["state"]["pending_messages"]:
+        failures.append("active empty delivery queue collapsed into absence")
+    if runtime.delivery.rng is runtime.simple_flow.rng:
+        failures.append("delivery and flow share one RNG object")
+    return FullDayAuditCase(
+        "full_day_delivery_ownership_refusals",
+        (
+            f"refusals={refused} second_clock=true forged_digest=true "
+            "unknown_kind=true orphan_causal_id=true zero_latency_absent=true "
+            "active_empty_preserved=true failure_atomicity=true rng_separation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e3_delivery_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise passive venue routing and independently delayed client state."""
+
+    return (
+        _wo31e3_composition_case(),
+        _wo31e3_timeline_case(),
+        _wo31e3_fresh_restore_case(),
+        _wo31e3_ownership_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -13219,4 +13805,5 @@ __all__ = [
     "audit_wo31e2_queue_reactive_flow_slice",
     "audit_wo31e2_simple_flow_slice",
     "audit_wo31e2_flow_restore",
+    "audit_wo31e3_delivery_restore",
 ]

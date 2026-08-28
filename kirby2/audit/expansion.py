@@ -106,6 +106,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-D",
     "WO31-E1",
     "WO31-E2",
+    "WO31-E3",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1615,6 +1616,71 @@ def _audit_wo31e2() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31e3() -> ExpansionGateReport:
+    """Run the passive venue/client delivery and restart evidence."""
+
+    from kirby2.audit.full_day import audit_wo31e3_delivery_restore
+    from kirby2.full_day.composition import (
+        DELIVERY_PROFILE_ID,
+        executable_delivery_composition_matrix,
+    )
+    from kirby2.full_day.restore import FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID
+
+    cases = audit_wo31e3_delivery_restore()
+    expected_names = (
+        "full_day_delivery_composition",
+        "full_day_delivery_timelines_and_races",
+        "full_day_delivery_fresh_process_restore",
+        "full_day_delivery_ownership_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-E3 cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-E3 cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-E3 cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    matrix = executable_delivery_composition_matrix()
+    profile = matrix.profile(DELIVERY_PROFILE_ID, 1)
+    return ExpansionGateReport(
+        card_id="WO31-E3",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("composition_matrix_sha256", matrix.sha256),
+            ("fresh_process_boundary_count", "3"),
+            ("hostile_refusal_count", "6"),
+            ("profile_id", profile.profile_id),
+            ("profile_version", str(profile.profile_version)),
+            ("restore_format", FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID),
+            ("restored_scope", "VENUE_TRUTH_AND_CLIENT_DELIVERY"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1700,6 +1766,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-D", _audit_wo31d),
     ("WO31-E1", _audit_wo31e1),
     ("WO31-E2", _audit_wo31e2),
+    ("WO31-E3", _audit_wo31e3),
 )
 
 

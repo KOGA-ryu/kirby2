@@ -1,7 +1,6 @@
 """Authoritative deterministic scheduling kernel for one synthetic full day.
 
-The E1 mechanics profile and bounded E2 simple/Hawkes flow profiles execute here.
-The runtime owns
+The E1 mechanics, E2 flow, and E3 passive-delivery profiles execute here.  The runtime owns
 the calendar, simulation clock, scheduling heap, global/event/order allocators,
 quiescent-cut controller, and the one market-mechanics engine.  Optional agent
 code is an injected scheduler over those owners; it cannot advance time or
@@ -38,6 +37,8 @@ from .checkpoint_contract import QuiescentCutV1
 from .composition import (
     ABSENT_REASON_COMPONENT_INACTIVE,
     AGENT_SCHEDULER_COMPONENT,
+    DELIVERY_ASYNC_COMPONENT,
+    DELIVERY_PROFILE_ID,
     FLOW_HAWKES_COMPONENT,
     FLOW_PROFILE_ID,
     FLOW_QUEUE_REACTIVE_COMPONENT,
@@ -47,6 +48,7 @@ from .composition import (
     MECHANICS_COMPONENT,
     agent_scheduler_is_active,
     executable_agent_mechanics_composition_matrix,
+    executable_delivery_composition_matrix,
     executable_hawkes_flow_composition_matrix,
     executable_queue_reactive_flow_composition_matrix,
     executable_simple_flow_composition_matrix,
@@ -90,6 +92,7 @@ AGENT_NATIVE_LEDGER_ID = "AGENT_SCHEDULER_EVENTS_V1"
 SIMPLE_FLOW_NATIVE_LEDGER_ID = "SIMPLE_FLOW_PROPOSALS_V1"
 HAWKES_FLOW_NATIVE_LEDGER_ID = "HAWKES_FLOW_PROPOSALS_V1"
 QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID = "QUEUE_REACTIVE_FLOW_PROPOSALS_V1"
+DELIVERY_NATIVE_LEDGER_ID = "DELIVERY_ASYNC_EVENTS_V1"
 
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
@@ -106,6 +109,8 @@ _WORK_REOPEN_COMPLETE = "REOPEN_COMPLETE"
 _WORK_SIMPLE_FLOW_PROPOSAL = "SIMPLE_FLOW_PROPOSAL"
 _WORK_HAWKES_FLOW_PROPOSAL = "HAWKES_FLOW_PROPOSAL"
 _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL = "QUEUE_REACTIVE_FLOW_PROPOSAL"
+_WORK_DELIVERY_VENUE_RECEIPT = "DELIVERY_VENUE_RECEIPT"
+_WORK_DELIVERY_CLIENT_MESSAGE = "DELIVERY_CLIENT_MESSAGE"
 
 _WORK_TYPES = frozenset(
     {
@@ -113,6 +118,8 @@ _WORK_TYPES = frozenset(
         _WORK_AGENT_DECISION,
         _WORK_CALENDAR_BOUNDARY,
         _WORK_CHECKPOINT_CAPTURE,
+        _WORK_DELIVERY_CLIENT_MESSAGE,
+        _WORK_DELIVERY_VENUE_RECEIPT,
         _WORK_GTT_EXPIRY,
         _WORK_HAWKES_FLOW_PROPOSAL,
         _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL,
@@ -151,6 +158,16 @@ _WORK_CONTRACTS: Mapping[
             FULL_DAY_RUNTIME_COMPONENT,
             frozenset({WorkStageV1.CHECKPOINT_CAPTURE}),
             frozenset({"checkpoint_request_ids"}),
+        ),
+        _WORK_DELIVERY_CLIENT_MESSAGE: (
+            DELIVERY_ASYNC_COMPONENT,
+            frozenset({WorkStageV1.OBSERVABLE_CLIENT_DELIVERY}),
+            frozenset({"message_id"}),
+        ),
+        _WORK_DELIVERY_VENUE_RECEIPT: (
+            DELIVERY_ASYNC_COMPONENT,
+            frozenset({WorkStageV1.PENDING_VENUE_ARRIVAL}),
+            frozenset({"route_id"}),
         ),
         _WORK_GTT_EXPIRY: (
             FULL_DAY_RUNTIME_COMPONENT,
@@ -1117,6 +1134,9 @@ def _runtime_composition_matrix(plan: FullDayPlanV1):
             expected_version = 3
         else:
             raise ValueError("FullDayRuntime flow profile version is unsupported")
+    elif profile_id == DELIVERY_PROFILE_ID:
+        matrix = executable_delivery_composition_matrix()
+        expected_version = 1
     else:
         raise ValueError("FullDayRuntime does not implement this composition profile")
     if (
@@ -1144,6 +1164,7 @@ class FullDayRuntime:
         simple_flow: object | None,
         hawkes_flow: object | None,
         queue_reactive_flow: object | None,
+        delivery: object | None,
         order_id_allocator: RuntimeOrderIdAllocatorV1,
         bootstrap: bool,
         restoring: bool = False,
@@ -1157,6 +1178,7 @@ class FullDayRuntime:
         self.simple_flow = simple_flow
         self.hawkes_flow = hawkes_flow
         self.queue_reactive_flow = queue_reactive_flow
+        self.delivery = delivery
         self._order_id_allocator = order_id_allocator
         self._validate_profile_and_core_owners(restoring=restoring)
 
@@ -1185,6 +1207,8 @@ class FullDayRuntime:
             self._component_sequences[FLOW_HAWKES_COMPONENT] = 0
         if self.queue_reactive_flow is not None:
             self._component_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
+        if self.delivery is not None:
+            self._component_sequences[DELIVERY_ASYNC_COMPONENT] = 0
         self._native_sequences: dict[str, int] = {}
         if self.agent_scheduler is not None:
             self._native_sequences[AGENT_SCHEDULER_COMPONENT] = 0
@@ -1194,6 +1218,8 @@ class FullDayRuntime:
             self._native_sequences[FLOW_HAWKES_COMPONENT] = 0
         if self.queue_reactive_flow is not None:
             self._native_sequences[FLOW_QUEUE_REACTIVE_COMPONENT] = 0
+        if self.delivery is not None:
+            self._native_sequences[DELIVERY_ASYNC_COMPONENT] = 0
         self._mechanics_event_cursor = len(self.engine.events)
         self._calendar_boundary_index = 0
         self._participant_schedule_index = 0
@@ -1225,6 +1251,8 @@ class FullDayRuntime:
                 _WORK_AGENT_DECISION: "_handle_agent_work",
                 _WORK_CALENDAR_BOUNDARY: "_handle_calendar_boundary",
                 _WORK_CHECKPOINT_CAPTURE: "_handle_checkpoint_capture",
+                _WORK_DELIVERY_CLIENT_MESSAGE: "_handle_delivery_client_message",
+                _WORK_DELIVERY_VENUE_RECEIPT: "_handle_delivery_venue_receipt",
                 _WORK_GTT_EXPIRY: "_handle_gtt_expiry",
                 _WORK_HAWKES_FLOW_PROPOSAL: "_handle_hawkes_flow_proposal",
                 _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL: (
@@ -1265,6 +1293,7 @@ class FullDayRuntime:
         simple_flow: object | None = None,
         hawkes_flow: object | None = None,
         queue_reactive_flow: object | None = None,
+        delivery: object | None = None,
         order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
     ) -> FullDayRuntime:
         if type(plan) is not FullDayPlanV1:
@@ -1288,6 +1317,7 @@ class FullDayRuntime:
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
+            delivery=delivery,
             order_id_allocator=allocator,
             bootstrap=True,
         )
@@ -1303,6 +1333,7 @@ class FullDayRuntime:
         simple_flow_configuration: object | None = None,
         hawkes_flow_configuration: object | None = None,
         queue_reactive_flow_configuration: object | None = None,
+        delivery_configuration: object | None = None,
     ) -> FullDayRuntime:
         """Construct the scheduler only after the sole owners exist."""
 
@@ -1398,6 +1429,18 @@ class FullDayRuntime:
                 plan,
                 queue_reactive_flow_configuration,
             )
+        delivery = None
+        if delivery_configuration is not None:
+            from .components_delivery import (
+                DeliveryConfigurationV1,
+                DeliveryOwnerV1,
+            )
+
+            if type(delivery_configuration) is not DeliveryConfigurationV1:
+                raise TypeError(
+                    "delivery configuration must use DeliveryConfigurationV1"
+                )
+            delivery = DeliveryOwnerV1(plan, delivery_configuration)
         return cls.create(
             plan,
             engine=selected_engine,
@@ -1406,6 +1449,7 @@ class FullDayRuntime:
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
+            delivery=delivery,
             order_id_allocator=allocator,
         )
 
@@ -1619,6 +1663,19 @@ class FullDayRuntime:
             self._reject_smuggled_core_owner(
                 self.queue_reactive_flow,
                 owner_label="queue-reactive component",
+            )
+        delivery_required = DELIVERY_ASYNC_COMPONENT in active_components
+        if delivery_required != (self.delivery is not None):
+            raise ValueError("delivery presence differs from its active predicate")
+        if self.delivery is not None:
+            from .components_delivery import DeliveryOwnerV1
+
+            if type(self.delivery) is not DeliveryOwnerV1:
+                raise ValueError("runtime requires the exact DeliveryOwnerV1")
+            self.delivery.assert_invariants(self.plan)
+            self._reject_smuggled_core_owner(
+                self.delivery,
+                owner_label="delivery component",
             )
         self.engine.assert_invariants()
 
@@ -2149,6 +2206,11 @@ class FullDayRuntime:
                 else self.agent_scheduler.checkpoint_state()
             ),
             "engine": self.engine.checkpoint_state(),
+            "delivery": (
+                None
+                if self.delivery is None
+                else self.delivery.checkpoint_state()
+            ),
             "hawkes_flow": (
                 None
                 if self.hawkes_flow is None
@@ -2213,6 +2275,7 @@ class FullDayRuntime:
                 self.simple_flow,
                 self.hawkes_flow,
                 self.queue_reactive_flow,
+                self.delivery,
                 self._state_runtime,
                 self._order_id_allocator,
             ),
@@ -2248,6 +2311,7 @@ class FullDayRuntime:
             simple_flow,
             hawkes_flow,
             queue_reactive_flow,
+            delivery,
             state_runtime,
             order_allocator,
         ) = snapshot["owner_identities"]
@@ -2347,6 +2411,25 @@ class FullDayRuntime:
             queue_reactive_flow.__dict__.update(
                 restored_queue_reactive_flow.__dict__
             )
+        raw_delivery = owner_bundle["delivery"]
+        if raw_delivery is None:
+            if delivery is not None:
+                raise RuntimeError(
+                    "transaction snapshot delivery identity is inconsistent"
+                )
+        else:
+            from .components_delivery import DeliveryOwnerV1
+
+            restored_delivery = DeliveryOwnerV1.from_checkpoint_state(
+                raw_delivery,
+                plan=self.plan,
+            )
+            if delivery is None:
+                raise RuntimeError(
+                    "transaction snapshot delivery identity is inconsistent"
+                )
+            delivery.__dict__.clear()
+            delivery.__dict__.update(restored_delivery.__dict__)
         state_runtime_state = HierarchicalStateRuntimeStateV1.from_dict(
             owner_bundle["state_runtime"]
         )
@@ -2365,6 +2448,7 @@ class FullDayRuntime:
         self.simple_flow = simple_flow
         self.hawkes_flow = hawkes_flow
         self.queue_reactive_flow = queue_reactive_flow
+        self.delivery = delivery
         self._state_runtime = state_runtime
         self._order_id_allocator = order_allocator
         self._heap = snapshot["heap"]
@@ -2600,11 +2684,31 @@ class FullDayRuntime:
         ):
             raise ValueError("GTT expiry must lie between arrival and plan end")
         required_capacity = 1 + int(expiry_time is not None)
+        if self.delivery is not None:
+            required_capacity = 1
         if (
             len(self._pending) + required_capacity
             > self.plan.deterministic_limits.maximum_pending_work_items
         ):
             raise RuntimeError("maximum pending-work limit exceeded")
+        if self.delivery is not None:
+            route = self.delivery.plan_route(
+                action="SUBMIT",
+                command_payload={"request": request.as_dict()},
+                order_id=request.order_id,
+                source_time_us=time_us,
+                horizon_us=self.plan.calendar.end_time_us,
+            )
+            item = self._enqueue_new(
+                simulation_time_us=route.arrival_time_us,
+                microstep=self._next_external_microstep(route.arrival_time_us),
+                stage=WorkStageV1.PENDING_VENUE_ARRIVAL,
+                source_component_id=DELIVERY_ASYNC_COMPONENT,
+                work_type=_WORK_DELIVERY_VENUE_RECEIPT,
+                payload={"route_id": route.route_id},
+            )
+            self.delivery.bind_route_work(route.route_id, item.work_id)
+            return item
         item = self._enqueue_new(
             simulation_time_us=time_us,
             microstep=microstep,
@@ -2633,13 +2737,39 @@ class FullDayRuntime:
         at_time_us: int | None = None,
     ) -> RuntimeWorkItemV1:
         time_us = self.clock.current_time_us if at_time_us is None else at_time_us
+        self._next_external_microstep(time_us)
+        canonical_order_id = _identifier(order_id, "order_id")
+        canonical_reason = _identifier(reason, "reason")
+        if self.delivery is not None:
+            if len(self._pending) >= self.plan.deterministic_limits.maximum_pending_work_items:
+                raise RuntimeError("maximum pending-work limit exceeded")
+            route = self.delivery.plan_route(
+                action="CANCEL",
+                command_payload={
+                    "order_id": canonical_order_id,
+                    "reason": canonical_reason,
+                },
+                order_id=canonical_order_id,
+                source_time_us=time_us,
+                horizon_us=self.plan.calendar.end_time_us,
+            )
+            item = self._enqueue_new(
+                simulation_time_us=route.arrival_time_us,
+                microstep=self._next_external_microstep(route.arrival_time_us),
+                stage=WorkStageV1.PENDING_VENUE_ARRIVAL,
+                source_component_id=DELIVERY_ASYNC_COMPONENT,
+                work_type=_WORK_DELIVERY_VENUE_RECEIPT,
+                payload={"route_id": route.route_id},
+            )
+            self.delivery.bind_route_work(route.route_id, item.work_id)
+            return item
         return self._enqueue_new(
             simulation_time_us=time_us,
             microstep=self._next_external_microstep(time_us),
             stage=WorkStageV1.PENDING_VENUE_ARRIVAL,
             source_component_id=FULL_DAY_RUNTIME_COMPONENT,
             work_type=_WORK_MECHANICS_CANCEL,
-            payload={"order_id": _identifier(order_id, "order_id"), "reason": _identifier(reason, "reason")},
+            payload={"order_id": canonical_order_id, "reason": canonical_reason},
         )
 
     def replace_order(
@@ -2657,6 +2787,39 @@ class FullDayRuntime:
                 "FD-O order IDs are reserved for the runtime-owned allocator"
             )
         time_us = self.clock.current_time_us if at_time_us is None else at_time_us
+        self._next_external_microstep(time_us)
+        canonical_order_id = _identifier(order_id, "order_id")
+        canonical_quantity = _exact_int(
+            new_quantity, "new_quantity", minimum=1
+        )
+        canonical_price = _exact_optional_int(
+            new_price_ticks, "new_price_ticks", minimum=1
+        )
+        if self.delivery is not None:
+            if len(self._pending) >= self.plan.deterministic_limits.maximum_pending_work_items:
+                raise RuntimeError("maximum pending-work limit exceeded")
+            route = self.delivery.plan_route(
+                action="REPLACE",
+                command_payload={
+                    "new_order_id": canonical_new_order_id,
+                    "new_price_ticks": canonical_price,
+                    "new_quantity": canonical_quantity,
+                    "order_id": canonical_order_id,
+                },
+                order_id=canonical_order_id,
+                source_time_us=time_us,
+                horizon_us=self.plan.calendar.end_time_us,
+            )
+            item = self._enqueue_new(
+                simulation_time_us=route.arrival_time_us,
+                microstep=self._next_external_microstep(route.arrival_time_us),
+                stage=WorkStageV1.PENDING_VENUE_ARRIVAL,
+                source_component_id=DELIVERY_ASYNC_COMPONENT,
+                work_type=_WORK_DELIVERY_VENUE_RECEIPT,
+                payload={"route_id": route.route_id},
+            )
+            self.delivery.bind_route_work(route.route_id, item.work_id)
+            return item
         return self._enqueue_new(
             simulation_time_us=time_us,
             microstep=self._next_external_microstep(time_us),
@@ -2665,9 +2828,9 @@ class FullDayRuntime:
             work_type=_WORK_MECHANICS_REPLACE,
             payload={
                 "new_order_id": canonical_new_order_id,
-                "new_price_ticks": new_price_ticks,
-                "new_quantity": _exact_int(new_quantity, "new_quantity", minimum=1),
-                "order_id": _identifier(order_id, "order_id"),
+                "new_price_ticks": canonical_price,
+                "new_quantity": canonical_quantity,
+                "order_id": canonical_order_id,
             },
         )
 
@@ -3382,6 +3545,92 @@ class FullDayRuntime:
         if executed_flow != len(entries):
             raise RuntimeError("executed flow work differs from native evidence")
 
+    def _assert_delivery_reconciliation(self) -> None:
+        delivery_work = tuple(
+            item
+            for item in (*self._executed_work.values(), *self._pending.values())
+            if item.work_type
+            in {_WORK_DELIVERY_VENUE_RECEIPT, _WORK_DELIVERY_CLIENT_MESSAGE}
+        )
+        entries = tuple(
+            sorted(
+                (
+                    entry
+                    for entry in self._native_ledger.values()
+                    if entry.reference.owner_component_id == DELIVERY_ASYNC_COMPONENT
+                ),
+                key=lambda entry: entry.reference.local_sequence,
+            )
+        )
+        if self.delivery is None:
+            if delivery_work or entries:
+                raise RuntimeError("inactive delivery retains work or native evidence")
+            return
+        self.delivery.assert_invariants(self.plan)
+        for sequence, entry in enumerate(entries, start=1):
+            reference = entry.reference
+            if (
+                reference.native_ledger_id != DELIVERY_NATIVE_LEDGER_ID
+                or reference.local_sequence != sequence
+                or reference.event_id
+                != f"DELIVERY_ASYNC_EVENT_{sequence:012d}"
+                or reference.event_type
+                not in {"PENDING_VENUE_ARRIVAL", "CLIENT_MESSAGE_DELIVERED"}
+            ):
+                raise RuntimeError("delivery native identity sequence is invalid")
+        if self.delivery.native_sequence != len(entries):
+            raise RuntimeError("delivery native cursor differs from native evidence")
+        if self.delivery.last_observed_mechanics_sequence != len(self.engine.events):
+            raise RuntimeError("delivery venue-truth cursor differs from mechanics")
+        pending_routes = {
+            item.payload["route_id"]: item
+            for item in self._pending.values()
+            if item.work_type == _WORK_DELIVERY_VENUE_RECEIPT
+        }
+        pending_messages = {
+            item.payload["message_id"]: item
+            for item in self._pending.values()
+            if item.work_type == _WORK_DELIVERY_CLIENT_MESSAGE
+        }
+        if set(pending_routes) != set(self.delivery.pending_routes):
+            raise RuntimeError("delivery venue queue differs from runtime work")
+        if set(pending_messages) != set(self.delivery.pending_messages):
+            raise RuntimeError("client delivery queue differs from runtime work")
+        for route_id, route in self.delivery.pending_routes.items():
+            item = pending_routes[route_id]
+            if (
+                route.work_id != item.work_id
+                or route.arrival_time_us != item.key.simulation_time_us
+            ):
+                raise RuntimeError("delivery route differs from exact pending work")
+        outer_ids = {event.event_id for event in self._events}
+        for message_id, message in self.delivery.pending_messages.items():
+            item = pending_messages[message_id]
+            if (
+                message.work_id != item.work_id
+                or message.delivery_time_us != item.key.simulation_time_us
+                or not set(message.causal_outer_event_ids).issubset(outer_ids)
+            ):
+                raise RuntimeError("delivery message differs from causal pending work")
+        from .components_delivery import DeliveryMessageV1
+
+        for row in self.delivery.delivered_messages:
+            message = DeliveryMessageV1.from_dict(row)
+            if not set(message.causal_outer_event_ids).issubset(outer_ids):
+                raise RuntimeError("delivered message retains an orphan causal ID")
+        executed_routes = sum(
+            item.work_type == _WORK_DELIVERY_VENUE_RECEIPT
+            for item in self._executed_work.values()
+        )
+        executed_messages = sum(
+            item.work_type == _WORK_DELIVERY_CLIENT_MESSAGE
+            for item in self._executed_work.values()
+        )
+        if executed_routes != len(self.delivery.completed_routes):
+            raise RuntimeError("completed delivery routes differ from executed work")
+        if executed_messages != len(self.delivery.delivered_messages):
+            raise RuntimeError("delivered client messages differ from executed work")
+
     def _wrap_new_mechanics(
         self,
         *,
@@ -3391,8 +3640,10 @@ class FullDayRuntime:
         events = self.engine.events
         if self._mechanics_event_cursor > len(events):
             raise RuntimeError("mechanics event cursor exceeds its ledger")
+        mechanics_suffix = events[self._mechanics_event_cursor :]
+        causal_outer_ids: list[str] = []
         emitted_parent = parent_id
-        for native in events[self._mechanics_event_cursor :]:
+        for native in mechanics_suffix:
             if native.simulation_time_us != self.clock.current_time_us:
                 raise RuntimeError("new mechanics event differs from dequeued work time")
             outer = self._emit_native(
@@ -3405,6 +3656,7 @@ class FullDayRuntime:
                 parent_id=emitted_parent,
             )
             emitted_parent = outer.event_id
+            causal_outer_ids.append(outer.event_id)
         self._mechanics_event_cursor = len(events)
         if self.agent_scheduler is not None:
             synchronize = getattr(
@@ -3416,7 +3668,71 @@ class FullDayRuntime:
             emitted_parent = self._wrap_new_scheduler_public_events(
                 parent_id=emitted_parent
             )
+        if self.delivery is not None and mechanics_suffix:
+            messages = self.delivery.observe_mechanics(
+                mechanics_events=tuple(native.as_dict() for native in mechanics_suffix),
+                causal_outer_event_ids=tuple(causal_outer_ids),
+                public_market_cut=self._delivery_public_market_cut(),
+                order_snapshots={
+                    order.request.order_id: order.as_dict()
+                    for order in self.engine.orders
+                },
+                source_time_us=self.clock.current_time_us,
+                horizon_us=self.plan.calendar.end_time_us,
+            )
+            for message in messages:
+                self._enqueue_delivery_message(message)
         return emitted_parent
+
+    def _delivery_public_market_cut(self) -> dict[str, object]:
+        """Materialize disclosure-safe market state at one venue-truth cut."""
+
+        book = self.engine.book
+        return {
+            "ask_levels": [
+                {
+                    "price_ticks": price,
+                    "quantity": book.asks[price].total_quantity,
+                }
+                for price in book.ask_prices
+            ],
+            "best_ask_ticks": book.best_ask,
+            "best_bid_ticks": book.best_bid,
+            "bid_levels": [
+                {
+                    "price_ticks": price,
+                    "quantity": book.bids[price].total_quantity,
+                }
+                for price in book.bid_prices
+            ],
+            "last_trade_price_ticks": self.engine.last_trade_price_ticks,
+            "session_state": self.engine.session_state.value,
+            "simulation_time_us": self.clock.current_time_us,
+        }
+
+    def _enqueue_delivery_message(self, message: object) -> RuntimeWorkItemV1:
+        from .components_delivery import DeliveryMessageV1
+
+        if self.delivery is None or type(message) is not DeliveryMessageV1:
+            raise RuntimeError("delivery message requires its exact active owner")
+        if len(self._pending) >= self.plan.deterministic_limits.maximum_pending_work_items:
+            raise RuntimeError("maximum pending-work limit exceeded")
+        microstep = (
+            self._executing.key.microstep + 1
+            if self._executing is not None
+            and message.delivery_time_us == self.clock.current_time_us
+            else 0
+        )
+        item = self._enqueue_new(
+            simulation_time_us=message.delivery_time_us,
+            microstep=microstep,
+            stage=WorkStageV1.OBSERVABLE_CLIENT_DELIVERY,
+            source_component_id=DELIVERY_ASYNC_COMPONENT,
+            work_type=_WORK_DELIVERY_CLIENT_MESSAGE,
+            payload={"message_id": message.message_id},
+        )
+        self.delivery.bind_message_work(message.message_id, item.work_id)
+        return item
 
     def _handle_calendar_boundary(self, item: RuntimeWorkItemV1) -> None:
         scheduler_book_before = self._scheduler_market_snapshot()
@@ -3798,6 +4114,112 @@ class FullDayRuntime:
             scheduler_book_before=scheduler_book_before
         )
 
+    def _handle_delivery_venue_receipt(self, item: RuntimeWorkItemV1) -> None:
+        """Interpret one due passive route through the sole mechanics owner."""
+
+        if self.delivery is None:
+            raise RuntimeError("delivery venue work has no active owner")
+        route_id = _identifier(item.payload.get("route_id"), "route_id")
+        route = self.delivery.take_due_route(
+            route_id,
+            work_id=item.work_id,
+            now_us=self.clock.current_time_us,
+        )
+        sequence = self._native_sequences[DELIVERY_ASYNC_COMPONENT] + 1
+        self._native_sequences[DELIVERY_ASYNC_COMPONENT] = sequence
+        self.delivery.native_sequence = sequence
+        arrival_outer = self._emit_native(
+            owner_component_id=DELIVERY_ASYNC_COMPONENT,
+            native_ledger_id=DELIVERY_NATIVE_LEDGER_ID,
+            native_event_type="PENDING_VENUE_ARRIVAL",
+            native_local_sequence=sequence,
+            native_event_id=f"DELIVERY_ASYNC_EVENT_{sequence:012d}",
+            native_payload={
+                "action": route.action,
+                "arrival_time_us": route.arrival_time_us,
+                "command_payload": dict(route.command_payload),
+                "order_id": route.order_id,
+                "route_id": route.route_id,
+                "source_time_us": route.source_time_us,
+            },
+            outer_event_type=FullDayEventTypeV1.PENDING_VENUE_ARRIVAL,
+            outer_data={
+                "arrival_time_us": route.arrival_time_us,
+                "order_id": route.order_id,
+            },
+        )
+        scheduler_book_before = self._scheduler_market_snapshot()
+        if route.action == "SUBMIT":
+            raw = _plain_object(route.command_payload.get("request"), "delivery request")
+            request = AdvancedOrderRequest.from_dict(raw)
+            if request.as_dict() != raw or request.order_id != route.order_id:
+                raise ValueError("delivery submit route is not canonical")
+            self.engine.submit(request)
+            expiry = request.good_until_time_us
+            if expiry is not None and expiry > self.clock.current_time_us:
+                self._enqueue_new(
+                    simulation_time_us=expiry,
+                    microstep=0,
+                    stage=WorkStageV1.PENDING_VENUE_ARRIVAL,
+                    source_component_id=FULL_DAY_RUNTIME_COMPONENT,
+                    work_type=_WORK_GTT_EXPIRY,
+                    payload={"expiry_time_us": expiry},
+                )
+        elif route.action == "CANCEL":
+            self.engine.cancel(
+                _identifier(route.command_payload.get("order_id"), "order_id"),
+                reason=_identifier(route.command_payload.get("reason"), "reason"),
+            )
+        elif route.action == "REPLACE":
+            self.engine.replace_order(
+                _identifier(route.command_payload.get("order_id"), "order_id"),
+                new_order_id=_identifier(
+                    route.command_payload.get("new_order_id"), "new_order_id"
+                ),
+                new_quantity=_exact_int(
+                    route.command_payload.get("new_quantity"),
+                    "new_quantity",
+                    minimum=1,
+                ),
+                new_price_ticks=_exact_optional_int(
+                    route.command_payload.get("new_price_ticks"),
+                    "new_price_ticks",
+                    minimum=1,
+                ),
+            )
+        else:  # pragma: no cover - route contract is exhaustive
+            raise RuntimeError("delivery route action is unsupported")
+        self.delivery.complete_route(route, outcome="VENUE_PROCESSED")
+        self._wrap_new_mechanics(
+            parent_id=arrival_outer.event_id,
+            scheduler_book_before=scheduler_book_before,
+        )
+
+    def _handle_delivery_client_message(self, item: RuntimeWorkItemV1) -> None:
+        if self.delivery is None:
+            raise RuntimeError("client delivery work has no active owner")
+        message = self.delivery.deliver(
+            _identifier(item.payload.get("message_id"), "message_id"),
+            work_id=item.work_id,
+            now_us=self.clock.current_time_us,
+        )
+        sequence = self._native_sequences[DELIVERY_ASYNC_COMPONENT] + 1
+        self._native_sequences[DELIVERY_ASYNC_COMPONENT] = sequence
+        self.delivery.native_sequence = sequence
+        self._emit_native(
+            owner_component_id=DELIVERY_ASYNC_COMPONENT,
+            native_ledger_id=DELIVERY_NATIVE_LEDGER_ID,
+            native_event_type="CLIENT_MESSAGE_DELIVERED",
+            native_local_sequence=sequence,
+            native_event_id=f"DELIVERY_ASYNC_EVENT_{sequence:012d}",
+            native_payload=message.as_dict(),
+            outer_event_type=FullDayEventTypeV1.OBSERVABLE_DELIVERY,
+            outer_data={
+                "information_cutoff_us": message.information_cutoff_us,
+                "message_id": message.message_id,
+            },
+        )
+
     def _handle_mechanics_cancel(self, item: RuntimeWorkItemV1) -> None:
         scheduler_book_before = self._scheduler_market_snapshot()
         self.engine.cancel(
@@ -4167,6 +4589,19 @@ class FullDayRuntime:
             "status": "PRESERVED",
         }
 
+    def _delivery_checkpoint_union(self) -> dict[str, object]:
+        if self.delivery is None:
+            return {
+                "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
+                "status": "ABSENT",
+            }
+        state = self.delivery.checkpoint_state()
+        return {
+            "state": _plain(state),
+            "state_sha256": canonical_sha256(state),
+            "status": "PRESERVED",
+        }
+
     @staticmethod
     def _component_presence_inventory(
         plan: FullDayPlanV1,
@@ -4175,6 +4610,7 @@ class FullDayRuntime:
         simple_flow_present: bool,
         hawkes_flow_present: bool,
         queue_reactive_flow_present: bool,
+        delivery_present: bool,
     ) -> list[dict[str, object]]:
         matrix = _runtime_composition_matrix(plan)
         profile = matrix.profile(
@@ -4214,6 +4650,10 @@ class FullDayRuntime:
         ) != queue_reactive_flow_present:
             raise ValueError(
                 "queue-reactive presence differs from the composition active predicate"
+            )
+        if (DELIVERY_ASYNC_COMPONENT in active) != delivery_present:
+            raise ValueError(
+                "delivery presence differs from the composition active predicate"
             )
         rows: list[dict[str, object]] = []
         for component in profile.components:
@@ -4299,6 +4739,7 @@ class FullDayRuntime:
                 queue_reactive_flow_present=(
                     self.queue_reactive_flow is not None
                 ),
+                delivery_present=self.delivery is not None,
             ),
             "dequeued_count": self._dequeued_count,
             "engine": self.engine.checkpoint_state(),
@@ -4360,6 +4801,8 @@ class FullDayRuntime:
             state["queue_reactive_flow"] = (
                 self._queue_reactive_flow_checkpoint_union()
             )
+        if self.delivery is not None:
+            state["delivery"] = self._delivery_checkpoint_union()
         validate_strict_json(state)
         if (
             len(canonical_json_bytes(state))
@@ -4386,6 +4829,7 @@ class FullDayRuntime:
         state.pop("simple_flow", None)
         state.pop("hawkes_flow", None)
         state.pop("queue_reactive_flow", None)
+        state.pop("delivery", None)
         validate_strict_json(state)
         return state
 
@@ -4457,6 +4901,7 @@ class FullDayRuntime:
             queue_reactive_flow_present=(
                 FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids
             ),
+            delivery_present=DELIVERY_ASYNC_COMPONENT in plan.selected_component_ids,
         )
         if payload["component_presence"] != expected_presence:
             raise ValueError(
@@ -4599,6 +5044,12 @@ class FullDayRuntime:
                 if scheduler_active
                 else ()
             ),
+            *(component_id for component_id in (
+                FLOW_SIMPLE_COMPONENT,
+                FLOW_HAWKES_COMPONENT,
+                FLOW_QUEUE_REACTIVE_COMPONENT,
+                DELIVERY_ASYNC_COMPONENT,
+            ) if component_id in plan.selected_component_ids),
         }
         expected_component_sequences = {
             component_id: 0 for component_id in active_components
@@ -4669,21 +5120,20 @@ class FullDayRuntime:
             component_sequences=component_sequences,
         )
 
-        expected_native_sequences = (
-            {
-                AGENT_SCHEDULER_COMPONENT: max(
-                    (
-                        entry.reference.local_sequence
-                        for entry in native
-                        if entry.reference.owner_component_id
-                        == AGENT_SCHEDULER_COMPONENT
-                    ),
-                    default=0,
-                )
-            }
-            if scheduler_active
-            else {}
+        native_allocator_components = active_components.difference(
+            {FULL_DAY_RUNTIME_COMPONENT, MECHANICS_COMPONENT}
         )
+        expected_native_sequences = {
+            component_id: max(
+                (
+                    entry.reference.local_sequence
+                    for entry in native
+                    if entry.reference.owner_component_id == component_id
+                ),
+                default=0,
+            )
+            for component_id in native_allocator_components
+        }
         raw_native_sequences = _plain_object(
             payload["native_sequences"], "runtime-owner native sequences"
         )
@@ -4942,6 +5392,10 @@ class FullDayRuntime:
                 "state_sha256"
             )
             result["queue_reactive_flow_status"] = queue_flow["status"]
+        if self.delivery is not None:
+            delivery = self._delivery_checkpoint_union()
+            result["delivery_state_sha256"] = delivery.get("state_sha256")
+            result["delivery_status"] = delivery["status"]
         return result
 
     @classmethod
@@ -4993,6 +5447,8 @@ class FullDayRuntime:
             expected.add("hawkes_flow")
         if FLOW_QUEUE_REACTIVE_COMPONENT in plan.selected_component_ids:
             expected.add("queue_reactive_flow")
+        if DELIVERY_ASYNC_COMPONENT in plan.selected_component_ids:
+            expected.add("delivery")
         _require_exact_fields(payload, expected, "FullDayRuntime checkpoint")
         if (
             payload["schema_version"] != FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION
@@ -5059,6 +5515,7 @@ class FullDayRuntime:
         simple_flow: object | None = None
         hawkes_flow: object | None = None
         queue_reactive_flow: object | None = None
+        delivery: object | None = None
         if FLOW_SIMPLE_COMPONENT in plan.selected_component_ids:
             raw_simple_flow = _plain_object(
                 payload["simple_flow"], "simple-flow union"
@@ -5147,12 +5604,38 @@ class FullDayRuntime:
                 raise ValueError(
                     "executable queue-reactive profile requires preserved flow state"
                 )
+        if DELIVERY_ASYNC_COMPONENT in plan.selected_component_ids:
+            raw_delivery = _plain_object(payload["delivery"], "delivery union")
+            delivery_status = raw_delivery.get("status")
+            if delivery_status != "PRESERVED":
+                raise ValueError(
+                    "executable delivery profile requires preserved delivery state"
+                )
+            _require_exact_fields(
+                raw_delivery,
+                {"state", "state_sha256", "status"},
+                "preserved delivery",
+            )
+            raw_delivery_state = _plain_object(
+                raw_delivery["state"], "delivery state"
+            )
+            if raw_delivery["state_sha256"] != canonical_sha256(
+                raw_delivery_state
+            ):
+                raise ValueError("delivery state digest mismatch")
+            from .components_delivery import DeliveryOwnerV1
+
+            delivery = DeliveryOwnerV1.from_checkpoint_state(
+                raw_delivery_state,
+                plan=plan,
+            )
         if payload["component_presence"] != cls._component_presence_inventory(
             plan,
             scheduler_present=scheduler is not None,
             simple_flow_present=simple_flow is not None,
             hawkes_flow_present=hawkes_flow is not None,
             queue_reactive_flow_present=queue_reactive_flow is not None,
+            delivery_present=delivery is not None,
         ):
             raise ValueError(
                 "runtime checkpoint component presence differs from composition"
@@ -5165,6 +5648,7 @@ class FullDayRuntime:
             simple_flow=simple_flow,
             hawkes_flow=hawkes_flow,
             queue_reactive_flow=queue_reactive_flow,
+            delivery=delivery,
             order_id_allocator=allocator,
             bootstrap=False,
             restoring=True,
@@ -5360,6 +5844,8 @@ class FullDayRuntime:
             active_component_ids.add(FLOW_HAWKES_COMPONENT)
         if self.queue_reactive_flow is not None:
             active_component_ids.add(FLOW_QUEUE_REACTIVE_COMPONENT)
+        if self.delivery is not None:
+            active_component_ids.add(DELIVERY_ASYNC_COMPONENT)
         if set(self._component_sequences) != active_component_ids:
             raise RuntimeError(
                 "component allocator owners differ from the exact active profile"
@@ -5434,6 +5920,7 @@ class FullDayRuntime:
         self._assert_simple_flow_native_reconciliation()
         self._assert_hawkes_flow_native_reconciliation()
         self._assert_queue_reactive_flow_native_reconciliation()
+        self._assert_delivery_reconciliation()
         published_scheduled_ids = {
             str(event.payload.data["scheduled_event_id"])
             for event in self._events
@@ -5732,6 +6219,7 @@ class FullDayRuntime:
                 FLOW_QUEUE_REACTIVE_COMPONENT,
                 self.queue_reactive_flow is not None,
             ),
+            (DELIVERY_ASYNC_COMPONENT, self.delivery is not None),
         ):
             if present:
                 expected_native_sequences[component_id] = max(
