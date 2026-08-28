@@ -17,6 +17,7 @@ from kirby2.exchange.mechanics_models import (
     InstrumentRules,
     MechanicsEventType,
     OrderInstruction,
+    ScheduledSessionState,
     SessionSchedule,
     SessionState,
 )
@@ -97,6 +98,12 @@ def audit_wo31a_contracts() -> tuple[FullDayAuditCase, ...]:
             required=False,
         ),
     )
+
+
+def audit_dev0004_atomic_boundary_replay() -> tuple[FullDayAuditCase, ...]:
+    """Exercise the repaired shared-clock boundary replay and strict cut rule."""
+
+    return (_mechanics_boundary_case(),)
 
 
 def _expect_refusal(operation: Callable[[], object], label: str) -> str | None:
@@ -6523,6 +6530,104 @@ def _mechanics_boundary_case() -> FullDayAuditCase:
         engine.assert_invariants()
     except RuntimeError as error:
         failures.append(f"boundary invariant failure: {error}")
+    try:
+        checkpoint = engine.checkpoint_state()
+        restored = MarketMechanicsEngine.from_checkpoint_state(checkpoint)
+        if restored.canonical_state_bytes() != engine.canonical_state_bytes():
+            failures.append("completed boundary checkpoint did not round-trip exactly")
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"completed boundary checkpoint failure: {error}")
+
+    transient = _continuous_engine()
+    transient.submit(
+        _limit(
+            "BOUNDARY-TRANSIENT-GTT",
+            Side.BUY,
+            10,
+            96,
+            time_in_force=OrderInstruction.GOOD_UNTIL_TIME,
+            good_until_time_us=200,
+        )
+    )
+    _apply_native_boundary(
+        transient,
+        100,
+        SessionState.CLOSING_AUCTION,
+        uncross_before=False,
+        reason="WO31_A_TRANSIENT_CLOSING_CALL",
+    )
+    transient.clock.advance_to(200)
+    transient.uncross_auction()
+    transient.transition_session(
+        SessionState.POSTCLOSE,
+        reason="WO31_A_TRANSIENT_POSTCLOSE",
+    )
+    refusal = _expect_refusal(
+        transient.checkpoint_state,
+        "boundary checkpoint before exact-time GTT completion",
+    )
+    if refusal:
+        failures.append(refusal)
+    transient.advance_to(200)
+    try:
+        transient.checkpoint_state()
+    except (TypeError, ValueError, RuntimeError) as error:
+        failures.append(f"completed transient boundary checkpoint failure: {error}")
+
+    scheduled = MarketMechanicsEngine(
+        InstrumentRules(
+            session_schedule=SessionSchedule(
+                (ScheduledSessionState(200, SessionState.POSTCLOSE),)
+            )
+        )
+    )
+    for state in (
+        SessionState.PREOPEN,
+        SessionState.OPENING_AUCTION,
+    ):
+        scheduled.transition_session(state, reason="WO31_A_SCHEDULE_DEFERRAL_PROBE")
+    scheduled.uncross_auction()
+    scheduled.transition_session(
+        SessionState.CONTINUOUS,
+        reason="WO31_A_SCHEDULE_DEFERRAL_PROBE",
+    )
+    scheduled.transition_session(
+        SessionState.CLOSING_AUCTION,
+        reason="WO31_A_SCHEDULE_DEFERRAL_PROBE",
+    )
+    scheduled.clock.advance_to(200)
+    refusal = _expect_refusal(
+        scheduled.uncross_auction,
+        "configured engine-owned transition deferral",
+    )
+    if refusal:
+        failures.append(refusal)
+
+    overdue = _continuous_engine()
+    overdue.submit(
+        _limit(
+            "BOUNDARY-OVERDUE-GTT",
+            Side.BUY,
+            10,
+            96,
+            time_in_force=OrderInstruction.GOOD_UNTIL_TIME,
+            good_until_time_us=150,
+        )
+    )
+    _apply_native_boundary(
+        overdue,
+        100,
+        SessionState.CLOSING_AUCTION,
+        uncross_before=False,
+        reason="WO31_A_OVERDUE_CLOSING_CALL",
+    )
+    overdue.clock.advance_to(200)
+    refusal = _expect_refusal(
+        overdue.uncross_auction,
+        "overdue GTT deferral",
+    )
+    if refusal:
+        failures.append(refusal)
 
     halt_failures, resume_trace = _halt_resume_boundary_probe()
     failures.extend(halt_failures)
@@ -6530,7 +6635,9 @@ def _mechanics_boundary_case() -> FullDayAuditCase:
         "atomic_market_mechanics_boundary_trace",
         (
             "uncross, transition-owned expirations, session/HALT/RESUME, and "
-            "same-time GTT expiry retain native order; "
+            "same-time GTT expiry retain native order; incomplete exact-time GTT "
+            "work is refused by strict checkpoints; configured schedules and overdue "
+            "GTT work cannot defer; "
             f"calendar_trace={calendar_trace}; resume_trace={resume_trace}"
         ),
         tuple(failures),
@@ -14739,6 +14846,7 @@ __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
     "audit_dev0003_state_checkpoint_inventory",
+    "audit_dev0004_atomic_boundary_replay",
     "audit_wo31a_contracts",
     "audit_wo31b_transitions",
     "audit_wo31c_checkpoints",

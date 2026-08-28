@@ -94,6 +94,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0001", "K2X-02"),
     ("DEV-0002", "WO31-B"),
     ("DEV-0003", "WO31-B"),
+    ("DEV-0004", "WO31-E6"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -109,6 +110,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-E3",
     "WO31-E4",
     "WO31-E5",
+    "DEV-0004",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1891,6 +1893,42 @@ def _audit_dev0003() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0004() -> ExpansionGateReport:
+    from kirby2.audit.full_day import audit_dev0004_atomic_boundary_replay
+
+    cases = audit_dev0004_atomic_boundary_replay()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=case.required,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0004",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("deferred_due_class", "EXACT_TIME_GOOD_UNTIL_TIME"),
+            ("engine_owned_schedule_deferral", "REFUSED"),
+            ("incomplete_durable_cut", "REFUSED"),
+            ("repaired_owner", "MARKET_MECHANICS_OUTER_REPLAY_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -1905,6 +1943,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-E3", _audit_wo31e3),
     ("WO31-E4", _audit_wo31e4),
     ("WO31-E5", _audit_wo31e5),
+    ("DEV-0004", _audit_dev0004),
 )
 
 

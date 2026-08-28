@@ -143,3 +143,51 @@ macro cursor, observation history, allocator offset, and separate transition cou
 cannot be omitted; the obsolete aggregate counter is absent and cannot replace the
 level counters; canonical inventory bytes round-trip without identity drift; and no
 runtime capability beyond the interrupted WO31-B implementation is claimed.
+
+## DEV-0004 — Reconcile atomic boundary replay ordering
+
+- Interrupted canonical card: `WO31-E6`
+- Exact first-parent predecessor: `f34274032577167d72c65d76bd2a88241f485787`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO31-A`
+- Observed terminal result: `GATE_EXCEPTION`, caused by
+  `RuntimeError: outer mechanics group differs from deterministic public replay`
+  during the postclose auction uncross.
+- Root cause: the full-day runtime owns a shared mechanics clock and advances it
+  before executing its atomic stage-zero calendar boundary. The frozen boundary
+  order is auction uncross, transition-owned expirations, session transition, then
+  same-time GTT expiry. The strengthened outer-command validator instead called
+  `advance_to` before replaying the first boundary event, causing the shadow engine
+  to publish the same-time GTT expiry first and disagree with the valid native
+  ledger.
+- Repair: when no configured engine-owned session transition or overdue timer is
+  pending, defer only GTT work due at the exact boundary timestamp while replaying
+  preceding outer-owned operations. Non-strict live invariant checks may observe
+  that in-flight prefix; strict checkpoint validation still refuses the state until
+  every due GTT event is present. Completed boundary checkpoints round-trip through
+  the exact public-operation replay.
+- Owned repair paths: `kirby2/exchange/mechanics_engine.py`,
+  `kirby2/audit/full_day.py`, `kirby2/audit/expansion.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0004` immediately before the unregistered `WO31-E6`
+  frontier.
+- Inherited gates: `WO31-A`, market mechanics, `WO31-E1` through `WO31-E5`, and
+  `K2X-02` remain unchanged.
+- Exact commit subject: `Reconcile atomic boundary replay ordering`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0004
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO31-A
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-market-mechanics
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate all
+git diff --check
+```
+
+Acceptance: the postclose boundary retains native uncross, transition-owned expiry,
+session, and exact-time GTT order; completed state round-trips through a strict
+mechanics checkpoint; an in-flight boundary that still owes exact-time GTT work is
+not checkpointable; configured session transitions and overdue timers cannot use the
+deferral; the aggregate expansion gate is green; and no V1 wire schema or unrelated
+runtime capability changes.

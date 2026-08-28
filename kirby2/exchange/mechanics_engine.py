@@ -2397,6 +2397,52 @@ def _validate_outer_command_replay(
                 return candidate
         return None
 
+    def exact_time_gtt_ids_if_sole_due_work(target_time: int) -> frozenset[str]:
+        """Return due GTT IDs only when no earlier or engine-owned work is due."""
+
+        transitions = shadow.rules.session_schedule.transitions
+        if (
+            shadow._schedule_index < len(transitions)
+            and transitions[shadow._schedule_index].simulation_time_us <= target_time
+        ):
+            return frozenset()
+        due = tuple(
+            order
+            for order in shadow.orders
+            if shadow._is_managed_active(order)
+            and order.request.time_in_force
+            is OrderInstruction.GOOD_UNTIL_TIME
+            and order.request.good_until_time_us is not None
+            and order.request.good_until_time_us <= target_time
+        )
+        if not due or any(
+            order.request.good_until_time_us < target_time for order in due
+        ):
+            return frozenset()
+        return frozenset(order.request.order_id for order in due)
+
+    def should_defer_exact_time_gtt(target_time: int) -> bool:
+        """Preserve an outer owner's atomic same-time boundary ordering.
+
+        Full-day execution shares this engine's clock and advances it before its
+        stage-zero boundary operation.  That operation deliberately uncrosses and
+        transitions the session before asking the engine to publish GTT expiries
+        due at the same timestamp.  Replaying ``advance_to`` unconditionally here
+        would invert that frozen order.  Only exact-time GTT work may wait; an
+        overdue GTT or a configured engine-owned session transition must still be
+        consumed by ``advance_to`` immediately.
+        """
+
+        due_order_ids = exact_time_gtt_ids_if_sole_due_work(target_time)
+        if not due_order_ids:
+            return False
+        event = source[cursor]
+        return not (
+            event.event_type is MechanicsEventType.ORDER_EXPIRED
+            and event.data.get("reason") == "GOOD_UNTIL_TIME"
+            and event.data.get("order_id") in due_order_ids
+        )
+
     def replacement_candidate(
         managed: ManagedOrder,
         *,
@@ -2548,7 +2594,10 @@ def _validate_outer_command_replay(
     while cursor < len(source):
         target_time = source[cursor].simulation_time_us
         before = len(shadow.events)
-        shadow.advance_to(target_time)
+        if should_defer_exact_time_gtt(target_time):
+            shadow.clock.advance_to(target_time)
+        else:
+            shadow.advance_to(target_time)
         if len(shadow.events) != before:
             if consume_generated(before):
                 return
@@ -2767,6 +2816,15 @@ def _validate_outer_command_replay(
         )
 
     before = len(shadow.events)
+    if (
+        not strict
+        and exact_time_gtt_ids_if_sole_due_work(engine.clock.current_time_us)
+    ):
+        # ``assert_invariants`` is called inside each public sub-operation of an
+        # outer atomic boundary.  Its final ``advance_to`` has not run yet, so a
+        # non-durable prefix may still own exact-time GTT work.  Strict checkpoint
+        # validation never takes this return and therefore cannot omit that work.
+        return
     shadow.advance_to(engine.clock.current_time_us)
     if len(shadow.events) != before:
         raise RuntimeError("restored clock omits due deterministic outer events")
