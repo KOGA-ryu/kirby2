@@ -93,8 +93,15 @@ CANONICAL_IMPLEMENTATION_CARD_IDS = (
 RECORDED_DEVIATIONS = (
     ("DEV-0001", "K2X-02"),
     ("DEV-0002", "WO31-B"),
+    ("DEV-0003", "WO31-B"),
 )
-REGISTERABLE_GATE_IDS = ("DEV-0001", "K2X-02", "WO31-A", "DEV-0002")
+REGISTERABLE_GATE_IDS = (
+    "DEV-0001",
+    "K2X-02",
+    "WO31-A",
+    "DEV-0002",
+    "DEV-0003",
+)
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
 )
@@ -1307,11 +1314,49 @@ def _audit_dev0002() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0003() -> ExpansionGateReport:
+    """Prove exact state-runtime authority is checkpoint-inventoried."""
+
+    from kirby2.audit.full_day import audit_dev0003_state_checkpoint_inventory
+
+    cases = audit_dev0003_state_checkpoint_inventory()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=case.required,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0003",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("owned_state_field_count", "27"),
+            ("obsolete_aggregate_alias", "ABSENT"),
+            ("repaired_owner", "FULL_DAY_CHECKPOINT_INVENTORY_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
     ("WO31-A", _audit_wo31a),
     ("DEV-0002", _audit_dev0002),
+    ("DEV-0003", _audit_dev0003),
 )
 
 

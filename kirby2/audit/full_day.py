@@ -106,6 +106,139 @@ def _expect_refusal(operation: Callable[[], object], label: str) -> str | None:
     return f"{label} was accepted"
 
 
+def _dev0003_state_checkpoint_fields() -> frozenset[str]:
+    """Return the complete semantic state-runtime inventory sealed by DEV-0003."""
+
+    return frozenset(
+        {
+            "state.component_local_sequence",
+            "state.component_sequence_offset",
+            "state.current_day",
+            "state.current_local",
+            "state.day_elapsed_age_us",
+            "state.day_entered_time_us",
+            "state.day_next_eligible_transition_id",
+            "state.day_next_eligible_transition_time_us",
+            "state.day_sampled_deadline_us",
+            "state.day_sampled_duration_us",
+            "state.day_transition_count",
+            "state.day_transitions_since_macro_anchor",
+            "state.day_trigger_memory",
+            "state.input_closed_through_time_us",
+            "state.local_elapsed_age_us",
+            "state.local_entered_time_us",
+            "state.local_next_eligible_transition_id",
+            "state.local_next_eligible_transition_time_us",
+            "state.local_sampled_deadline_us",
+            "state.local_sampled_duration_us",
+            "state.local_transition_count",
+            "state.local_trigger_memory",
+            "state.next_macro_segment_index",
+            "state.observation_ids_seen",
+            "state.plan_sha256",
+            "state.runtime_emission_count",
+            "state.state_model_sha256",
+        }
+    )
+
+
+def audit_dev0003_state_checkpoint_inventory() -> tuple[FullDayAuditCase, ...]:
+    """Prove the state runtime's complete restorable authority is inventoried."""
+
+    from kirby2.full_day import checkpoint_contract as contract
+    from kirby2.full_day.checkpoint_contract import (
+        CheckpointInventoryV1,
+        checkpoint_inventory_v1,
+    )
+
+    inventory = checkpoint_inventory_v1()
+    item_index = next(
+        index
+        for index, item in enumerate(inventory.items)
+        if item.component_id
+        == "CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1"
+    )
+    item = inventory.items[item_index]
+    expected = _dev0003_state_checkpoint_fields()
+    actual = frozenset(item.owned_state_fields)
+    failures: list[str] = []
+    if actual != expected:
+        failures.append(
+            "state runtime checkpoint fields differ: "
+            f"missing={tuple(sorted(expected - actual))} "
+            f"extra={tuple(sorted(actual - expected))}"
+        )
+    restored = CheckpointInventoryV1.from_json_bytes(inventory.canonical_bytes())
+    if restored.as_dict() != inventory.as_dict() or restored.sha256 != inventory.sha256:
+        failures.append("amended checkpoint inventory did not round trip canonically")
+    aliases = contract._SEMANTIC_FIELD_FAMILY_ALIASES
+    if "state.completed_transition_count" in aliases:
+        failures.append("obsolete aggregate transition-counter alias remains registered")
+
+    omission_refusals = 0
+    for field_id in sorted(expected):
+        incomplete_item = replace(
+            item,
+            owned_state_fields=tuple(
+                field for field in item.owned_state_fields if field != field_id
+            ),
+        )
+        incomplete_items = tuple(
+            incomplete_item if index == item_index else row
+            for index, row in enumerate(inventory.items)
+        )
+        failure = _expect_refusal(
+            lambda rows=incomplete_items: replace(inventory, items=rows),
+            f"state checkpoint inventory omitting {field_id}",
+        )
+        if failure:
+            failures.append(failure)
+        else:
+            omission_refusals += 1
+
+    aggregate_item = replace(
+        item,
+        owned_state_fields=tuple(
+            sorted(
+                {
+                    *(
+                        field
+                        for field in item.owned_state_fields
+                        if field
+                        not in {
+                            "state.day_transition_count",
+                            "state.local_transition_count",
+                        }
+                    ),
+                    "state.completed_transition_count",
+                }
+            )
+        ),
+    )
+    aggregate_rows = tuple(
+        aggregate_item if index == item_index else row
+        for index, row in enumerate(inventory.items)
+    )
+    failure = _expect_refusal(
+        lambda: replace(inventory, items=aggregate_rows),
+        "aggregate completed-transition counter replacing separate level counters",
+    )
+    if failure:
+        failures.append(failure)
+
+    return (
+        FullDayAuditCase(
+            "complete_state_runtime_checkpoint_authority",
+            (
+                f"owned_fields={len(expected)} omission_refusals={omission_refusals} "
+                "plan_model_bindings=preserved separate_transition_counts=preserved "
+                "obsolete_alias=absent"
+            ),
+            tuple(failures),
+        ),
+    )
+
+
 def audit_dev0002_anchor_transition_ordering() -> tuple[FullDayAuditCase, ...]:
     """Exercise the repaired causal ordering at a macro-state anchor."""
 
@@ -4244,17 +4377,9 @@ def _checkpoint_case() -> FullDayAuditCase:
             "hidden.venue_trade_sequence_allocators",
             "hidden.venue_truth_event_prefixes",
         },
-        "CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1": {
-            "state.component_local_sequence",
-            "state.current_day",
-            "state.current_local",
-            "state.day_elapsed_age_us",
-            "state.day_next_eligible_transition_id",
-            "state.day_sampled_duration_us",
-            "state.local_elapsed_age_us",
-            "state.local_next_eligible_transition_id",
-            "state.local_sampled_duration_us",
-        },
+        "CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1": set(
+            _dev0003_state_checkpoint_fields()
+        ),
         "SCHEDULED_EVENT_SHOCK_HALT_REOPEN_STATE_V1": {
             "halt_reopen.controller_local_sequence",
             "halt_reopen.halt_count",
@@ -4518,10 +4643,8 @@ def _checkpoint_case() -> FullDayAuditCase:
             ),
         ),
         (
-            "legacy completed-transition counter in state runtime",
-            lambda: validate_checkpoint_owned_state_semantics(
-                legacy_transition_counter_items
-            ),
+            "legacy aggregate completed-transition counter in state runtime",
+            lambda: replace(inventory, items=legacy_transition_counter_items),
         ),
         (
             "preserved component state omitting one frozen field",
@@ -5377,4 +5500,9 @@ def _limit(
     )
 
 
-__all__ = ["FullDayAuditCase", "audit_wo31a_contracts"]
+__all__ = [
+    "FullDayAuditCase",
+    "audit_dev0002_anchor_transition_ordering",
+    "audit_dev0003_state_checkpoint_inventory",
+    "audit_wo31a_contracts",
+]

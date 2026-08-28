@@ -91,3 +91,55 @@ outer-event cause field; same-microstep successors, nonzero-microstep anchors, a
 minimum-age violations fail closed; a checkpoint suffix must continue the verified
 prefix's state and entry age; the repair changes no V1 wire schema and no unrelated
 runtime capability claim.
+
+## DEV-0003 — Reconcile state runtime checkpoint inventory
+
+- Interrupted canonical card: `WO31-B`
+- Exact first-parent predecessor: `5203f62611e90cdeadace46b3882d4af97a831db`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -c 'from kirby2.full_day.checkpoint_contract import checkpoint_inventory_v1; item=next(x for x in checkpoint_inventory_v1().items if x.component_id=="CURRENT_DAY_LOCAL_STATE_AGES_DEADLINES_TRIGGER_MEMORY_V1"); required={"state.component_sequence_offset","state.runtime_emission_count","state.day_transition_count","state.local_transition_count","state.day_transitions_since_macro_anchor","state.next_macro_segment_index","state.observation_ids_seen","state.input_closed_through_time_us","state.plan_sha256","state.state_model_sha256"}; missing=sorted(required-set(item.owned_state_fields)); assert not missing, f"missing checkpoint state ownership: {missing}"'`
+- Observed terminal result: `AssertionError: missing checkpoint state ownership:
+  ['state.component_sequence_offset', 'state.day_transition_count',
+  'state.day_transitions_since_macro_anchor',
+  'state.input_closed_through_time_us', 'state.local_transition_count',
+  'state.next_macro_segment_index', 'state.observation_ids_seen',
+  'state.plan_sha256', 'state.runtime_emission_count',
+  'state.state_model_sha256']`
+- Root cause: the frozen WO31-A inventory described only the initial day/local
+  state, age, sampled duration/deadline, selected transition, trigger memory, and
+  component-local high-water value. WO31-B's exact continuation contract also owns
+  the allocator offset and emission reconciliation counters, separate day/local
+  transition counts, macro-anchor cursor, observation-consumption history, closed
+  input frontier, plan/model bindings, and derived next-eligibility projections.
+  The old semantic-alias table also retained an orphan aggregate
+  `state.completed_transition_count`, which cannot represent the separate counters.
+- Repair: expand the existing state-runtime inventory row to the complete 27-field
+  semantic authority set, including the plan/model bindings and both
+  next-eligibility projections; preserve day and local transition counters
+  separately; remove the orphan aggregate alias; and make every one-field omission
+  plus an aggregate-counter substitution fail the exact inventory contract.
+- Owned repair paths: `kirby2/full_day/checkpoint_contract.py`,
+  `kirby2/audit/full_day.py`, `kirby2/audit/expansion.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0003` through the existing K2X-02 expansion seam,
+  immediately after `DEV-0002` and before resumed `WO31-B`.
+- Inherited gates: `WO31-A`, `DEV-0002`, and `K2X-02` remain unchanged.
+- Exact commit subject: `Reconcile state runtime checkpoint inventory`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0003
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO31-A
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0002
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the state-runtime inventory declares exactly 27 sorted unique semantic
+fields; every field needed to reconcile exact restore authority is represented;
+each one-field omission fails closed; plan/model bindings, closed-input frontier,
+macro cursor, observation history, allocator offset, and separate transition counts
+cannot be omitted; the obsolete aggregate counter is absent and cannot replace the
+level counters; canonical inventory bytes round-trip without identity drift; and no
+runtime capability beyond the interrupted WO31-B implementation is claimed.
