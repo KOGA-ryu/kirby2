@@ -1,0 +1,14 @@
+schema_version = 1
+manifest_id = "WO31_F_PILOT_LIMITS_V1"
+manifest_version = 1
+semantic_version = 1
+pilot_duration_us = 300000000
+max_outer_events = 250000
+max_pending_work_items = 25000
+max_microsteps_per_timestamp = 128
+max_events_per_timestamp = 10000
+max_checkpoint_bytes = 67108864
+max_generation_wall_time_ns = 120000000000
+max_peak_rss_bytes = 2147483648
+semantic_sha256 = "3fc82e0d79896452fb939133110abd73cba3e688eb56515aa0bebb15bb710ee7"
+manifest_sha256 = "2aa1cf22b012bc689db32a9610b46599d3e5df09503ee943fa23da359a00b4d0"

@@ -91,7 +91,7 @@ CANONICAL_IMPLEMENTATION_CARD_IDS = (
     "WO40-J",
 )
 RECORDED_DEVIATIONS = (("DEV-0001", "K2X-02"),)
-REGISTERABLE_GATE_IDS = ("DEV-0001", "K2X-02")
+REGISTERABLE_GATE_IDS = ("DEV-0001", "K2X-02", "WO31-A")
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
 )
@@ -1207,9 +1207,70 @@ def _audit_dev0001() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31a() -> ExpansionGateReport:
+    """Run the contract-only full-day audit without claiming a runtime."""
+
+    from kirby2.audit.full_day import audit_wo31a_contracts
+
+    cases = audit_wo31a_contracts()
+    checks: list[ExpansionGateCheck] = []
+    failures: list[str] = []
+    for case in cases:
+        if case.status_override is not None:
+            status = ExpansionGateStatus(case.status_override)
+        else:
+            status = (
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            )
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=status,
+                detail=(
+                    case.detail
+                    if case.reason_code is None
+                    else f"{case.detail}; reason_code={case.reason_code}"
+                ),
+                required=case.required,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+    runtime_cases = tuple(
+        case
+        for case in cases
+        if case.status_override == ExpansionGateStatus.NOT_EXERCISED.value
+    )
+    if (
+        len(runtime_cases) != 1
+        or runtime_cases[0].required
+        or runtime_cases[0].reason_code != "RESTORE_NOT_IMPLEMENTED"
+    ):
+        failures.append(
+            "WO31-A requires exactly one optional NOT_EXERCISED runtime case with "
+            "reason RESTORE_NOT_IMPLEMENTED"
+        )
+    runtime_reason = (
+        runtime_cases[0].reason_code if len(runtime_cases) == 1 else "INVALID_RUNTIME_CASE"
+    )
+    return ExpansionGateReport(
+        card_id="WO31-A",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("contract_case_count", str(len(cases))),
+            ("runtime_capability", ExpansionGateStatus.NOT_EXERCISED.value),
+            ("runtime_reason_code", runtime_reason or "MISSING_RUNTIME_REASON"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
+    ("WO31-A", _audit_wo31a),
 )
 
 
