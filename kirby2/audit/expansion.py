@@ -103,6 +103,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0003",
     "WO31-B",
     "WO31-C",
+    "WO31-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1392,6 +1393,69 @@ def _audit_wo31c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31d() -> ExpansionGateReport:
+    """Run fresh-process restoration at every fixed core-session boundary."""
+
+    from kirby2.audit.full_day import audit_wo31d_core_restore
+    from kirby2.full_day.restore import CORE_SESSION_CHECKPOINT_FORMAT_ID
+
+    cases = audit_wo31d_core_restore()
+    checks: list[ExpansionGateCheck] = []
+    failures: list[str] = []
+    expected_names = (
+        "core_restore_post_t0_quiet",
+        "core_restore_auction_order_imbalance",
+        "core_restore_post_uncross",
+        "core_restore_partial_fill",
+        "core_restore_working_player_order",
+        "core_restore_queued_fifo_depth",
+        "core_restore_halt",
+        "core_restore_reopen",
+        "core_restore_hostile_refusals",
+        "core_restore_worker_protocol_scope",
+    )
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-D audit cases differ from the fixed boundary inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-D cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-D cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO31-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("checkpoint_format", CORE_SESSION_CHECKPOINT_FORMAT_ID),
+            ("fixed_boundary_count", "8"),
+            ("fresh_process_runtime", "EXECUTED"),
+            ("hostile_refusal_count", "14"),
+            ("restored_scope", "SINGLE_VENUE_MARKET_MECHANICS"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1474,6 +1538,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0003", _audit_dev0003),
     ("WO31-B", _audit_wo31b),
     ("WO31-C", _audit_wo31c),
+    ("WO31-D", _audit_wo31d),
 )
 
 

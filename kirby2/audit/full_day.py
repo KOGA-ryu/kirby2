@@ -9490,6 +9490,1052 @@ def _wo31c_checkpoint_relocation_case() -> FullDayAuditCase:
     )
 
 
+def _wo31d_order(
+    order_id: str,
+    side: Side,
+    quantity: int,
+    *,
+    price_ticks: int | None = None,
+    owner: OrderOwner = OrderOwner.SIMULATED,
+    auction_only: bool = False,
+) -> AdvancedOrderRequest:
+    """Build one deterministic mechanics request for the restoration audit."""
+
+    is_market = price_ticks is None
+    return AdvancedOrderRequest(
+        order_id=order_id,
+        side=side,
+        quantity=quantity,
+        instruction=(
+            OrderInstruction.MARKET if is_market else OrderInstruction.LIMIT
+        ),
+        owner=owner,
+        account_id=f"ACCOUNT-{order_id}",
+        price_ticks=price_ticks,
+        time_in_force=(
+            OrderInstruction.IOC
+            if is_market
+            else OrderInstruction.DAY
+        ),
+        auction_only=auction_only,
+    )
+
+
+def _wo31d_open_continuous(engine: MarketMechanicsEngine, reason: str) -> None:
+    engine.transition_session(SessionState.PREOPEN, reason=reason)
+    engine.transition_session(SessionState.OPENING_AUCTION, reason=reason)
+    engine.transition_session(SessionState.CONTINUOUS, reason=reason)
+
+
+def _wo31d_command(
+    sequence: int,
+    simulation_time_us: int,
+    command_type: str,
+    parameters: dict[str, object],
+):
+    from kirby2.full_day.restore import CoreSessionCommandV1
+
+    return CoreSessionCommandV1(
+        sequence=sequence,
+        simulation_time_us=simulation_time_us,
+        command_type=command_type,
+        parameters=parameters,
+    )
+
+
+def _wo31d_submit(
+    sequence: int,
+    simulation_time_us: int,
+    request: AdvancedOrderRequest,
+):
+    return _wo31d_command(
+        sequence,
+        simulation_time_us,
+        "SUBMIT",
+        {"request": request.as_dict()},
+    )
+
+
+def _wo31d_transition(
+    sequence: int,
+    simulation_time_us: int,
+    state: SessionState,
+    reason: str,
+):
+    return _wo31d_command(
+        sequence,
+        simulation_time_us,
+        "TRANSITION",
+        {"reason": reason, "state": state.value},
+    )
+
+
+def _wo31d_boundary_fixtures():
+    """Return the eight checkpoint boundaries fixed by WO31-D."""
+
+    fixtures: list[tuple[str, MarketMechanicsEngine, tuple[object, ...], int]] = []
+
+    quiet = MarketMechanicsEngine()
+    _wo31d_open_continuous(quiet, "WO31D_QUIET_OPEN")
+    quiet.advance_to(11)
+    fixtures.append(
+        (
+            "post_t0_quiet",
+            quiet,
+            (
+                _wo31d_submit(
+                    1,
+                    12,
+                    _wo31d_order("QUIET-BID", Side.BUY, 90, price_ticks=100),
+                ),
+                _wo31d_submit(
+                    2,
+                    13,
+                    _wo31d_order("QUIET-ASK", Side.SELL, 80, price_ticks=102),
+                ),
+            ),
+            14,
+        )
+    )
+
+    auction = MarketMechanicsEngine()
+    auction.transition_session(SessionState.PREOPEN, reason="WO31D_AUCTION_OPEN")
+    auction.transition_session(
+        SessionState.OPENING_AUCTION,
+        reason="WO31D_AUCTION_OPEN",
+    )
+    auction.submit(
+        _wo31d_order(
+            "AUC-BUY",
+            Side.BUY,
+            100,
+            price_ticks=101,
+            auction_only=True,
+        )
+    )
+    auction.submit(
+        _wo31d_order(
+            "AUC-SELL",
+            Side.SELL,
+            40,
+            price_ticks=100,
+            owner=OrderOwner.PLAYER,
+            auction_only=True,
+        )
+    )
+    fixtures.append(
+        (
+            "auction_order_imbalance",
+            auction,
+            (
+                _wo31d_command(1, 1, "UNCROSS", {}),
+                _wo31d_transition(
+                    2,
+                    2,
+                    SessionState.CONTINUOUS,
+                    "WO31D_AUCTION_COMPLETE",
+                ),
+            ),
+            3,
+        )
+    )
+
+    post_uncross = MarketMechanicsEngine()
+    post_uncross.transition_session(
+        SessionState.PREOPEN,
+        reason="WO31D_POST_UNCROSS_OPEN",
+    )
+    post_uncross.transition_session(
+        SessionState.OPENING_AUCTION,
+        reason="WO31D_POST_UNCROSS_OPEN",
+    )
+    post_uncross.submit(
+        _wo31d_order(
+            "POST-AUC-BUY",
+            Side.BUY,
+            60,
+            price_ticks=101,
+            auction_only=True,
+        )
+    )
+    post_uncross.submit(
+        _wo31d_order(
+            "POST-AUC-SELL",
+            Side.SELL,
+            60,
+            price_ticks=100,
+            auction_only=True,
+        )
+    )
+    post_uncross.uncross_auction()
+    fixtures.append(
+        (
+            "post_uncross",
+            post_uncross,
+            (
+                _wo31d_transition(
+                    1,
+                    1,
+                    SessionState.CONTINUOUS,
+                    "WO31D_POST_UNCROSS_CONTINUOUS",
+                ),
+                _wo31d_submit(
+                    2,
+                    2,
+                    _wo31d_order("POST-BID", Side.BUY, 70, price_ticks=99),
+                ),
+            ),
+            3,
+        )
+    )
+
+    partial = MarketMechanicsEngine()
+    _wo31d_open_continuous(partial, "WO31D_PARTIAL_OPEN")
+    partial.submit(
+        _wo31d_order("PARTIAL-MAKER", Side.SELL, 100, price_ticks=101)
+    )
+    partial.submit(
+        _wo31d_order(
+            "PARTIAL-PLAYER",
+            Side.BUY,
+            40,
+            owner=OrderOwner.PLAYER,
+        )
+    )
+    fixtures.append(
+        (
+            "partial_fill",
+            partial,
+            (
+                _wo31d_submit(
+                    1,
+                    1,
+                    _wo31d_order("PARTIAL-FINISH", Side.BUY, 60),
+                ),
+                _wo31d_submit(
+                    2,
+                    2,
+                    _wo31d_order("PARTIAL-BID", Side.BUY, 25, price_ticks=99),
+                ),
+            ),
+            3,
+        )
+    )
+
+    working_player = MarketMechanicsEngine()
+    _wo31d_open_continuous(working_player, "WO31D_PLAYER_OPEN")
+    working_player.submit(
+        _wo31d_order(
+            "WORKING-PLAYER",
+            Side.BUY,
+            50,
+            price_ticks=100,
+            owner=OrderOwner.PLAYER,
+        )
+    )
+    fixtures.append(
+        (
+            "working_player_order",
+            working_player,
+            (
+                _wo31d_submit(
+                    1,
+                    1,
+                    _wo31d_order("PLAYER-HIT", Side.SELL, 20),
+                ),
+            ),
+            2,
+        )
+    )
+
+    fifo = MarketMechanicsEngine()
+    _wo31d_open_continuous(fifo, "WO31D_FIFO_OPEN")
+    fifo.submit(
+        _wo31d_order("FIFO-AHEAD", Side.BUY, 1_100, price_ticks=100)
+    )
+    fifo.submit(
+        _wo31d_order(
+            "FIFO-PLAYER",
+            Side.BUY,
+            500,
+            price_ticks=100,
+            owner=OrderOwner.PLAYER,
+        )
+    )
+    fixtures.append(
+        (
+            "queued_fifo_depth",
+            fifo,
+            (
+                _wo31d_submit(
+                    1,
+                    1,
+                    _wo31d_order("FIFO-AGGRESSOR", Side.SELL, 1_200),
+                ),
+            ),
+            2,
+        )
+    )
+
+    halted = MarketMechanicsEngine()
+    _wo31d_open_continuous(halted, "WO31D_HALT_OPEN")
+    halted.submit(_wo31d_order("HALT-BID", Side.BUY, 90, price_ticks=99))
+    halted.transition_session(SessionState.HALTED, reason="WO31D_HALT")
+    fixtures.append(
+        (
+            "halt",
+            halted,
+            (
+                _wo31d_transition(
+                    1,
+                    1,
+                    SessionState.REOPENING_AUCTION,
+                    "WO31D_REOPEN_CALL",
+                ),
+                _wo31d_submit(
+                    2,
+                    2,
+                    _wo31d_order(
+                        "HALT-AUC-BUY",
+                        Side.BUY,
+                        30,
+                        price_ticks=101,
+                        auction_only=True,
+                    ),
+                ),
+                _wo31d_submit(
+                    3,
+                    2,
+                    _wo31d_order(
+                        "HALT-AUC-SELL",
+                        Side.SELL,
+                        30,
+                        price_ticks=100,
+                        auction_only=True,
+                    ),
+                ),
+                _wo31d_command(4, 3, "UNCROSS", {}),
+                _wo31d_transition(
+                    5,
+                    4,
+                    SessionState.CONTINUOUS,
+                    "WO31D_REOPEN_COMPLETE",
+                ),
+            ),
+            5,
+        )
+    )
+
+    reopened = MarketMechanicsEngine()
+    _wo31d_open_continuous(reopened, "WO31D_REOPEN_PREFIX")
+    reopened.submit(
+        _wo31d_order("REOPEN-ASK", Side.SELL, 80, price_ticks=102)
+    )
+    reopened.transition_session(SessionState.HALTED, reason="WO31D_REOPEN_HALT")
+    reopened.transition_session(
+        SessionState.REOPENING_AUCTION,
+        reason="WO31D_REOPEN_CALL",
+    )
+    reopened.submit(
+        _wo31d_order(
+            "REOPEN-AUC-BUY",
+            Side.BUY,
+            25,
+            price_ticks=101,
+            auction_only=True,
+        )
+    )
+    reopened.submit(
+        _wo31d_order(
+            "REOPEN-AUC-SELL",
+            Side.SELL,
+            25,
+            price_ticks=100,
+            auction_only=True,
+        )
+    )
+    reopened.uncross_auction()
+    reopened.transition_session(
+        SessionState.CONTINUOUS,
+        reason="WO31D_REOPEN_COMPLETE",
+    )
+    fixtures.append(
+        (
+            "reopen",
+            reopened,
+            (
+                _wo31d_submit(
+                    1,
+                    1,
+                    _wo31d_order(
+                        "REOPEN-PLAYER",
+                        Side.BUY,
+                        20,
+                        owner=OrderOwner.PLAYER,
+                    ),
+                ),
+            ),
+            2,
+        )
+    )
+    return tuple(fixtures)
+
+
+def _wo31d_run_worker(raw: bytes):
+    """Run the documented worker from an empty directory in a new interpreter."""
+
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    prior_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(repository)
+        if not prior_path
+        else str(repository) + os.pathsep + prior_path
+    )
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    with TemporaryDirectory(prefix="kirby2-wo31d-worker-") as temporary:
+        directory = Path(temporary)
+        before = tuple(sorted(str(path.relative_to(directory)) for path in directory.rglob("*")))
+        completed = subprocess.run(
+            [sys.executable, "-m", "kirby2.full_day.restore_worker"],
+            input=raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=directory,
+            env=environment,
+            check=False,
+            timeout=20,
+        )
+        after = tuple(sorted(str(path.relative_to(directory)) for path in directory.rglob("*")))
+    return completed.returncode, completed.stdout, completed.stderr, before != after
+
+
+def _wo31d_boundary_case(
+    boundary: str,
+    engine: MarketMechanicsEngine,
+    raw_commands: tuple[object, ...],
+    completed_time_us: int,
+) -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes, parse_canonical_json_object
+    from kirby2.full_day.restore import (
+        CORE_RESTORE_REQUEST_FORMAT_ID,
+        CORE_RESTORE_REQUEST_SCHEMA_VERSION,
+        CoreRestoreRequestV1,
+        CoreSessionCheckpointV1,
+        CoreSessionCommandV1,
+        execute_uninterrupted_suffix,
+    )
+
+    failures: list[str] = []
+    commands = tuple(raw_commands)
+    if any(type(command) is not CoreSessionCommandV1 for command in commands):
+        failures.append("boundary fixture contains a noncanonical suffix command")
+        return FullDayAuditCase(
+            f"core_restore_{boundary}",
+            f"boundary={boundary} fixture=invalid",
+            tuple(failures),
+        )
+    checkpoint = CoreSessionCheckpointV1.capture(engine)
+    request = CoreRestoreRequestV1(
+        schema_version=CORE_RESTORE_REQUEST_SCHEMA_VERSION,
+        format_id=CORE_RESTORE_REQUEST_FORMAT_ID,
+        checkpoint=checkpoint,
+        suffix_commands=commands,
+        completed_time_us=completed_time_us,
+    )
+    uninterrupted = execute_uninterrupted_suffix(
+        engine,
+        checkpoint,
+        commands,
+        completed_time_us=completed_time_us,
+    )
+    expected = canonical_json_bytes(uninterrupted)
+    returncode, stdout, stderr, wrote_files = _wo31d_run_worker(
+        request.canonical_bytes()
+    )
+    if returncode != 0:
+        failures.append(
+            f"fresh worker exited {returncode}: "
+            f"{stderr.decode('utf-8', errors='backslashreplace').strip()}"
+        )
+    if stderr:
+        failures.append("successful fresh worker wrote diagnostics to stderr")
+    if wrote_files:
+        failures.append("fresh worker changed its empty working directory")
+    if stdout != expected:
+        failures.append("fresh restore result differs byte-for-byte from uninterrupted suffix")
+    try:
+        parsed = parse_canonical_json_object(stdout)
+    except (TypeError, ValueError) as error:
+        failures.append(f"fresh worker stdout is not one canonical JSON object: {error}")
+        parsed = {}
+    prefix = parsed.get("prefix")
+    if not isinstance(prefix, dict) or set(prefix) != {
+        "local_event_count",
+        "outer_event_count",
+        "sha256",
+    }:
+        failures.append("worker result re-emits prefix state instead of digest metadata")
+    checkpoint_payload = checkpoint.as_dict()["engine_state"]
+    assert isinstance(checkpoint_payload, dict)
+    checkpoint_book = checkpoint_payload["book"]
+    checkpoint_auction = checkpoint_payload["auction"]
+    assert isinstance(checkpoint_book, dict) and isinstance(checkpoint_auction, dict)
+    prefix_continuous_fills = checkpoint_book["fills"]
+    prefix_auction_executions = checkpoint_auction["executions"]
+    assert isinstance(prefix_continuous_fills, list)
+    assert isinstance(prefix_auction_executions, list)
+    final = uninterrupted["final"]
+    assert isinstance(final, dict)
+    explicit_fills = final["fills"]
+    assert isinstance(explicit_fills, dict)
+    suffix_continuous_fills = explicit_fills["continuous"]
+    suffix_auction_executions = explicit_fills["auction"]
+    assert isinstance(suffix_continuous_fills, list)
+    assert isinstance(suffix_auction_executions, list)
+    prefix_continuous_trade_ids = {
+        row["trade_id"] for row in prefix_continuous_fills if isinstance(row, dict)
+    }
+    prefix_auction_trade_ids = {
+        row["trade_id"] for row in prefix_auction_executions if isinstance(row, dict)
+    }
+    if any(
+        isinstance(row, dict) and row.get("trade_id") in prefix_continuous_trade_ids
+        for row in suffix_continuous_fills
+    ):
+        failures.append("explicit continuous fills re-emit checkpoint-prefix fills")
+    if any(
+        isinstance(row, dict) and row.get("trade_id") in prefix_auction_trade_ids
+        for row in suffix_auction_executions
+    ):
+        failures.append("explicit auction fills re-emit checkpoint-prefix executions")
+    final_book = final["book_state"]
+    final_auction = final["auction_state"]
+    final_position = final["player_position_state"]
+    assert isinstance(final_book, dict)
+    assert isinstance(final_auction, dict)
+    assert isinstance(final_position, dict)
+    if {"fills", "journal", "player_position", "trades"} & set(final_book):
+        failures.append("final book projection re-emits prefix history rows")
+    if (
+        {"executions", "uncross_history"} & set(final_auction)
+        or "fills" in final_position
+    ):
+        failures.append("final auction or position projection re-emits prefix rows")
+    suffix = uninterrupted["suffix"]
+    assert isinstance(suffix, dict)
+    outer_events = suffix["outer_events"]
+    local_events = suffix["local_events"]
+    assert isinstance(outer_events, list) and isinstance(local_events, list)
+    return FullDayAuditCase(
+        f"core_restore_{boundary}",
+        (
+            f"boundary={boundary} fresh_process=executed "
+            f"suffix_outer_events={len(outer_events)} "
+            f"suffix_local_events={len(local_events)} "
+            f"result_bytes={len(expected)} "
+            f"result_sha256={hashlib.sha256(expected).hexdigest()}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31d_hostile_fixture():
+    """Return a checkpoint containing FIFO depth and a player fill history."""
+
+    from kirby2.full_day.restore import CoreSessionCheckpointV1
+
+    engine = MarketMechanicsEngine()
+    _wo31d_open_continuous(engine, "WO31D_HOSTILE_OPEN")
+    engine.submit(_wo31d_order("HOST-AHEAD", Side.BUY, 100, price_ticks=100))
+    engine.submit(
+        _wo31d_order(
+            "HOST-PLAYER",
+            Side.BUY,
+            50,
+            price_ticks=100,
+            owner=OrderOwner.PLAYER,
+        )
+    )
+    engine.submit(_wo31d_order("HOST-BEHIND", Side.BUY, 50, price_ticks=100))
+    engine.submit(_wo31d_order("HOST-HIT", Side.SELL, 120))
+    return CoreSessionCheckpointV1.capture(engine)
+
+
+def _wo31d_request_payload(checkpoint_payload: dict[str, object]) -> dict[str, object]:
+    from kirby2.full_day.restore import (
+        CORE_RESTORE_REQUEST_FORMAT_ID,
+        CORE_RESTORE_REQUEST_SCHEMA_VERSION,
+    )
+
+    clock = checkpoint_payload["engine_state"]
+    assert isinstance(clock, dict)
+    clock = clock["clock"]
+    assert isinstance(clock, dict)
+    current_time = clock["current_time_us"]
+    assert type(current_time) is int
+    return {
+        "checkpoint": checkpoint_payload,
+        "completed_time_us": current_time,
+        "format_id": CORE_RESTORE_REQUEST_FORMAT_ID,
+        "schema_version": CORE_RESTORE_REQUEST_SCHEMA_VERSION,
+        "suffix_commands": [],
+    }
+
+
+def _wo31d_rebind_engine_digest(checkpoint_payload: dict[str, object]) -> None:
+    from kirby2.full_day.models import canonical_sha256
+
+    state = checkpoint_payload["engine_state"]
+    assert isinstance(state, dict)
+    checkpoint_payload["engine_state_sha256"] = canonical_sha256(state)
+
+
+def _wo31d_rebind_prefix_digest(checkpoint_payload: dict[str, object]) -> None:
+    from kirby2.full_day.models import canonical_sha256
+
+    state = checkpoint_payload["engine_state"]
+    assert isinstance(state, dict)
+    book = state["book"]
+    assert isinstance(book, dict)
+    journal = book["journal"]
+    assert isinstance(journal, dict)
+    local_events = journal["events"]
+    outer_events = state["events"]
+    assert isinstance(local_events, list) and isinstance(outer_events, list)
+    checkpoint_payload["prefix_local_event_count"] = len(local_events)
+    checkpoint_payload["prefix_outer_event_count"] = len(outer_events)
+    checkpoint_payload["prefix_sha256"] = canonical_sha256(
+        {"local_events": local_events, "outer_events": outer_events}
+    )
+
+
+def _wo31d_refusal_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes
+
+    checkpoint = _wo31d_hostile_fixture()
+    refusals: list[tuple[str, bytes]] = []
+
+    duplicate = copy.deepcopy(checkpoint.as_dict())
+    duplicate_state = duplicate["engine_state"]
+    assert isinstance(duplicate_state, dict)
+    duplicate_orders = duplicate_state["managed_orders"]
+    assert isinstance(duplicate_orders, list) and duplicate_orders
+    duplicate_orders.append(copy.deepcopy(duplicate_orders[0]))
+    _wo31d_rebind_engine_digest(duplicate)
+    refusals.append(
+        ("duplicate_ids", canonical_json_bytes(_wo31d_request_payload(duplicate)))
+    )
+
+    fifo = copy.deepcopy(checkpoint.as_dict())
+    fifo_state = fifo["engine_state"]
+    assert isinstance(fifo_state, dict)
+    fifo_book = fifo_state["book"]
+    assert isinstance(fifo_book, dict)
+    bid_levels = fifo_book["bid_levels"]
+    assert isinstance(bid_levels, list) and bid_levels
+    level = bid_levels[0]
+    assert isinstance(level, dict)
+    order_ids = level["order_ids"]
+    assert isinstance(order_ids, list) and len(order_ids) >= 2
+    order_ids[0], order_ids[1] = order_ids[1], order_ids[0]
+    _wo31d_rebind_engine_digest(fifo)
+    refusals.append(("corrupt_fifo", canonical_json_bytes(_wo31d_request_payload(fifo))))
+
+    fill_history = copy.deepcopy(checkpoint.as_dict())
+    fill_state = fill_history["engine_state"]
+    assert isinstance(fill_state, dict)
+    fill_book = fill_state["book"]
+    assert isinstance(fill_book, dict)
+    position = fill_book["player_position"]
+    assert isinstance(position, dict)
+    player_fills = position["fills"]
+    assert isinstance(player_fills, list) and player_fills
+    player_fill = player_fills[0]
+    assert isinstance(player_fill, dict)
+    player_fill["quantity"] = int(player_fill["quantity"]) + 1
+    position["bought_quantity"] = int(position["bought_quantity"]) + 1
+    position["position"] = int(position["position"]) + 1
+    _wo31d_rebind_engine_digest(fill_history)
+    refusals.append(
+        (
+            "mutated_fill_history",
+            canonical_json_bytes(_wo31d_request_payload(fill_history)),
+        )
+    )
+
+    allocator = copy.deepcopy(checkpoint.as_dict())
+    allocator_state = allocator["engine_state"]
+    assert isinstance(allocator_state, dict)
+    allocators = allocator_state["allocators"]
+    assert isinstance(allocators, dict)
+    allocators["arrival_sequence"] = int(allocators["arrival_sequence"]) - 1
+    _wo31d_rebind_engine_digest(allocator)
+    refusals.append(
+        ("bad_allocator", canonical_json_bytes(_wo31d_request_payload(allocator)))
+    )
+
+    historical_engine = MarketMechanicsEngine()
+    _wo31d_open_continuous(historical_engine, "WO31D_HISTORICAL_FIFO_OPEN")
+    historical_engine.submit(
+        _wo31d_order("HIST-ASK-1", Side.SELL, 10, price_ticks=101)
+    )
+    historical_engine.submit(
+        _wo31d_order("HIST-ASK-2", Side.SELL, 10, price_ticks=101)
+    )
+    historical_engine.submit(_wo31d_order("HIST-BUY", Side.BUY, 20))
+    from kirby2.full_day.restore import CoreSessionCheckpointV1
+
+    historical_fifo = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(historical_engine).as_dict()
+    )
+    historical_state = historical_fifo["engine_state"]
+    assert isinstance(historical_state, dict)
+    historical_book = historical_state["book"]
+    assert isinstance(historical_book, dict)
+    historical_orders = historical_book["orders"]
+    assert isinstance(historical_orders, list)
+    historical_by_id = {
+        row["order_id"]: row for row in historical_orders if isinstance(row, dict)
+    }
+    first_historical = historical_by_id["HIST-ASK-1"]
+    second_historical = historical_by_id["HIST-ASK-2"]
+    first_historical["resting_sequence"], second_historical["resting_sequence"] = (
+        second_historical["resting_sequence"],
+        first_historical["resting_sequence"],
+    )
+    _wo31d_rebind_engine_digest(historical_fifo)
+    refusals.append(
+        (
+            "historical_fifo_forgery",
+            canonical_json_bytes(_wo31d_request_payload(historical_fifo)),
+        )
+    )
+
+    cancel_engine = MarketMechanicsEngine()
+    _wo31d_open_continuous(cancel_engine, "WO31D_CANCEL_TARGET_OPEN")
+    cancel_engine.submit(
+        _wo31d_order("TARGET-ONE", Side.BUY, 10, price_ticks=99)
+    )
+    cancel_engine.submit(
+        _wo31d_order("TARGET-TWO", Side.BUY, 10, price_ticks=98)
+    )
+    cancel_engine.cancel("TARGET-ONE", reason="WO31D_TARGET_CANCEL")
+    cancel_target = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(cancel_engine).as_dict()
+    )
+    cancel_state = cancel_target["engine_state"]
+    assert isinstance(cancel_state, dict)
+    cancel_book = cancel_state["book"]
+    assert isinstance(cancel_book, dict)
+    cancel_orders = cancel_book["orders"]
+    assert isinstance(cancel_orders, list)
+    command_rows = [
+        row
+        for row in cancel_orders
+        if isinstance(row, dict) and row.get("order_type") == "cancel"
+    ]
+    assert len(command_rows) == 1
+    command_rows[0]["cancel_target_id"] = "TARGET-TWO"
+    _wo31d_rebind_engine_digest(cancel_target)
+    refusals.append(
+        (
+            "cancel_target_forgery",
+            canonical_json_bytes(_wo31d_request_payload(cancel_target)),
+        )
+    )
+
+    allocation_engine = MarketMechanicsEngine()
+    allocation_engine.transition_session(
+        SessionState.PREOPEN,
+        reason="WO31D_ALLOCATION_OPEN",
+    )
+    allocation_engine.transition_session(
+        SessionState.OPENING_AUCTION,
+        reason="WO31D_ALLOCATION_OPEN",
+    )
+    for request in (
+        _wo31d_order(
+            "ALLOC-BUY-1",
+            Side.BUY,
+            10,
+            price_ticks=101,
+            auction_only=True,
+        ),
+        _wo31d_order(
+            "ALLOC-BUY-2",
+            Side.BUY,
+            10,
+            price_ticks=101,
+            auction_only=True,
+        ),
+        _wo31d_order(
+            "ALLOC-SELL",
+            Side.SELL,
+            20,
+            price_ticks=100,
+            auction_only=True,
+        ),
+    ):
+        allocation_engine.submit(request)
+    allocation_engine.uncross_auction()
+    allocation = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(allocation_engine).as_dict()
+    )
+    allocation_state = allocation["engine_state"]
+    assert isinstance(allocation_state, dict)
+    allocation_auction = allocation_state["auction"]
+    assert isinstance(allocation_auction, dict)
+    allocation_executions = allocation_auction["executions"]
+    allocation_history = allocation_auction["uncross_history"]
+    assert isinstance(allocation_executions, list) and len(allocation_executions) == 2
+    assert isinstance(allocation_history, list) and len(allocation_history) == 1
+    first_execution, second_execution = allocation_executions
+    assert isinstance(first_execution, dict) and isinstance(second_execution, dict)
+    first_execution["buy_order_id"], second_execution["buy_order_id"] = (
+        second_execution["buy_order_id"],
+        first_execution["buy_order_id"],
+    )
+    history_row = allocation_history[0]
+    assert isinstance(history_row, dict)
+    history_result = history_row["result"]
+    assert isinstance(history_result, dict)
+    history_executions = history_result["executions"]
+    assert isinstance(history_executions, list) and len(history_executions) == 2
+    first_history, second_history = history_executions
+    assert isinstance(first_history, dict) and isinstance(second_history, dict)
+    first_history["buy_order_id"], second_history["buy_order_id"] = (
+        second_history["buy_order_id"],
+        first_history["buy_order_id"],
+    )
+    _wo31d_rebind_engine_digest(allocation)
+    refusals.append(
+        (
+            "auction_allocation_forgery",
+            canonical_json_bytes(_wo31d_request_payload(allocation)),
+        )
+    )
+
+    terminal_engine = MarketMechanicsEngine()
+    _wo31d_open_continuous(terminal_engine, "WO31D_TERMINAL_OPEN")
+    terminal = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(terminal_engine).as_dict()
+    )
+    terminal_state = terminal["engine_state"]
+    assert isinstance(terminal_state, dict)
+    terminal_state["session_state"] = SessionState.HALTED.value
+    _wo31d_rebind_engine_digest(terminal)
+    refusals.append(
+        (
+            "terminal_session_forgery",
+            canonical_json_bytes(_wo31d_request_payload(terminal)),
+        )
+    )
+
+    from kirby2.exchange.mechanics_models import ScheduledSessionState
+
+    scheduled_rules = replace(
+        InstrumentRules(),
+        session_schedule=SessionSchedule(
+            (ScheduledSessionState(0, SessionState.PREOPEN),)
+        ),
+    )
+    scheduled_engine = MarketMechanicsEngine(scheduled_rules)
+    scheduled_engine.advance_to(0)
+    schedule_cursor = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(scheduled_engine).as_dict()
+    )
+    schedule_state = schedule_cursor["engine_state"]
+    assert isinstance(schedule_state, dict)
+    schedule_state["schedule_index"] = 0
+    _wo31d_rebind_engine_digest(schedule_cursor)
+    refusals.append(
+        (
+            "equal_time_schedule_rollback",
+            canonical_json_bytes(_wo31d_request_payload(schedule_cursor)),
+        )
+    )
+
+    rejected_engine = MarketMechanicsEngine()
+    rejected_engine.submit(
+        _wo31d_order("REJECTED-LIFECYCLE", Side.BUY, 10, price_ticks=99)
+    )
+    rejected = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(rejected_engine).as_dict()
+    )
+    rejected_state = rejected["engine_state"]
+    assert isinstance(rejected_state, dict)
+    rejected_orders = rejected_state["managed_orders"]
+    assert isinstance(rejected_orders, list) and len(rejected_orders) == 1
+    rejected_row = rejected_orders[0]
+    assert isinstance(rejected_row, dict)
+    rejected_row["filled_quantity"] = 5
+    rejected_row["remaining_quantity"] = 5
+    rejected_row["resting_sequence"] = 1
+    _wo31d_rebind_engine_digest(rejected)
+    refusals.append(
+        (
+            "rejected_lifecycle_forgery",
+            canonical_json_bytes(_wo31d_request_payload(rejected)),
+        )
+    )
+
+    duplicate_event = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(terminal_engine).as_dict()
+    )
+    duplicate_event_state = duplicate_event["engine_state"]
+    assert isinstance(duplicate_event_state, dict)
+    duplicate_events = duplicate_event_state["events"]
+    assert isinstance(duplicate_events, list) and duplicate_events
+    forged_event = copy.deepcopy(duplicate_events[-1])
+    assert isinstance(forged_event, dict)
+    forged_event["sequence"] = len(duplicate_events) + 1
+    duplicate_events.append(forged_event)
+    _wo31d_rebind_engine_digest(duplicate_event)
+    _wo31d_rebind_prefix_digest(duplicate_event)
+    refusals.append(
+        (
+            "semantic_event_duplication",
+            canonical_json_bytes(_wo31d_request_payload(duplicate_event)),
+        )
+    )
+
+    closure_engine = MarketMechanicsEngine()
+    closure_engine.transition_session(
+        SessionState.PREOPEN,
+        reason="WO31D_CLOSURE_OPEN",
+    )
+    closure_engine.transition_session(
+        SessionState.OPENING_AUCTION,
+        reason="WO31D_CLOSURE_OPEN",
+    )
+    closure_engine.submit(
+        _wo31d_order(
+            "CLOSURE-AUCTION",
+            Side.BUY,
+            10,
+            price_ticks=100,
+            auction_only=True,
+        )
+    )
+    closure_engine.cancel("CLOSURE-AUCTION", reason="WO31D_USER_CANCEL")
+    closure = copy.deepcopy(
+        CoreSessionCheckpointV1.capture(closure_engine).as_dict()
+    )
+    closure_state = closure["engine_state"]
+    assert isinstance(closure_state, dict)
+    closure_managed = closure_state["managed_orders"]
+    closure_auction = closure_state["auction"]
+    assert isinstance(closure_managed, list) and len(closure_managed) == 1
+    assert isinstance(closure_auction, dict)
+    closure_orders = closure_auction["orders"]
+    assert isinstance(closure_orders, list) and len(closure_orders) == 1
+    assert isinstance(closure_managed[0], dict) and isinstance(closure_orders[0], dict)
+    closure_managed[0]["status"] = "CANCELLED_STP"
+    closure_orders[0]["status"] = "CANCELLED_STP"
+    _wo31d_rebind_engine_digest(closure)
+    refusals.append(
+        (
+            "auction_closure_reason_forgery",
+            canonical_json_bytes(_wo31d_request_payload(closure)),
+        )
+    )
+
+    canonical_request = canonical_json_bytes(
+        _wo31d_request_payload(copy.deepcopy(checkpoint.as_dict()))
+    )
+    refusals.append(("noncanonical_wire", b" " + canonical_request))
+
+    regeneration = _wo31d_request_payload(copy.deepcopy(checkpoint.as_dict()))
+    regeneration["seed"] = 42
+    regeneration["prefix_commands"] = []
+    refusals.append(("prefix_regeneration", canonical_json_bytes(regeneration)))
+
+    failures: list[str] = []
+    refusal_count = 0
+    for label, raw in refusals:
+        returncode, stdout, stderr, wrote_files = _wo31d_run_worker(raw)
+        if returncode == 0:
+            failures.append(f"{label} was accepted by the fresh worker")
+        else:
+            refusal_count += 1
+        if stdout:
+            failures.append(f"{label} refusal wrote a result to stdout")
+        if not stderr:
+            failures.append(f"{label} refusal omitted its stderr diagnostic")
+        if wrote_files:
+            failures.append(f"{label} refusal changed the worker directory")
+    return FullDayAuditCase(
+        "core_restore_hostile_refusals",
+        (
+            f"hostile_refusals={refusal_count} duplicate_ids=refused "
+            "corrupt_fifo=refused mutated_fill_history=refused "
+            "bad_allocator=refused noncanonical_wire=refused "
+            "prefix_regeneration=refused historical_fifo=refused "
+            "cancel_target=refused auction_allocation=refused "
+            "terminal_session=refused schedule_cursor=refused "
+            "rejected_lifecycle=refused duplicate_event=refused "
+            "auction_closure_reason=refused"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31d_protocol_case() -> FullDayAuditCase:
+    from pathlib import Path
+
+    from kirby2.full_day.restore import (
+        CORE_RNG_STATE_ABSENT,
+        CoreSessionCheckpointV1,
+    )
+
+    failures: list[str] = []
+    engine = MarketMechanicsEngine()
+    _wo31d_open_continuous(engine, "WO31D_PROTOCOL_OPEN")
+    checkpoint = CoreSessionCheckpointV1.capture(engine)
+    if checkpoint.core_rng_state != CORE_RNG_STATE_ABSENT:
+        failures.append("core checkpoint invented RNG state")
+    worker_source = (
+        Path(__file__).resolve().parents[1] / "full_day" / "restore_worker.py"
+    ).read_text(encoding="utf-8")
+    forbidden_calls = ("open(", "write_text(", "write_bytes(", "Path(")
+    if any(token in worker_source for token in forbidden_calls):
+        failures.append("restore worker source exposes a filesystem-write surface")
+    if "seed" in {
+        key.lower() for key in _wo31d_request_payload(checkpoint.as_dict())
+    }:
+        failures.append("restore request exposes seed-based prefix regeneration")
+    return FullDayAuditCase(
+        "core_restore_worker_protocol_scope",
+        (
+            "stdin=one_canonical_request stdout=one_canonical_result "
+            "stderr=diagnostics_only filesystem_writes=absent "
+            "prefix_fixture_import=absent core_rng=ABSENT "
+            "scope=single_venue_market_mechanics"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31d_core_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise core restoration in fresh interpreters at all fixed boundaries."""
+
+    boundary_cases = tuple(
+        _wo31d_boundary_case(boundary, engine, commands, completed_time_us)
+        for boundary, engine, commands, completed_time_us in _wo31d_boundary_fixtures()
+    )
+    return boundary_cases + (
+        _wo31d_refusal_case(),
+        _wo31d_protocol_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -9497,4 +10543,5 @@ __all__ = [
     "audit_wo31a_contracts",
     "audit_wo31b_transitions",
     "audit_wo31c_checkpoints",
+    "audit_wo31d_core_restore",
 ]
