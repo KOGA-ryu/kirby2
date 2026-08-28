@@ -54,6 +54,7 @@ from .store import DEFAULT_AUDIT_LAB_STORE, AuditLabStore, PacketRecord
 PROVENANCE_PACKAGE_ROOTS = (
     "auditlab",
     "audit",
+    "cli",
     "exchange",
     "features",
     "historical",
