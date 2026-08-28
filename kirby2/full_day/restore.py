@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -35,6 +36,14 @@ CORE_RESTORE_REQUEST_FORMAT_ID = "KIRBY2_CORE_RESTORE_REQUEST_V1"
 CORE_RESTORE_RESULT_SCHEMA_VERSION = 1
 CORE_RESTORE_RESULT_FORMAT_ID = "KIRBY2_CORE_RESTORE_RESULT_V1"
 CORE_RNG_STATE_ABSENT = "ABSENT"
+FULL_DAY_RUNTIME_RESTORE_REQUEST_SCHEMA_VERSION = 1
+FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID = (
+    "KIRBY2_FULL_DAY_RUNTIME_RESTORE_REQUEST_V1"
+)
+FULL_DAY_RUNTIME_RESTORE_RESULT_SCHEMA_VERSION = 1
+FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID = (
+    "KIRBY2_FULL_DAY_RUNTIME_RESTORE_RESULT_V1"
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _COMMAND_TYPES = frozenset(
@@ -820,6 +829,437 @@ def execute_uninterrupted_suffix(
     return _core_result(engine, checkpoint)
 
 
+def _full_day_runtime_prefix_counts(
+    checkpoint_state: Mapping[str, object],
+) -> dict[str, object]:
+    """Return strict prefix cursors without inventing a replay surface."""
+
+    events = _wire_array(checkpoint_state["events"], "full-day outer events")
+    engine = _wire_object(checkpoint_state["engine"], "full-day engine state")
+    mechanics_events = _wire_array(engine["events"], "mechanics events")
+    native = _wire_array(
+        checkpoint_state["native_ledger"], "full-day native ledger"
+    )
+    scheduler_union = _wire_object(
+        checkpoint_state["agent_scheduler"], "agent scheduler union"
+    )
+    scheduler_status = _wire_string(
+        scheduler_union["status"], "agent scheduler status"
+    )
+    public_count = 0
+    truth_count = 0
+    if scheduler_status == "PRESERVED":
+        scheduler = _wire_object(
+            scheduler_union["state"], "agent scheduler checkpoint"
+        )
+        owned = _wire_object(scheduler["state"], "agent scheduler owned state")
+        public_count = len(
+            _wire_array(owned["public_events"], "agent public events")
+        )
+        truth_count = len(
+            _wire_array(owned["truth_events"], "agent truth events")
+        )
+    elif scheduler_status != "ABSENT":
+        raise ValueError("full-day scheduler union has an unsupported status")
+    return {
+        "agent_public_event_count": public_count,
+        "agent_truth_event_count": truth_count,
+        "mechanics_event_count": len(mechanics_events),
+        "native_ledger_count": len(native),
+        "native_ledger_sha256": hashlib.sha256(
+            canonical_json_bytes(native)
+        ).hexdigest(),
+        "outer_event_count": len(events),
+        "outer_event_sha256": hashlib.sha256(
+            canonical_json_bytes(events)
+        ).hexdigest(),
+    }
+
+
+def _full_day_native_ledger_key(
+    row: Mapping[str, object],
+) -> tuple[str, str, str]:
+    """Return the immutable identity of one serialized native-ledger row."""
+
+    reference = _wire_object(row["reference"], "native ledger reference")
+    return (
+        _wire_string(
+            reference["owner_component_id"],
+            "native ledger owner component ID",
+        ),
+        _wire_string(reference["native_ledger_id"], "native ledger ID"),
+        _wire_string(reference["event_id"], "native ledger event ID"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FullDayRuntimeRestoreRequestV1:
+    """One composed checkpoint plus deterministic post-checkpoint time targets."""
+
+    schema_version: int
+    format_id: str
+    checkpoint_state: Mapping[str, object]
+    checkpoint_state_sha256: str
+    suffix_targets_us: tuple[int, ...]
+    final_checkpoint_request_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            _wire_int(
+                self.schema_version,
+                "full-day restore request schema version",
+                minimum=1,
+            )
+            != FULL_DAY_RUNTIME_RESTORE_REQUEST_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported full-day restore request schema")
+        if self.format_id != FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID:
+            raise ValueError("unsupported full-day restore request format")
+        detached = _detached_object(
+            _wire_object(self.checkpoint_state, "full-day checkpoint state")
+        )
+        digest = _wire_sha256(
+            self.checkpoint_state_sha256, "full-day checkpoint state SHA-256"
+        )
+        if canonical_sha256(detached) != digest:
+            raise ValueError("full-day checkpoint state digest does not match")
+        if type(self.suffix_targets_us) is not tuple or any(
+            type(value) is not int or value < 0
+            for value in self.suffix_targets_us
+        ):
+            raise TypeError(
+                "full-day suffix targets must be an integer tuple"
+            )
+        if self.suffix_targets_us != tuple(sorted(self.suffix_targets_us)):
+            raise ValueError("full-day suffix targets must be monotonic")
+        request_id = _wire_string(
+            self.final_checkpoint_request_id,
+            "final checkpoint request ID",
+        )
+        if re.fullmatch(r"[A-Z0-9_.:-]+", request_id) is None:
+            raise ValueError("final checkpoint request ID is not canonical")
+
+        from kirby2.full_day.runtime import FullDayRuntime
+
+        runtime = FullDayRuntime.from_checkpoint_state(detached)
+        current_time_us = runtime.clock.current_time_us
+        if self.suffix_targets_us and self.suffix_targets_us[0] < current_time_us:
+            raise ValueError("full-day suffix target precedes its checkpoint")
+        if self.suffix_targets_us and (
+            self.suffix_targets_us[-1] > runtime.plan.calendar.end_time_us
+        ):
+            raise ValueError("full-day suffix target exceeds the plan calendar")
+        controller = _wire_object(
+            detached["checkpoint_controller"], "checkpoint controller"
+        )
+        allocated = _wire_array(
+            controller["allocated_request_ids"], "allocated checkpoint IDs"
+        )
+        if request_id in allocated:
+            raise ValueError("final checkpoint request ID was already allocated")
+        object.__setattr__(self, "checkpoint_state", freeze_json(detached))
+
+    @classmethod
+    def capture(
+        cls,
+        runtime: object,
+        *,
+        suffix_targets_us: Sequence[int],
+        final_checkpoint_request_id: str,
+    ) -> FullDayRuntimeRestoreRequestV1:
+        from kirby2.full_day.runtime import FullDayRuntime
+
+        if type(runtime) is not FullDayRuntime:
+            raise TypeError("full-day restore capture requires FullDayRuntime")
+        if not isinstance(suffix_targets_us, Sequence) or isinstance(
+            suffix_targets_us, (str, bytes, bytearray)
+        ):
+            raise TypeError("full-day suffix targets must be a sequence")
+        state = runtime.checkpoint_state()
+        return cls(
+            schema_version=FULL_DAY_RUNTIME_RESTORE_REQUEST_SCHEMA_VERSION,
+            format_id=FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID,
+            checkpoint_state=state,
+            checkpoint_state_sha256=canonical_sha256(state),
+            suffix_targets_us=tuple(suffix_targets_us),
+            final_checkpoint_request_id=final_checkpoint_request_id,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_state": _as_plain_object(self.checkpoint_state),
+            "checkpoint_state_sha256": self.checkpoint_state_sha256,
+            "final_checkpoint_request_id": self.final_checkpoint_request_id,
+            "format_id": self.format_id,
+            "schema_version": self.schema_version,
+            "suffix_targets_us": list(self.suffix_targets_us),
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.as_dict())
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, object]
+    ) -> FullDayRuntimeRestoreRequestV1:
+        _require_exact_fields(
+            payload,
+            {
+                "checkpoint_state",
+                "checkpoint_state_sha256",
+                "final_checkpoint_request_id",
+                "format_id",
+                "schema_version",
+                "suffix_targets_us",
+            },
+            "FullDayRuntimeRestoreRequestV1",
+        )
+        targets = _wire_array(payload["suffix_targets_us"], "suffix targets")
+        return cls(
+            schema_version=_wire_int(
+                payload["schema_version"],
+                "full-day restore request schema version",
+                minimum=1,
+            ),
+            format_id=_wire_string(payload["format_id"], "restore request format"),
+            checkpoint_state=_wire_object(
+                payload["checkpoint_state"], "full-day checkpoint state"
+            ),
+            checkpoint_state_sha256=_wire_sha256(
+                payload["checkpoint_state_sha256"],
+                "full-day checkpoint state SHA-256",
+            ),
+            suffix_targets_us=tuple(
+                _wire_int(value, f"suffix_targets_us[{index}]", minimum=0)
+                for index, value in enumerate(targets)
+            ),
+            final_checkpoint_request_id=_wire_string(
+                payload["final_checkpoint_request_id"],
+                "final checkpoint request ID",
+            ),
+        )
+
+    @classmethod
+    def from_json_bytes(
+        cls, payload: bytes
+    ) -> FullDayRuntimeRestoreRequestV1:
+        return cls.from_dict(parse_canonical_json_object(payload))
+
+
+def _full_day_scheduler_suffix(
+    runtime: object,
+    *,
+    public_start: int,
+    truth_start: int,
+) -> dict[str, object]:
+    scheduler = getattr(runtime, "agent_scheduler")
+    if scheduler is None:
+        return {
+            "public_event_bytes_sha256": hashlib.sha256(
+                canonical_json_bytes([])
+            ).hexdigest(),
+            "public_events": [],
+            "status": "ABSENT",
+            "truth_event_bytes_sha256": hashlib.sha256(
+                canonical_json_bytes([])
+            ).hexdigest(),
+            "truth_events": [],
+        }
+    scheduler_state = scheduler.checkpoint_state()
+    owned = _wire_object(scheduler_state["state"], "agent scheduler owned state")
+    public = _wire_array(owned["public_events"], "agent public events")
+    truth = _wire_array(owned["truth_events"], "agent truth events")
+    if public_start > len(public) or truth_start > len(truth):
+        raise RuntimeError("restored agent ledgers are shorter than their checkpoint")
+    public_suffix = public[public_start:]
+    truth_suffix = truth[truth_start:]
+    return {
+        "public_event_bytes_sha256": hashlib.sha256(
+            canonical_json_bytes(public_suffix)
+        ).hexdigest(),
+        "public_events": public_suffix,
+        "status": "PRESERVED",
+        "truth_event_bytes_sha256": hashlib.sha256(
+            canonical_json_bytes(truth_suffix)
+        ).hexdigest(),
+        "truth_events": truth_suffix,
+    }
+
+
+def apply_full_day_runtime_suffix(
+    runtime: object,
+    targets_us: Sequence[int],
+    *,
+    final_checkpoint_request_id: str,
+) -> None:
+    """Advance only the serialized suffix and finish at a quiescent marker."""
+
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    if type(runtime) is not FullDayRuntime:
+        raise TypeError("full-day suffix execution requires FullDayRuntime")
+    if not isinstance(targets_us, Sequence) or isinstance(
+        targets_us, (str, bytes, bytearray)
+    ):
+        raise TypeError("full-day suffix targets must be a sequence")
+    for target in targets_us:
+        if type(target) is not int:
+            raise TypeError("full-day suffix target must be an integer")
+        runtime.advance_to(target)
+    runtime.capture_quiescent_cut(
+        final_checkpoint_request_id,
+        at_time_us=runtime.clock.current_time_us,
+    )
+    runtime.assert_invariants()
+
+
+def _full_day_runtime_result(
+    runtime: object,
+    request: FullDayRuntimeRestoreRequestV1,
+) -> dict[str, object]:
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    if type(runtime) is not FullDayRuntime:
+        raise TypeError("full-day result requires FullDayRuntime")
+    checkpoint_state = _as_plain_object(request.checkpoint_state)
+    prefix = _full_day_runtime_prefix_counts(checkpoint_state)
+    outer_start = int(prefix["outer_event_count"])
+    mechanics_start = int(prefix["mechanics_event_count"])
+    outer_suffix = [event.as_dict() for event in runtime.events[outer_start:]]
+    mechanics_suffix = [
+        event.as_dict() for event in runtime.engine.events[mechanics_start:]
+    ]
+    scheduler_suffix = _full_day_scheduler_suffix(
+        runtime,
+        public_start=int(prefix["agent_public_event_count"]),
+        truth_start=int(prefix["agent_truth_event_count"]),
+    )
+    final_state = runtime.checkpoint_state()
+    prefix_native_rows = _wire_array(
+        checkpoint_state["native_ledger"],
+        "checkpoint native ledger",
+    )
+    prefix_native_keys = {
+        _full_day_native_ledger_key(
+            _wire_object(row, f"checkpoint native ledger[{index}]")
+        )
+        for index, row in enumerate(prefix_native_rows)
+    }
+    if len(prefix_native_keys) != len(prefix_native_rows):
+        raise RuntimeError("checkpoint native ledger contains duplicate identities")
+    final_native_rows = _wire_array(
+        final_state["native_ledger"], "final native ledger"
+    )
+    final_native_keys = {
+        _full_day_native_ledger_key(
+            _wire_object(row, f"final native ledger[{index}]")
+        )
+        for index, row in enumerate(final_native_rows)
+    }
+    if len(final_native_keys) != len(final_native_rows):
+        raise RuntimeError("final native ledger contains duplicate identities")
+    if not prefix_native_keys.issubset(final_native_keys):
+        raise RuntimeError("restored native ledger lost a checkpoint identity")
+    native_suffix = [
+        row
+        for row in final_native_rows
+        if _full_day_native_ledger_key(
+            _wire_object(row, "final native ledger row")
+        )
+        not in prefix_native_keys
+    ]
+    suffix = {
+        "agent_scheduler": scheduler_suffix,
+        "mechanics_event_bytes_sha256": hashlib.sha256(
+            canonical_json_bytes(mechanics_suffix)
+        ).hexdigest(),
+        "mechanics_events": mechanics_suffix,
+        "native_ledger_bytes_sha256": hashlib.sha256(
+            canonical_json_bytes(native_suffix)
+        ).hexdigest(),
+        "native_ledger": native_suffix,
+        "outer_event_bytes_sha256": hashlib.sha256(
+            canonical_json_bytes(outer_suffix)
+        ).hexdigest(),
+        "outer_events": outer_suffix,
+    }
+    final = {
+        "projection": runtime.result_projection(),
+        "restorable_state_sha256": canonical_sha256(final_state),
+    }
+    invariant_projection = {"final": final, "prefix": prefix, "suffix": suffix}
+    return {
+        "final": final,
+        "format_id": FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID,
+        "invariant_sha256": canonical_sha256(invariant_projection),
+        "prefix": prefix,
+        "schema_version": FULL_DAY_RUNTIME_RESTORE_RESULT_SCHEMA_VERSION,
+        "suffix": suffix,
+    }
+
+
+def execute_full_day_runtime_restore_request(
+    request: FullDayRuntimeRestoreRequestV1,
+) -> dict[str, object]:
+    """Restore the composed owner graph and execute only its suffix targets."""
+
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    if type(request) is not FullDayRuntimeRestoreRequestV1:
+        raise TypeError(
+            "full-day restore execution requires FullDayRuntimeRestoreRequestV1"
+        )
+    runtime = FullDayRuntime.from_checkpoint_state(
+        _as_plain_object(request.checkpoint_state)
+    )
+    apply_full_day_runtime_suffix(
+        runtime,
+        request.suffix_targets_us,
+        final_checkpoint_request_id=request.final_checkpoint_request_id,
+    )
+    return _full_day_runtime_result(runtime, request)
+
+
+def execute_uninterrupted_full_day_runtime_suffix(
+    runtime: object,
+    request: FullDayRuntimeRestoreRequestV1,
+) -> dict[str, object]:
+    """Reference path over the already-running authoritative owner graph."""
+
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    if type(runtime) is not FullDayRuntime:
+        raise TypeError("uninterrupted full-day suffix requires FullDayRuntime")
+    if runtime.canonical_state_bytes() != canonical_json_bytes(
+        _as_plain_object(request.checkpoint_state)
+    ):
+        raise ValueError("uninterrupted runtime no longer equals the checkpoint")
+    apply_full_day_runtime_suffix(
+        runtime,
+        request.suffix_targets_us,
+        final_checkpoint_request_id=request.final_checkpoint_request_id,
+    )
+    return _full_day_runtime_result(runtime, request)
+
+
+def full_day_runtime_restore_worker_main() -> int:
+    """Canonical stdin/stdout worker used by the WO31-E1 fresh-process gate."""
+
+    raw = sys.stdin.buffer.read()
+    try:
+        request = FullDayRuntimeRestoreRequestV1.from_json_bytes(raw)
+        result = execute_full_day_runtime_restore_request(request)
+        output = canonical_json_bytes(result)
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        diagnostic = (
+            f"FULL_DAY_RUNTIME_RESTORE_REFUSED {type(error).__name__}: {error}\n"
+        ).encode("utf-8", errors="backslashreplace")
+        sys.stderr.buffer.write(diagnostic)
+        return 2
+    sys.stdout.buffer.write(output)
+    return 0
+
+
 __all__ = [
     "CORE_RESTORE_REQUEST_FORMAT_ID",
     "CORE_RESTORE_REQUEST_SCHEMA_VERSION",
@@ -831,7 +1271,16 @@ __all__ = [
     "CoreRestoreRequestV1",
     "CoreSessionCheckpointV1",
     "CoreSessionCommandV1",
+    "FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID",
+    "FULL_DAY_RUNTIME_RESTORE_REQUEST_SCHEMA_VERSION",
+    "FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID",
+    "FULL_DAY_RUNTIME_RESTORE_RESULT_SCHEMA_VERSION",
+    "FullDayRuntimeRestoreRequestV1",
+    "apply_full_day_runtime_suffix",
     "apply_core_session_suffix",
+    "execute_full_day_runtime_restore_request",
     "execute_core_restore_request",
+    "execute_uninterrupted_full_day_runtime_suffix",
     "execute_uninterrupted_suffix",
+    "full_day_runtime_restore_worker_main",
 ]

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from typing import Callable
@@ -10536,6 +10537,1096 @@ def audit_wo31d_core_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e1_plan():
+    """Return the small executable E1 fixture over the frozen WO31-A plan."""
+
+    from kirby2.full_day.composition import (
+        executable_agent_mechanics_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        FlowSideV1,
+        IntegerParameterUnitV1,
+        NamedIntegerParameterV1,
+        ParticipantScheduleActionV1,
+        ParticipantScheduleEntryV1,
+        ScheduledEventTypeV1,
+        ScheduledEventV1,
+        VersionedReferenceV1,
+        canonical_sha256,
+    )
+
+    base = _sample_plan()
+    matrix = executable_agent_mechanics_composition_matrix()
+    population = _wo31e1_population(base)
+    specs_by_id = {spec.agent_id: spec for spec in population.agents}
+    spec_references = {
+        participant.participant_id: VersionedReferenceV1(
+            participant.specification.reference_id,
+            participant.specification.version,
+            canonical_sha256(
+                specs_by_id[participant.participant_id].identity_dict()
+            ),
+        )
+        for participant in base.participant_definitions
+    }
+    participant_definitions = tuple(
+        replace(
+            participant,
+            specification=spec_references[participant.participant_id],
+        )
+        for participant in base.participant_definitions
+    )
+    original_agent_references = {
+        participant.specification: spec_references[participant.participant_id]
+        for participant in base.participant_definitions
+    }
+    component_configurations = tuple(
+        sorted(
+            (
+                replace(
+                    binding,
+                    configuration=original_agent_references.get(
+                        binding.configuration, binding.configuration
+                    ),
+                )
+                for binding in base.component_configurations
+            ),
+            key=lambda binding: binding.sort_key,
+        )
+    )
+    phases = {phase.phase_id: phase for phase in base.calendar.phases}
+    opening_start = phases["OPENING_AUCTION"].start.simulation_time_us
+    continuous_start = phases["CONTINUOUS"].start.simulation_time_us
+    participant_by_id = {
+        participant.participant_id: participant
+        for participant in participant_definitions
+    }
+    parameter = NamedIntegerParameterV1
+    scheduled_events = tuple(
+        sorted(
+            (
+                ScheduledEventV1(
+                    "E1_AUCTION_IMBALANCE",
+                    opening_start + 10,
+                    ScheduledEventTypeV1.AUCTION_IMBALANCE_PUBLICATION,
+                    1,
+                    FlowSideV1.BUY,
+                    (
+                        parameter(
+                            "imbalance_shares",
+                            IntegerParameterUnitV1.SHARES,
+                            20,
+                        ),
+                    ),
+                    None,
+                    base.halt_reopen_rules.halt_trigger_reference,
+                ),
+                ScheduledEventV1(
+                    "E1_ACTIVE_METAORDER",
+                    continuous_start + 12,
+                    ScheduledEventTypeV1.LARGE_SCHEDULED_METAORDER,
+                    1,
+                    FlowSideV1.BUY,
+                    (
+                        parameter(
+                            "duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            1_000_000_000,
+                        ),
+                        parameter(
+                            "participation_ppm",
+                            IntegerParameterUnitV1.PPM,
+                            250_000,
+                        ),
+                        parameter(
+                            "quantity_shares",
+                            IntegerParameterUnitV1.SHARES,
+                            60,
+                        ),
+                    ),
+                    participant_by_id["AUDIT_METAORDER"].specification,
+                    None,
+                ),
+                ScheduledEventV1(
+                    "E1_HALT",
+                    continuous_start + 200,
+                    ScheduledEventTypeV1.HALT,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "halt_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            20,
+                        ),
+                    ),
+                    None,
+                    base.halt_reopen_rules.halt_trigger_reference,
+                ),
+                ScheduledEventV1(
+                    "E1_REOPEN",
+                    continuous_start + 220,
+                    ScheduledEventTypeV1.REOPENING,
+                    1,
+                    FlowSideV1.NONE,
+                    (
+                        parameter(
+                            "reopening_auction_duration_us",
+                            IntegerParameterUnitV1.MICROSECONDS,
+                            10,
+                        ),
+                    ),
+                    None,
+                    base.halt_reopen_rules.resume_trigger_reference,
+                ),
+            ),
+            key=lambda event: (event.simulation_time_us, event.event_id),
+        )
+    )
+    participant_schedule = tuple(
+        sorted(
+            (
+                ParticipantScheduleEntryV1(
+                    "E1_MAKER_ACTIVATE",
+                    100,
+                    "AUDIT_MAKER",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "E1_METAORDER_ACTIVATE",
+                    continuous_start + 10,
+                    "AUDIT_METAORDER",
+                    ParticipantScheduleActionV1.ACTIVATE,
+                    None,
+                ),
+                ParticipantScheduleEntryV1(
+                    "E1_MAKER_WITHDRAW",
+                    continuous_start + 500,
+                    "AUDIT_MAKER",
+                    ParticipantScheduleActionV1.DEACTIVATE,
+                    None,
+                ),
+            ),
+            key=lambda entry: (entry.simulation_time_us, entry.schedule_id),
+        )
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            "SINGLE_VENUE_AGENT_MECHANICS_V1",
+            2,
+            matrix.sha256,
+        ),
+        component_configurations=component_configurations,
+        participant_definitions=participant_definitions,
+        participant_schedule=participant_schedule,
+        scheduled_events=scheduled_events,
+    )
+
+
+def _wo31e1_population(plan):
+    from kirby2.agents.models import AgentFamily, PopulationDefinition
+    from kirby2.agents.populations import _spec
+
+    end_us = plan.calendar.end_time_us
+    continuous_start = next(
+        phase.start.simulation_time_us
+        for phase in plan.calendar.phases
+        if phase.phase_id == "CONTINUOUS"
+    )
+    maker = _spec(
+        "AUDIT_MAKER",
+        AgentFamily.PASSIVE_MARKET_MAKER,
+        end_us,
+        budget=100,
+        working=100,
+        max_order=20,
+        clip=20,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    metaorder = _spec(
+        "AUDIT_METAORDER",
+        AgentFamily.SCHEDULED_METAORDER,
+        end_us,
+        side=Side.BUY,
+        activation_us=continuous_start + 10,
+        budget=60,
+        working=60,
+        max_order=20,
+        clip=20,
+        rate=1,
+        latency_us=5,
+        interval_us=1_000_000_000,
+    )
+    return PopulationDefinition(
+        "WO31_E1_AUDIT_POPULATION_V1",
+        "Two bounded synthetic participants for composed restore evidence.",
+        (maker, metaorder),
+        end_us,
+        initial_mid_ticks=10_000,
+        initial_depth_levels=1,
+        initial_level_quantity=20,
+    )
+
+
+def _wo31e1_runtime():
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e1_plan()
+    return FullDayRuntime.create_with_agent_scheduler(
+        plan,
+        _wo31e1_population(plan),
+    )
+
+
+def _wo31e1_limit(
+    order_id: str,
+    side: Side,
+    quantity: int,
+    price_ticks: int,
+    *,
+    auction_only: bool = False,
+) -> AdvancedOrderRequest:
+    return AdvancedOrderRequest(
+        order_id=order_id,
+        side=side,
+        quantity=quantity,
+        instruction=OrderInstruction.LIMIT,
+        owner=OrderOwner.SIMULATED,
+        account_id="WO31-E1-AUDIT-LIQUIDITY",
+        price_ticks=price_ticks,
+        time_in_force=OrderInstruction.DAY,
+        auction_only=auction_only,
+    )
+
+
+def _wo31e1_times(runtime) -> tuple[int, int]:
+    phases = {phase.phase_id: phase for phase in runtime.plan.calendar.phases}
+    return (
+        phases["OPENING_AUCTION"].start.simulation_time_us,
+        phases["CONTINUOUS"].start.simulation_time_us,
+    )
+
+
+def _wo31e1_prepare_boundary(boundary: str):
+    runtime = _wo31e1_runtime()
+    opening_start, continuous_start = _wo31e1_times(runtime)
+    if boundary in {"auction_imbalance", "auction_uncross"}:
+        runtime.advance_to(0)
+        runtime.submit_request(
+            _wo31e1_limit(
+                "E1-AUCTION-BUY", Side.BUY, 50, 10_001, auction_only=True
+            ),
+            at_time_us=1,
+        )
+        runtime.submit_request(
+            _wo31e1_limit(
+                "E1-AUCTION-SELL", Side.SELL, 30, 9_999, auction_only=True
+            ),
+            at_time_us=1,
+        )
+        cut_time = (
+            opening_start + 10
+            if boundary == "auction_imbalance"
+            else continuous_start
+        )
+    elif boundary == "participant_activation":
+        cut_time = 100
+    elif boundary in {
+        "active_metaorder",
+        "agent_inventories",
+        "next_scheduled_decision",
+        "agent_substream_state",
+        "order_allocator",
+    }:
+        runtime.advance_to(continuous_start)
+        runtime.submit_request(
+            _wo31e1_limit("E1-META-LIQ-ASK", Side.SELL, 50, 10_001),
+            at_time_us=continuous_start + 5,
+        )
+        cut_time = (
+            continuous_start + 10
+            if boundary
+            in {
+                "active_metaorder",
+                "next_scheduled_decision",
+                "agent_substream_state",
+            }
+            else continuous_start + 15
+        )
+    elif boundary in {"exchange_queues", "same_time_microsteps"}:
+        runtime.advance_to(continuous_start)
+        cut_time = continuous_start + 50
+        for request in (
+            _wo31e1_limit("E1-FIFO-BUY-1", Side.BUY, 10, 9_999),
+            _wo31e1_limit("E1-FIFO-BUY-2", Side.BUY, 15, 9_999),
+            _wo31e1_limit("E1-FIFO-ASK-1", Side.SELL, 12, 10_001),
+        ):
+            runtime.submit_request(request, at_time_us=cut_time)
+            runtime.advance_to(cut_time)
+    elif boundary == "halt":
+        cut_time = continuous_start + 200
+    elif boundary == "reopen":
+        cut_time = continuous_start + 220
+    elif boundary == "participant_withdrawal":
+        cut_time = continuous_start + 500
+    else:  # pragma: no cover - fixed inventory controls calls
+        raise ValueError(f"unknown WO31-E1 boundary: {boundary}")
+    runtime.advance_to(cut_time)
+    runtime.capture_quiescent_cut(
+        f"WO31-E1-{boundary.upper()}-CUT",
+        at_time_us=cut_time,
+    )
+    return runtime, cut_time
+
+
+def _wo31e1_boundary_probe(
+    boundary: str,
+    runtime,
+    cut_time: int,
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    scheduler = runtime.agent_scheduler
+    if scheduler is None:
+        return ("active WO31-E1 fixture omitted AgentScheduler",)
+    if boundary == "auction_imbalance":
+        indication = runtime.engine.auction_indication()
+        if (
+            indication.matched_quantity != 30
+            or indication.imbalance_quantity != 20
+            or len(runtime.engine.auction.active_orders) != 2
+        ):
+            failures.append("auction imbalance/queue state is not preserved")
+    elif boundary == "auction_uncross":
+        if (
+            runtime.engine.session_state is not SessionState.CONTINUOUS
+            or not runtime.engine.auction.executions
+            or runtime.engine.auction.active_orders
+        ):
+            failures.append("opening uncross did not preserve its exact result")
+    elif boundary == "halt":
+        if runtime.engine.session_state is not SessionState.HALTED:
+            failures.append("halt cut is not HALTED")
+    elif boundary == "reopen":
+        if runtime.engine.session_state is not SessionState.REOPENING_AUCTION:
+            failures.append("reopen cut is not REOPENING_AUCTION")
+    elif boundary == "participant_activation":
+        if scheduler._active.get("AUDIT_MAKER") is not True:
+            failures.append("maker activation state is absent")
+    elif boundary == "participant_withdrawal":
+        if scheduler._active.get("AUDIT_MAKER") is not False:
+            failures.append("maker withdrawal state is absent")
+    elif boundary == "active_metaorder":
+        if (
+            scheduler._active.get("AUDIT_METAORDER") is not True
+            or scheduler.next_pending_arrival_time_us != cut_time + 5
+        ):
+            failures.append("active metaorder/pending child is not exact")
+    elif boundary == "agent_inventories":
+        if scheduler.agents["AUDIT_METAORDER"].inventory != 20:
+            failures.append("metaorder inventory does not reconcile to its fill")
+    elif boundary == "next_scheduled_decision":
+        if (
+            scheduler.next_decision_time_us is None
+            or scheduler.next_decision_time_us <= cut_time
+        ):
+            failures.append("next scheduled participant decision is absent")
+    elif boundary == "agent_substream_state":
+        state = scheduler.checkpoint_state()["state"]
+        agent_state = state["agents"]["AUDIT_METAORDER"]
+        if (
+            state["rng_labels"]["AUDIT_METAORDER"]
+            != "full_day/participant/audit_metaorder/decision"
+            or not agent_state["rng"]["internal_state"]
+        ):
+            failures.append("labeled agent RNG substream state is absent")
+    elif boundary == "order_allocator":
+        if runtime._order_id_allocator.next_sequence != 2:
+            failures.append("runtime order allocator did not preserve FD-O highwater")
+    elif boundary == "exchange_queues":
+        level = runtime.engine.book.bids.get(9_999)
+        if level is None or tuple(
+            order.order_id for order in level.orders
+        ) != ("E1-FIFO-BUY-1", "E1-FIFO-BUY-2"):
+            failures.append("continuous exchange FIFO queue is not exact")
+    elif boundary == "same_time_microsteps":
+        microsteps = tuple(
+            sorted(
+                {
+                    key.microstep
+                    for key in runtime.executed_work_items.values()
+                    if key.simulation_time_us == cut_time
+                    and key.stage_ordinal.value == 5
+                }
+            )
+        )
+        if microsteps[:3] != (0, 1, 2):
+            failures.append("same-time venue work did not retain microsteps 0/1/2")
+    return tuple(failures)
+
+
+def _wo31e1_run_worker(raw: bytes):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    prior_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(repository)
+        if not prior_path
+        else str(repository) + os.pathsep + prior_path
+    )
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    script = (
+        "from kirby2.full_day.restore import "
+        "full_day_runtime_restore_worker_main as main; "
+        "raise SystemExit(main())"
+    )
+    with TemporaryDirectory(prefix="kirby2-wo31e1-worker-") as temporary:
+        directory = Path(temporary)
+        before = tuple(directory.rglob("*"))
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            input=raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=directory,
+            env=environment,
+            check=False,
+            timeout=30,
+        )
+        after = tuple(directory.rglob("*"))
+    return completed.returncode, completed.stdout, completed.stderr, before != after
+
+
+def _wo31e1_fresh_boundary_case(boundary: str) -> FullDayAuditCase:
+    from kirby2.full_day.models import (
+        canonical_json_bytes,
+        parse_canonical_json_object,
+    )
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    runtime, cut_time = _wo31e1_prepare_boundary(boundary)
+    failures = list(_wo31e1_boundary_probe(boundary, runtime, cut_time))
+    target = cut_time + (10 if boundary == "reopen" else 1)
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        runtime,
+        suffix_targets_us=(target,),
+        final_checkpoint_request_id=f"WO31-E1-{boundary.upper()}-FINAL",
+    )
+    raw = request.canonical_bytes()
+    returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(raw)
+    expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+    actual: dict[str, object] | None = None
+    if returncode != 0:
+        failures.append(
+            f"fresh worker returned {returncode}: "
+            f"{stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    else:
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"fresh worker emitted noncanonical JSON: {error}")
+    if stderr:
+        failures.append("successful fresh worker wrote diagnostics to stderr")
+    if wrote_files:
+        failures.append("fresh worker wrote into its empty working directory")
+    if actual is not None:
+        if canonical_json_bytes(actual) != stdout:
+            failures.append("fresh worker output is not its canonical byte form")
+        if actual != expected:
+            failures.append("fresh-process suffix differs from uninterrupted suffix")
+        suffix = actual.get("suffix")
+        if not isinstance(suffix, Mapping) or set(suffix) != {
+            "agent_scheduler",
+            "mechanics_event_bytes_sha256",
+            "mechanics_events",
+            "native_ledger",
+            "native_ledger_bytes_sha256",
+            "outer_event_bytes_sha256",
+            "outer_events",
+        }:
+            failures.append("fresh result omits one composed replay ledger")
+    digest = "ABSENT" if actual is None else str(actual["invariant_sha256"])
+    return FullDayAuditCase(
+        f"full_day_restore_{boundary}",
+        (
+            f"boundary={boundary} cut_us={cut_time} target_us={target} "
+            f"fresh_process=true invariant_sha256={digest}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e1_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import (
+        MarketMechanicsComponentAdapterV1,
+    )
+    from kirby2.full_day.composition import (
+        AGENT_SCHEDULER_COMPONENT,
+        FULL_DAY_RUNTIME_COMPONENT,
+        INITIAL_PROFILE_ID,
+        MECHANICS_COMPONENT,
+        executable_agent_mechanics_composition_matrix,
+        initial_composition_matrix,
+    )
+
+    failures: list[str] = []
+    prior = initial_composition_matrix()
+    matrix = executable_agent_mechanics_composition_matrix()
+    if tuple(profile.as_dict() for profile in matrix.profiles[:-1]) != tuple(
+        profile.as_dict() for profile in prior.profiles
+    ):
+        failures.append("composition matrix v2 rewrote immutable v1 rows")
+    profile = matrix.profile(INITIAL_PROFILE_ID, 2)
+    statuses = {
+        component.component_id: (
+            component.component_version,
+            component.implementation_status,
+        )
+        for component in profile.components
+    }
+    if statuses != {
+        AGENT_SCHEDULER_COMPONENT: (2, "EXECUTABLE"),
+        FULL_DAY_RUNTIME_COMPONENT: (1, "CONTRACT_ONLY"),
+        MECHANICS_COMPONENT: (2, "EXECUTABLE"),
+    } or profile.implementation_status != "EXECUTABLE":
+        failures.append("E1 statuses/versions differ from the append-only promotion")
+    plan = _wo31e1_plan()
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+        ),
+        plan=plan,
+        profile=profile,
+    )
+    if graph.restore_order != (
+        FULL_DAY_RUNTIME_COMPONENT,
+        MECHANICS_COMPONENT,
+        AGENT_SCHEDULER_COMPONENT,
+    ):
+        failures.append("component restore dependency order is not exact")
+    exact_resources = {
+        resource: graph.resource_owners.get(resource)
+        for resource in (
+            "MARKET_MECHANICS_ENGINE",
+            "ORDER_ALLOCATOR",
+            "ORDER_BOOK",
+            "SESSION_CALENDAR",
+            "SIMULATION_CLOCK",
+        )
+    }
+    if any(owner != FULL_DAY_RUNTIME_COMPONENT for owner in exact_resources.values()):
+        failures.append("clock/engine/book/calendar/allocator ownership is not singular")
+    if profile.refused_component_ids != prior.profiles[0].refused_component_ids:
+        failures.append("unrelated/refused component inventory changed in E1")
+    return FullDayAuditCase(
+        "full_day_mechanics_agent_composition",
+        (
+            f"matrix_v1_sha256={prior.sha256} matrix_v2_sha256={matrix.sha256} "
+            f"restore_order={graph.restore_order} exact_resources={exact_resources}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e1_one_shot_case() -> FullDayAuditCase:
+    failures: list[str] = []
+    one_shot = _wo31e1_runtime()
+    subdivided = _wo31e1_runtime()
+    opening_start, continuous_start = _wo31e1_times(one_shot)
+    target = continuous_start + 50
+    one_shot.advance_to(target)
+    for time_us in (
+        0,
+        100,
+        opening_start,
+        opening_start + 10,
+        continuous_start,
+        continuous_start + 10,
+        continuous_start + 15,
+        target,
+    ):
+        subdivided.advance_to(time_us)
+    one_shot.capture_quiescent_cut("WO31-E1-ADVANCE-EQUIVALENCE")
+    subdivided.capture_quiescent_cut("WO31-E1-ADVANCE-EQUIVALENCE")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("one-shot and subdivided runtime checkpoints differ")
+    if one_shot.event_stream_bytes() != subdivided.event_stream_bytes():
+        failures.append("one-shot and subdivided outer event streams differ")
+    return FullDayAuditCase(
+        "full_day_one_shot_subdivided",
+        (
+            f"target_us={target} events={len(one_shot.events)} "
+            f"state_sha256={one_shot.state_sha256()}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e1_inactive_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import (
+        MarketMechanicsComponentAdapterV1,
+    )
+    from kirby2.full_day.composition import (
+        ABSENT_REASON_COMPONENT_INACTIVE,
+        AGENT_SCHEDULER_COMPONENT,
+        executable_agent_mechanics_composition_matrix,
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = replace(_wo31e1_plan(), participant_schedule=())
+    runtime = FullDayRuntime.create(plan)
+    runtime.advance_to(0)
+    runtime.capture_quiescent_cut("WO31-E1-INACTIVE-CUT")
+    state = runtime.checkpoint_state()
+    restored = FullDayRuntime.from_checkpoint_state(state)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+        ),
+        plan=plan,
+        profile=executable_agent_mechanics_composition_matrix().profile(
+            "SINGLE_VENUE_AGENT_MECHANICS_V1", 2
+        ),
+    )
+    failures: list[str] = []
+    union = state["agent_scheduler"]
+    if union != {
+        "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
+        "status": "ABSENT",
+    }:
+        failures.append("inactive scheduler union does not use the stable ABSENT reason")
+    if AGENT_SCHEDULER_COMPONENT in graph.active_component_ids:
+        failures.append("inactive scheduler adapter remains active")
+    if restored.canonical_state_bytes() != runtime.canonical_state_bytes():
+        failures.append("inactive ABSENT runtime did not restore exactly")
+    return FullDayAuditCase(
+        "full_day_inactive_scheduler_absent",
+        (
+            f"reason={union.get('absent_reason')} "
+            f"active_components={graph.active_component_ids}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e1_refresh_cut_digests(state: dict[str, object]) -> None:
+    from kirby2.full_day.events import (
+        FullDayEventV1,
+        canonical_event_prefix_sha256,
+    )
+
+    events = tuple(FullDayEventV1.from_dict(row) for row in state["events"])
+    for cut in state["checkpoint_controller"]["quiescent_cuts"]:
+        prefix_length = int(cut["event_prefix_last_global_sequence"])
+        cut["event_prefix_sha256"] = canonical_event_prefix_sha256(
+            events[:prefix_length]
+        )
+
+
+def _wo31e1_hostile_case() -> FullDayAuditCase:
+    from kirby2.agents.ecology import AgentEcology
+    from kirby2.full_day.models import canonical_sha256
+    from kirby2.full_day.restore import FullDayRuntimeRestoreRequestV1
+    from kirby2.full_day.runtime import (
+        FullDayRuntime,
+        RuntimeOrderIdAllocatorV1,
+    )
+
+    failures: list[str] = []
+    refused = 0
+
+    def probe(label: str, operation: Callable[[], object]) -> None:
+        nonlocal refused
+        failure = _expect_refusal(operation, label)
+        if failure:
+            failures.append(failure)
+        else:
+            refused += 1
+
+    def atomic_probe(
+        label: str,
+        runtime: object,
+        operation: Callable[[], object],
+    ) -> None:
+        before = runtime.canonical_state_bytes()
+        probe(label, operation)
+        try:
+            after = runtime.canonical_state_bytes()
+        except (TypeError, ValueError, RuntimeError) as error:
+            failures.append(f"{label} damaged canonical state after refusal: {error}")
+            return
+        if after != before:
+            failures.append(f"{label} mutated canonical state before refusing")
+
+    class Holder:
+        pass
+
+    for label, value in (
+        ("nested second mechanics engine", MarketMechanicsEngine()),
+        ("nested second session calendar", _wo31e1_plan().calendar),
+        ("nested second order allocator", RuntimeOrderIdAllocatorV1()),
+    ):
+        runtime = _wo31e1_runtime()
+        holder = Holder()
+        holder.value = value
+        runtime.agent_scheduler._hostile_holder = holder
+        probe(label, runtime.assert_invariants)
+
+    plan = _wo31e1_plan()
+    compatibility = AgentEcology(_wo31e1_population(plan), 42)
+    probe(
+        "compatibility-wrapper scheduler smuggling",
+        lambda: FullDayRuntime.create(plan, agent_scheduler=compatibility),
+    )
+
+    runtime, _cut = _wo31e1_prepare_boundary("participant_activation")
+    active_state = runtime.checkpoint_state()
+    omitted = copy.deepcopy(active_state)
+    omitted["agent_scheduler"] = {
+        "absent_reason": "COMPOSITION_ACTIVE_PREDICATE_FALSE",
+        "status": "ABSENT",
+    }
+    probe(
+        "active omitted scheduler component",
+        lambda: FullDayRuntime.from_checkpoint_state(omitted),
+    )
+
+    unowned = copy.deepcopy(active_state)
+    pending_row = next(
+        row
+        for row in unowned["pending_work"]
+        if row["work_type"] == "SCHEDULED_INFORMATION"
+    )
+    pending_row["key"]["source_component_id"] = "ENGINE_MARKET_MECHANICS_V1"
+    from kirby2.full_day.events import ScheduledWorkKeyV1
+
+    forged_key = ScheduledWorkKeyV1.from_dict(pending_row["key"])
+    pending_row["causal_parent_id"] = forged_key.work_id
+    probe(
+        "pending unowned scheduled event",
+        lambda: FullDayRuntime.from_checkpoint_state(unowned),
+    )
+
+    orphan = copy.deepcopy(active_state)
+    orphan["events"][-1]["causal_parent_ids"] = ["work:" + "a" * 64]
+    _wo31e1_refresh_cut_digests(orphan)
+    probe(
+        "orphan outer-event causal parent",
+        lambda: FullDayRuntime.from_checkpoint_state(orphan),
+    )
+
+    inactive_plan = replace(_wo31e1_plan(), participant_schedule=())
+    inactive = FullDayRuntime.create(inactive_plan)
+    inactive.advance_to(0)
+    inactive.capture_quiescent_cut("WO31-E1-HOSTILE-INACTIVE")
+    split_truth = copy.deepcopy(inactive.checkpoint_state())
+    mechanics_row = next(
+        row
+        for row in split_truth["native_ledger"]
+        if row["reference"]["owner_component_id"]
+        == "ENGINE_MARKET_MECHANICS_V1"
+    )
+    mechanics_row["payload"]["data"]["reason"] = "TAMPERED_BUT_CANONICAL"
+    ledger_key = mechanics_row["reference"]["event_id"]
+    outer = next(
+        row
+        for row in split_truth["events"]
+        if row["payload"]["native_event"] is not None
+        and row["payload"]["native_event"]["event_id"] == ledger_key
+    )
+    outer["payload"]["data"]["native_payload_sha256"] = canonical_sha256(
+        mechanics_row["payload"]
+    )
+    _wo31e1_refresh_cut_digests(split_truth)
+    probe(
+        "split mechanics/native ledger truth",
+        lambda: FullDayRuntime.from_checkpoint_state(split_truth),
+    )
+
+    halt_runtime, _halt_cut = _wo31e1_prepare_boundary("halt")
+    forged_owner_reason = copy.deepcopy(
+        halt_runtime.runtime_owner_checkpoint_state()
+    )
+    forged_transition = next(
+        row
+        for row in forged_owner_reason["native_ledger"]
+        if row["reference"]["owner_component_id"]
+        == "ENGINE_MARKET_MECHANICS_V1"
+        and row["reference"]["event_type"] == "SESSION_STATE_CHANGED"
+        and row["payload"]["data"]["current_state"] == "HALTED"
+    )
+    forged_transition["payload"]["data"]["reason"] = (
+        "FORGED_BUT_CANONICAL"
+    )
+    forged_event_id = forged_transition["reference"]["event_id"]
+    forged_outer = next(
+        row
+        for row in forged_owner_reason["events"]
+        if row["payload"]["native_event"] is not None
+        and row["payload"]["native_event"]["event_id"] == forged_event_id
+    )
+    forged_outer["payload"]["data"]["native_payload_sha256"] = canonical_sha256(
+        forged_transition["payload"]
+    )
+    _wo31e1_refresh_cut_digests(forged_owner_reason)
+    probe(
+        "runtime-owner forged session transition cause",
+        lambda: FullDayRuntime.validate_runtime_owner_checkpoint_state(
+            forged_owner_reason
+        ),
+    )
+    missing_state_batch = copy.deepcopy(active_state)
+    missing_state_batch["state_scheduled_time"] = (
+        active_state["clock"]["current_time_us"] + 1
+    )
+    probe(
+        "runtime-owner orphan state batch marker",
+        lambda: FullDayRuntime.validate_runtime_owner_checkpoint_state(
+            {
+                key: value
+                for key, value in missing_state_batch.items()
+                if key not in {"agent_scheduler", "engine", "engine_state_sha256"}
+            }
+        ),
+    )
+
+    forged_executed_owner_runtime, forged_time = _wo31e1_prepare_boundary(
+        "agent_inventories"
+    )
+    forged_executed_owner = copy.deepcopy(
+        forged_executed_owner_runtime.checkpoint_state()
+    )
+    first_agent_arrival_event = next(
+        row
+        for row in forged_executed_owner["events"]
+        if row["simulation_time_us"] == forged_time and row["stage"] == 5
+    )
+    original_parent_id = first_agent_arrival_event["causal_parent_ids"][0]
+    executed_agent_arrival = next(
+        row
+        for row in forged_executed_owner["executed_work"]
+        if ScheduledWorkKeyV1.from_dict(row["key"]).work_id
+        == original_parent_id
+    )
+    executed_agent_arrival["key"]["source_component_id"] = (
+        "FULL_DAY_RUNTIME_V1"
+    )
+    executed_agent_arrival["key"]["component_local_sequence"] = (
+        forged_executed_owner["component_sequences"]["FULL_DAY_RUNTIME_V1"]
+    )
+    forged_executed_key = ScheduledWorkKeyV1.from_dict(
+        executed_agent_arrival["key"]
+    )
+    executed_agent_arrival["causal_parent_id"] = forged_executed_key.work_id
+    first_agent_arrival_event["causal_parent_ids"] = [
+        forged_executed_key.work_id
+    ]
+    _wo31e1_refresh_cut_digests(forged_executed_owner)
+    probe(
+        "executed agent work reowned by runtime",
+        lambda: FullDayRuntime.from_checkpoint_state(forged_executed_owner),
+    )
+
+    native_jump = copy.deepcopy(active_state)
+    native_jump["native_sequences"] = {
+        "AGENT_SCHEDULER_V1": 999,
+        "EVIL_OWNER": 7,
+    }
+    probe(
+        "native allocator owner/highwater jump",
+        lambda: FullDayRuntime.from_checkpoint_state(native_jump),
+    )
+    allocator_jump = copy.deepcopy(active_state)
+    allocator_jump["order_id_allocator"]["next_sequence"] = 999
+    probe(
+        "order allocator highwater jump",
+        lambda: FullDayRuntime.from_checkpoint_state(allocator_jump),
+    )
+    deadline_jump = copy.deepcopy(active_state)
+    scheduler_state = deadline_jump["agent_scheduler"]["state"]
+    next_decisions = scheduler_state["state"]["next_decision_us"]
+    maker_deadline = next_decisions["AUDIT_MAKER"]
+    next_decisions["AUDIT_MAKER"] = maker_deadline + 1
+    deadline_jump["agent_scheduler"]["state_sha256"] = canonical_sha256(
+        scheduler_state
+    )
+    probe(
+        "scheduler/runtime deadline cross-bind",
+        lambda: FullDayRuntime.from_checkpoint_state(deadline_jump),
+    )
+    def cut_runtime():
+        return _wo31e1_prepare_boundary("participant_activation")[0]
+
+    horizon = cut_runtime()
+    atomic_probe(
+        "submit beyond plan calendar",
+        horizon,
+        lambda: horizon.submit_request(
+            _wo31e1_limit("E1-BEYOND-HORIZON", Side.BUY, 1, 9_999),
+            at_time_us=horizon.plan.calendar.end_time_us + 1,
+        ),
+    )
+    horizon = cut_runtime()
+    atomic_probe(
+        "checkpoint beyond plan calendar",
+        horizon,
+        lambda: horizon.capture_quiescent_cut(
+            "WO31-E1-BEYOND-HORIZON-CUT",
+            at_time_us=horizon.plan.calendar.end_time_us + 1,
+        ),
+    )
+    horizon = cut_runtime()
+    atomic_probe(
+        "cancel beyond plan calendar",
+        horizon,
+        lambda: horizon.cancel_order(
+            "E1-NONEXISTENT-CANCEL",
+            at_time_us=horizon.plan.calendar.end_time_us + 1,
+        ),
+    )
+    horizon = cut_runtime()
+    atomic_probe(
+        "replace beyond plan calendar",
+        horizon,
+        lambda: horizon.replace_order(
+            "E1-NONEXISTENT-REPLACE",
+            new_order_id="E1-NONEXISTENT-REPLACEMENT",
+            new_quantity=1,
+            at_time_us=horizon.plan.calendar.end_time_us + 1,
+        ),
+    )
+    horizon = cut_runtime()
+    invalid_gtt = replace(
+        _wo31e1_limit("E1-GTT-BEYOND-HORIZON", Side.BUY, 1, 9_999),
+        time_in_force=OrderInstruction.GOOD_UNTIL_TIME,
+        good_until_time_us=horizon.plan.calendar.end_time_us + 1,
+    )
+    atomic_probe(
+        "GTT expiry beyond plan calendar",
+        horizon,
+        lambda: horizon.submit_request(
+            invalid_gtt,
+            at_time_us=horizon.clock.current_time_us + 1,
+        ),
+    )
+    horizon = cut_runtime()
+    atomic_probe(
+        "external replacement claims runtime order namespace",
+        horizon,
+        lambda: horizon.replace_order(
+            "E1-NONEXISTENT-RESERVED",
+            new_order_id="FD-O-0000000001",
+            new_quantity=1,
+            at_time_us=horizon.clock.current_time_us + 1,
+        ),
+    )
+
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        runtime,
+        suffix_targets_us=(runtime.clock.current_time_us + 1,),
+        final_checkpoint_request_id="WO31-E1-HOSTILE-WIRE-FINAL",
+    )
+    probe(
+        "noncanonical restore wire",
+        lambda: FullDayRuntimeRestoreRequestV1.from_json_bytes(
+            request.canonical_bytes() + b"\n"
+        ),
+    )
+    return FullDayAuditCase(
+        "full_day_hostile_owner_protocol_refusals",
+        (
+            f"refusals={refused} active_omission=true duplicate_core_owners=true "
+            "unowned_work=true split_truth=true allocator_bindings=true "
+            "failure_atomicity=true owner_session_cause=true state_batch=true "
+            "executed_work_contracts=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e1_protocol_case() -> FullDayAuditCase:
+    import inspect
+
+    from kirby2.full_day.restore import (
+        FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID,
+        full_day_runtime_restore_worker_main,
+    )
+
+    failures: list[str] = []
+    source = inspect.getsource(full_day_runtime_restore_worker_main)
+    if any(token in source for token in ("open(", "Path(", "write_bytes", "write_text")):
+        failures.append("fresh restore worker exposes a filesystem surface")
+    if "stdin.buffer.read" not in source or "stdout.buffer.write" not in source:
+        failures.append("fresh restore worker is not a single stdin/stdout protocol")
+    return FullDayAuditCase(
+        "full_day_restore_worker_protocol_scope",
+        (
+            f"format={FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID} "
+            "stdin=one_checkpoint_plus_suffix stdout=one_canonical_result "
+            "prefix_regeneration=absent filesystem_writes=absent"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e1_runtime_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise the complete E1 owner spine and every fixed fresh-process cut."""
+
+    boundaries = (
+        "auction_imbalance",
+        "auction_uncross",
+        "halt",
+        "reopen",
+        "participant_activation",
+        "participant_withdrawal",
+        "active_metaorder",
+        "agent_inventories",
+        "next_scheduled_decision",
+        "agent_substream_state",
+        "order_allocator",
+        "exchange_queues",
+        "same_time_microsteps",
+    )
+    return (
+        _wo31e1_composition_case(),
+        _wo31e1_one_shot_case(),
+        *(
+            _wo31e1_fresh_boundary_case(boundary)
+            for boundary in boundaries
+        ),
+        _wo31e1_inactive_case(),
+        _wo31e1_hostile_case(),
+        _wo31e1_protocol_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -10544,4 +11635,5 @@ __all__ = [
     "audit_wo31b_transitions",
     "audit_wo31c_checkpoints",
     "audit_wo31d_core_restore",
+    "audit_wo31e1_runtime_restore",
 ]

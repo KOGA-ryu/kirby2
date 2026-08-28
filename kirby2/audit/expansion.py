@@ -104,6 +104,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-B",
     "WO31-C",
     "WO31-D",
+    "WO31-E1",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1456,6 +1457,87 @@ def _audit_wo31d() -> ExpansionGateReport:
     )
 
 
+def _audit_wo31e1() -> ExpansionGateReport:
+    """Run the executable mechanics/agent spine and composed restore cuts."""
+
+    from kirby2.audit.full_day import audit_wo31e1_runtime_restore
+    from kirby2.full_day.composition import (
+        INITIAL_PROFILE_ID,
+        executable_agent_mechanics_composition_matrix,
+    )
+    from kirby2.full_day.restore import (
+        FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID,
+    )
+
+    cases = audit_wo31e1_runtime_restore()
+    expected_names = (
+        "full_day_mechanics_agent_composition",
+        "full_day_one_shot_subdivided",
+        "full_day_restore_auction_imbalance",
+        "full_day_restore_auction_uncross",
+        "full_day_restore_halt",
+        "full_day_restore_reopen",
+        "full_day_restore_participant_activation",
+        "full_day_restore_participant_withdrawal",
+        "full_day_restore_active_metaorder",
+        "full_day_restore_agent_inventories",
+        "full_day_restore_next_scheduled_decision",
+        "full_day_restore_agent_substream_state",
+        "full_day_restore_order_allocator",
+        "full_day_restore_exchange_queues",
+        "full_day_restore_same_time_microsteps",
+        "full_day_inactive_scheduler_absent",
+        "full_day_hostile_owner_protocol_refusals",
+        "full_day_restore_worker_protocol_scope",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-E1 cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-E1 cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append(
+                "WO31-E1 cases must report ordinary PASS/FAIL status"
+            )
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    matrix = executable_agent_mechanics_composition_matrix()
+    profile = matrix.profile(INITIAL_PROFILE_ID, 2)
+    return ExpansionGateReport(
+        card_id="WO31-E1",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("composition_matrix_sha256", matrix.sha256),
+            ("fresh_process_boundary_count", "13"),
+            ("hostile_refusal_count", "20"),
+            ("profile_id", profile.profile_id),
+            ("profile_version", str(profile.profile_version)),
+            ("restore_format", FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID),
+            ("restored_scope", "SINGLE_VENUE_AGENT_MECHANICS"),
+        ),
+    )
+
+
 def _audit_dev0002() -> ExpansionGateReport:
     """Prove the sealed macro-anchor ordering repair remains fail closed."""
 
@@ -1539,6 +1621,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-B", _audit_wo31b),
     ("WO31-C", _audit_wo31c),
     ("WO31-D", _audit_wo31d),
+    ("WO31-E1", _audit_wo31e1),
 )
 
 

@@ -501,12 +501,84 @@ class OwnOrderView:
     remaining_quantity: int
     auction_only: bool
 
+    def __post_init__(self) -> None:
+        if type(self.order_id) is not str or not self.order_id:
+            raise ValueError("own-order view requires a nonempty order ID")
+        if type(self.side) is not Side:
+            raise TypeError("own-order view side must use Side")
+        if self.price_ticks is not None and (
+            type(self.price_ticks) is not int or self.price_ticks <= 0
+        ):
+            raise ValueError("own-order view price must use positive integer ticks")
+        if type(self.remaining_quantity) is not int or self.remaining_quantity <= 0:
+            raise ValueError("own-order view remaining quantity must be positive")
+        if type(self.auction_only) is not bool:
+            raise TypeError("own-order view auction flag must be boolean")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "auction_only": self.auction_only,
+            "order_id": self.order_id,
+            "price_ticks": self.price_ticks,
+            "remaining_quantity": self.remaining_quantity,
+            "side": self.side.value,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> OwnOrderView:
+        _require_fields(
+            payload,
+            {
+                "auction_only",
+                "order_id",
+                "price_ticks",
+                "remaining_quantity",
+                "side",
+            },
+            "own-order view",
+        )
+        return cls(
+            order_id=_wire_str(payload, "order_id"),
+            side=Side(_wire_str(payload, "side")),
+            price_ticks=_wire_optional_int(payload, "price_ticks"),
+            remaining_quantity=_wire_int(payload, "remaining_quantity"),
+            auction_only=_wire_bool(payload, "auction_only"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PublicTradeView:
     simulation_time_us: int
     price_ticks: int
     quantity: int
+
+    def __post_init__(self) -> None:
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("public trade time must be nonnegative")
+        if type(self.price_ticks) is not int or self.price_ticks <= 0:
+            raise ValueError("public trade price must use positive integer ticks")
+        if type(self.quantity) is not int or self.quantity <= 0:
+            raise ValueError("public trade quantity must be positive")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "price_ticks": self.price_ticks,
+            "quantity": self.quantity,
+            "simulation_time_us": self.simulation_time_us,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PublicTradeView:
+        _require_fields(
+            payload,
+            {"price_ticks", "quantity", "simulation_time_us"},
+            "public trade view",
+        )
+        return cls(
+            simulation_time_us=_wire_int(payload, "simulation_time_us"),
+            price_ticks=_wire_int(payload, "price_ticks"),
+            quantity=_wire_int(payload, "quantity"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,6 +658,45 @@ class AgentIntent:
             "side": None if self.side is None else self.side.value,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AgentIntent:
+        _require_fields(
+            payload,
+            {
+                "auction_only",
+                "cancel_target_order_id",
+                "intent_type",
+                "order_type",
+                "price_ticks",
+                "quantity",
+                "rationale",
+                "side",
+            },
+            "agent intent",
+        )
+        raw_order_type = payload["order_type"]
+        raw_side = payload["side"]
+        raw_cancel = payload["cancel_target_order_id"]
+        for value, label in (
+            (raw_order_type, "order_type"),
+            (raw_side, "side"),
+            (raw_cancel, "cancel_target_order_id"),
+        ):
+            if value is not None and type(value) is not str:
+                raise TypeError(f"serialized {label} must be a string or null")
+        return cls(
+            intent_type=AgentIntentType(_wire_str(payload, "intent_type")),
+            rationale=_wire_str(payload, "rationale"),
+            order_type=(
+                None if raw_order_type is None else OrderType(raw_order_type)
+            ),
+            side=None if raw_side is None else Side(raw_side),
+            quantity=_wire_optional_int(payload, "quantity"),
+            price_ticks=_wire_optional_int(payload, "price_ticks"),
+            cancel_target_order_id=raw_cancel,
+            auction_only=_wire_bool(payload, "auction_only"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class PublicEcologyEvent:
@@ -595,6 +706,12 @@ class PublicEcologyEvent:
     data: Mapping[str, object]
 
     def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("public ecology event sequence must be positive")
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("public ecology event time must be nonnegative")
+        if type(self.event_type) is not str or not self.event_type:
+            raise ValueError("public ecology event type must be nonempty")
         frozen = freeze_json(self.data)
         if not isinstance(frozen, Mapping):
             raise TypeError("public ecology event data must be a JSON object")
@@ -607,6 +724,23 @@ class PublicEcologyEvent:
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PublicEcologyEvent:
+        _require_fields(
+            payload,
+            {"data", "event_type", "sequence", "simulation_time_us"},
+            "public ecology event",
+        )
+        raw_data = payload["data"]
+        if not isinstance(raw_data, Mapping):
+            raise TypeError("serialized public ecology event data must be an object")
+        return cls(
+            sequence=_wire_int(payload, "sequence"),
+            simulation_time_us=_wire_int(payload, "simulation_time_us"),
+            event_type=_wire_str(payload, "event_type"),
+            data=raw_data,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -623,6 +757,40 @@ class AgentTruthEvent:
     exchange_event_start: int | None
     exchange_event_end: int | None
 
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("agent truth sequence must be positive")
+        if (
+            type(self.decision_time_us) is not int
+            or type(self.arrival_time_us) is not int
+            or self.decision_time_us < 0
+            or self.arrival_time_us < self.decision_time_us
+        ):
+            raise ValueError("agent truth decision/arrival time is invalid")
+        if type(self.agent_id) is not str or not self.agent_id:
+            raise ValueError("agent truth event requires an agent ID")
+        if type(self.family) is not AgentFamily:
+            raise TypeError("agent truth family must use AgentFamily")
+        if type(self.intent) is not AgentIntent:
+            raise TypeError("agent truth intent must use AgentIntent")
+        if type(self.status) is not AgentActionStatus:
+            raise TypeError("agent truth status must use AgentActionStatus")
+        if type(self.result_reason) is not str or not self.result_reason:
+            raise ValueError("agent truth event requires a result reason")
+        if self.order_id is not None and (
+            type(self.order_id) is not str or not self.order_id
+        ):
+            raise ValueError("agent truth order ID must be nonempty or null")
+        if (self.exchange_event_start is None) != (self.exchange_event_end is None):
+            raise ValueError("agent truth exchange-event range must be wholly present or null")
+        if self.exchange_event_start is not None and (
+            type(self.exchange_event_start) is not int
+            or type(self.exchange_event_end) is not int
+            or self.exchange_event_start <= 0
+            or self.exchange_event_end < self.exchange_event_start
+        ):
+            raise ValueError("agent truth exchange-event range is invalid")
+
     def as_dict(self) -> dict[str, object]:
         return {
             "agent_id": self.agent_id,
@@ -637,6 +805,47 @@ class AgentTruthEvent:
             "sequence": self.sequence,
             "status": self.status.value,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AgentTruthEvent:
+        _require_fields(
+            payload,
+            {
+                "agent_id",
+                "arrival_time_us",
+                "decision_time_us",
+                "exchange_event_end",
+                "exchange_event_start",
+                "family",
+                "intent",
+                "order_id",
+                "result_reason",
+                "sequence",
+                "status",
+            },
+            "agent truth event",
+        )
+        raw_intent = payload["intent"]
+        if not isinstance(raw_intent, Mapping):
+            raise TypeError("serialized agent truth intent must be an object")
+        raw_order_id = payload["order_id"]
+        if raw_order_id is not None and type(raw_order_id) is not str:
+            raise TypeError("serialized agent truth order ID must be a string or null")
+        return cls(
+            sequence=_wire_int(payload, "sequence"),
+            decision_time_us=_wire_int(payload, "decision_time_us"),
+            arrival_time_us=_wire_int(payload, "arrival_time_us"),
+            agent_id=_wire_str(payload, "agent_id"),
+            family=AgentFamily(_wire_str(payload, "family")),
+            intent=AgentIntent.from_dict(raw_intent),
+            status=AgentActionStatus(_wire_str(payload, "status")),
+            result_reason=_wire_str(payload, "result_reason"),
+            order_id=raw_order_id,
+            exchange_event_start=_wire_optional_int(
+                payload, "exchange_event_start"
+            ),
+            exchange_event_end=_wire_optional_int(payload, "exchange_event_end"),
+        )
 
 
 def _require_fields(
