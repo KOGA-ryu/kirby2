@@ -104,6 +104,21 @@ class SimpleFlowModel:
     def runtime_state(self) -> dict[str, object]:
         return {"model": self.model_name, "state": "STATELESS"}
 
+    @classmethod
+    def from_runtime_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> "SimpleFlowModel":
+        """Restore the exact stateless baseline model envelope."""
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("simple flow runtime state must be an object")
+        if set(payload) != {"model", "state"}:
+            raise ValueError("simple flow runtime state fields are not exact")
+        if payload["model"] != "simple" or payload["state"] != "STATELESS":
+            raise ValueError("simple flow runtime state identity is invalid")
+        return cls()
+
 
 @dataclass(frozen=True, slots=True)
 class HawkesStabilityCertification:
@@ -377,6 +392,87 @@ class HawkesFlowModel:
             "thinning_rejections": self._thinning_rejections,
             "use_runtime_baseline": self.use_runtime_baseline,
         }
+
+    @classmethod
+    def from_runtime_state(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        config: HawkesConfig,
+    ) -> "HawkesFlowModel":
+        """Restore excitation, decay time, and bounded diagnostic counters.
+
+        The configuration is supplied by the caller's identity-bearing component
+        binding; the state is accepted only when it names that exact profile and is
+        a canonical fixed point of ``runtime_state``.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("Hawkes flow runtime state must be an object")
+        if type(config) is not HawkesConfig:
+            raise TypeError("Hawkes restore requires HawkesConfig")
+        expected = {
+            "excitation",
+            "intensity_cap_hits",
+            "model",
+            "observed_events",
+            "profile_id",
+            "state_time_us",
+            "thinning_rejections",
+            "use_runtime_baseline",
+        }
+        if set(payload) != expected:
+            raise ValueError("Hawkes flow runtime state fields are not exact")
+        if payload["model"] != "hawkes":
+            raise ValueError("Hawkes flow runtime state has the wrong model ID")
+        if payload["profile_id"] != config.profile_id:
+            raise ValueError("Hawkes flow state differs from its bound profile")
+        use_runtime_baseline = payload["use_runtime_baseline"]
+        if type(use_runtime_baseline) is not bool:
+            raise TypeError("Hawkes runtime-baseline state must be boolean")
+        excitation = payload["excitation"]
+        size = len(FLOW_CHANNELS)
+        if type(excitation) is not list or len(excitation) != size:
+            raise ValueError("Hawkes excitation must cover every target channel")
+        restored_excitation: list[list[float]] = []
+        for row in excitation:
+            if type(row) is not list or len(row) != size or any(
+                type(value) is not float
+                or not math.isfinite(value)
+                or value < 0.0
+                for value in row
+            ):
+                raise ValueError(
+                    "Hawkes excitation rows must contain finite nonnegative floats"
+                )
+            restored_excitation.append(list(row))
+        counters: dict[str, int] = {}
+        for field_name in (
+            "intensity_cap_hits",
+            "observed_events",
+            "state_time_us",
+            "thinning_rejections",
+        ):
+            value = payload[field_name]
+            if type(value) is not int or value < 0:
+                raise ValueError(
+                    f"Hawkes {field_name} must be a nonnegative integer"
+                )
+            counters[field_name] = value
+        restored = cls(
+            config,
+            use_runtime_baseline=use_runtime_baseline,
+        )
+        restored._excitation = restored_excitation
+        restored._intensity_cap_hits = counters["intensity_cap_hits"]
+        restored._observed_events = counters["observed_events"]
+        restored._state_time_us = counters["state_time_us"]
+        restored._thinning_rejections = counters["thinning_rejections"]
+        if restored.runtime_state() != dict(payload):
+            raise ValueError(
+                "Hawkes flow runtime state is not a canonical fixed point"
+            )
+        return restored
 
     def _baseline(
         self,

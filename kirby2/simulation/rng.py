@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 
 class SeededRng:
@@ -77,6 +77,49 @@ class SeededRng:
             "random_state_version": version,
             "seed": self.seed,
         }
+
+    @classmethod
+    def from_runtime_state(cls, payload: Mapping[str, object]) -> "SeededRng":
+        """Restore one detached RNG from its exact portable state.
+
+        Full-day component restore must not recreate a stream from its seed after
+        draws have been consumed.  This constructor therefore requires the native
+        PRNG state as well as the identity-bearing seed and refuses coercions or
+        extra fields.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise TypeError("RNG runtime state must be an object")
+        expected = {
+            "gaussian_cache",
+            "internal_state",
+            "random_state_version",
+            "seed",
+        }
+        if set(payload) != expected:
+            raise ValueError("RNG runtime state fields are not exact")
+        seed = payload["seed"]
+        version = payload["random_state_version"]
+        internal = payload["internal_state"]
+        gaussian = payload["gaussian_cache"]
+        if type(seed) is not int or seed < 0:
+            raise ValueError("RNG seed must be a nonnegative integer")
+        if type(version) is not int or version < 1:
+            raise ValueError("RNG state version must be a positive integer")
+        if type(internal) is not list or not internal or any(
+            type(item) is not int for item in internal
+        ):
+            raise TypeError("RNG internal state must be a nonempty integer array")
+        if gaussian is not None and type(gaussian) is not float:
+            raise TypeError("RNG Gaussian cache must be null or a float")
+        restored = cls(seed)
+        try:
+            restored._random.setstate((version, tuple(internal), gaussian))
+        except (TypeError, ValueError) as error:
+            raise ValueError("RNG runtime state is invalid") from error
+        if restored.runtime_state() != dict(payload):
+            raise ValueError("RNG runtime state is not a canonical fixed point")
+        return restored
 
     def state_sha256(self) -> str:
         canonical = json.dumps(
