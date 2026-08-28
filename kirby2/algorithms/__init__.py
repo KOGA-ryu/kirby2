@@ -1,7 +1,10 @@
 """Observable-only execution algorithms and deterministic benchmark bench."""
 
 from .benchmark import (
+    CLIENT_TRACKER_CHECKPOINT_SCHEMA_VERSION,
+    ClientTrackerV1,
     ExecutionCellResult,
+    apply_algorithm_action,
     run_execution_benchmark,
     run_execution_cell,
 )
@@ -31,9 +34,12 @@ from .models import (
     RiskLimits,
 )
 from .policies import (
+    EXECUTION_ALGORITHM_POLICY_STATE_SCHEMA_VERSION,
+    EXECUTION_ALGORITHM_POLICY_VERSION,
     ExecutionAlgorithm,
     create_algorithm,
     default_algorithm_manifest,
+    restore_algorithm_from_checkpoint_state,
 )
 from .scenarios import (
     BENCHMARK_SCENARIOS,
@@ -53,7 +59,10 @@ __all__ = [
     "ALGORITHM_RECORD_SCHEMA_VERSION",
     "BENCHMARK_RESULT_SCHEMA_VERSION",
     "BENCHMARK_SCENARIOS",
+    "CLIENT_TRACKER_CHECKPOINT_SCHEMA_VERSION",
     "DEFAULT_ALGORITHM_RUN_STORE",
+    "EXECUTION_ALGORITHM_POLICY_STATE_SCHEMA_VERSION",
+    "EXECUTION_ALGORITHM_POLICY_VERSION",
     "MANUAL_REPLAY_TRANSLATION_VERSION",
     "AlgorithmAction",
     "AlgorithmActionType",
@@ -67,6 +76,7 @@ __all__ = [
     "BackgroundMarketEvent",
     "BenchmarkManifest",
     "BenchmarkRunResult",
+    "ClientTrackerV1",
     "ClientFill",
     "ClientLatencyState",
     "ClientVenueState",
@@ -80,10 +90,12 @@ __all__ = [
     "ImmutableAlgorithmRunManifest",
     "ObservableMarketFeatures",
     "RiskLimits",
+    "apply_algorithm_action",
     "create_algorithm",
     "default_algorithm_manifest",
     "get_benchmark_scenario",
     "manual_manifest_from_session_recording",
     "run_execution_benchmark",
     "run_execution_cell",
+    "restore_algorithm_from_checkpoint_state",
 ]

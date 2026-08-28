@@ -21,6 +21,7 @@ FLOW_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_V1"
 DELIVERY_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_V1"
 RESEARCH_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_DELIVERY_STRATEGY_V1"
 MULTIVENUE_HIDDEN_PROFILE_ID = "MULTIVENUE_HIDDEN_RESEARCH_V1"
+EXECUTION_ALGORITHM_PROFILE_ID = "STANDALONE_EXECUTION_ALGORITHM_V1"
 INITIAL_MATRIX_ID = "COMPOSITION_MATRIX_V1"
 
 FULL_DAY_RUNTIME_COMPONENT = "FULL_DAY_RUNTIME_V1"
@@ -32,6 +33,7 @@ FLOW_QUEUE_REACTIVE_COMPONENT = "FLOW_QUEUE_REACTIVE_V1"
 DELIVERY_ASYNC_COMPONENT = "DELIVERY_ASYNC_V1"
 FEATURE_STRATEGY_PLAYER_COMPONENT = "FEATURE_STRATEGY_PLAYER_V1"
 MULTIVENUE_HIDDEN_COMPONENT = "VENUE_MULTIVENUE_HIDDEN_V1"
+EXECUTION_ALGORITHM_COMPONENT = "EXECUTION_ALGORITHM_V1"
 
 FLOW_COMPONENT_IDS = (
     FLOW_HAWKES_COMPONENT,
@@ -1539,6 +1541,76 @@ def restorable_multivenue_hidden_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def restorable_execution_algorithm_composition_matrix() -> CompositionMatrixV1:
+    """Append WO31-E6 as a standalone restorable algorithm boundary.
+
+    The policy, client tracker, decision schedule, child allocator, latency view,
+    and its private coordinator restore together.  This row intentionally refuses
+    both full-day execution and historical replay; it is not a compatibility claim
+    with either the E4 or E5 owner graph.
+    """
+
+    previous = restorable_multivenue_hidden_composition_matrix()
+    algorithm = ComponentSpecV1(
+        schema_version=1,
+        component_id=EXECUTION_ALGORITHM_COMPONENT,
+        component_version=1,
+        implementation_status="RESTORABLE_COMPONENT_ONLY",
+        active_predicate="ALWAYS",
+        dependencies=(),
+        owned_resources=tuple(
+            sorted(
+                {
+                    "ALGORITHM_CHILD_ORDER_ALLOCATOR",
+                    "ALGORITHM_CLIENT_TRACKER",
+                    "ALGORITHM_DECISION_SCHEDULE",
+                    "ALGORITHM_POLICY_STATE",
+                    "CLIENT_LATENCY_VENUE_STATE",
+                    "CONSOLIDATED_OBSERVABLE_FEED",
+                    "MULTIVENUE_COORDINATOR",
+                    "MULTIVENUE_ROUTE_STATE",
+                    "ORDER_GATEWAY",
+                    "SIMULATION_CLOCK",
+                }
+            )
+        ),
+        borrowed_resources=(),
+        rng_label_prefixes=(),
+        checkpoint_state_ids=(EXECUTION_ALGORITHM_COMPONENT,),
+    )
+    profile = CompositionProfileV1(
+        schema_version=1,
+        profile_id=EXECUTION_ALGORITHM_PROFILE_ID,
+        profile_version=1,
+        implementation_status="CONTRACT_ONLY",
+        runtime_owner_component_id=EXECUTION_ALGORITHM_COMPONENT,
+        components=(algorithm,),
+        refused_component_ids=tuple(
+            sorted(
+                {
+                    "ENGINE_MARKET_MECHANICS_V1",
+                    "FEATURES",
+                    "FULL_DAY_RUNTIME_V1",
+                    "HISTORICAL_REPLAY",
+                    "PLAYER_OVERLAY",
+                    "STRATEGIES",
+                    "VENUE_MULTIVENUE_HIDDEN_V1",
+                }
+            )
+        ),
+        exactly_one_component_groups=(),
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1548,6 +1620,8 @@ __all__ = [
     "COMPOSITION_SCHEMA_VERSION",
     "DELIVERY_ASYNC_COMPONENT",
     "DELIVERY_PROFILE_ID",
+    "EXECUTION_ALGORITHM_COMPONENT",
+    "EXECUTION_ALGORITHM_PROFILE_ID",
     "FEATURE_STRATEGY_PLAYER_COMPONENT",
     "ComponentSpecV1",
     "CompositionMatrixV1",
@@ -1573,5 +1647,6 @@ __all__ = [
     "executable_research_composition_matrix",
     "executable_simple_flow_composition_matrix",
     "initial_composition_matrix",
+    "restorable_execution_algorithm_composition_matrix",
     "restorable_multivenue_hidden_composition_matrix",
 ]

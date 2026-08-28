@@ -19,6 +19,10 @@ from .models import (
 )
 
 
+EXECUTION_ALGORITHM_POLICY_STATE_SCHEMA_VERSION = 1
+EXECUTION_ALGORITHM_POLICY_VERSION = 1
+
+
 class ExecutionAlgorithm(ABC):
     """Algorithms consume one client observation and return one declarative action."""
 
@@ -37,6 +41,26 @@ class ExecutionAlgorithm(ABC):
         if observation.remaining_quantity == 0:
             return _finish("objective completed")
         return None
+
+    def checkpoint_state(self) -> dict[str, object]:
+        if self.objective is None:
+            raise RuntimeError("algorithm policy cannot checkpoint before reset")
+        return {
+            "manifest": self.manifest.as_dict(),
+            "manifest_sha256": self.manifest.sha256(),
+            "mutable_state": self._mutable_checkpoint_state(),
+            "objective": self.objective.as_dict(),
+            "policy_id": self.manifest.algorithm.value,
+            "policy_version": EXECUTION_ALGORITHM_POLICY_VERSION,
+            "schema_version": EXECUTION_ALGORITHM_POLICY_STATE_SCHEMA_VERSION,
+        }
+
+    def _mutable_checkpoint_state(self) -> dict[str, object]:
+        return {}
+
+    def _restore_mutable_checkpoint_state(self, payload: Mapping[str, object]) -> None:
+        if not isinstance(payload, Mapping) or payload:
+            raise ValueError("stateless algorithm policy gained mutable state")
 
 
 class _TimedPassiveAlgorithm(ExecutionAlgorithm):
@@ -58,6 +82,24 @@ class _TimedPassiveAlgorithm(ExecutionAlgorithm):
     def _near_deadline(self, observation: AlgorithmObservation) -> bool:
         timeout = _int(self.manifest, "passive_timeout_us")
         return observation.simulation_time_us >= observation.objective.deadline_us - timeout
+
+    def _mutable_checkpoint_state(self) -> dict[str, object]:
+        return {"last_submit_time_us": self.last_submit_time_us}
+
+    def _restore_mutable_checkpoint_state(self, payload: Mapping[str, object]) -> None:
+        _require_exact_policy_fields(
+            payload,
+            {"last_submit_time_us"},
+            "timed algorithm mutable state",
+        )
+        value = payload["last_submit_time_us"]
+        if value is not None and (type(value) is not int or value < 0):
+            raise TypeError("algorithm last-submit time must be null or nonnegative")
+        if value is not None and self.objective is not None and not (
+            self.objective.start_time_us <= value <= self.objective.deadline_us
+        ):
+            raise ValueError("algorithm last-submit time is outside its objective")
+        self.last_submit_time_us = value
 
 
 class ImmediateMarketAlgorithm(ExecutionAlgorithm):
@@ -449,6 +491,26 @@ class ManualReplayAlgorithm(ExecutionAlgorithm):
             action_type=action,
         )
 
+    def _mutable_checkpoint_state(self) -> dict[str, object]:
+        return {"replay_index": self.index}
+
+    def _restore_mutable_checkpoint_state(self, payload: Mapping[str, object]) -> None:
+        _require_exact_policy_fields(
+            payload,
+            {"replay_index"},
+            "manual replay mutable state",
+        )
+        value = payload["replay_index"]
+        actions = self.manifest.parameters.get("replay_actions")
+        if (
+            type(value) is not int
+            or value < 0
+            or not isinstance(actions, (list, tuple))
+            or value > len(actions)
+        ):
+            raise ValueError("manual replay index is outside its action schedule")
+        self.index = value
+
 
 def create_algorithm(manifest: AlgorithmParameterManifest) -> ExecutionAlgorithm:
     classes = {
@@ -464,6 +526,51 @@ def create_algorithm(manifest: AlgorithmParameterManifest) -> ExecutionAlgorithm
         AlgorithmName.MANUAL_REPLAY: ManualReplayAlgorithm,
     }
     return classes[manifest.algorithm](manifest)
+
+
+def restore_algorithm_from_checkpoint_state(
+    payload: Mapping[str, object],
+) -> ExecutionAlgorithm:
+    """Restore policy-local progress without replaying an earlier observation."""
+
+    _require_exact_policy_fields(
+        payload,
+        {
+            "manifest",
+            "manifest_sha256",
+            "mutable_state",
+            "objective",
+            "policy_id",
+            "policy_version",
+            "schema_version",
+        },
+        "algorithm policy checkpoint",
+    )
+    if payload["schema_version"] != EXECUTION_ALGORITHM_POLICY_STATE_SCHEMA_VERSION:
+        raise ValueError("unsupported algorithm policy checkpoint schema")
+    if payload["policy_version"] != EXECUTION_ALGORITHM_POLICY_VERSION:
+        raise ValueError("unsupported algorithm policy version")
+    manifest_raw = payload["manifest"]
+    objective_raw = payload["objective"]
+    mutable_raw = payload["mutable_state"]
+    if not isinstance(manifest_raw, Mapping):
+        raise TypeError("algorithm policy manifest must be an object")
+    if not isinstance(objective_raw, Mapping):
+        raise TypeError("algorithm policy objective must be an object")
+    if not isinstance(mutable_raw, Mapping):
+        raise TypeError("algorithm mutable state must be an object")
+    manifest = AlgorithmParameterManifest.from_dict(manifest_raw)
+    objective = ExecutionObjective.from_dict(objective_raw)
+    if payload["policy_id"] != manifest.algorithm.value:
+        raise ValueError("algorithm policy ID differs from its manifest")
+    if payload["manifest_sha256"] != manifest.sha256():
+        raise ValueError("algorithm policy manifest digest differs")
+    algorithm = create_algorithm(manifest)
+    algorithm.reset(objective)
+    algorithm._restore_mutable_checkpoint_state(mutable_raw)
+    if algorithm.checkpoint_state() != dict(payload):
+        raise ValueError("algorithm policy checkpoint is not a fixed point")
+    return algorithm
 
 
 def default_algorithm_manifest(name: AlgorithmName | str) -> AlgorithmParameterManifest:
@@ -678,3 +785,18 @@ def _int_tuple(manifest: AlgorithmParameterManifest, key: str) -> tuple[int, ...
     ):
         raise ValueError(f"algorithm parameter {key} must be an integer array")
     return tuple(value)
+
+
+def _require_exact_policy_fields(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )

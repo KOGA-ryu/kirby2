@@ -1,9 +1,10 @@
 """Strict fresh-process restoration for bounded authoritative owner graphs.
 
 The full-day path restores :class:`MarketMechanicsEngine` and its selected
-single-venue owners.  A separate component-only protocol restores the existing
-multi-venue/hidden owner; it does not claim coexistence with that single-engine
-profile.  Neither protocol reconstructs a prefix from a seed.
+single-venue owners.  Separate component-only protocols restore the existing
+multi-venue/hidden owner and the standalone execution-algorithm owner; neither
+claims coexistence with the single-engine profile.  No protocol reconstructs a
+prefix from a seed.
 """
 
 from __future__ import annotations
@@ -52,6 +53,14 @@ MULTIVENUE_HIDDEN_RESTORE_REQUEST_FORMAT_ID = (
 MULTIVENUE_HIDDEN_RESTORE_RESULT_SCHEMA_VERSION = 1
 MULTIVENUE_HIDDEN_RESTORE_RESULT_FORMAT_ID = (
     "KIRBY2_MULTIVENUE_HIDDEN_RESTORE_RESULT_V1"
+)
+EXECUTION_ALGORITHM_RESTORE_REQUEST_SCHEMA_VERSION = 1
+EXECUTION_ALGORITHM_RESTORE_REQUEST_FORMAT_ID = (
+    "KIRBY2_EXECUTION_ALGORITHM_RESTORE_REQUEST_V1"
+)
+EXECUTION_ALGORITHM_RESTORE_RESULT_SCHEMA_VERSION = 1
+EXECUTION_ALGORITHM_RESTORE_RESULT_FORMAT_ID = (
+    "KIRBY2_EXECUTION_ALGORITHM_RESTORE_RESULT_V1"
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1739,6 +1748,286 @@ def multivenue_hidden_restore_worker_main() -> int:
     return 0
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionAlgorithmRestoreRequestV1:
+    """One standalone algorithm checkpoint plus an exact post-cut suffix."""
+
+    schema_version: int
+    format_id: str
+    checkpoint_state: Mapping[str, object]
+    checkpoint_state_sha256: str
+    suffix_commands: tuple[object, ...]
+    completed_time_us: int
+
+    def __post_init__(self) -> None:
+        from kirby2.full_day.components_algorithms import (
+            ExecutionAlgorithmOwnerV1,
+            ExecutionAlgorithmSuffixCommandV1,
+        )
+
+        if (
+            _wire_int(
+                self.schema_version,
+                "execution-algorithm restore request schema version",
+                minimum=1,
+            )
+            != EXECUTION_ALGORITHM_RESTORE_REQUEST_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported execution-algorithm restore request schema")
+        if self.format_id != EXECUTION_ALGORITHM_RESTORE_REQUEST_FORMAT_ID:
+            raise ValueError("unsupported execution-algorithm restore request format")
+        detached = _detached_object(
+            _wire_object(
+                self.checkpoint_state,
+                "execution-algorithm component checkpoint",
+            )
+        )
+        digest = _wire_sha256(
+            self.checkpoint_state_sha256,
+            "execution-algorithm checkpoint SHA-256",
+        )
+        if canonical_sha256(detached) != digest:
+            raise ValueError("execution-algorithm checkpoint digest does not match")
+        owner = ExecutionAlgorithmOwnerV1.from_checkpoint_state(detached)
+        if type(self.suffix_commands) is not tuple or any(
+            type(command) is not ExecutionAlgorithmSuffixCommandV1
+            for command in self.suffix_commands
+        ):
+            raise TypeError("execution-algorithm suffix must be a canonical tuple")
+        sequences = tuple(command.sequence for command in self.suffix_commands)
+        if sequences != tuple(range(1, len(self.suffix_commands) + 1)):
+            raise ValueError("execution-algorithm suffix sequence must start at one")
+        times = tuple(command.simulation_time_us for command in self.suffix_commands)
+        if times != tuple(sorted(times)):
+            raise ValueError("execution-algorithm suffix time moved backward")
+        checkpoint_time = owner.coordinator.clock.current_time_us
+        if times and times[0] < checkpoint_time:
+            raise ValueError("execution-algorithm suffix precedes the checkpoint")
+        completed = _wire_int(
+            self.completed_time_us,
+            "execution-algorithm restore completion time",
+            minimum=0,
+        )
+        if completed < checkpoint_time:
+            raise ValueError("execution-algorithm completion precedes the checkpoint")
+        if times and completed < times[-1]:
+            raise ValueError("execution-algorithm completion precedes its final command")
+        object.__setattr__(self, "checkpoint_state", freeze_json(detached))
+
+    @classmethod
+    def capture(
+        cls,
+        owner: object,
+        *,
+        suffix_commands: Sequence[object],
+        completed_time_us: int,
+    ) -> ExecutionAlgorithmRestoreRequestV1:
+        from kirby2.full_day.components_algorithms import ExecutionAlgorithmOwnerV1
+
+        if type(owner) is not ExecutionAlgorithmOwnerV1:
+            raise TypeError("execution-algorithm restore capture requires its exact owner")
+        if not isinstance(suffix_commands, Sequence) or isinstance(
+            suffix_commands, (str, bytes, bytearray)
+        ):
+            raise TypeError("execution-algorithm suffix commands must be a sequence")
+        state = owner.checkpoint_state()
+        return cls(
+            schema_version=EXECUTION_ALGORITHM_RESTORE_REQUEST_SCHEMA_VERSION,
+            format_id=EXECUTION_ALGORITHM_RESTORE_REQUEST_FORMAT_ID,
+            checkpoint_state=state,
+            checkpoint_state_sha256=canonical_sha256(state),
+            suffix_commands=tuple(suffix_commands),
+            completed_time_us=completed_time_us,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_state": _as_plain_object(self.checkpoint_state),
+            "checkpoint_state_sha256": self.checkpoint_state_sha256,
+            "completed_time_us": self.completed_time_us,
+            "format_id": self.format_id,
+            "schema_version": self.schema_version,
+            "suffix_commands": [command.as_dict() for command in self.suffix_commands],
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.as_dict())
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ExecutionAlgorithmRestoreRequestV1:
+        from kirby2.full_day.components_algorithms import (
+            ExecutionAlgorithmSuffixCommandV1,
+        )
+
+        _require_exact_fields(
+            payload,
+            {
+                "checkpoint_state",
+                "checkpoint_state_sha256",
+                "completed_time_us",
+                "format_id",
+                "schema_version",
+                "suffix_commands",
+            },
+            "ExecutionAlgorithmRestoreRequestV1",
+        )
+        commands = tuple(
+            ExecutionAlgorithmSuffixCommandV1.from_dict(
+                _wire_object(raw, "execution-algorithm suffix command")
+            )
+            for raw in _wire_array(
+                payload["suffix_commands"],
+                "execution-algorithm suffix commands",
+            )
+        )
+        return cls(
+            schema_version=_wire_int(
+                payload["schema_version"],
+                "execution-algorithm restore request schema version",
+                minimum=1,
+            ),
+            format_id=_wire_string(
+                payload["format_id"], "execution-algorithm restore request format"
+            ),
+            checkpoint_state=_wire_object(
+                payload["checkpoint_state"],
+                "execution-algorithm component checkpoint",
+            ),
+            checkpoint_state_sha256=_wire_sha256(
+                payload["checkpoint_state_sha256"],
+                "execution-algorithm checkpoint SHA-256",
+            ),
+            suffix_commands=commands,
+            completed_time_us=_wire_int(
+                payload["completed_time_us"],
+                "execution-algorithm completion time",
+                minimum=0,
+            ),
+        )
+
+    @classmethod
+    def from_json_bytes(cls, payload: bytes) -> ExecutionAlgorithmRestoreRequestV1:
+        return cls.from_dict(parse_canonical_json_object(payload))
+
+
+def _execution_algorithm_restore_result(
+    owner: object,
+    request: ExecutionAlgorithmRestoreRequestV1,
+) -> dict[str, object]:
+    from kirby2.full_day.components_algorithms import ExecutionAlgorithmOwnerV1
+
+    if type(owner) is not ExecutionAlgorithmOwnerV1:
+        raise TypeError("execution-algorithm result requires its exact owner")
+    checkpoint = _as_plain_object(request.checkpoint_state)
+    checkpoint_decisions = _wire_array(
+        checkpoint["decisions"], "checkpoint algorithm decisions"
+    )
+    checkpoint_allocators = _wire_object(
+        checkpoint["allocators"], "checkpoint algorithm allocators"
+    )
+    prefix_route_ids = _wire_array(
+        checkpoint_allocators["route_ids"], "checkpoint algorithm route IDs"
+    )
+    final_state = owner.checkpoint_state()
+    suffix_decisions = [
+        decision.as_dict() for decision in owner.decisions[len(checkpoint_decisions) :]
+    ]
+    suffix_route_ids = owner.route_ids[len(prefix_route_ids) :]
+    prefix = {
+        "checkpoint_state_sha256": request.checkpoint_state_sha256,
+        "decision_count": len(checkpoint_decisions),
+        "route_count": len(prefix_route_ids),
+    }
+    suffix = {
+        "decision_count": len(suffix_decisions),
+        "decision_sha256": canonical_sha256(suffix_decisions),
+        "route_ids": suffix_route_ids,
+    }
+    final = {
+        "coordinator_state_sha256": owner.coordinator.state_sha256(),
+        "public_projection": owner.public_projection(),
+        "restorable_state_sha256": canonical_sha256(final_state),
+    }
+    invariant_projection = {"final": final, "prefix": prefix, "suffix": suffix}
+    return {
+        "final": final,
+        "format_id": EXECUTION_ALGORITHM_RESTORE_RESULT_FORMAT_ID,
+        "invariant_sha256": canonical_sha256(invariant_projection),
+        "prefix": prefix,
+        "schema_version": EXECUTION_ALGORITHM_RESTORE_RESULT_SCHEMA_VERSION,
+        "suffix": suffix,
+    }
+
+
+def execute_execution_algorithm_restore_request(
+    request: ExecutionAlgorithmRestoreRequestV1,
+) -> dict[str, object]:
+    """Restore the standalone algorithm owner and execute only its suffix."""
+
+    from kirby2.full_day.components_algorithms import (
+        ExecutionAlgorithmOwnerV1,
+        apply_execution_algorithm_suffix,
+    )
+
+    if type(request) is not ExecutionAlgorithmRestoreRequestV1:
+        raise TypeError("execution-algorithm restore requires its canonical request")
+    owner = ExecutionAlgorithmOwnerV1.from_checkpoint_state(
+        _as_plain_object(request.checkpoint_state)
+    )
+    apply_execution_algorithm_suffix(
+        owner,
+        request.suffix_commands,
+        completed_time_us=request.completed_time_us,
+    )
+    return _execution_algorithm_restore_result(owner, request)
+
+
+def execute_uninterrupted_execution_algorithm_suffix(
+    owner: object,
+    request: ExecutionAlgorithmRestoreRequestV1,
+) -> dict[str, object]:
+    """Reference suffix over the already-running standalone algorithm owner."""
+
+    from kirby2.full_day.components_algorithms import (
+        ExecutionAlgorithmOwnerV1,
+        apply_execution_algorithm_suffix,
+    )
+
+    if type(owner) is not ExecutionAlgorithmOwnerV1:
+        raise TypeError("uninterrupted algorithm suffix requires its exact owner")
+    if owner.canonical_state_bytes() != canonical_json_bytes(
+        _as_plain_object(request.checkpoint_state)
+    ):
+        raise ValueError("uninterrupted algorithm owner differs from checkpoint")
+    apply_execution_algorithm_suffix(
+        owner,
+        request.suffix_commands,
+        completed_time_us=request.completed_time_us,
+    )
+    return _execution_algorithm_restore_result(owner, request)
+
+
+def execution_algorithm_restore_worker_main() -> int:
+    """Canonical stdin/stdout worker for WO31-E6 component restoration."""
+
+    raw = sys.stdin.buffer.read()
+    try:
+        request = ExecutionAlgorithmRestoreRequestV1.from_json_bytes(raw)
+        result = execute_execution_algorithm_restore_request(request)
+        output = canonical_json_bytes(result)
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        diagnostic = (
+            f"EXECUTION_ALGORITHM_RESTORE_REFUSED {type(error).__name__}: {error}\n"
+        ).encode("utf-8", errors="backslashreplace")
+        sys.stderr.buffer.write(diagnostic)
+        return 2
+    sys.stdout.buffer.write(output)
+    return 0
+
+
 __all__ = [
     "CORE_RESTORE_REQUEST_FORMAT_ID",
     "CORE_RESTORE_REQUEST_SCHEMA_VERSION",
@@ -1750,6 +2039,11 @@ __all__ = [
     "CoreRestoreRequestV1",
     "CoreSessionCheckpointV1",
     "CoreSessionCommandV1",
+    "EXECUTION_ALGORITHM_RESTORE_REQUEST_FORMAT_ID",
+    "EXECUTION_ALGORITHM_RESTORE_REQUEST_SCHEMA_VERSION",
+    "EXECUTION_ALGORITHM_RESTORE_RESULT_FORMAT_ID",
+    "EXECUTION_ALGORITHM_RESTORE_RESULT_SCHEMA_VERSION",
+    "ExecutionAlgorithmRestoreRequestV1",
     "FULL_DAY_RUNTIME_RESTORE_REQUEST_FORMAT_ID",
     "FULL_DAY_RUNTIME_RESTORE_REQUEST_SCHEMA_VERSION",
     "FULL_DAY_RUNTIME_RESTORE_RESULT_FORMAT_ID",
@@ -1764,10 +2058,13 @@ __all__ = [
     "apply_core_session_suffix",
     "execute_full_day_runtime_restore_request",
     "execute_core_restore_request",
+    "execute_execution_algorithm_restore_request",
     "execute_multivenue_hidden_restore_request",
     "execute_uninterrupted_full_day_runtime_suffix",
+    "execute_uninterrupted_execution_algorithm_suffix",
     "execute_uninterrupted_suffix",
     "execute_uninterrupted_multivenue_hidden_suffix",
     "full_day_runtime_restore_worker_main",
+    "execution_algorithm_restore_worker_main",
     "multivenue_hidden_restore_worker_main",
 ]

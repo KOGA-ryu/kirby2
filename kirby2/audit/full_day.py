@@ -14842,6 +14842,419 @@ def audit_wo31e5_multivenue_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e6_owner(boundary: str, *, algorithm_name="immediate"):
+    from kirby2.algorithms import (
+        ExecutionObjective,
+        RiskLimits,
+        create_algorithm,
+        default_algorithm_manifest,
+        get_benchmark_scenario,
+    )
+    from kirby2.full_day.components_algorithms import ExecutionAlgorithmOwnerV1
+    from kirby2.multivenue import MarketCoordinator
+
+    scenario = get_benchmark_scenario(
+        "balanced_execution",
+        duration_us=1_000_000,
+        decision_interval_us=250_000,
+    )
+    coordinator = MarketCoordinator(
+        scenario.venue_configs,
+        seed=31_006,
+        depth_subscriptions=frozenset(
+            config.venue_id for config in scenario.venue_configs
+        ),
+    )
+    for venue_id, request in scenario.initial_orders():
+        coordinator.add_resting_order(venue_id, request)
+    coordinator.advance_to(scenario.start_time_us)
+    feed = coordinator.consolidated_feed()
+    if feed.best_bid_ticks is None or feed.best_ask_ticks is None:
+        raise RuntimeError("WO31-E6 fixture lacks a two-sided observable market")
+    objective = ExecutionObjective(
+        Side.BUY,
+        200,
+        scenario.start_time_us,
+        scenario.deadline_us,
+        feed.best_bid_ticks + feed.best_ask_ticks,
+    )
+    owner = ExecutionAlgorithmOwnerV1.create(
+        coordinator,
+        create_algorithm(default_algorithm_manifest(algorithm_name)),
+        objective,
+        RiskLimits(200, 200, 200, 10),
+        scenario.volume_profile_bps,
+        scenario.decision_interval_us,
+    )
+    if boundary == "pending_deadline":
+        pass
+    elif boundary == "pending_action":
+        owner.capture_decision()
+    elif boundary == "outstanding_child":
+        owner.capture_decision()
+        decision = owner.apply_pending_action()
+        if decision.resulting_route_id is None or owner.tracker.pending_route_quantity <= 0:
+            raise RuntimeError("WO31-E6 fixture lacks an outstanding child route")
+    else:
+        raise ValueError(f"unknown WO31-E6 boundary: {boundary}")
+    return owner
+
+
+def _wo31e6_suffix(boundary: str):
+    from kirby2.full_day.components_algorithms import (
+        ExecutionAlgorithmSuffixCommandV1,
+    )
+
+    start = 1_000
+    next_deadline = 251_000
+    if boundary == "pending_deadline":
+        commands = (
+            ExecutionAlgorithmSuffixCommandV1(1, start, "DECIDE", {}),
+            ExecutionAlgorithmSuffixCommandV1(2, start, "APPLY", {}),
+        )
+        completed_time_us = start
+    elif boundary == "pending_action":
+        commands = (ExecutionAlgorithmSuffixCommandV1(1, start, "APPLY", {}),)
+        completed_time_us = start
+    elif boundary == "outstanding_child":
+        commands = (
+            ExecutionAlgorithmSuffixCommandV1(1, next_deadline, "DECIDE", {}),
+            ExecutionAlgorithmSuffixCommandV1(2, next_deadline, "APPLY", {}),
+        )
+        completed_time_us = next_deadline
+    else:
+        raise ValueError(f"unknown WO31-E6 boundary: {boundary}")
+    return commands, completed_time_us
+
+
+def _wo31e6_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.composition import (
+        EXECUTION_ALGORITHM_COMPONENT,
+        EXECUTION_ALGORITHM_PROFILE_ID,
+        MULTIVENUE_HIDDEN_PROFILE_ID,
+        CompositionProfileV1,
+        restorable_execution_algorithm_composition_matrix,
+        restorable_multivenue_hidden_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = restorable_multivenue_hidden_composition_matrix()
+    matrix = restorable_execution_algorithm_composition_matrix()
+    profile = matrix.profile(EXECUTION_ALGORITHM_PROFILE_ID, 1)
+    component = next(
+        row for row in profile.components if row.component_id == EXECUTION_ALGORITHM_COMPONENT
+    )
+    if matrix.previous_matrix_sha256 != previous.sha256:
+        failures.append("E6 composition matrix does not bind the exact E5 matrix")
+    if matrix.profiles[:-1] != previous.profiles:
+        failures.append("E6 composition matrix rewrote a prior profile")
+    if profile.implementation_status != "CONTRACT_ONLY":
+        failures.append("standalone algorithm profile overclaims executable status")
+    if component.implementation_status != "RESTORABLE_COMPONENT_ONLY":
+        failures.append("algorithm owner lacks exact component-only restore status")
+    if component.checkpoint_state_ids != ("EXECUTION_ALGORITHM_V1",):
+        failures.append("algorithm checkpoint ownership inventory is not exact")
+    if not {"FULL_DAY_RUNTIME_V1", "HISTORICAL_REPLAY"} <= set(
+        profile.refused_component_ids
+    ):
+        failures.append("algorithm profile does not refuse full-day and historical mixing")
+
+    e5 = previous.profile(MULTIVENUE_HIDDEN_PROFILE_ID, 1)
+    e5_component = e5.components[0]
+    double_owner_refused = False
+    try:
+        CompositionProfileV1(
+            schema_version=1,
+            profile_id="HOSTILE_ALGORITHM_MULTIVENUE_COOWNER_V1",
+            profile_version=1,
+            implementation_status="CONTRACT_ONLY",
+            runtime_owner_component_id=EXECUTION_ALGORITHM_COMPONENT,
+            components=tuple(sorted((component, e5_component), key=lambda row: row.component_id)),
+            refused_component_ids=("HISTORICAL_REPLAY",),
+            exactly_one_component_groups=(),
+        )
+    except (TypeError, ValueError):
+        double_owner_refused = True
+    if not double_owner_refused:
+        failures.append("composition accepted duplicate coordinator/feed/clock owners")
+
+    return FullDayAuditCase(
+        "full_day_algorithm_component_composition",
+        (
+            f"matrix_version={matrix.matrix_version} profile={profile.profile_id} "
+            f"profile_status={profile.implementation_status} "
+            f"component_status={component.implementation_status} "
+            "prior_profiles_immutable=true double_owner_refused=true "
+            "full_day_refused=true historical_refused=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e6_checkpoint_case() -> FullDayAuditCase:
+    from kirby2.algorithms import AlgorithmName
+    from kirby2.full_day.components_algorithms import ExecutionAlgorithmOwnerV1
+
+    failures: list[str] = []
+    owner = _wo31e6_owner("pending_action")
+    state = owner.checkpoint_state()
+    restored = ExecutionAlgorithmOwnerV1.from_canonical_state_bytes(
+        owner.canonical_state_bytes()
+    )
+    if restored.checkpoint_state() != state:
+        failures.append("algorithm component checkpoint did not round trip exactly")
+    pending = state["pending_action"]
+    assert isinstance(pending, dict)
+    if pending["information_cutoff_time_us"] != state["schedule"][
+        "next_decision_time_us"
+    ]:
+        failures.append("pending action is not bound to its decision deadline")
+    policy = state["policy"]
+    assert isinstance(policy, dict)
+    if policy["objective"] != state["objective"]:
+        failures.append("policy objective differs from component objective")
+    tracker = state["tracker"]
+    assert isinstance(tracker, dict)
+    if tracker["sequence"] != 1 or state["tracker_metrics"][
+        "client_observation_sequence"
+    ] != 1:
+        failures.append("client tracker observation progress was not preserved")
+    frozen_digest = pending["observation_sha256"]
+    frozen_action = pending["action"]
+    decision = restored.apply_pending_action()
+    if (
+        decision.observation_sha256 != frozen_digest
+        or decision.action.as_dict() != frozen_action
+    ):
+        failures.append("restored pending action was recomputed or rebound")
+    metrics = restored.checkpoint_state()["tracker_metrics"]
+    known_quantity = (
+        metrics["observed_fill_quantity"]
+        + metrics["working_quantity"]
+        + metrics["pending_route_quantity"]
+    )
+    if known_quantity > restored.objective.target_quantity:
+        failures.append("restored client-known quantity does not conserve")
+    restored_policy_count = 0
+    for algorithm_name in AlgorithmName:
+        policy_owner = _wo31e6_owner(
+            "pending_action",
+            algorithm_name=algorithm_name,
+        )
+        policy_state = policy_owner.checkpoint_state()
+        policy_restored = ExecutionAlgorithmOwnerV1.from_checkpoint_state(policy_state)
+        if policy_restored.algorithm.checkpoint_state() != policy_state["policy"]:
+            failures.append(
+                f"{algorithm_name.value} policy progress did not restore exactly"
+            )
+        else:
+            restored_policy_count += 1
+    return FullDayAuditCase(
+        "full_day_algorithm_checkpoint_cutoff_and_conservation",
+        (
+            f"state_sha256={owner.state_sha256()} policy={owner.algorithm.manifest.algorithm.value} "
+            f"observation_sequence={tracker['sequence']} policies={restored_policy_count} "
+            "pending_action=true "
+            f"known_quantity={known_quantity} cutoff_bound=true recomputation=false "
+            "objective_risk_schedule_tracker_preserved=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e6_run_worker(raw: bytes):
+    import subprocess
+    import sys
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    prior_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(repository)
+        if not prior_path
+        else str(repository) + os.pathsep + prior_path
+    )
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    script = (
+        "from kirby2.full_day.restore import "
+        "execution_algorithm_restore_worker_main as main; "
+        "raise SystemExit(main())"
+    )
+    with TemporaryDirectory(prefix="kirby2-wo31e6-worker-") as temporary:
+        directory = Path(temporary)
+        before = tuple(directory.rglob("*"))
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            input=raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=directory,
+            env=environment,
+            check=False,
+            timeout=30,
+        )
+        after = tuple(directory.rglob("*"))
+    return completed.returncode, completed.stdout, completed.stderr, before != after
+
+
+def _wo31e6_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import canonical_json_bytes, parse_canonical_json_object
+    from kirby2.full_day.restore import (
+        ExecutionAlgorithmRestoreRequestV1,
+        execute_uninterrupted_execution_algorithm_suffix,
+    )
+
+    failures: list[str] = []
+    digests: list[str] = []
+    for boundary in ("pending_deadline", "pending_action", "outstanding_child"):
+        owner = _wo31e6_owner(boundary)
+        commands, completed_time_us = _wo31e6_suffix(boundary)
+        request = ExecutionAlgorithmRestoreRequestV1.capture(
+            owner,
+            suffix_commands=commands,
+            completed_time_us=completed_time_us,
+        )
+        returncode, stdout, stderr, wrote_files = _wo31e6_run_worker(
+            request.canonical_bytes()
+        )
+        expected = execute_uninterrupted_execution_algorithm_suffix(owner, request)
+        if returncode != 0:
+            failures.append(
+                f"{boundary} fresh worker returned {returncode}: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+            continue
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"{boundary} fresh worker emitted invalid JSON: {error}")
+            continue
+        if stderr or wrote_files:
+            failures.append(f"{boundary} fresh worker produced side effects")
+        if canonical_json_bytes(actual) != stdout or actual != expected:
+            failures.append(f"{boundary} fresh suffix differs from uninterrupted suffix")
+        digests.append(str(actual["invariant_sha256"]))
+    return FullDayAuditCase(
+        "full_day_algorithm_fresh_process_restore",
+        (
+            f"fresh_process_boundaries={len(digests)} "
+            f"invariant_sha256={','.join(digests)} "
+            "pending_deadline=true pending_action=true outstanding_child=true "
+            "prefix_replay=false later_observation_recompute=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e6_hostile_case() -> FullDayAuditCase:
+    from kirby2.full_day.components_algorithms import ExecutionAlgorithmOwnerV1
+
+    pending = _wo31e6_owner("pending_action")
+    state = pending.checkpoint_state()
+    before = pending.canonical_state_bytes()
+    probes: list[tuple[str, dict[str, object]]] = []
+
+    unknown_component = copy.deepcopy(state)
+    unknown_component["schema_version"] = 999
+    probes.append(("unknown component schema", unknown_component))
+
+    unknown_policy_schema = copy.deepcopy(state)
+    unknown_policy_schema["policy"]["schema_version"] = 999
+    probes.append(("unknown policy schema", unknown_policy_schema))
+
+    unknown_policy_version = copy.deepcopy(state)
+    unknown_policy_version["policy"]["policy_version"] = 999
+    probes.append(("unknown policy version", unknown_policy_version))
+
+    unknown_policy_id = copy.deepcopy(state)
+    unknown_policy_id["policy"]["policy_id"] = "UNKNOWN_POLICY"
+    probes.append(("unknown policy ID", unknown_policy_id))
+
+    objective_mismatch = copy.deepcopy(state)
+    objective_mismatch["objective"]["target_quantity"] += 1
+    probes.append(("policy objective mismatch", objective_mismatch))
+
+    cutoff_moved = copy.deepcopy(state)
+    cutoff_moved["pending_action"]["information_cutoff_time_us"] += 1
+    probes.append(("pending information cutoff moved", cutoff_moved))
+
+    early_deadline = _wo31e6_owner("pending_deadline").checkpoint_state()
+    early_deadline["schedule"]["next_decision_time_us"] -= 1
+    probes.append(("early decision deadline", early_deadline))
+
+    late_deadline = _wo31e6_owner("pending_deadline").checkpoint_state()
+    late_deadline["schedule"]["next_decision_time_us"] += 1
+    probes.append(("late decision deadline", late_deadline))
+
+    outstanding = _wo31e6_owner("outstanding_child").checkpoint_state()
+    orphan_child = copy.deepcopy(outstanding)
+    orphan_child["allocators"]["route_ids"].append("R999999")
+    orphan_child["allocators"]["child_request_sequence"] += 1
+    probes.append(("orphan child route", orphan_child))
+
+    orphan_order = copy.deepcopy(outstanding)
+    route_id = orphan_order["allocators"]["route_ids"][0]
+    fake_order_id = f"ALG-E6-000001-{route_id}-L999"
+    orphan_order["tracker"]["route_order_allocations"][route_id] = {
+        fake_order_id: 1
+    }
+    orphan_order["tracker"]["order_sides"][fake_order_id] = Side.BUY.value
+    orphan_order["tracker"]["order_decision_midpoints_x2"][fake_order_id] = 20_000
+    orphan_order["tracker_metrics"]["pending_route_quantity"] -= 1
+    probes.append(("orphan child order", orphan_order))
+
+    nonconserving = copy.deepcopy(outstanding)
+    route_id = nonconserving["allocators"]["route_ids"][0]
+    nonconserving["tracker"]["route_quantities"][route_id] += 1
+    nonconserving["tracker_metrics"]["pending_route_quantity"] += 1
+    probes.append(("client quantity nonconservation", nonconserving))
+
+    historical_mix = copy.deepcopy(state)
+    historical_mix["historical_cursor"] = {"row": 1}
+    probes.append(("historical state mixing", historical_mix))
+
+    failures: list[str] = []
+    refused = 0
+    for label, hostile in probes:
+        refusal = _expect_refusal(
+            lambda hostile=hostile: ExecutionAlgorithmOwnerV1.from_checkpoint_state(
+                hostile
+            ),
+            label,
+        )
+        if refusal is None:
+            refused += 1
+        else:
+            failures.append(refusal)
+    if pending.canonical_state_bytes() != before:
+        failures.append("hostile algorithm restores mutated the authoritative owner")
+    return FullDayAuditCase(
+        "full_day_algorithm_hostile_refusals",
+        (
+            f"refusals={refused} unknown_schema=true unknown_policy_version=true "
+            "objective_mismatch=true cutoff_moved=true early_deadline=true "
+            "late_deadline=true orphan_child_route=true orphan_child_order=true "
+            "conservation=true "
+            "historical_mixing=true failure_atomicity=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e6_execution_algorithm_restore() -> tuple[FullDayAuditCase, ...]:
+    """Exercise standalone execution-algorithm restoration and refusals."""
+
+    return (
+        _wo31e6_composition_case(),
+        _wo31e6_checkpoint_case(),
+        _wo31e6_fresh_restore_case(),
+        _wo31e6_hostile_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -14859,4 +15272,5 @@ __all__ = [
     "audit_wo31e3_delivery_restore",
     "audit_wo31e4_research_restore",
     "audit_wo31e5_multivenue_restore",
+    "audit_wo31e6_execution_algorithm_restore",
 ]

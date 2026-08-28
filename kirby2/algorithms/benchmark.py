@@ -45,6 +45,9 @@ from .scenarios import BackgroundMarketEvent, get_benchmark_scenario
 from .store import AlgorithmRunArtifacts, AlgorithmRunStore
 
 
+CLIENT_TRACKER_CHECKPOINT_SCHEMA_VERSION = 1
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionCellResult:
     """One non-persisted algorithm run on a deterministic benchmark cell."""
@@ -191,6 +194,23 @@ class _ClientTracker:
         observed_midpoint_x2: int | None,
         quantity: int,
     ) -> None:
+        if (
+            type(route_id) is not str
+            or not route_id
+            or route_id in self._route_send_time
+            or type(time_us) is not int
+            or time_us < 0
+            or type(quantity) is not int
+            or quantity <= 0
+            or (
+                observed_midpoint_x2 is not None
+                and (
+                    type(observed_midpoint_x2) is not int
+                    or observed_midpoint_x2 <= 0
+                )
+            )
+        ):
+            raise ValueError("client tracker route state is invalid")
         self._route_ids.append(route_id)
         self._route_send_time[route_id] = time_us
         self._route_quantities[route_id] = quantity
@@ -206,6 +226,268 @@ class _ClientTracker:
             )
             for route_id in self._route_ids
         )
+
+    @property
+    def sequence(self) -> int:
+        return self._sequence
+
+    @property
+    def last_observation_time_us(self) -> int:
+        return self._last_observation_time_us
+
+    @property
+    def last_midpoint_x2(self) -> int | None:
+        return self._last_midpoint_x2
+
+    def checkpoint_state(self) -> dict[str, object]:
+        self.assert_invariants()
+        return {
+            "fills": [fill.as_dict() for fill in self.fills],
+            "last_midpoint_x2": self._last_midpoint_x2,
+            "last_observation_time_us": self._last_observation_time_us,
+            "order_decision_midpoints_x2": dict(
+                sorted(self._order_decision_midpoints_x2.items())
+            ),
+            "order_sides": {
+                order_id: side.value
+                for order_id, side in sorted(self._order_sides.items())
+            },
+            "route_decision_midpoints_x2": dict(
+                sorted(self._route_decision_midpoints_x2.items())
+            ),
+            "route_ids": list(self._route_ids),
+            "route_order_allocations": {
+                route_id: dict(sorted(rows.items()))
+                for route_id, rows in sorted(self._route_order_allocations.items())
+            },
+            "route_order_fills": {
+                route_id: dict(sorted(rows.items()))
+                for route_id, rows in sorted(self._route_order_fills.items())
+            },
+            "route_quantities": dict(sorted(self._route_quantities.items())),
+            "route_send_time_us": dict(sorted(self._route_send_time.items())),
+            "schema_version": CLIENT_TRACKER_CHECKPOINT_SCHEMA_VERSION,
+            "seen_events": [
+                {"sequence": sequence, "venue_id": venue_id}
+                for venue_id, sequence in sorted(self._seen_events)
+            ],
+            "sequence": self._sequence,
+        }
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> _ClientTracker:
+        _require_exact_tracker_fields(
+            payload,
+            {
+                "fills",
+                "last_midpoint_x2",
+                "last_observation_time_us",
+                "order_decision_midpoints_x2",
+                "order_sides",
+                "route_decision_midpoints_x2",
+                "route_ids",
+                "route_order_allocations",
+                "route_order_fills",
+                "route_quantities",
+                "route_send_time_us",
+                "schema_version",
+                "seen_events",
+                "sequence",
+            },
+            "client tracker checkpoint",
+        )
+        if payload["schema_version"] != CLIENT_TRACKER_CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("unsupported client tracker checkpoint schema")
+        tracker = cls()
+        raw_fills = _tracker_array(payload["fills"], "client tracker fills")
+        tracker.fills = [
+            ClientFill.from_dict(_tracker_object(row, "client tracker fill"))
+            for row in raw_fills
+        ]
+        raw_seen = _tracker_array(payload["seen_events"], "client tracker seen events")
+        seen: set[tuple[str, int]] = set()
+        for raw in raw_seen:
+            row = _tracker_object(raw, "client tracker seen event")
+            _require_exact_tracker_fields(
+                row,
+                {"sequence", "venue_id"},
+                "client tracker seen event",
+            )
+            seen.add(
+                (
+                    _tracker_string(row["venue_id"], "client tracker event venue"),
+                    _tracker_int(
+                        row["sequence"],
+                        "client tracker event sequence",
+                        minimum=1,
+                    ),
+                )
+            )
+        if len(seen) != len(raw_seen):
+            raise ValueError("client tracker seen events are duplicated")
+        tracker._seen_events = seen
+        tracker._order_sides = {
+            _tracker_string(key, "client tracker order ID"): Side(
+                _tracker_string(value, "client tracker order side")
+            )
+            for key, value in _tracker_object(
+                payload["order_sides"], "client tracker order sides"
+            ).items()
+        }
+        tracker._order_decision_midpoints_x2 = _tracker_optional_int_map(
+            payload["order_decision_midpoints_x2"],
+            "client tracker order decision midpoints",
+            minimum=1,
+        )
+        tracker._route_send_time = _tracker_int_map(
+            payload["route_send_time_us"],
+            "client tracker route send times",
+            minimum=0,
+        )
+        tracker._route_quantities = _tracker_int_map(
+            payload["route_quantities"],
+            "client tracker route quantities",
+            minimum=1,
+        )
+        tracker._route_decision_midpoints_x2 = _tracker_optional_int_map(
+            payload["route_decision_midpoints_x2"],
+            "client tracker route decision midpoints",
+            minimum=1,
+        )
+        tracker._route_ids = [
+            _tracker_string(value, "client tracker route ID")
+            for value in _tracker_array(payload["route_ids"], "client tracker route IDs")
+        ]
+        tracker._route_order_allocations = _tracker_nested_int_map(
+            payload["route_order_allocations"],
+            "client tracker route allocations",
+            minimum=1,
+        )
+        tracker._route_order_fills = _tracker_nested_int_map(
+            payload["route_order_fills"],
+            "client tracker route fills",
+            minimum=1,
+        )
+        tracker._last_observation_time_us = _tracker_int(
+            payload["last_observation_time_us"],
+            "client tracker last observation time",
+            minimum=-1,
+        )
+        tracker._last_midpoint_x2 = _tracker_optional_int(
+            payload["last_midpoint_x2"],
+            "client tracker last midpoint",
+            minimum=1,
+        )
+        tracker._sequence = _tracker_int(
+            payload["sequence"], "client tracker sequence", minimum=0
+        )
+        tracker.assert_invariants()
+        if tracker.checkpoint_state() != dict(payload):
+            raise ValueError("client tracker checkpoint is not a fixed point")
+        return tracker
+
+    def assert_invariants(self) -> None:
+        if type(self._sequence) is not int or self._sequence < 0:
+            raise RuntimeError("client tracker sequence is invalid")
+        if type(self._last_observation_time_us) is not int or (
+            self._last_observation_time_us < -1
+        ):
+            raise RuntimeError("client tracker observation time is invalid")
+        if (self._sequence == 0) != (self._last_observation_time_us == -1):
+            raise RuntimeError("client tracker sequence and observation time disagree")
+        if self._last_midpoint_x2 is not None and (
+            type(self._last_midpoint_x2) is not int or self._last_midpoint_x2 <= 0
+        ):
+            raise RuntimeError("client tracker midpoint is invalid")
+        if self.fills != sorted(
+            self.fills,
+            key=lambda item: (
+                item.received_time_us,
+                item.venue_id,
+                item.trade_id,
+                item.order_id,
+            ),
+        ):
+            raise RuntimeError("client tracker fills are not canonical")
+        fill_keys = tuple(
+            (fill.venue_id, fill.trade_id, fill.order_id) for fill in self.fills
+        )
+        if len(fill_keys) != len(set(fill_keys)):
+            raise RuntimeError("client tracker fills are duplicated")
+        if len(self._route_ids) != len(set(self._route_ids)) or any(
+            type(route_id) is not str or not route_id for route_id in self._route_ids
+        ):
+            raise RuntimeError("client tracker route IDs are invalid")
+        route_set = set(self._route_ids)
+        if any(
+            set(mapping) != route_set
+            for mapping in (
+                self._route_send_time,
+                self._route_quantities,
+                self._route_decision_midpoints_x2,
+            )
+        ):
+            raise RuntimeError("client tracker route authority is incomplete")
+        if set(self._route_order_allocations) - route_set or set(
+            self._route_order_fills
+        ) - route_set:
+            raise RuntimeError("client tracker child rows cite an unknown route")
+        if any(
+            type(value) is not int or value < 0
+            for value in self._route_send_time.values()
+        ) or any(
+            type(value) is not int or value <= 0
+            for value in self._route_quantities.values()
+        ):
+            raise RuntimeError("client tracker route timing or quantity is invalid")
+        if any(
+            value is not None and (type(value) is not int or value <= 0)
+            for value in self._route_decision_midpoints_x2.values()
+        ):
+            raise RuntimeError("client tracker route midpoint is invalid")
+        allocated_order_ids: set[str] = set()
+        for route_id in self._route_ids:
+            allocations = self._route_order_allocations.get(route_id, {})
+            fills = self._route_order_fills.get(route_id, {})
+            if any(
+                type(order_id) is not str
+                or not order_id
+                or type(quantity) is not int
+                or quantity <= 0
+                for rows in (allocations, fills)
+                for order_id, quantity in rows.items()
+            ):
+                raise RuntimeError("client tracker child quantities are invalid")
+            local_ids = set(allocations) | set(fills)
+            if allocated_order_ids & local_ids:
+                raise RuntimeError("client tracker child order belongs to multiple routes")
+            allocated_order_ids.update(local_ids)
+            if self._observed_route_quantity(route_id) > self._route_quantities[route_id]:
+                raise RuntimeError("client tracker route quantity does not conserve")
+        if any(
+            type(order_id) is not str
+            or not order_id
+            or not isinstance(side, Side)
+            for order_id, side in self._order_sides.items()
+        ):
+            raise RuntimeError("client tracker order-side map is invalid")
+        if any(
+            order_id not in self._order_sides
+            for order_id in self._order_decision_midpoints_x2
+        ) or any(fill.order_id not in self._order_sides for fill in self.fills):
+            raise RuntimeError("client tracker order metadata is orphaned")
+        if set(self._order_sides) != allocated_order_ids or set(
+            self._order_decision_midpoints_x2
+        ) != allocated_order_ids:
+            raise RuntimeError("client tracker child-order metadata inventory differs")
+        if any(
+            value is not None and (type(value) is not int or value <= 0)
+            for value in self._order_decision_midpoints_x2.values()
+        ):
+            raise RuntimeError("client tracker order midpoint is invalid")
 
     def observation(
         self,
@@ -308,6 +590,23 @@ class _ClientTracker:
         objective: ExecutionObjective,
     ) -> None:
         self._refresh_orders_and_fills(coordinator, objective)
+
+    def refresh_client_state(
+        self,
+        coordinator: MarketCoordinator,
+        objective: ExecutionObjective,
+    ) -> None:
+        """Consume currently delivered own-order/fill state without a policy read."""
+
+        self._refresh_orders_and_fills(coordinator, objective)
+
+    def current_working_orders(
+        self,
+        coordinator: MarketCoordinator,
+    ) -> tuple[ClientWorkingOrder, ...]:
+        """Return the currently delivered client-visible working inventory."""
+
+        return self._working_orders(coordinator)
 
     def _refresh_orders_and_fills(
         self,
@@ -726,7 +1025,13 @@ def _apply_action(
     tracker: _ClientTracker,
     observation: AlgorithmObservation,
     action: AlgorithmAction,
+    *,
+    request_order_id: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
+    if request_order_id is not None and (
+        type(request_order_id) is not str or not request_order_id
+    ):
+        raise TypeError("algorithm request order ID must be null or nonempty")
     rejection = _risk_rejection(observation, action)
     if rejection is not None:
         return False, rejection, None
@@ -785,7 +1090,11 @@ def _apply_action(
             ):
                 effective_limit = observation.risk_limits.price_limit_ticks
             request = RoutingRequest(
-                order_id=f"ALG-{observation.sequence:04d}",
+                order_id=(
+                    f"ALG-{observation.sequence:04d}"
+                    if request_order_id is None
+                    else request_order_id
+                ),
                 side=observation.objective.side,
                 quantity=action.quantity,
                 policy=action.route_policy,
@@ -805,6 +1114,30 @@ def _apply_action(
     except (TypeError, ValueError, RuntimeError) as error:
         return False, f"ACTION_REJECTED:{error}", None
     return True, None, None
+
+
+# Public names used by the standalone WO31-E6 owner.  The benchmark keeps its
+# original private implementation names so the inherited runtime path is unchanged.
+ClientTrackerV1 = _ClientTracker
+
+
+def apply_algorithm_action(
+    recorder: object,
+    tracker: ClientTrackerV1,
+    observation: AlgorithmObservation,
+    action: AlgorithmAction,
+    *,
+    request_order_id: str | None = None,
+) -> tuple[bool, str | None, str | None]:
+    """Apply one action through the existing venue/client stages."""
+
+    return _apply_action(
+        recorder,  # type: ignore[arg-type]
+        tracker,
+        observation,
+        action,
+        request_order_id=request_order_id,
+    )
 
 
 def _risk_rejection(
@@ -1007,3 +1340,88 @@ def _observe_only_action() -> AlgorithmAction:
         AlgorithmActionType.WAIT,
         "observe-only control emits no child order",
     )
+
+
+def _require_exact_tracker_fields(
+    payload: Mapping[str, object], expected: set[str], label: str
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _tracker_object(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be an object")
+    return value
+
+
+def _tracker_array(value: object, label: str) -> list[object]:
+    if type(value) is not list:
+        raise TypeError(f"{label} must be an array")
+    return value
+
+
+def _tracker_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} must be a nonempty string")
+    return value
+
+
+def _tracker_int(value: object, label: str, *, minimum: int) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an integer")
+    if value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    return value
+
+
+def _tracker_optional_int(
+    value: object, label: str, *, minimum: int
+) -> int | None:
+    if value is None:
+        return None
+    return _tracker_int(value, label, minimum=minimum)
+
+
+def _tracker_int_map(
+    value: object, label: str, *, minimum: int
+) -> dict[str, int]:
+    payload = _tracker_object(value, label)
+    return {
+        _tracker_string(key, f"{label} key"): _tracker_int(
+            item, f"{label} value", minimum=minimum
+        )
+        for key, item in payload.items()
+    }
+
+
+def _tracker_optional_int_map(
+    value: object, label: str, *, minimum: int
+) -> dict[str, int | None]:
+    payload = _tracker_object(value, label)
+    return {
+        _tracker_string(key, f"{label} key"): _tracker_optional_int(
+            item, f"{label} value", minimum=minimum
+        )
+        for key, item in payload.items()
+    }
+
+
+def _tracker_nested_int_map(
+    value: object, label: str, *, minimum: int
+) -> dict[str, dict[str, int]]:
+    payload = _tracker_object(value, label)
+    return {
+        _tracker_string(route_id, f"{label} route ID"): _tracker_int_map(
+            rows,
+            f"{label} route rows",
+            minimum=minimum,
+        )
+        for route_id, rows in payload.items()
+    }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -15,6 +16,72 @@ from kirby2.multivenue.models import canonical_sha256
 
 ALGORITHM_RECORD_SCHEMA_VERSION = 1
 BENCHMARK_RESULT_SCHEMA_VERSION = 1
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _require_exact_fields(
+    payload: Mapping[str, object],
+    expected: set[str],
+    label: str,
+) -> None:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{label} must be an object")
+    actual = set(payload)
+    if actual != expected:
+        raise ValueError(
+            f"{label} fields differ: missing={sorted(expected - actual)} "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _wire_int(value: object, label: str, *, minimum: int | None = None) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{label} must be at least {minimum}")
+    return value
+
+
+def _wire_string(value: object, label: str) -> str:
+    if type(value) is not str or not value:
+        raise TypeError(f"{label} must be a nonempty string")
+    return value
+
+
+def _wire_optional_int(
+    value: object,
+    label: str,
+    *,
+    minimum: int | None = None,
+) -> int | None:
+    if value is None:
+        return None
+    return _wire_int(value, label, minimum=minimum)
+
+
+def _wire_object(value: object, label: str) -> dict[str, object]:
+    if type(value) is not dict:
+        raise TypeError(f"{label} must be an object")
+    return value
+
+
+def _wire_array(value: object, label: str) -> list[object]:
+    if type(value) is not list:
+        raise TypeError(f"{label} must be an array")
+    return value
+
+
+def _wire_sha256(value: object, label: str) -> str:
+    digest = _wire_string(value, label)
+    if _SHA256.fullmatch(digest) is None:
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return digest
+
+
+def _wire_bool(value: object, label: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{label} must be boolean")
+    return value
 
 
 class AlgorithmName(str, Enum):
@@ -78,6 +145,46 @@ class ExecutionObjective:
             "target_quantity": self.target_quantity,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ExecutionObjective:
+        _require_exact_fields(
+            payload,
+            {
+                "arrival_midpoint_x2",
+                "deadline_us",
+                "side",
+                "start_time_us",
+                "target_quantity",
+            },
+            "execution objective",
+        )
+        objective = cls(
+            Side(_wire_string(payload["side"], "execution objective side")),
+            _wire_int(
+                payload["target_quantity"],
+                "execution objective target quantity",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["start_time_us"],
+                "execution objective start time",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["deadline_us"],
+                "execution objective deadline",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["arrival_midpoint_x2"],
+                "execution objective arrival midpoint",
+                minimum=1,
+            ),
+        )
+        if objective.as_dict() != dict(payload):
+            raise ValueError("execution objective is not a canonical fixed point")
+        return objective
+
 
 @dataclass(frozen=True, slots=True)
 class RiskLimits:
@@ -109,6 +216,50 @@ class RiskLimits:
             "maximum_working_quantity": self.maximum_working_quantity,
             "price_limit_ticks": self.price_limit_ticks,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RiskLimits:
+        _require_exact_fields(
+            payload,
+            {
+                "maximum_child_quantity",
+                "maximum_position",
+                "maximum_spread_ticks",
+                "maximum_working_quantity",
+                "price_limit_ticks",
+            },
+            "risk limits",
+        )
+        limits = cls(
+            _wire_int(
+                payload["maximum_child_quantity"],
+                "maximum child quantity",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["maximum_working_quantity"],
+                "maximum working quantity",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["maximum_position"],
+                "maximum position",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["maximum_spread_ticks"],
+                "maximum spread ticks",
+                minimum=1,
+            ),
+            _wire_optional_int(
+                payload["price_limit_ticks"],
+                "risk price limit",
+                minimum=1,
+            ),
+        )
+        if limits.as_dict() != dict(payload):
+            raise ValueError("risk limits are not a canonical fixed point")
+        return limits
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +299,76 @@ class ObservableMarketFeatures:
             "observed_interval_volume": self.observed_interval_volume,
             "spread_ticks": self.spread_ticks,
         }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ObservableMarketFeatures:
+        _require_exact_fields(
+            payload,
+            {
+                "best_ask_ticks",
+                "best_bid_ticks",
+                "cumulative_observed_volume",
+                "displayed_ask_quantity",
+                "displayed_bid_quantity",
+                "expected_volume_profile_bps",
+                "midpoint_change_x2",
+                "midpoint_x2",
+                "observed_interval_volume",
+                "spread_ticks",
+            },
+            "observable market features",
+        )
+        features = cls(
+            _wire_optional_int(
+                payload["best_bid_ticks"], "observable best bid", minimum=1
+            ),
+            _wire_optional_int(
+                payload["best_ask_ticks"], "observable best ask", minimum=1
+            ),
+            _wire_optional_int(
+                payload["midpoint_x2"], "observable midpoint", minimum=1
+            ),
+            _wire_optional_int(
+                payload["spread_ticks"], "observable spread", minimum=0
+            ),
+            _wire_int(
+                payload["displayed_bid_quantity"],
+                "observable displayed bid quantity",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["displayed_ask_quantity"],
+                "observable displayed ask quantity",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["observed_interval_volume"],
+                "observable interval volume",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["cumulative_observed_volume"],
+                "observable cumulative volume",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["midpoint_change_x2"],
+                "observable midpoint change",
+            ),
+            tuple(
+                _wire_int(item, "expected volume profile basis points", minimum=0)
+                for item in _wire_array(
+                    payload["expected_volume_profile_bps"],
+                    "expected volume profile",
+                )
+            ),
+        )
+        if features.as_dict() != dict(payload):
+            raise ValueError("observable market features are not a canonical fixed point")
+        return features
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +410,50 @@ class ClientWorkingOrder:
             "venue_id": self.venue_id,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ClientWorkingOrder:
+        _require_exact_fields(
+            payload,
+            {
+                "filled_quantity",
+                "order_id",
+                "original_quantity",
+                "price_ticks",
+                "remaining_quantity",
+                "side",
+                "status",
+                "venue_id",
+            },
+            "client working order",
+        )
+        order = cls(
+            _wire_string(payload["venue_id"], "client working-order venue"),
+            _wire_string(payload["order_id"], "client working-order ID"),
+            Side(_wire_string(payload["side"], "client working-order side")),
+            _wire_optional_int(
+                payload["price_ticks"], "client working-order price", minimum=1
+            ),
+            _wire_int(
+                payload["original_quantity"],
+                "client working-order original quantity",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["filled_quantity"],
+                "client working-order filled quantity",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["remaining_quantity"],
+                "client working-order remaining quantity",
+                minimum=1,
+            ),
+            _wire_string(payload["status"], "client working-order status"),
+        )
+        if order.as_dict() != dict(payload):
+            raise ValueError("client working order is not a canonical fixed point")
+        return order
+
 
 @dataclass(frozen=True, slots=True)
 class ClientFill:
@@ -229,6 +494,42 @@ class ClientFill:
             "venue_id": self.venue_id,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ClientFill:
+        _require_exact_fields(
+            payload,
+            {
+                "order_id",
+                "observed_midpoint_x2_at_decision",
+                "price_x2",
+                "quantity",
+                "received_time_us",
+                "side",
+                "trade_id",
+                "venue_id",
+            },
+            "client fill",
+        )
+        fill = cls(
+            _wire_string(payload["venue_id"], "client fill venue"),
+            _wire_string(payload["trade_id"], "client fill trade ID"),
+            _wire_string(payload["order_id"], "client fill order ID"),
+            Side(_wire_string(payload["side"], "client fill side")),
+            _wire_int(payload["price_x2"], "client fill price", minimum=1),
+            _wire_int(payload["quantity"], "client fill quantity", minimum=1),
+            _wire_int(
+                payload["received_time_us"], "client fill received time", minimum=0
+            ),
+            _wire_optional_int(
+                payload["observed_midpoint_x2_at_decision"],
+                "client fill decision midpoint",
+                minimum=1,
+            ),
+        )
+        if fill.as_dict() != dict(payload):
+            raise ValueError("client fill is not a canonical fixed point")
+        return fill
+
 
 @dataclass(frozen=True, slots=True)
 class ClientLatencyState:
@@ -261,6 +562,61 @@ class ClientLatencyState:
             "oldest_pending_age_us": self.oldest_pending_age_us,
             "pending_route_count": self.pending_route_count,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ClientLatencyState:
+        _require_exact_fields(
+            payload,
+            {
+                "expected_route_latency_by_venue_us",
+                "maximum_quote_age_us",
+                "oldest_pending_age_us",
+                "pending_route_count",
+            },
+            "client latency state",
+        )
+        rows: list[tuple[str, int]] = []
+        for raw in _wire_array(
+            payload["expected_route_latency_by_venue_us"],
+            "client route latency rows",
+        ):
+            row = _wire_object(raw, "client route latency row")
+            _require_exact_fields(
+                row,
+                {"expected_latency_us", "venue_id"},
+                "client route latency row",
+            )
+            rows.append(
+                (
+                    _wire_string(row["venue_id"], "client latency venue"),
+                    _wire_int(
+                        row["expected_latency_us"],
+                        "client expected route latency",
+                        minimum=0,
+                    ),
+                )
+            )
+        state = cls(
+            _wire_int(
+                payload["pending_route_count"],
+                "pending route count",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["oldest_pending_age_us"],
+                "oldest pending age",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["maximum_quote_age_us"],
+                "maximum quote age",
+                minimum=0,
+            ),
+            tuple(rows),
+        )
+        if state.as_dict() != dict(payload):
+            raise ValueError("client latency state is not a canonical fixed point")
+        return state
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +665,64 @@ class ClientVenueState:
             "taker_fee_micros_per_share": self.taker_fee_micros_per_share,
             "venue_id": self.venue_id,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ClientVenueState:
+        _require_exact_fields(
+            payload,
+            {
+                "best_ask_quantity",
+                "best_ask_ticks",
+                "best_bid_quantity",
+                "best_bid_ticks",
+                "expected_fill_probability_bps",
+                "maker_rebate_micros_per_share",
+                "quote_age_us",
+                "session_state",
+                "taker_fee_micros_per_share",
+                "venue_id",
+            },
+            "client venue state",
+        )
+        state = cls(
+            _wire_string(payload["venue_id"], "client venue ID"),
+            _wire_optional_int(
+                payload["best_bid_ticks"], "client best bid", minimum=1
+            ),
+            _wire_int(
+                payload["best_bid_quantity"],
+                "client best-bid quantity",
+                minimum=0,
+            ),
+            _wire_optional_int(
+                payload["best_ask_ticks"], "client best ask", minimum=1
+            ),
+            _wire_int(
+                payload["best_ask_quantity"],
+                "client best-ask quantity",
+                minimum=0,
+            ),
+            _wire_int(payload["quote_age_us"], "client quote age", minimum=0),
+            _wire_string(payload["session_state"], "client session state"),
+            _wire_int(
+                payload["expected_fill_probability_bps"],
+                "client expected fill probability",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["taker_fee_micros_per_share"],
+                "client taker fee",
+                minimum=0,
+            ),
+            _wire_int(
+                payload["maker_rebate_micros_per_share"],
+                "client maker rebate",
+                minimum=0,
+            ),
+        )
+        if state.as_dict() != dict(payload):
+            raise ValueError("client venue state is not a canonical fixed point")
+        return state
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +846,67 @@ class AlgorithmAction:
             "target_order_ids": list(self.target_order_ids),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AlgorithmAction:
+        _require_exact_fields(
+            payload,
+            {
+                "action_type",
+                "direct_venue_id",
+                "limit_price_ticks",
+                "maximum_venues",
+                "quantity",
+                "reason",
+                "route_policy",
+                "route_style",
+                "target_order_ids",
+            },
+            "algorithm action",
+        )
+        raw_policy = payload["route_policy"]
+        raw_style = payload["route_style"]
+        raw_direct = payload["direct_venue_id"]
+        if raw_direct is not None and (type(raw_direct) is not str or not raw_direct):
+            raise TypeError("algorithm direct venue must be null or a nonempty string")
+        targets = tuple(
+            _wire_string(item, "algorithm target order ID")
+            for item in _wire_array(
+                payload["target_order_ids"], "algorithm target order IDs"
+            )
+        )
+        action = cls(
+            AlgorithmActionType(
+                _wire_string(payload["action_type"], "algorithm action type")
+            ),
+            _wire_string(payload["reason"], "algorithm action reason"),
+            _wire_int(payload["quantity"], "algorithm action quantity", minimum=0),
+            (
+                None
+                if raw_policy is None
+                else RoutePolicy(_wire_string(raw_policy, "algorithm route policy"))
+            ),
+            (
+                None
+                if raw_style is None
+                else RouteStyle(_wire_string(raw_style, "algorithm route style"))
+            ),
+            raw_direct,
+            _wire_optional_int(
+                payload["limit_price_ticks"],
+                "algorithm limit price",
+                minimum=1,
+            ),
+            _wire_int(
+                payload["maximum_venues"],
+                "algorithm maximum venues",
+                minimum=1,
+            ),
+            targets,
+        )
+        if action.as_dict() != dict(payload):
+            raise ValueError("algorithm action is not a canonical fixed point")
+        return action
+
 
 @dataclass(frozen=True, slots=True)
 class AlgorithmParameterManifest:
@@ -469,6 +944,29 @@ class AlgorithmParameterManifest:
     def sha256(self) -> str:
         return canonical_sha256(self.as_dict())
 
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> AlgorithmParameterManifest:
+        _require_exact_fields(
+            payload,
+            {"algorithm", "parameters", "simulator_only"},
+            "algorithm parameter manifest",
+        )
+        if type(payload["simulator_only"]) is not bool:
+            raise TypeError("algorithm simulator-only flag must be boolean")
+        manifest = cls(
+            AlgorithmName(
+                _wire_string(payload["algorithm"], "algorithm manifest policy ID")
+            ),
+            _wire_object(payload["parameters"], "algorithm manifest parameters"),
+            payload["simulator_only"],
+        )
+        if manifest.as_dict() != dict(payload):
+            raise ValueError("algorithm manifest is not a canonical fixed point")
+        return manifest
+
 
 @dataclass(frozen=True, slots=True)
 class AlgorithmDecision:
@@ -483,21 +981,106 @@ class AlgorithmDecision:
     resulting_route_id: str | None
 
     def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("algorithm decision sequence must be positive")
+        if type(self.simulation_time_us) is not int or self.simulation_time_us < 0:
+            raise ValueError("algorithm decision time must be nonnegative")
+        _wire_sha256(self.observation_sha256, "algorithm observation SHA-256")
+        _wire_sha256(self.manifest_sha256, "algorithm manifest SHA-256")
+        if type(self.observation) is not dict:
+            raise TypeError("algorithm decision observation must be an object")
+        if type(self.action_accepted) is not bool:
+            raise TypeError("algorithm decision acceptance must be boolean")
+        if self.action_accepted != (self.rejection_reason is None):
+            raise ValueError("algorithm decision acceptance and rejection disagree")
+        if self.rejection_reason is not None and (
+            type(self.rejection_reason) is not str or not self.rejection_reason
+        ):
+            raise TypeError("algorithm rejection reason must be null or nonempty")
+        if self.resulting_route_id is not None and (
+            type(self.resulting_route_id) is not str or not self.resulting_route_id
+        ):
+            raise TypeError("algorithm resulting route ID must be null or nonempty")
+        if self.resulting_route_id is not None and (
+            not self.action_accepted
+            or self.action.action_type
+            not in {AlgorithmActionType.SUBMIT, AlgorithmActionType.REPLACE}
+        ):
+            raise ValueError("algorithm route ID is detached from an accepted route action")
+        if self.observation.get("sequence") != self.sequence:
+            raise ValueError("algorithm decision sequence differs from its observation")
+        if self.observation.get("simulation_time_us") != self.simulation_time_us:
+            raise ValueError("algorithm decision time differs from its observation")
         if canonical_sha256(self.observation) != self.observation_sha256:
             raise ValueError("algorithm decision observation digest is invalid")
 
     def as_dict(self) -> dict[str, object]:
+        observation = _copy_json(self.observation)
+        if type(observation) is not dict:  # pragma: no cover - constructor fixes this
+            raise TypeError("algorithm decision observation is not an object")
         return {
             "action": self.action.as_dict(),
             "action_accepted": self.action_accepted,
             "manifest_sha256": self.manifest_sha256,
-            "observation": self.observation,
+            "observation": observation,
             "observation_sha256": self.observation_sha256,
             "rejection_reason": self.rejection_reason,
             "resulting_route_id": self.resulting_route_id,
             "sequence": self.sequence,
             "simulation_time_us": self.simulation_time_us,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> AlgorithmDecision:
+        _require_exact_fields(
+            payload,
+            {
+                "action",
+                "action_accepted",
+                "manifest_sha256",
+                "observation",
+                "observation_sha256",
+                "rejection_reason",
+                "resulting_route_id",
+                "sequence",
+                "simulation_time_us",
+            },
+            "algorithm decision",
+        )
+        rejection = payload["rejection_reason"]
+        route_id = payload["resulting_route_id"]
+        if rejection is not None and (type(rejection) is not str or not rejection):
+            raise TypeError("algorithm rejection reason must be null or nonempty")
+        if route_id is not None and (type(route_id) is not str or not route_id):
+            raise TypeError("algorithm route ID must be null or nonempty")
+        decision = cls(
+            _wire_int(payload["sequence"], "algorithm decision sequence", minimum=1),
+            _wire_int(
+                payload["simulation_time_us"],
+                "algorithm decision time",
+                minimum=0,
+            ),
+            _wire_sha256(
+                payload["observation_sha256"], "algorithm observation SHA-256"
+            ),
+            _copy_json(
+                _wire_object(payload["observation"], "algorithm decision observation")
+            ),
+            _wire_sha256(
+                payload["manifest_sha256"], "algorithm manifest SHA-256"
+            ),
+            AlgorithmAction.from_dict(
+                _wire_object(payload["action"], "algorithm decision action")
+            ),
+            _wire_bool(
+                payload["action_accepted"], "algorithm decision acceptance"
+            ),
+            rejection,
+            route_id,
+        )
+        if decision.as_dict() != dict(payload):
+            raise ValueError("algorithm decision is not a canonical fixed point")
+        return decision
 
 
 @dataclass(frozen=True, slots=True)

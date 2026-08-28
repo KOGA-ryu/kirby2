@@ -22,7 +22,10 @@ from .composition import (
     ComponentSpecV1,
     CompositionMatrixV1,
     CompositionProfileV1,
+    EXECUTION_ALGORITHM_COMPONENT,
+    EXECUTION_ALGORITHM_PROFILE_ID,
     initial_composition_matrix,
+    restorable_execution_algorithm_composition_matrix,
 )
 from .events import (
     CALENDAR_BOUNDARY_INDEX_V1,
