@@ -11627,6 +11627,463 @@ def audit_wo31e1_runtime_restore() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e2_simple_configuration():
+    from kirby2.full_day.components_flow import SimpleFlowConfigurationV1
+
+    return SimpleFlowConfigurationV1(
+        schema_version=1,
+        configuration_id="AUDIT_SIMPLE_FLOW_V1",
+        configuration_version=1,
+        limit_buy_microevents_per_second=5_000,
+        limit_sell_microevents_per_second=5_000,
+        market_buy_microevents_per_second=5_000,
+        market_sell_microevents_per_second=5_000,
+        cancel_bid_microevents_per_second=5_000,
+        cancel_ask_microevents_per_second=5_000,
+        minimum_quantity=1,
+        maximum_quantity=5,
+        minimum_placement_depth_ticks=0,
+        maximum_placement_depth_ticks=2,
+        account_id="WO31-E2-FLOW",
+    )
+
+
+def _wo31e2_simple_plan():
+    from kirby2.full_day.components_flow import SIMPLE_FLOW_RNG_LABEL
+    from kirby2.full_day.composition import (
+        FLOW_PROFILE_ID,
+        FLOW_SIMPLE_COMPONENT,
+        executable_simple_flow_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        VersionedReferenceV1,
+        derive_substream_seed,
+    )
+
+    base = _wo31e1_plan()
+    configuration = _wo31e2_simple_configuration()
+    matrix = executable_simple_flow_composition_matrix()
+    declaration = SubstreamDeclarationV1(
+        SIMPLE_FLOW_RNG_LABEL,
+        derive_substream_seed(
+            base.seed_policy.root_seed,
+            base.seed_policy.policy_version,
+            SIMPLE_FLOW_RNG_LABEL,
+        ),
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            FLOW_PROFILE_ID,
+            1,
+            matrix.sha256,
+        ),
+        component_configurations=tuple(
+            sorted(
+                (
+                    *base.component_configurations,
+                    ComponentConfigurationBindingV1(
+                        FLOW_SIMPLE_COMPONENT,
+                        configuration.reference,
+                    ),
+                ),
+                key=lambda item: item.sort_key,
+            )
+        ),
+        seed_policy=replace(
+            base.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (*base.seed_policy.substreams, declaration),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+
+
+def _wo31e2_simple_runtime():
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e2_simple_plan()
+    return FullDayRuntime.create_with_agent_scheduler(
+        plan,
+        _wo31e1_population(plan),
+        simple_flow_configuration=_wo31e2_simple_configuration(),
+    )
+
+
+def _wo31e2_simple_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_flow import (
+        HawkesFlowComponentAdapterV1,
+        QueueReactiveFlowComponentAdapterV1,
+        SimpleFlowComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import (
+        MarketMechanicsComponentAdapterV1,
+    )
+    from kirby2.full_day.composition import (
+        FLOW_HAWKES_COMPONENT,
+        FLOW_PROFILE_ID,
+        FLOW_QUEUE_REACTIVE_COMPONENT,
+        FLOW_SIMPLE_COMPONENT,
+        executable_agent_mechanics_composition_matrix,
+        executable_simple_flow_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_agent_mechanics_composition_matrix()
+    matrix = executable_simple_flow_composition_matrix()
+    if tuple(row.canonical_bytes() for row in matrix.profiles[:2]) != tuple(
+        row.canonical_bytes() for row in previous.profiles
+    ):
+        failures.append("simple-flow matrix rewrote an E1 composition row")
+    profile = matrix.profile(FLOW_PROFILE_ID, 1)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+            HawkesFlowComponentAdapterV1(),
+            QueueReactiveFlowComponentAdapterV1(),
+            SimpleFlowComponentAdapterV1(),
+        ),
+        plan=_wo31e2_simple_plan(),
+        profile=profile,
+    )
+    if FLOW_SIMPLE_COMPONENT not in graph.active_component_ids or any(
+        component_id in graph.active_component_ids
+        for component_id in (
+            FLOW_HAWKES_COMPONENT,
+            FLOW_QUEUE_REACTIVE_COMPONENT,
+        )
+    ):
+        failures.append("exactly-one flow activation does not select only simple flow")
+    statuses = {
+        component.component_id: component.implementation_status
+        for component in profile.components
+        if component.component_id
+        in {
+            FLOW_HAWKES_COMPONENT,
+            FLOW_QUEUE_REACTIVE_COMPONENT,
+            FLOW_SIMPLE_COMPONENT,
+        }
+    }
+    if statuses != {
+        FLOW_HAWKES_COMPONENT: "CONTRACT_ONLY",
+        FLOW_QUEUE_REACTIVE_COMPONENT: "CONTRACT_ONLY",
+        FLOW_SIMPLE_COMPONENT: "EXECUTABLE",
+    }:
+        failures.append("flow adapter statuses overclaim the bounded simple slice")
+    return FullDayAuditCase(
+        "full_day_simple_flow_composition",
+        (
+            f"matrix_v2_sha256={previous.sha256} matrix_v3_sha256={matrix.sha256} "
+            f"active_components={graph.active_component_ids} statuses={statuses}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_simple_one_shot_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+
+    failures: list[str] = []
+    one_shot = _wo31e2_simple_runtime()
+    subdivided = _wo31e2_simple_runtime()
+    target = 1_300_000_000
+    one_shot.advance_to(target)
+    for time_us in (
+        0,
+        300_000_000,
+        600_000_000,
+        900_000_000,
+        1_200_000_000,
+        1_250_000_000,
+        target,
+    ):
+        subdivided.advance_to(time_us)
+    one_shot.capture_quiescent_cut("WO31-E2-SIMPLE-EQUIVALENCE")
+    subdivided.capture_quiescent_cut("WO31-E2-SIMPLE-EQUIVALENCE")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("simple flow differs under one-shot and subdivided advance")
+    proposal_events = tuple(
+        event
+        for event in one_shot.events
+        if event.event_type is FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL
+    )
+    owner = one_shot.simple_flow
+    if (
+        owner is None
+        or not proposal_events
+        or owner.applied_count == 0
+        or owner.rejected_count == 0
+        or owner.pending_proposal is None
+    ):
+        failures.append("simple flow did not exercise applied/rejected/pending states")
+    if any(
+        "price_ticks" in entry.payload["proposal"]
+        for entry in one_shot.native_event_ledger.values()
+        if entry.reference.owner_component_id == "FLOW_SIMPLE_V1"
+    ):
+        failures.append("a flow proposal smuggled an absolute price command")
+    perturbed_plan = _wo31e2_simple_plan()
+    perturbed_plan = replace(
+        perturbed_plan,
+        participant_schedule=tuple(
+            sorted(
+                (
+                    replace(entry, simulation_time_us=200)
+                    if entry.schedule_id == "E1_MAKER_ACTIVATE"
+                    else entry
+                    for entry in perturbed_plan.participant_schedule
+                ),
+                key=lambda entry: (
+                    entry.simulation_time_us,
+                    entry.participant_id,
+                    entry.schedule_id,
+                ),
+            )
+        ),
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    perturbed = FullDayRuntime.create_with_agent_scheduler(
+        perturbed_plan,
+        _wo31e1_population(perturbed_plan),
+        simple_flow_configuration=_wo31e2_simple_configuration(),
+    )
+    perturbed.advance_to(target)
+
+    def proposal_draw_core(flow_owner) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                row.get("family"),
+                row.get("scheduled_time_us"),
+                row.get("quantity"),
+                row.get("placement_depth_ticks"),
+                row.get("rng_state_after_sha256"),
+            )
+            for row in flow_owner.diagnostic_draw_sequence
+        )
+
+    if owner is not None and (
+        proposal_draw_core(owner) != proposal_draw_core(perturbed.simple_flow)
+        or owner.rng.state_sha256() != perturbed.simple_flow.rng.state_sha256()
+    ):
+        failures.append("participant schedule change reseeded or reordered simple flow")
+    return FullDayAuditCase(
+        "full_day_simple_flow_one_shot_subdivided",
+        (
+            f"target_us={target} proposals={len(proposal_events)} "
+            f"applied={0 if owner is None else owner.applied_count} "
+            f"rejected={0 if owner is None else owner.rejected_count} "
+            "participant_schedule_rng_independence=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_simple_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import (
+        canonical_json_bytes,
+        parse_canonical_json_object,
+    )
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    runtime = _wo31e2_simple_runtime()
+    cut_time = 1_250_000_000
+    target = 1_300_000_000
+    runtime.advance_to(cut_time)
+    runtime.capture_quiescent_cut("WO31-E2-SIMPLE-CUT")
+    flow_state = runtime.simple_flow.checkpoint_state()
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        runtime,
+        suffix_targets_us=(target,),
+        final_checkpoint_request_id="WO31-E2-SIMPLE-FINAL",
+    )
+    returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+        request.canonical_bytes()
+    )
+    expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+    actual: dict[str, object] | None = None
+    if returncode != 0:
+        failures.append(
+            f"fresh simple-flow worker returned {returncode}: "
+            f"{stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    else:
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"fresh simple-flow worker emitted invalid JSON: {error}")
+    if stderr:
+        failures.append("successful simple-flow worker wrote stderr diagnostics")
+    if wrote_files:
+        failures.append("simple-flow restore worker wrote into its empty directory")
+    if actual is not None and (
+        canonical_json_bytes(actual) != stdout or actual != expected
+    ):
+        failures.append("fresh simple-flow suffix differs from uninterrupted suffix")
+    if (
+        flow_state["pending_proposal"] is None
+        or not flow_state["diagnostic_draw_sequence"]
+        or not flow_state["rng_state"]["internal_state"]
+    ):
+        failures.append("simple-flow cut omits pending/draw/RNG state")
+    digest = "ABSENT" if actual is None else str(actual["invariant_sha256"])
+    return FullDayAuditCase(
+        "full_day_simple_flow_fresh_process_restore",
+        (
+            f"cut_us={cut_time} target_us={target} fresh_process=true "
+            f"invariant_sha256={digest}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_simple_ownership_case() -> FullDayAuditCase:
+    from kirby2.simulation.clock import SimulationClock
+    from kirby2.full_day.components_flow import SimpleFlowComponentAdapterV1
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    failures: list[str] = []
+    refused = 0
+    runtime = _wo31e2_simple_runtime()
+    runtime.advance_to(1_300_000_000)
+    runtime.capture_quiescent_cut("WO31-E2-SIMPLE-OWNERSHIP")
+    owner = runtime.simple_flow
+    if owner is None:
+        failures.append("simple-flow owner is absent")
+        return FullDayAuditCase(
+            "full_day_simple_flow_ownership_refusals",
+            "owner=ABSENT",
+            tuple(failures),
+        )
+    adapter = SimpleFlowComponentAdapterV1()
+    snapshot = adapter.snapshot(owner)
+    restored = adapter.restore(snapshot, plan=runtime.plan)
+    if restored.canonical_state_bytes() != owner.canonical_state_bytes():
+        failures.append("simple-flow component adapter is not a fixed point")
+    owner.clock = SimulationClock()
+    try:
+        runtime.assert_invariants()
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("simple flow smuggled a second clock")
+    finally:
+        del owner.clock
+    forged = copy.deepcopy(snapshot.as_dict())
+    forged["state"]["proposal_sequence"] += 1
+    try:
+        type(snapshot).from_dict(forged)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("forged simple-flow snapshot digest was accepted")
+
+    plan = runtime.plan
+    hawkes_binding = replace(
+        next(
+            binding
+            for binding in plan.component_configurations
+            if binding.component_id == "FLOW_SIMPLE_V1"
+        ),
+        component_id="FLOW_HAWKES_V1",
+    )
+    hawkes_binding = replace(
+        hawkes_binding,
+        configuration=replace(
+            hawkes_binding.configuration,
+            reference_id="AUDIT_HAWKES_FLOW_V1",
+        ),
+    )
+    two_flow_plan = replace(
+        plan,
+        component_configurations=tuple(
+            sorted(
+                (*plan.component_configurations, hawkes_binding),
+                key=lambda item: item.sort_key,
+            )
+        ),
+    )
+    try:
+        FullDayRuntime.create_with_agent_scheduler(
+            two_flow_plan,
+            _wo31e1_population(two_flow_plan),
+            simple_flow_configuration=_wo31e2_simple_configuration(),
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("two selected flow adapters bypassed exactly-one activation")
+    atomic = _wo31e2_simple_runtime()
+    atomic.advance_to(0)
+    pending = atomic.simple_flow.pending_proposal
+    if pending is None:
+        failures.append("failure-atomicity probe has no pending flow proposal")
+    else:
+        pre_failure_time = pending.scheduled_time_us - 1
+        atomic.advance_to(pre_failure_time)
+        atomic.capture_quiescent_cut("WO31-E2-SIMPLE-ATOMIC-PREFIX")
+        before = atomic.canonical_state_bytes()
+        original_emit_native = atomic._emit_native
+
+        def refuse_flow_native(**kwargs):
+            if kwargs.get("owner_component_id") == "FLOW_SIMPLE_V1":
+                raise RuntimeError("AUDIT_FORCED_FLOW_NATIVE_FAILURE")
+            return original_emit_native(**kwargs)
+
+        atomic._emit_native = refuse_flow_native
+        try:
+            atomic.advance_to(pending.scheduled_time_us)
+        except RuntimeError as error:
+            if "AUDIT_FORCED_FLOW_NATIVE_FAILURE" not in str(error):
+                failures.append("flow failure-atomicity probe raised the wrong error")
+            else:
+                refused += 1
+        else:
+            failures.append("flow native-ledger failure was not propagated")
+        finally:
+            del atomic._emit_native
+        if atomic.canonical_state_bytes() != before:
+            failures.append("flow failure changed owner, engine, RNG, or allocator state")
+    if owner.rng is runtime.agent_scheduler.agents["AUDIT_MAKER"].rng:
+        failures.append("simple flow shares an agent RNG object")
+    return FullDayAuditCase(
+        "full_day_simple_flow_ownership_refusals",
+        (
+            f"refusals={refused} second_clock=true forged_state=true "
+            "multiple_flow_selection=true failure_atomicity=true "
+            "agent_rng_separation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e2_simple_flow_slice() -> tuple[FullDayAuditCase, ...]:
+    """Exercise the bounded simple adapter without promoting all of WO31-E2."""
+
+    return (
+        _wo31e2_simple_composition_case(),
+        _wo31e2_simple_one_shot_case(),
+        _wo31e2_simple_fresh_restore_case(),
+        _wo31e2_simple_ownership_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -11636,4 +12093,5 @@ __all__ = [
     "audit_wo31c_checkpoints",
     "audit_wo31d_core_restore",
     "audit_wo31e1_runtime_restore",
+    "audit_wo31e2_simple_flow_slice",
 ]

@@ -17,11 +17,21 @@ from .models import (
 
 COMPOSITION_SCHEMA_VERSION = 1
 INITIAL_PROFILE_ID = "SINGLE_VENUE_AGENT_MECHANICS_V1"
+FLOW_PROFILE_ID = "SINGLE_VENUE_AGENT_FLOW_V1"
 INITIAL_MATRIX_ID = "COMPOSITION_MATRIX_V1"
 
 FULL_DAY_RUNTIME_COMPONENT = "FULL_DAY_RUNTIME_V1"
 MECHANICS_COMPONENT = "ENGINE_MARKET_MECHANICS_V1"
 AGENT_SCHEDULER_COMPONENT = "AGENT_SCHEDULER_V1"
+FLOW_SIMPLE_COMPONENT = "FLOW_SIMPLE_V1"
+FLOW_HAWKES_COMPONENT = "FLOW_HAWKES_V1"
+FLOW_QUEUE_REACTIVE_COMPONENT = "FLOW_QUEUE_REACTIVE_V1"
+
+FLOW_COMPONENT_IDS = (
+    FLOW_HAWKES_COMPONENT,
+    FLOW_QUEUE_REACTIVE_COMPONENT,
+    FLOW_SIMPLE_COMPONENT,
+)
 
 _INITIAL_COMPONENT_IDS = (
     AGENT_SCHEDULER_COMPONENT,
@@ -1156,6 +1166,85 @@ def executable_agent_mechanics_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def executable_simple_flow_composition_matrix() -> CompositionMatrixV1:
+    """Append the bounded WO31-E2 simple-flow executable profile.
+
+    The E1 rows remain byte-identical.  The new profile declares the complete
+    exactly-one flow selection contract while promoting only ``FLOW_SIMPLE_V1``;
+    Hawkes and queue-reactive remain explicit contract-only rows until their
+    independent executable/restore evidence exists.
+    """
+
+    previous = executable_agent_mechanics_composition_matrix()
+    e1_profile = previous.profile(INITIAL_PROFILE_ID, 2)
+    flow_specs = tuple(
+        ComponentSpecV1(
+            schema_version=1,
+            component_id=component_id,
+            component_version=1,
+            implementation_status=(
+                "EXECUTABLE"
+                if component_id == FLOW_SIMPLE_COMPONENT
+                else "CONTRACT_ONLY"
+            ),
+            active_predicate=component_configured_predicate(component_id),
+            dependencies=tuple(
+                sorted({FULL_DAY_RUNTIME_COMPONENT, MECHANICS_COMPONENT})
+            ),
+            owned_resources=tuple(
+                sorted(
+                    {
+                        f"{component_id}_MODEL_STATE",
+                        f"{component_id}_PENDING_PROPOSAL",
+                        f"{component_id}_RNG_SUBSTREAM",
+                    }
+                )
+            ),
+            borrowed_resources=tuple(
+                sorted({"ORDER_GATEWAY", "SIMULATION_CLOCK"})
+            ),
+            rng_label_prefixes={
+                FLOW_HAWKES_COMPONENT: ("full_day/flow/hawkes",),
+                FLOW_QUEUE_REACTIVE_COMPONENT: (
+                    "full_day/flow/queue_reactive",
+                ),
+                FLOW_SIMPLE_COMPONENT: ("full_day/flow/simple",),
+            }[component_id],
+            checkpoint_state_ids=(component_id,),
+        )
+        for component_id in FLOW_COMPONENT_IDS
+    )
+    profile = CompositionProfileV1(
+        schema_version=1,
+        profile_id=FLOW_PROFILE_ID,
+        profile_version=1,
+        implementation_status="EXECUTABLE",
+        runtime_owner_component_id=FULL_DAY_RUNTIME_COMPONENT,
+        components=tuple(
+            sorted(
+                (*e1_profile.components, *flow_specs),
+                key=lambda item: item.component_id,
+            )
+        ),
+        refused_component_ids=tuple(
+            component_id
+            for component_id in e1_profile.refused_component_ids
+            if component_id
+            not in {"FLOW_HAWKES", "FLOW_QUEUE_REACTIVE", "FLOW_SIMPLE"}
+        ),
+        exactly_one_component_groups=(FLOW_COMPONENT_IDS,),
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1167,11 +1256,17 @@ __all__ = [
     "CompositionMatrixV1",
     "CompositionProfileV1",
     "FULL_DAY_RUNTIME_COMPONENT",
+    "FLOW_COMPONENT_IDS",
+    "FLOW_HAWKES_COMPONENT",
+    "FLOW_PROFILE_ID",
+    "FLOW_QUEUE_REACTIVE_COMPONENT",
+    "FLOW_SIMPLE_COMPONENT",
     "INITIAL_MATRIX_ID",
     "INITIAL_PROFILE_ID",
     "MECHANICS_COMPONENT",
     "agent_scheduler_is_active",
     "component_configured_predicate",
     "executable_agent_mechanics_composition_matrix",
+    "executable_simple_flow_composition_matrix",
     "initial_composition_matrix",
 ]
