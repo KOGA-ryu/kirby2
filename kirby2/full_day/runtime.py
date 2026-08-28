@@ -1,6 +1,6 @@
 """Authoritative deterministic scheduling kernel for one synthetic full day.
 
-The E1 mechanics profile and bounded E2 simple-flow profile are executable here.
+The E1 mechanics profile and bounded E2 simple/Hawkes flow profiles execute here.
 The runtime owns
 the calendar, simulation clock, scheduling heap, global/event/order allocators,
 quiescent-cut controller, and the one market-mechanics engine.  Optional agent
@@ -38,6 +38,7 @@ from .checkpoint_contract import QuiescentCutV1
 from .composition import (
     ABSENT_REASON_COMPONENT_INACTIVE,
     AGENT_SCHEDULER_COMPONENT,
+    FLOW_HAWKES_COMPONENT,
     FLOW_PROFILE_ID,
     FLOW_SIMPLE_COMPONENT,
     FULL_DAY_RUNTIME_COMPONENT,
@@ -45,6 +46,7 @@ from .composition import (
     MECHANICS_COMPONENT,
     agent_scheduler_is_active,
     executable_agent_mechanics_composition_matrix,
+    executable_hawkes_flow_composition_matrix,
     executable_simple_flow_composition_matrix,
 )
 from .events import (
@@ -84,6 +86,7 @@ FULL_DAY_RUNTIME_PROFILE_VERSION = 2
 MECHANICS_NATIVE_LEDGER_ID = "MARKET_MECHANICS_EVENTS_V1"
 AGENT_NATIVE_LEDGER_ID = "AGENT_SCHEDULER_EVENTS_V1"
 SIMPLE_FLOW_NATIVE_LEDGER_ID = "SIMPLE_FLOW_PROPOSALS_V1"
+HAWKES_FLOW_NATIVE_LEDGER_ID = "HAWKES_FLOW_PROPOSALS_V1"
 
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
@@ -98,6 +101,7 @@ _WORK_MECHANICS_REPLACE = "MECHANICS_REPLACE"
 _WORK_GTT_EXPIRY = "GTT_EXPIRY"
 _WORK_REOPEN_COMPLETE = "REOPEN_COMPLETE"
 _WORK_SIMPLE_FLOW_PROPOSAL = "SIMPLE_FLOW_PROPOSAL"
+_WORK_HAWKES_FLOW_PROPOSAL = "HAWKES_FLOW_PROPOSAL"
 
 _WORK_TYPES = frozenset(
     {
@@ -106,6 +110,7 @@ _WORK_TYPES = frozenset(
         _WORK_CALENDAR_BOUNDARY,
         _WORK_CHECKPOINT_CAPTURE,
         _WORK_GTT_EXPIRY,
+        _WORK_HAWKES_FLOW_PROPOSAL,
         _WORK_MECHANICS_CANCEL,
         _WORK_MECHANICS_REPLACE,
         _WORK_MECHANICS_SUBMIT,
@@ -146,6 +151,11 @@ _WORK_CONTRACTS: Mapping[
             FULL_DAY_RUNTIME_COMPONENT,
             frozenset({WorkStageV1.PENDING_VENUE_ARRIVAL}),
             frozenset({"expiry_time_us"}),
+        ),
+        _WORK_HAWKES_FLOW_PROPOSAL: (
+            FLOW_HAWKES_COMPONENT,
+            frozenset({WorkStageV1.BACKGROUND_FLOW_PROPOSAL}),
+            frozenset({"proposal_id"}),
         ),
         _WORK_MECHANICS_CANCEL: (
             FULL_DAY_RUNTIME_COMPONENT,
@@ -1086,8 +1096,14 @@ def _runtime_composition_matrix(plan: FullDayPlanV1):
         matrix = executable_agent_mechanics_composition_matrix()
         expected_version = FULL_DAY_RUNTIME_PROFILE_VERSION
     elif profile_id == FLOW_PROFILE_ID:
-        matrix = executable_simple_flow_composition_matrix()
-        expected_version = 1
+        if plan.composition_profile.version == 1:
+            matrix = executable_simple_flow_composition_matrix()
+            expected_version = 1
+        elif plan.composition_profile.version == 2:
+            matrix = executable_hawkes_flow_composition_matrix()
+            expected_version = 2
+        else:
+            raise ValueError("FullDayRuntime flow profile version is unsupported")
     else:
         raise ValueError("FullDayRuntime does not implement this composition profile")
     if (
@@ -1113,6 +1129,7 @@ class FullDayRuntime:
         clock: SimulationClock,
         agent_scheduler: object | None,
         simple_flow: object | None,
+        hawkes_flow: object | None,
         order_id_allocator: RuntimeOrderIdAllocatorV1,
         bootstrap: bool,
         restoring: bool = False,
@@ -1124,6 +1141,7 @@ class FullDayRuntime:
         self.clock = clock
         self.agent_scheduler = agent_scheduler
         self.simple_flow = simple_flow
+        self.hawkes_flow = hawkes_flow
         self._order_id_allocator = order_id_allocator
         self._validate_profile_and_core_owners(restoring=restoring)
 
@@ -1148,11 +1166,15 @@ class FullDayRuntime:
             self._component_sequences[AGENT_SCHEDULER_COMPONENT] = 0
         if self.simple_flow is not None:
             self._component_sequences[FLOW_SIMPLE_COMPONENT] = 0
+        if self.hawkes_flow is not None:
+            self._component_sequences[FLOW_HAWKES_COMPONENT] = 0
         self._native_sequences: dict[str, int] = {}
         if self.agent_scheduler is not None:
             self._native_sequences[AGENT_SCHEDULER_COMPONENT] = 0
         if self.simple_flow is not None:
             self._native_sequences[FLOW_SIMPLE_COMPONENT] = 0
+        if self.hawkes_flow is not None:
+            self._native_sequences[FLOW_HAWKES_COMPONENT] = 0
         self._mechanics_event_cursor = len(self.engine.events)
         self._calendar_boundary_index = 0
         self._participant_schedule_index = 0
@@ -1185,6 +1207,7 @@ class FullDayRuntime:
                 _WORK_CALENDAR_BOUNDARY: "_handle_calendar_boundary",
                 _WORK_CHECKPOINT_CAPTURE: "_handle_checkpoint_capture",
                 _WORK_GTT_EXPIRY: "_handle_gtt_expiry",
+                _WORK_HAWKES_FLOW_PROPOSAL: "_handle_hawkes_flow_proposal",
                 _WORK_MECHANICS_CANCEL: "_handle_mechanics_cancel",
                 _WORK_MECHANICS_REPLACE: "_handle_mechanics_replace",
                 _WORK_MECHANICS_SUBMIT: "_handle_mechanics_submit",
@@ -1203,6 +1226,7 @@ class FullDayRuntime:
             self._mechanics_event_cursor = 0
             self._bootstrap_plan_work()
             self._schedule_initial_simple_flow()
+            self._schedule_initial_hawkes_flow()
             self._schedule_agent_work()
             self._schedule_next_state_batch()
             self.assert_invariants()
@@ -1216,6 +1240,7 @@ class FullDayRuntime:
         clock: SimulationClock | None = None,
         agent_scheduler: object | None = None,
         simple_flow: object | None = None,
+        hawkes_flow: object | None = None,
         order_id_allocator: RuntimeOrderIdAllocatorV1 | None = None,
     ) -> FullDayRuntime:
         if type(plan) is not FullDayPlanV1:
@@ -1237,6 +1262,7 @@ class FullDayRuntime:
             clock=selected_clock,
             agent_scheduler=agent_scheduler,
             simple_flow=simple_flow,
+            hawkes_flow=hawkes_flow,
             order_id_allocator=allocator,
             bootstrap=True,
         )
@@ -1250,6 +1276,7 @@ class FullDayRuntime:
         seed: int | None = None,
         engine: MarketMechanicsEngine | None = None,
         simple_flow_configuration: object | None = None,
+        hawkes_flow_configuration: object | None = None,
     ) -> FullDayRuntime:
         """Construct the scheduler only after the sole owners exist."""
 
@@ -1314,12 +1341,25 @@ class FullDayRuntime:
                     "simple flow configuration must use SimpleFlowConfigurationV1"
                 )
             simple_flow = SimpleFlowOwnerV1(plan, simple_flow_configuration)
+        hawkes_flow = None
+        if hawkes_flow_configuration is not None:
+            from .components_flow import (
+                HawkesFlowConfigurationV1,
+                HawkesFlowOwnerV1,
+            )
+
+            if type(hawkes_flow_configuration) is not HawkesFlowConfigurationV1:
+                raise TypeError(
+                    "Hawkes flow configuration must use HawkesFlowConfigurationV1"
+                )
+            hawkes_flow = HawkesFlowOwnerV1(plan, hawkes_flow_configuration)
         return cls.create(
             plan,
             engine=selected_engine,
             clock=selected_engine.clock,
             agent_scheduler=scheduler,
             simple_flow=simple_flow,
+            hawkes_flow=hawkes_flow,
             order_id_allocator=allocator,
         )
 
@@ -1369,11 +1409,8 @@ class FullDayRuntime:
             ),
         )
         active_components = set(profile.resolve_active_components(predicate_values))
-        if active_components & {
-            "FLOW_HAWKES_V1",
-            "FLOW_QUEUE_REACTIVE_V1",
-        }:
-            raise ValueError("only FLOW_SIMPLE_V1 is executable in this E2 slice")
+        if "FLOW_QUEUE_REACTIVE_V1" in active_components:
+            raise ValueError("FLOW_QUEUE_REACTIVE_V1 remains contract-only")
         if type(self.engine) is not MarketMechanicsEngine:
             raise TypeError("runtime engine must be exactly MarketMechanicsEngine")
         if type(self.clock) is not SimulationClock or self.clock is not self.engine.clock:
@@ -1509,6 +1546,18 @@ class FullDayRuntime:
             self.simple_flow.assert_invariants(self.plan)
             self._reject_smuggled_core_owner(
                 self.simple_flow, owner_label="simple-flow component"
+            )
+        hawkes_required = FLOW_HAWKES_COMPONENT in active_components
+        if hawkes_required != (self.hawkes_flow is not None):
+            raise ValueError("Hawkes-flow presence differs from its active predicate")
+        if self.hawkes_flow is not None:
+            from .components_flow import HawkesFlowOwnerV1
+
+            if type(self.hawkes_flow) is not HawkesFlowOwnerV1:
+                raise ValueError("runtime requires the exact HawkesFlowOwnerV1")
+            self.hawkes_flow.assert_invariants(self.plan)
+            self._reject_smuggled_core_owner(
+                self.hawkes_flow, owner_label="Hawkes-flow component"
             )
         self.engine.assert_invariants()
 
@@ -1689,6 +1738,30 @@ class FullDayRuntime:
             stage=WorkStageV1.BACKGROUND_FLOW_PROPOSAL,
             source_component_id=FLOW_SIMPLE_COMPONENT,
             work_type=_WORK_SIMPLE_FLOW_PROPOSAL,
+            payload={"proposal_id": proposal.proposal_id},
+        )
+
+    def _schedule_initial_hawkes_flow(self) -> None:
+        if self.hawkes_flow is None:
+            return
+        proposal = self.hawkes_flow.plan_next(
+            self._flow_observation_cut(),
+            horizon_us=self.plan.calendar.end_time_us,
+        )
+        if proposal is not None:
+            self._enqueue_hawkes_flow_proposal(proposal)
+
+    def _enqueue_hawkes_flow_proposal(self, proposal: object) -> RuntimeWorkItemV1:
+        from .components_flow import HawkesFlowProposalV1
+
+        if type(proposal) is not HawkesFlowProposalV1:
+            raise TypeError("runtime requires a typed Hawkes-flow proposal")
+        return self._enqueue_new(
+            simulation_time_us=proposal.scheduled_time_us,
+            microstep=0,
+            stage=WorkStageV1.BACKGROUND_FLOW_PROPOSAL,
+            source_component_id=FLOW_HAWKES_COMPONENT,
+            work_type=_WORK_HAWKES_FLOW_PROPOSAL,
             payload={"proposal_id": proposal.proposal_id},
         )
 
@@ -1939,6 +2012,11 @@ class FullDayRuntime:
                 else self.agent_scheduler.checkpoint_state()
             ),
             "engine": self.engine.checkpoint_state(),
+            "hawkes_flow": (
+                None
+                if self.hawkes_flow is None
+                else self.hawkes_flow.checkpoint_state()
+            ),
             "order_id_allocator": self._order_id_allocator.checkpoint_state(),
             "simple_flow": (
                 None
@@ -1991,6 +2069,7 @@ class FullDayRuntime:
                 self.engine.auction,
                 self.agent_scheduler,
                 self.simple_flow,
+                self.hawkes_flow,
                 self._state_runtime,
                 self._order_id_allocator,
             ),
@@ -2024,6 +2103,7 @@ class FullDayRuntime:
             auction,
             scheduler,
             simple_flow,
+            hawkes_flow,
             state_runtime,
             order_allocator,
         ) = snapshot["owner_identities"]
@@ -2081,6 +2161,25 @@ class FullDayRuntime:
                 )
             simple_flow.__dict__.clear()
             simple_flow.__dict__.update(restored_simple_flow.__dict__)
+        raw_hawkes_flow = owner_bundle["hawkes_flow"]
+        if raw_hawkes_flow is None:
+            if hawkes_flow is not None:
+                raise RuntimeError(
+                    "transaction snapshot Hawkes-flow identity is inconsistent"
+                )
+        else:
+            from .components_flow import HawkesFlowOwnerV1
+
+            restored_hawkes_flow = HawkesFlowOwnerV1.from_checkpoint_state(
+                raw_hawkes_flow,
+                plan=self.plan,
+            )
+            if hawkes_flow is None:
+                raise RuntimeError(
+                    "transaction snapshot Hawkes-flow identity is inconsistent"
+                )
+            hawkes_flow.__dict__.clear()
+            hawkes_flow.__dict__.update(restored_hawkes_flow.__dict__)
         state_runtime_state = HierarchicalStateRuntimeStateV1.from_dict(
             owner_bundle["state_runtime"]
         )
@@ -2097,6 +2196,7 @@ class FullDayRuntime:
         self.clock = clock
         self.agent_scheduler = scheduler
         self.simple_flow = simple_flow
+        self.hawkes_flow = hawkes_flow
         self._state_runtime = state_runtime
         self._order_id_allocator = order_allocator
         self._heap = snapshot["heap"]
@@ -2533,11 +2633,6 @@ class FullDayRuntime:
         self._native_sequences[AGENT_SCHEDULER_COMPONENT] = value
         return value
 
-    def _next_simple_flow_native_sequence(self) -> int:
-        value = self._native_sequences[FLOW_SIMPLE_COMPONENT] + 1
-        self._native_sequences[FLOW_SIMPLE_COMPONENT] = value
-        return value
-
     def _scheduler_market_snapshot(self) -> dict[str, object] | None:
         if self.agent_scheduler is None:
             return None
@@ -2963,16 +3058,47 @@ class FullDayRuntime:
             )
 
     def _assert_simple_flow_native_reconciliation(self) -> None:
-        """Cross-bind simple-flow state, work, and its proposal ledger."""
-
         from .components_flow import SimpleFlowProposalV1
+
+        self._assert_background_flow_native_reconciliation(
+            owner=self.simple_flow,
+            proposal_type=SimpleFlowProposalV1,
+            component_id=FLOW_SIMPLE_COMPONENT,
+            work_type=_WORK_SIMPLE_FLOW_PROPOSAL,
+            native_ledger_id=SIMPLE_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="SIMPLE_FLOW_PROPOSAL",
+        )
+
+    def _assert_hawkes_flow_native_reconciliation(self) -> None:
+        from .components_flow import HawkesFlowProposalV1
+
+        self._assert_background_flow_native_reconciliation(
+            owner=self.hawkes_flow,
+            proposal_type=HawkesFlowProposalV1,
+            component_id=FLOW_HAWKES_COMPONENT,
+            work_type=_WORK_HAWKES_FLOW_PROPOSAL,
+            native_ledger_id=HAWKES_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="HAWKES_FLOW_PROPOSAL",
+        )
+
+    def _assert_background_flow_native_reconciliation(
+        self,
+        *,
+        owner: object | None,
+        proposal_type: type,
+        component_id: str,
+        work_type: str,
+        native_ledger_id: str,
+        native_event_id_prefix: str,
+    ) -> None:
+        """Cross-bind one selected flow owner, its work, and proposal ledger."""
 
         entries = tuple(
             sorted(
                 (
                     entry
                     for entry in self._native_ledger.values()
-                    if entry.reference.owner_component_id == FLOW_SIMPLE_COMPONENT
+                    if entry.reference.owner_component_id == component_id
                 ),
                 key=lambda entry: entry.reference.local_sequence,
             )
@@ -2983,13 +3109,13 @@ class FullDayRuntime:
                 *self._executed_work.values(),
                 *self._pending.values(),
             )
-            if item.work_type == _WORK_SIMPLE_FLOW_PROPOSAL
+            if item.work_type == work_type
         )
-        if self.simple_flow is None:
+        if owner is None:
             if entries or flow_work:
-                raise RuntimeError("inactive simple flow retains work or native evidence")
+                raise RuntimeError("inactive flow retains work or native evidence")
             return
-        self.simple_flow.assert_invariants(self.plan)
+        owner.assert_invariants(self.plan)
         outer_by_native = {
             event.payload.native_event.ledger_key: event
             for event in self._events
@@ -3000,17 +3126,17 @@ class FullDayRuntime:
         for sequence, entry in enumerate(entries, start=1):
             reference = entry.reference
             if (
-                reference.native_ledger_id != SIMPLE_FLOW_NATIVE_LEDGER_ID
+                reference.native_ledger_id != native_ledger_id
                 or reference.local_sequence != sequence
                 or reference.event_type
                 != FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL.value
                 or reference.event_id
-                != f"SIMPLE_FLOW_PROPOSAL_{sequence:012d}"
+                != f"{native_event_id_prefix}_{sequence:012d}"
             ):
-                raise RuntimeError("simple-flow native identity sequence is invalid")
+                raise RuntimeError("flow native identity sequence is invalid")
             payload = _plain(entry.payload)
             if type(payload) is not dict:
-                raise RuntimeError("simple-flow native payload is not an object")
+                raise RuntimeError("flow native payload is not an object")
             _require_exact_fields(
                 payload,
                 {
@@ -3023,21 +3149,21 @@ class FullDayRuntime:
                     "proposal_id",
                     "rejection_reason",
                 },
-                "simple-flow native payload",
+                "background-flow native payload",
             )
             raw_proposal = payload["proposal"]
             if not isinstance(raw_proposal, Mapping):
-                raise RuntimeError("simple-flow native proposal is not an object")
-            proposal = SimpleFlowProposalV1.from_dict(raw_proposal)
+                raise RuntimeError("flow native proposal is not an object")
+            proposal = proposal_type.from_dict(raw_proposal)
             if proposal.proposal_sequence != sequence:
-                raise RuntimeError("simple-flow proposal sequence has a gap")
+                raise RuntimeError("flow proposal sequence has a gap")
             applied = payload["applied"]
             if type(applied) is not bool:
-                raise RuntimeError("simple-flow applied state is not boolean")
+                raise RuntimeError("flow applied state is not boolean")
             applied_count += int(applied)
             rejected_count += int(not applied)
             if applied != (payload["rejection_reason"] is None):
-                raise RuntimeError("simple-flow rejection evidence is inconsistent")
+                raise RuntimeError("flow rejection evidence is inconsistent")
             outer = outer_by_native.get(entry.ledger_key)
             if (
                 outer is None
@@ -3047,34 +3173,34 @@ class FullDayRuntime:
                 or outer.payload.data.get("observation_cutoff_us")
                 != proposal.observation_cutoff_us
             ):
-                raise RuntimeError("simple-flow outer event differs from its proposal")
-        pending = self.simple_flow.pending_proposal
+                raise RuntimeError("flow outer event differs from its proposal")
+        pending = owner.pending_proposal
         pending_work = tuple(
             item
             for item in self._pending.values()
-            if item.work_type == _WORK_SIMPLE_FLOW_PROPOSAL
+            if item.work_type == work_type
         )
         if pending is None:
             if pending_work:
-                raise RuntimeError("simple-flow pending work lacks an owned proposal")
+                raise RuntimeError("flow pending work lacks an owned proposal")
         elif (
             len(pending_work) != 1
             or pending_work[0].payload.get("proposal_id") != pending.proposal_id
             or pending_work[0].key.simulation_time_us != pending.scheduled_time_us
         ):
-            raise RuntimeError("simple-flow pending work differs from owned proposal")
+            raise RuntimeError("flow pending work differs from owned proposal")
         if (
-            self.simple_flow.proposal_sequence != len(entries) + int(pending is not None)
-            or self.simple_flow.applied_count != applied_count
-            or self.simple_flow.rejected_count != rejected_count
+            owner.proposal_sequence != len(entries) + int(pending is not None)
+            or owner.applied_count != applied_count
+            or owner.rejected_count != rejected_count
         ):
-            raise RuntimeError("simple-flow state differs from native proposal replay")
+            raise RuntimeError("flow state differs from native proposal replay")
         executed_flow = sum(
-            item.work_type == _WORK_SIMPLE_FLOW_PROPOSAL
+            item.work_type == work_type
             for item in self._executed_work.values()
         )
         if executed_flow != len(entries):
-            raise RuntimeError("executed simple-flow work differs from native evidence")
+            raise RuntimeError("executed flow work differs from native evidence")
 
     def _wrap_new_mechanics(
         self,
@@ -3524,20 +3650,57 @@ class FullDayRuntime:
         )
 
     def _handle_simple_flow_proposal(self, item: RuntimeWorkItemV1) -> None:
-        from kirby2.simulation.flow import FlowEventFamily
         from .components_flow import SimpleFlowProposalV1
 
-        if self.simple_flow is None:
-            raise RuntimeError("simple-flow work has no active component owner")
-        proposal = self.simple_flow.pending_proposal
-        if type(proposal) is not SimpleFlowProposalV1:
-            raise RuntimeError("simple-flow owner has no typed pending proposal")
+        self._handle_background_flow_proposal(
+            item,
+            owner=self.simple_flow,
+            proposal_type=SimpleFlowProposalV1,
+            component_id=FLOW_SIMPLE_COMPONENT,
+            native_ledger_id=SIMPLE_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="SIMPLE_FLOW_PROPOSAL",
+            enqueue_next=self._enqueue_simple_flow_proposal,
+        )
+
+    def _handle_hawkes_flow_proposal(self, item: RuntimeWorkItemV1) -> None:
+        from .components_flow import HawkesFlowProposalV1
+
+        self._handle_background_flow_proposal(
+            item,
+            owner=self.hawkes_flow,
+            proposal_type=HawkesFlowProposalV1,
+            component_id=FLOW_HAWKES_COMPONENT,
+            native_ledger_id=HAWKES_FLOW_NATIVE_LEDGER_ID,
+            native_event_id_prefix="HAWKES_FLOW_PROPOSAL",
+            enqueue_next=self._enqueue_hawkes_flow_proposal,
+        )
+
+    def _handle_background_flow_proposal(
+        self,
+        item: RuntimeWorkItemV1,
+        *,
+        owner: object | None,
+        proposal_type: type,
+        component_id: str,
+        native_ledger_id: str,
+        native_event_id_prefix: str,
+        enqueue_next: object,
+    ) -> None:
+        """Apply one typed flow proposal through the sole mechanics gateway."""
+
+        from kirby2.simulation.flow import FlowEventFamily
+
+        if owner is None:
+            raise RuntimeError("background-flow work has no active component owner")
+        proposal = getattr(owner, "pending_proposal", None)
+        if type(proposal) is not proposal_type:
+            raise RuntimeError("background-flow owner has no typed pending proposal")
         if (
             item.payload.get("proposal_id") != proposal.proposal_id
             or item.key.simulation_time_us != proposal.scheduled_time_us
             or self.clock.current_time_us != proposal.scheduled_time_us
         ):
-            raise RuntimeError("simple-flow work differs from its pending proposal")
+            raise RuntimeError("background-flow work differs from its pending proposal")
 
         scheduler_book_before = self._scheduler_market_snapshot()
         mechanics_start = len(self.engine.events)
@@ -3604,7 +3767,7 @@ class FullDayRuntime:
                 quantity=quantity,
                 instruction=instruction,
                 owner=OrderOwner.SIMULATED,
-                account_id=self.simple_flow.configuration.account_id,
+                account_id=owner.configuration.account_id,
                 price_ticks=price_ticks,
                 time_in_force=OrderInstruction.DAY,
             )
@@ -3628,17 +3791,18 @@ class FullDayRuntime:
                 native_reason = mechanics_rejections[-1].data.get("reason")
                 if type(native_reason) is str and native_reason:
                     rejection_reason = native_reason
-        self.simple_flow.resolve_pending(
+        owner.resolve_pending(
             applied=applied,
             rejection_reason=rejection_reason,
         )
-        native_sequence = self._next_simple_flow_native_sequence()
+        native_sequence = self._native_sequences[component_id] + 1
+        self._native_sequences[component_id] = native_sequence
         flow_outer = self._emit_native(
-            owner_component_id=FLOW_SIMPLE_COMPONENT,
-            native_ledger_id=SIMPLE_FLOW_NATIVE_LEDGER_ID,
+            owner_component_id=component_id,
+            native_ledger_id=native_ledger_id,
             native_event_type=FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL.value,
             native_local_sequence=native_sequence,
-            native_event_id=f"SIMPLE_FLOW_PROPOSAL_{native_sequence:012d}",
+            native_event_id=f"{native_event_id_prefix}_{native_sequence:012d}",
             native_payload={
                 "application": application,
                 "applied": applied,
@@ -3663,12 +3827,14 @@ class FullDayRuntime:
             parent_id=flow_outer.event_id,
             scheduler_book_before=scheduler_book_before,
         )
-        next_proposal = self.simple_flow.plan_next(
+        next_proposal = owner.plan_next(
             self._flow_observation_cut(),
             horizon_us=self.plan.calendar.end_time_us,
         )
         if next_proposal is not None:
-            self._enqueue_simple_flow_proposal(next_proposal)
+            if not callable(enqueue_next):  # pragma: no cover - internal route
+                raise RuntimeError("background-flow enqueue route is not callable")
+            enqueue_next(next_proposal)
 
     def _handle_gtt_expiry(self, item: RuntimeWorkItemV1) -> None:
         scheduler_book_before = self._scheduler_market_snapshot()
@@ -3775,9 +3941,26 @@ class FullDayRuntime:
             "status": "PRESERVED",
         }
 
+    def _hawkes_flow_checkpoint_union(self) -> dict[str, object]:
+        if self.hawkes_flow is None:
+            return {
+                "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
+                "status": "ABSENT",
+            }
+        state = self.hawkes_flow.checkpoint_state()
+        return {
+            "state": _plain(state),
+            "state_sha256": canonical_sha256(state),
+            "status": "PRESERVED",
+        }
+
     @staticmethod
     def _component_presence_inventory(
-        plan: FullDayPlanV1, *, scheduler_present: bool, simple_flow_present: bool
+        plan: FullDayPlanV1,
+        *,
+        scheduler_present: bool,
+        simple_flow_present: bool,
+        hawkes_flow_present: bool,
     ) -> list[dict[str, object]]:
         matrix = _runtime_composition_matrix(plan)
         profile = matrix.profile(
@@ -3807,6 +3990,10 @@ class FullDayRuntime:
         if (FLOW_SIMPLE_COMPONENT in active) != simple_flow_present:
             raise ValueError(
                 "simple-flow presence differs from the composition active predicate"
+            )
+        if (FLOW_HAWKES_COMPONENT in active) != hawkes_flow_present:
+            raise ValueError(
+                "Hawkes-flow presence differs from the composition active predicate"
             )
         rows: list[dict[str, object]] = []
         for component in profile.components:
@@ -3888,6 +4075,7 @@ class FullDayRuntime:
                 self.plan,
                 scheduler_present=self.agent_scheduler is not None,
                 simple_flow_present=self.simple_flow is not None,
+                hawkes_flow_present=self.hawkes_flow is not None,
             ),
             "dequeued_count": self._dequeued_count,
             "engine": self.engine.checkpoint_state(),
@@ -3941,8 +4129,10 @@ class FullDayRuntime:
             "state_runtime": self._state_runtime.state().as_dict(),
             "state_scheduled_time": self._state_scheduled_time,
         }
-        if self.plan.composition_profile.reference_id == FLOW_PROFILE_ID:
+        if self.simple_flow is not None:
             state["simple_flow"] = self._simple_flow_checkpoint_union()
+        elif self.hawkes_flow is not None:
+            state["hawkes_flow"] = self._hawkes_flow_checkpoint_union()
         validate_strict_json(state)
         if (
             len(canonical_json_bytes(state))
@@ -3967,6 +4157,7 @@ class FullDayRuntime:
         for field in ("agent_scheduler", "engine", "engine_state_sha256"):
             del state[field]
         state.pop("simple_flow", None)
+        state.pop("hawkes_flow", None)
         validate_strict_json(state)
         return state
 
@@ -4034,6 +4225,7 @@ class FullDayRuntime:
                 ),
             ),
             simple_flow_present=FLOW_SIMPLE_COMPONENT in plan.selected_component_ids,
+            hawkes_flow_present=FLOW_HAWKES_COMPONENT in plan.selected_component_ids,
         )
         if payload["component_presence"] != expected_presence:
             raise ValueError(
@@ -4505,10 +4697,14 @@ class FullDayRuntime:
             "scheduler_state_sha256": scheduler.get("state_sha256"),
             "scheduler_status": scheduler["status"],
         }
-        if self.plan.composition_profile.reference_id == FLOW_PROFILE_ID:
+        if self.simple_flow is not None:
             simple_flow = self._simple_flow_checkpoint_union()
             result["simple_flow_state_sha256"] = simple_flow.get("state_sha256")
             result["simple_flow_status"] = simple_flow["status"]
+        elif self.hawkes_flow is not None:
+            hawkes_flow = self._hawkes_flow_checkpoint_union()
+            result["hawkes_flow_state_sha256"] = hawkes_flow.get("state_sha256")
+            result["hawkes_flow_status"] = hawkes_flow["status"]
         return result
 
     @classmethod
@@ -4554,8 +4750,10 @@ class FullDayRuntime:
             "state_runtime",
             "state_scheduled_time",
         }
-        if plan.composition_profile.reference_id == FLOW_PROFILE_ID:
+        if FLOW_SIMPLE_COMPONENT in plan.selected_component_ids:
             expected.add("simple_flow")
+        if FLOW_HAWKES_COMPONENT in plan.selected_component_ids:
+            expected.add("hawkes_flow")
         _require_exact_fields(payload, expected, "FullDayRuntime checkpoint")
         if (
             payload["schema_version"] != FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION
@@ -4619,10 +4817,9 @@ class FullDayRuntime:
             )
         else:
             raise ValueError("agent scheduler checkpoint union status is unsupported")
-        simple_flow: object | None
-        if plan.composition_profile.reference_id != FLOW_PROFILE_ID:
-            simple_flow = None
-        else:
+        simple_flow: object | None = None
+        hawkes_flow: object | None = None
+        if FLOW_SIMPLE_COMPONENT in plan.selected_component_ids:
             raw_simple_flow = _plain_object(
                 payload["simple_flow"], "simple-flow union"
             )
@@ -4650,10 +4847,39 @@ class FullDayRuntime:
                 raise ValueError(
                     "executable flow profile requires preserved simple-flow state"
                 )
+        if FLOW_HAWKES_COMPONENT in plan.selected_component_ids:
+            raw_hawkes_flow = _plain_object(
+                payload["hawkes_flow"], "Hawkes-flow union"
+            )
+            flow_status = raw_hawkes_flow.get("status")
+            if flow_status == "PRESERVED":
+                _require_exact_fields(
+                    raw_hawkes_flow,
+                    {"state", "state_sha256", "status"},
+                    "preserved Hawkes flow",
+                )
+                raw_flow_state = _plain_object(
+                    raw_hawkes_flow["state"], "Hawkes-flow state"
+                )
+                if raw_hawkes_flow["state_sha256"] != canonical_sha256(
+                    raw_flow_state
+                ):
+                    raise ValueError("Hawkes-flow state digest mismatch")
+                from .components_flow import HawkesFlowOwnerV1
+
+                hawkes_flow = HawkesFlowOwnerV1.from_checkpoint_state(
+                    raw_flow_state,
+                    plan=plan,
+                )
+            else:
+                raise ValueError(
+                    "executable Hawkes profile requires preserved flow state"
+                )
         if payload["component_presence"] != cls._component_presence_inventory(
             plan,
             scheduler_present=scheduler is not None,
             simple_flow_present=simple_flow is not None,
+            hawkes_flow_present=hawkes_flow is not None,
         ):
             raise ValueError(
                 "runtime checkpoint component presence differs from composition"
@@ -4664,6 +4890,7 @@ class FullDayRuntime:
             clock=engine.clock,
             agent_scheduler=scheduler,
             simple_flow=simple_flow,
+            hawkes_flow=hawkes_flow,
             order_id_allocator=allocator,
             bootstrap=False,
             restoring=True,
@@ -4855,6 +5082,8 @@ class FullDayRuntime:
             active_component_ids.add(AGENT_SCHEDULER_COMPONENT)
         if self.simple_flow is not None:
             active_component_ids.add(FLOW_SIMPLE_COMPONENT)
+        if self.hawkes_flow is not None:
+            active_component_ids.add(FLOW_HAWKES_COMPONENT)
         if set(self._component_sequences) != active_component_ids:
             raise RuntimeError(
                 "component allocator owners differ from the exact active profile"
@@ -4927,6 +5156,7 @@ class FullDayRuntime:
         self._assert_agent_native_reconciliation()
         self._assert_agent_deadline_replay()
         self._assert_simple_flow_native_reconciliation()
+        self._assert_hawkes_flow_native_reconciliation()
         published_scheduled_ids = {
             str(event.payload.data["scheduled_event_id"])
             for event in self._events
@@ -5220,6 +5450,7 @@ class FullDayRuntime:
         for component_id, present in (
             (AGENT_SCHEDULER_COMPONENT, self.agent_scheduler is not None),
             (FLOW_SIMPLE_COMPONENT, self.simple_flow is not None),
+            (FLOW_HAWKES_COMPONENT, self.hawkes_flow is not None),
         ):
             if present:
                 expected_native_sequences[component_id] = max(

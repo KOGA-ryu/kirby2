@@ -12084,6 +12084,574 @@ def audit_wo31e2_simple_flow_slice() -> tuple[FullDayAuditCase, ...]:
     )
 
 
+def _wo31e2_hawkes_configuration():
+    from kirby2.full_day.components_flow import HawkesFlowConfigurationV1
+
+    return HawkesFlowConfigurationV1.from_accepted_profile(
+        configuration_id="AUDIT_HAWKES_FLOW_V1",
+        configuration_version=1,
+        accepted_profile_id="balanced",
+        limit_buy_microevents_per_second=5_000,
+        limit_sell_microevents_per_second=5_000,
+        market_buy_microevents_per_second=5_000,
+        market_sell_microevents_per_second=5_000,
+        cancel_bid_microevents_per_second=5_000,
+        cancel_ask_microevents_per_second=5_000,
+        minimum_quantity=1,
+        maximum_quantity=5,
+        minimum_placement_depth_ticks=0,
+        maximum_placement_depth_ticks=2,
+        account_id="WO31-E2-HAWKES",
+    )
+
+
+def _wo31e2_hawkes_plan():
+    from kirby2.full_day.components_flow import HAWKES_FLOW_RNG_LABEL
+    from kirby2.full_day.composition import (
+        FLOW_HAWKES_COMPONENT,
+        FLOW_PROFILE_ID,
+        executable_hawkes_flow_composition_matrix,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        VersionedReferenceV1,
+        derive_substream_seed,
+    )
+
+    base = _wo31e1_plan()
+    configuration = _wo31e2_hawkes_configuration()
+    matrix = executable_hawkes_flow_composition_matrix()
+    declaration = SubstreamDeclarationV1(
+        HAWKES_FLOW_RNG_LABEL,
+        derive_substream_seed(
+            base.seed_policy.root_seed,
+            base.seed_policy.policy_version,
+            HAWKES_FLOW_RNG_LABEL,
+        ),
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            FLOW_PROFILE_ID,
+            2,
+            matrix.sha256,
+        ),
+        component_configurations=tuple(
+            sorted(
+                (
+                    *base.component_configurations,
+                    ComponentConfigurationBindingV1(
+                        FLOW_HAWKES_COMPONENT,
+                        configuration.reference,
+                    ),
+                ),
+                key=lambda item: item.sort_key,
+            )
+        ),
+        seed_policy=replace(
+            base.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (*base.seed_policy.substreams, declaration),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+
+
+def _wo31e2_hawkes_runtime():
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    plan = _wo31e2_hawkes_plan()
+    return FullDayRuntime.create_with_agent_scheduler(
+        plan,
+        _wo31e1_population(plan),
+        hawkes_flow_configuration=_wo31e2_hawkes_configuration(),
+    )
+
+
+def _wo31e2_hawkes_composition_case() -> FullDayAuditCase:
+    from kirby2.full_day.components import (
+        AgentSchedulerComponentAdapterV1,
+        ComponentAdapterGraphV1,
+        FullDayRuntimeComponentAdapterV1,
+    )
+    from kirby2.full_day.components_flow import (
+        HawkesFlowComponentAdapterV2,
+        QueueReactiveFlowComponentAdapterV1,
+        SimpleFlowComponentAdapterV1,
+    )
+    from kirby2.full_day.components_mechanics import (
+        MarketMechanicsComponentAdapterV1,
+    )
+    from kirby2.full_day.composition import (
+        FLOW_HAWKES_COMPONENT,
+        FLOW_PROFILE_ID,
+        FLOW_QUEUE_REACTIVE_COMPONENT,
+        FLOW_SIMPLE_COMPONENT,
+        executable_hawkes_flow_composition_matrix,
+        executable_simple_flow_composition_matrix,
+    )
+
+    failures: list[str] = []
+    previous = executable_simple_flow_composition_matrix()
+    matrix = executable_hawkes_flow_composition_matrix()
+    if tuple(row.canonical_bytes() for row in matrix.profiles[:3]) != tuple(
+        row.canonical_bytes() for row in previous.profiles
+    ):
+        failures.append("Hawkes matrix rewrote a previously published profile")
+    profile = matrix.profile(FLOW_PROFILE_ID, 2)
+    graph = ComponentAdapterGraphV1(
+        (
+            FullDayRuntimeComponentAdapterV1(),
+            MarketMechanicsComponentAdapterV1(),
+            AgentSchedulerComponentAdapterV1(),
+            HawkesFlowComponentAdapterV2(),
+            QueueReactiveFlowComponentAdapterV1(),
+            SimpleFlowComponentAdapterV1(),
+        ),
+        plan=_wo31e2_hawkes_plan(),
+        profile=profile,
+    )
+    if FLOW_HAWKES_COMPONENT not in graph.active_component_ids or any(
+        component_id in graph.active_component_ids
+        for component_id in (FLOW_QUEUE_REACTIVE_COMPONENT, FLOW_SIMPLE_COMPONENT)
+    ):
+        failures.append("exactly-one flow activation does not select only Hawkes")
+    statuses = {
+        component.component_id: component.implementation_status
+        for component in profile.components
+        if component.component_id
+        in {
+            FLOW_HAWKES_COMPONENT,
+            FLOW_QUEUE_REACTIVE_COMPONENT,
+            FLOW_SIMPLE_COMPONENT,
+        }
+    }
+    if statuses != {
+        FLOW_HAWKES_COMPONENT: "EXECUTABLE",
+        FLOW_QUEUE_REACTIVE_COMPONENT: "CONTRACT_ONLY",
+        FLOW_SIMPLE_COMPONENT: "EXECUTABLE",
+    }:
+        failures.append("Hawkes profile overclaims the queue-reactive adapter")
+    return FullDayAuditCase(
+        "full_day_hawkes_flow_composition",
+        (
+            f"matrix_v3_sha256={previous.sha256} matrix_v4_sha256={matrix.sha256} "
+            f"active_components={graph.active_component_ids} statuses={statuses}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_hawkes_one_shot_case() -> FullDayAuditCase:
+    from kirby2.full_day.events import FullDayEventTypeV1
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    failures: list[str] = []
+    one_shot = _wo31e2_hawkes_runtime()
+    subdivided = _wo31e2_hawkes_runtime()
+    target = 1_300_000_000
+    one_shot.advance_to(target)
+    for time_us in (
+        0,
+        300_000_000,
+        600_000_000,
+        900_000_000,
+        1_200_000_000,
+        1_250_000_000,
+        target,
+    ):
+        subdivided.advance_to(time_us)
+    one_shot.capture_quiescent_cut("WO31-E2-HAWKES-EQUIVALENCE")
+    subdivided.capture_quiescent_cut("WO31-E2-HAWKES-EQUIVALENCE")
+    if one_shot.canonical_state_bytes() != subdivided.canonical_state_bytes():
+        failures.append("Hawkes flow differs under one-shot/subdivided advance")
+    proposal_events = tuple(
+        event
+        for event in one_shot.events
+        if event.event_type is FullDayEventTypeV1.BACKGROUND_FLOW_PROPOSAL
+        and event.source_component_id == "FLOW_HAWKES_V1"
+    )
+    owner = one_shot.hawkes_flow
+    if (
+        owner is None
+        or not proposal_events
+        or owner.applied_count == 0
+        or owner.rejected_count == 0
+        or owner.pending_proposal is None
+    ):
+        failures.append("Hawkes flow did not exercise applied/rejected/pending states")
+    if any(
+        "price_ticks" in entry.payload["proposal"]
+        for entry in one_shot.native_event_ledger.values()
+        if entry.reference.owner_component_id == "FLOW_HAWKES_V1"
+    ):
+        failures.append("a Hawkes proposal smuggled an absolute price command")
+    if owner is not None:
+        state = owner.checkpoint_state()
+        excitation = state["excitation_state"]
+        if not any(
+            value != "0x0.0p+0"
+            for row in excitation
+            for value in row
+        ):
+            failures.append("Hawkes flow did not preserve nonzero excitation")
+        if not all(
+            type(value) is str and value == float.fromhex(value).hex()
+            for row in excitation
+            for value in row
+        ):
+            failures.append("Hawkes excitation is not canonical binary64 hex")
+
+    perturbed_plan = _wo31e2_hawkes_plan()
+    perturbed_plan = replace(
+        perturbed_plan,
+        participant_schedule=tuple(
+            sorted(
+                (
+                    replace(entry, simulation_time_us=200)
+                    if entry.schedule_id == "E1_MAKER_ACTIVATE"
+                    else entry
+                    for entry in perturbed_plan.participant_schedule
+                ),
+                key=lambda entry: (
+                    entry.simulation_time_us,
+                    entry.participant_id,
+                    entry.schedule_id,
+                ),
+            )
+        ),
+    )
+    perturbed = FullDayRuntime.create_with_agent_scheduler(
+        perturbed_plan,
+        _wo31e1_population(perturbed_plan),
+        hawkes_flow_configuration=_wo31e2_hawkes_configuration(),
+    )
+    perturbed.advance_to(target)
+
+    def proposal_draw_core(flow_owner) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                row.get("family"),
+                row.get("scheduled_time_us"),
+                row.get("quantity"),
+                row.get("placement_depth_ticks"),
+                row.get("intensity_state_before_hex"),
+                row.get("rng_state_after_sha256"),
+            )
+            for row in flow_owner.diagnostic_draw_sequence
+        )
+
+    if owner is not None and (
+        proposal_draw_core(owner) != proposal_draw_core(perturbed.hawkes_flow)
+        or owner.rng.state_sha256() != perturbed.hawkes_flow.rng.state_sha256()
+    ):
+        failures.append("participant schedule change reseeded/reordered Hawkes flow")
+    return FullDayAuditCase(
+        "full_day_hawkes_flow_one_shot_subdivided",
+        (
+            f"target_us={target} proposals={len(proposal_events)} "
+            f"applied={0 if owner is None else owner.applied_count} "
+            f"rejected={0 if owner is None else owner.rejected_count} "
+            "excitation_preserved=true participant_schedule_rng_independence=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_hawkes_fresh_restore_case() -> FullDayAuditCase:
+    from kirby2.full_day.models import (
+        canonical_json_bytes,
+        parse_canonical_json_object,
+    )
+    from kirby2.full_day.restore import (
+        FullDayRuntimeRestoreRequestV1,
+        execute_uninterrupted_full_day_runtime_suffix,
+    )
+
+    failures: list[str] = []
+    runtime = _wo31e2_hawkes_runtime()
+    cut_time = 1_250_000_000
+    target = 1_300_000_000
+    runtime.advance_to(cut_time)
+    runtime.capture_quiescent_cut("WO31-E2-HAWKES-CUT")
+    flow_state = runtime.hawkes_flow.checkpoint_state()
+    request = FullDayRuntimeRestoreRequestV1.capture(
+        runtime,
+        suffix_targets_us=(target,),
+        final_checkpoint_request_id="WO31-E2-HAWKES-FINAL",
+    )
+    returncode, stdout, stderr, wrote_files = _wo31e1_run_worker(
+        request.canonical_bytes()
+    )
+    expected = execute_uninterrupted_full_day_runtime_suffix(runtime, request)
+    actual: dict[str, object] | None = None
+    if returncode != 0:
+        failures.append(
+            f"fresh Hawkes worker returned {returncode}: "
+            f"{stderr.decode('utf-8', errors='replace').strip()}"
+        )
+    else:
+        try:
+            actual = parse_canonical_json_object(stdout)
+        except (TypeError, ValueError) as error:
+            failures.append(f"fresh Hawkes worker emitted invalid JSON: {error}")
+    if stderr:
+        failures.append("successful Hawkes worker wrote stderr diagnostics")
+    if wrote_files:
+        failures.append("Hawkes restore worker wrote into its empty directory")
+    if actual is not None and (
+        canonical_json_bytes(actual) != stdout or actual != expected
+    ):
+        failures.append("fresh Hawkes suffix differs from uninterrupted suffix")
+    if (
+        flow_state["pending_proposal"] is None
+        or not flow_state["diagnostic_draw_sequence"]
+        or not flow_state["rng_state"]["internal_state"]
+        or not flow_state["excitation_state"]
+        or flow_state["last_decay_time_us"] <= 0
+    ):
+        failures.append("Hawkes cut omits pending/draw/RNG/excitation/decay state")
+    digest = "ABSENT" if actual is None else str(actual["invariant_sha256"])
+    return FullDayAuditCase(
+        "full_day_hawkes_flow_fresh_process_restore",
+        (
+            f"cut_us={cut_time} target_us={target} fresh_process=true "
+            f"invariant_sha256={digest}"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo31e2_hawkes_ownership_case() -> FullDayAuditCase:
+    from kirby2.simulation.clock import SimulationClock
+    from kirby2.full_day.components_flow import (
+        FlowObservationCutV1,
+        HawkesFlowComponentAdapterV2,
+        HawkesFlowConfigurationV1,
+        HawkesFlowOwnerV1,
+        SIMPLE_FLOW_RNG_LABEL,
+    )
+    from kirby2.full_day.models import (
+        ComponentConfigurationBindingV1,
+        SubstreamDeclarationV1,
+        derive_substream_seed,
+    )
+    from kirby2.full_day.runtime import FullDayRuntime
+
+    failures: list[str] = []
+    refused = 0
+    runtime = _wo31e2_hawkes_runtime()
+    runtime.advance_to(1_300_000_000)
+    runtime.capture_quiescent_cut("WO31-E2-HAWKES-OWNERSHIP")
+    owner = runtime.hawkes_flow
+    if owner is None:
+        return FullDayAuditCase(
+            "full_day_hawkes_flow_ownership_refusals",
+            "owner=ABSENT",
+            ("Hawkes-flow owner is absent",),
+        )
+    adapter = HawkesFlowComponentAdapterV2()
+    snapshot = adapter.snapshot(owner)
+    restored = adapter.restore(snapshot, plan=runtime.plan)
+    if restored.canonical_state_bytes() != owner.canonical_state_bytes():
+        failures.append("Hawkes component adapter is not a fixed point")
+    owner.clock = SimulationClock()
+    try:
+        runtime.assert_invariants()
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("Hawkes flow smuggled a second clock")
+    finally:
+        del owner.clock
+    forged = copy.deepcopy(snapshot.as_dict())
+    forged["state"]["model_id_version"]["runtime_state"]["excitation"][0][0] = (
+        "0x1.0000000000000p+0"
+    )
+    try:
+        type(snapshot).from_dict(forged)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("forged Hawkes snapshot digest was accepted")
+
+    wrong_model = owner.checkpoint_state()
+    wrong_model["model_id_version"]["model_id"] = "SIMPLE_POISSON_FLOW_V1"
+    try:
+        HawkesFlowOwnerV1.from_checkpoint_state(wrong_model, plan=runtime.plan)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("wrong-model Hawkes owner state was accepted")
+
+    corrupt_excitation = owner.checkpoint_state()
+    corrupt_excitation["model_id_version"]["runtime_state"]["excitation"][0][0] = (
+        "not-binary64"
+    )
+    corrupt_excitation["excitation_state"][0][0] = "not-binary64"
+    try:
+        HawkesFlowOwnerV1.from_checkpoint_state(
+            corrupt_excitation,
+            plan=runtime.plan,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("corrupt Hawkes excitation state was accepted")
+
+    stale_owner = HawkesFlowOwnerV1(runtime.plan, _wo31e2_hawkes_configuration())
+    initial_cut = FlowObservationCutV1(
+        schema_version=1,
+        simulation_time_us=0,
+        best_bid_ticks=None,
+        best_ask_ticks=None,
+        reference_price_ticks=runtime.engine.rules.reference_price_ticks,
+        cancellable_bid_order_ids=(),
+        cancellable_ask_order_ids=(),
+    )
+    stale_proposal = stale_owner.plan_next(
+        initial_cut,
+        horizon_us=runtime.plan.calendar.end_time_us,
+    )
+    if stale_proposal is None:
+        failures.append("stale-observation probe did not schedule a proposal")
+    else:
+        stale_owner.resolve_pending(
+            applied=False,
+            rejection_reason="AUDIT_STALE_OBSERVATION_SETUP",
+        )
+        stale_cut = replace(
+            initial_cut,
+            simulation_time_us=stale_proposal.scheduled_time_us - 1,
+        )
+        try:
+            stale_owner.plan_next(
+                stale_cut,
+                horizon_us=runtime.plan.calendar.end_time_us,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            refused += 1
+        else:
+            failures.append("stale Hawkes observation cutoff was accepted")
+
+    configuration = _wo31e2_hawkes_configuration()
+    forged_profile = configuration.as_dict()
+    forged_profile["accepted_profile_sha256"] = "0" * 64
+    try:
+        HawkesFlowConfigurationV1.from_dict(forged_profile)
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("forged accepted Hawkes profile digest was accepted")
+
+    plan = runtime.plan
+    simple_configuration = _wo31e2_simple_configuration()
+    two_flow_plan = replace(
+        plan,
+        component_configurations=tuple(
+            sorted(
+                (
+                    *plan.component_configurations,
+                    ComponentConfigurationBindingV1(
+                        "FLOW_SIMPLE_V1",
+                        simple_configuration.reference,
+                    ),
+                ),
+                key=lambda item: item.sort_key,
+            )
+        ),
+        seed_policy=replace(
+            plan.seed_policy,
+            substreams=tuple(
+                sorted(
+                    (
+                        *plan.seed_policy.substreams,
+                        SubstreamDeclarationV1(
+                            SIMPLE_FLOW_RNG_LABEL,
+                            derive_substream_seed(
+                                plan.seed_policy.root_seed,
+                                plan.seed_policy.policy_version,
+                                SIMPLE_FLOW_RNG_LABEL,
+                            ),
+                        ),
+                    ),
+                    key=lambda item: item.semantic_path,
+                )
+            ),
+        ),
+    )
+    try:
+        FullDayRuntime.create_with_agent_scheduler(
+            two_flow_plan,
+            _wo31e1_population(two_flow_plan),
+            simple_flow_configuration=simple_configuration,
+            hawkes_flow_configuration=configuration,
+        )
+    except (TypeError, ValueError, RuntimeError):
+        refused += 1
+    else:
+        failures.append("two executable flow adapters bypassed exactly-one selection")
+
+    atomic = _wo31e2_hawkes_runtime()
+    atomic.advance_to(0)
+    pending = atomic.hawkes_flow.pending_proposal
+    if pending is None:
+        failures.append("Hawkes failure-atomicity probe has no pending proposal")
+    else:
+        pre_failure_time = pending.scheduled_time_us - 1
+        atomic.advance_to(pre_failure_time)
+        atomic.capture_quiescent_cut("WO31-E2-HAWKES-ATOMIC-PREFIX")
+        before = atomic.canonical_state_bytes()
+        original_emit_native = atomic._emit_native
+
+        def refuse_flow_native(**kwargs):
+            if kwargs.get("owner_component_id") == "FLOW_HAWKES_V1":
+                raise RuntimeError("AUDIT_FORCED_HAWKES_NATIVE_FAILURE")
+            return original_emit_native(**kwargs)
+
+        atomic._emit_native = refuse_flow_native
+        try:
+            atomic.advance_to(pending.scheduled_time_us)
+        except RuntimeError as error:
+            if "AUDIT_FORCED_HAWKES_NATIVE_FAILURE" not in str(error):
+                failures.append("Hawkes failure-atomicity raised the wrong error")
+            else:
+                refused += 1
+        else:
+            failures.append("Hawkes native-ledger failure was not propagated")
+        finally:
+            del atomic._emit_native
+        if atomic.canonical_state_bytes() != before:
+            failures.append("Hawkes failure changed owner/engine/RNG/allocator state")
+    if owner.rng is runtime.agent_scheduler.agents["AUDIT_MAKER"].rng:
+        failures.append("Hawkes flow shares an agent RNG object")
+    return FullDayAuditCase(
+        "full_day_hawkes_flow_ownership_refusals",
+        (
+            f"refusals={refused} second_clock=true forged_state=true "
+            "wrong_model=true corrupt_excitation=true stale_observation=true "
+            "accepted_profile_binding=true multiple_flow_selection=true "
+            "failure_atomicity=true agent_rng_separation=true"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo31e2_hawkes_flow_slice() -> tuple[FullDayAuditCase, ...]:
+    """Exercise Hawkes execution/restore without promoting all of WO31-E2."""
+
+    return (
+        _wo31e2_hawkes_composition_case(),
+        _wo31e2_hawkes_one_shot_case(),
+        _wo31e2_hawkes_fresh_restore_case(),
+        _wo31e2_hawkes_ownership_case(),
+    )
+
+
 __all__ = [
     "FullDayAuditCase",
     "audit_dev0002_anchor_transition_ordering",
@@ -12093,5 +12661,6 @@ __all__ = [
     "audit_wo31c_checkpoints",
     "audit_wo31d_core_restore",
     "audit_wo31e1_runtime_restore",
+    "audit_wo31e2_hawkes_flow_slice",
     "audit_wo31e2_simple_flow_slice",
 ]

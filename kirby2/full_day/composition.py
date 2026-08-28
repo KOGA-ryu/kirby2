@@ -1245,6 +1245,47 @@ def executable_simple_flow_composition_matrix() -> CompositionMatrixV1:
     return successor
 
 
+def executable_hawkes_flow_composition_matrix() -> CompositionMatrixV1:
+    """Append the independently evidenced Hawkes-flow profile revision.
+
+    Matrix/profile revisions already published for E1 and simple flow remain
+    byte-identical.  The new flow-profile revision promotes only the Hawkes
+    adapter; queue-reactive flow remains contract-only until its own executable
+    and restore evidence exists.
+    """
+
+    previous = executable_simple_flow_composition_matrix()
+    prior_profile = previous.profile(FLOW_PROFILE_ID, 1)
+    promoted_components: list[ComponentSpecV1] = []
+    for component in prior_profile.components:
+        if component.component_id != FLOW_HAWKES_COMPONENT:
+            promoted_components.append(component)
+            continue
+        payload = component.as_dict()
+        payload["component_version"] = component.component_version + 1
+        payload["implementation_status"] = "EXECUTABLE"
+        promoted_components.append(ComponentSpecV1.from_dict(payload))
+    promoted_profile = CompositionProfileV1(
+        schema_version=prior_profile.schema_version,
+        profile_id=prior_profile.profile_id,
+        profile_version=prior_profile.profile_version + 1,
+        implementation_status="EXECUTABLE",
+        runtime_owner_component_id=prior_profile.runtime_owner_component_id,
+        components=tuple(promoted_components),
+        refused_component_ids=prior_profile.refused_component_ids,
+        exactly_one_component_groups=prior_profile.exactly_one_component_groups,
+    )
+    successor = CompositionMatrixV1(
+        schema_version=previous.schema_version,
+        matrix_id=previous.matrix_id,
+        matrix_version=previous.matrix_version + 1,
+        previous_matrix_sha256=previous.sha256,
+        profiles=(*previous.profiles, promoted_profile),
+    )
+    previous.validate_append_only_successor(successor)
+    return successor
+
+
 __all__ = [
     "ABSENT_REASON_COMPONENT_INACTIVE",
     "ABSENT_REASON_COMPONENT_REFUSED",
@@ -1267,6 +1308,7 @@ __all__ = [
     "agent_scheduler_is_active",
     "component_configured_predicate",
     "executable_agent_mechanics_composition_matrix",
+    "executable_hawkes_flow_composition_matrix",
     "executable_simple_flow_composition_matrix",
     "initial_composition_matrix",
 ]

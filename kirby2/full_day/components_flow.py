@@ -7,11 +7,19 @@ runtime interprets every proposal and applies it through MarketMechanicsEngine.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from kirby2.simulation.flow import FlowEventFamily
-from kirby2.simulation.flow_models import SimpleFlowModel
+from kirby2.simulation.flow_models import (
+    FLOW_CHANNELS,
+    HawkesConfig,
+    HawkesFlowModel,
+    SimpleFlowModel,
+    load_accepted_hawkes_configs,
+)
 from kirby2.simulation.rng import SeededRng
 
 from .components import ComponentSnapshotV1, FullDayComponentAdapterV1
@@ -37,6 +45,10 @@ SIMPLE_FLOW_SCHEMA_VERSION = 1
 SIMPLE_FLOW_MODEL_ID = "SIMPLE_POISSON_FLOW_V1"
 SIMPLE_FLOW_MODEL_VERSION = 1
 SIMPLE_FLOW_RNG_LABEL = "full_day/flow/simple/proposal"
+HAWKES_FLOW_SCHEMA_VERSION = 1
+HAWKES_FLOW_MODEL_ID = "EXPONENTIAL_HAWKES_FLOW_V1"
+HAWKES_FLOW_MODEL_VERSION = 1
+HAWKES_FLOW_RNG_LABEL = "full_day/flow/hawkes/proposal"
 
 
 def _exact_int(value: object, field: str, *, minimum: int = 0) -> int:
@@ -56,6 +68,104 @@ def _optional_string(value: object, field: str) -> str | None:
     if value is None:
         return None
     return _exact_string(value, field)
+
+
+def _hawkes_profile_sha256(config: HawkesConfig) -> str:
+    if type(config) is not HawkesConfig:
+        raise TypeError("Hawkes profile digest requires HawkesConfig")
+    payload = json.dumps(
+        config.as_dict(),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _float_hex(value: float) -> str:
+    if type(value) is not float:
+        raise TypeError("Hawkes binary state must contain exact floats")
+    return value.hex()
+
+
+def _float_from_canonical_hex(value: object, field: str) -> float:
+    text = _exact_string(value, field)
+    try:
+        decoded = float.fromhex(text)
+    except ValueError as error:
+        raise ValueError(f"{field} is not an exact binary64 hexadecimal value") from error
+    if decoded.hex() != text:
+        raise ValueError(f"{field} is not canonical binary64 hexadecimal")
+    return decoded
+
+
+def _encode_hawkes_runtime_state(state: Mapping[str, object]) -> dict[str, object]:
+    _require_exact_fields(
+        state,
+        {
+            "excitation",
+            "intensity_cap_hits",
+            "model",
+            "observed_events",
+            "profile_id",
+            "state_time_us",
+            "thinning_rejections",
+            "use_runtime_baseline",
+        },
+        "Hawkes runtime state",
+    )
+    excitation = state["excitation"]
+    if type(excitation) is not list:
+        raise TypeError("Hawkes excitation state must be an array")
+    encoded_excitation: list[list[str]] = []
+    for row in excitation:
+        if type(row) is not list:
+            raise TypeError("Hawkes excitation rows must be arrays")
+        encoded_excitation.append([_float_hex(value) for value in row])
+    encoded = {
+        **{key: value for key, value in state.items() if key != "excitation"},
+        "excitation": encoded_excitation,
+    }
+    validate_strict_json(encoded)
+    return encoded
+
+
+def _decode_hawkes_runtime_state(state: Mapping[str, object]) -> dict[str, object]:
+    validate_strict_json(state)
+    _require_exact_fields(
+        state,
+        {
+            "excitation",
+            "intensity_cap_hits",
+            "model",
+            "observed_events",
+            "profile_id",
+            "state_time_us",
+            "thinning_rejections",
+            "use_runtime_baseline",
+        },
+        "encoded Hawkes runtime state",
+    )
+    excitation = state["excitation"]
+    if type(excitation) is not list:
+        raise TypeError("encoded Hawkes excitation state must be an array")
+    decoded_excitation: list[list[float]] = []
+    for row_index, row in enumerate(excitation):
+        if type(row) is not list:
+            raise TypeError("encoded Hawkes excitation rows must be arrays")
+        decoded_excitation.append(
+            [
+                _float_from_canonical_hex(
+                    value, f"excitation[{row_index}][{column_index}]"
+                )
+                for column_index, value in enumerate(row)
+            ]
+        )
+    return {
+        **{key: value for key, value in state.items() if key != "excitation"},
+        "excitation": decoded_excitation,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +298,207 @@ class SimpleFlowConfigurationV1:
             "schema_version",
         }
         _require_exact_fields(payload, expected, "SimpleFlowConfigurationV1")
+        return cls(**{field: payload[field] for field in expected})  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class HawkesFlowConfigurationV1:
+    """Strict full-day binding to one accepted Hawkes excitation profile.
+
+    The accepted model digest binds the floating-point alpha/beta profile while
+    integer micro-event baselines keep the semantic plan free of binary floats.
+    Binary model state is checkpointed separately as canonical ``float.hex``
+    strings, preserving exact fresh-process replay.
+    """
+
+    schema_version: int
+    configuration_id: str
+    configuration_version: int
+    accepted_profile_id: str
+    accepted_profile_sha256: str
+    limit_buy_microevents_per_second: int
+    limit_sell_microevents_per_second: int
+    market_buy_microevents_per_second: int
+    market_sell_microevents_per_second: int
+    cancel_bid_microevents_per_second: int
+    cancel_ask_microevents_per_second: int
+    minimum_quantity: int
+    maximum_quantity: int
+    minimum_placement_depth_ticks: int
+    maximum_placement_depth_ticks: int
+    account_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != HAWKES_FLOW_SCHEMA_VERSION
+        ):
+            raise ValueError("Hawkes-flow configuration schema version must be 1")
+        _exact_string(self.configuration_id, "configuration_id")
+        _exact_int(self.configuration_version, "configuration_version", minimum=1)
+        _exact_string(self.accepted_profile_id, "accepted_profile_id")
+        digest = _exact_string(
+            self.accepted_profile_sha256, "accepted_profile_sha256"
+        )
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("accepted Hawkes profile digest must be lowercase SHA-256")
+        rates = self.intensity_microevents_per_second
+        if not any(rates.values()):
+            raise ValueError("Hawkes-flow configuration requires a positive baseline")
+        _exact_int(self.minimum_quantity, "minimum_quantity", minimum=1)
+        _exact_int(
+            self.maximum_quantity,
+            "maximum_quantity",
+            minimum=self.minimum_quantity,
+        )
+        _exact_int(
+            self.minimum_placement_depth_ticks,
+            "minimum_placement_depth_ticks",
+        )
+        _exact_int(
+            self.maximum_placement_depth_ticks,
+            "maximum_placement_depth_ticks",
+            minimum=self.minimum_placement_depth_ticks,
+        )
+        _exact_string(self.account_id, "account_id")
+        self.accepted_profile
+
+    @property
+    def accepted_profile(self) -> HawkesConfig:
+        profiles = load_accepted_hawkes_configs()
+        try:
+            profile = profiles[self.accepted_profile_id]
+        except KeyError as error:
+            raise ValueError("Hawkes-flow profile is absent from the accepted registry") from error
+        if _hawkes_profile_sha256(profile) != self.accepted_profile_sha256:
+            raise ValueError("Hawkes-flow profile digest differs from the accepted registry")
+        return profile
+
+    @property
+    def intensity_microevents_per_second(self) -> dict[FlowEventFamily, int]:
+        return {
+            FlowEventFamily.LIMIT_BUY: _exact_int(
+                self.limit_buy_microevents_per_second,
+                "limit_buy_microevents_per_second",
+            ),
+            FlowEventFamily.LIMIT_SELL: _exact_int(
+                self.limit_sell_microevents_per_second,
+                "limit_sell_microevents_per_second",
+            ),
+            FlowEventFamily.MARKET_BUY: _exact_int(
+                self.market_buy_microevents_per_second,
+                "market_buy_microevents_per_second",
+            ),
+            FlowEventFamily.MARKET_SELL: _exact_int(
+                self.market_sell_microevents_per_second,
+                "market_sell_microevents_per_second",
+            ),
+            FlowEventFamily.CANCEL_BID: _exact_int(
+                self.cancel_bid_microevents_per_second,
+                "cancel_bid_microevents_per_second",
+            ),
+            FlowEventFamily.CANCEL_ASK: _exact_int(
+                self.cancel_ask_microevents_per_second,
+                "cancel_ask_microevents_per_second",
+            ),
+        }
+
+    @property
+    def reference(self) -> VersionedReferenceV1:
+        return VersionedReferenceV1(
+            self.configuration_id,
+            self.configuration_version,
+            self.sha256,
+        )
+
+    @property
+    def sha256(self) -> str:
+        return canonical_sha256(self.as_dict())
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "accepted_profile_id": self.accepted_profile_id,
+            "accepted_profile_sha256": self.accepted_profile_sha256,
+            "account_id": self.account_id,
+            "cancel_ask_microevents_per_second": self.cancel_ask_microevents_per_second,
+            "cancel_bid_microevents_per_second": self.cancel_bid_microevents_per_second,
+            "configuration_id": self.configuration_id,
+            "configuration_version": self.configuration_version,
+            "limit_buy_microevents_per_second": self.limit_buy_microevents_per_second,
+            "limit_sell_microevents_per_second": self.limit_sell_microevents_per_second,
+            "market_buy_microevents_per_second": self.market_buy_microevents_per_second,
+            "market_sell_microevents_per_second": self.market_sell_microevents_per_second,
+            "maximum_placement_depth_ticks": self.maximum_placement_depth_ticks,
+            "maximum_quantity": self.maximum_quantity,
+            "minimum_placement_depth_ticks": self.minimum_placement_depth_ticks,
+            "minimum_quantity": self.minimum_quantity,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_accepted_profile(
+        cls,
+        *,
+        configuration_id: str,
+        configuration_version: int,
+        accepted_profile_id: str,
+        limit_buy_microevents_per_second: int,
+        limit_sell_microevents_per_second: int,
+        market_buy_microevents_per_second: int,
+        market_sell_microevents_per_second: int,
+        cancel_bid_microevents_per_second: int,
+        cancel_ask_microevents_per_second: int,
+        minimum_quantity: int,
+        maximum_quantity: int,
+        minimum_placement_depth_ticks: int,
+        maximum_placement_depth_ticks: int,
+        account_id: str,
+    ) -> HawkesFlowConfigurationV1:
+        try:
+            profile = load_accepted_hawkes_configs()[accepted_profile_id]
+        except KeyError as error:
+            raise ValueError("unknown accepted Hawkes profile") from error
+        return cls(
+            schema_version=HAWKES_FLOW_SCHEMA_VERSION,
+            configuration_id=configuration_id,
+            configuration_version=configuration_version,
+            accepted_profile_id=accepted_profile_id,
+            accepted_profile_sha256=_hawkes_profile_sha256(profile),
+            limit_buy_microevents_per_second=limit_buy_microevents_per_second,
+            limit_sell_microevents_per_second=limit_sell_microevents_per_second,
+            market_buy_microevents_per_second=market_buy_microevents_per_second,
+            market_sell_microevents_per_second=market_sell_microevents_per_second,
+            cancel_bid_microevents_per_second=cancel_bid_microevents_per_second,
+            cancel_ask_microevents_per_second=cancel_ask_microevents_per_second,
+            minimum_quantity=minimum_quantity,
+            maximum_quantity=maximum_quantity,
+            minimum_placement_depth_ticks=minimum_placement_depth_ticks,
+            maximum_placement_depth_ticks=maximum_placement_depth_ticks,
+            account_id=account_id,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> HawkesFlowConfigurationV1:
+        validate_strict_json(payload)
+        expected = {
+            "accepted_profile_id",
+            "accepted_profile_sha256",
+            "account_id",
+            "cancel_ask_microevents_per_second",
+            "cancel_bid_microevents_per_second",
+            "configuration_id",
+            "configuration_version",
+            "limit_buy_microevents_per_second",
+            "limit_sell_microevents_per_second",
+            "market_buy_microevents_per_second",
+            "market_sell_microevents_per_second",
+            "maximum_placement_depth_ticks",
+            "maximum_quantity",
+            "minimum_placement_depth_ticks",
+            "minimum_quantity",
+            "schema_version",
+        }
+        _require_exact_fields(payload, expected, "HawkesFlowConfigurationV1")
         return cls(**{field: payload[field] for field in expected})  # type: ignore[arg-type]
 
 
@@ -356,6 +667,113 @@ class SimpleFlowProposalV1:
                 "schema_version",
             },
             "SimpleFlowProposalV1",
+        )
+        return cls(
+            schema_version=_exact_int(payload["schema_version"], "schema_version"),
+            proposal_id=_exact_string(payload["proposal_id"], "proposal_id"),
+            proposal_sequence=_exact_int(
+                payload["proposal_sequence"], "proposal_sequence", minimum=1
+            ),
+            scheduled_time_us=_exact_int(
+                payload["scheduled_time_us"], "scheduled_time_us"
+            ),
+            observation_cutoff_us=_exact_int(
+                payload["observation_cutoff_us"], "observation_cutoff_us"
+            ),
+            family=FlowEventFamily(_exact_string(payload["family"], "family")),
+            quantity=(
+                None
+                if payload["quantity"] is None
+                else _exact_int(payload["quantity"], "quantity", minimum=1)
+            ),
+            placement_depth_ticks=(
+                None
+                if payload["placement_depth_ticks"] is None
+                else _exact_int(
+                    payload["placement_depth_ticks"], "placement_depth_ticks"
+                )
+            ),
+            cancel_target_order_id=_optional_string(
+                payload["cancel_target_order_id"], "cancel_target_order_id"
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HawkesFlowProposalV1:
+    schema_version: int
+    proposal_id: str
+    proposal_sequence: int
+    scheduled_time_us: int
+    observation_cutoff_us: int
+    family: FlowEventFamily
+    quantity: int | None
+    placement_depth_ticks: int | None
+    cancel_target_order_id: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("Hawkes-flow proposal schema version must be 1")
+        _exact_string(self.proposal_id, "proposal_id")
+        _exact_int(self.proposal_sequence, "proposal_sequence", minimum=1)
+        _exact_int(self.scheduled_time_us, "scheduled_time_us")
+        _exact_int(self.observation_cutoff_us, "observation_cutoff_us")
+        if self.scheduled_time_us < self.observation_cutoff_us:
+            raise ValueError("Hawkes proposal cannot precede its observation cut")
+        if type(self.family) is not FlowEventFamily:
+            raise TypeError("Hawkes proposal family must use FlowEventFamily")
+        submit = self.family in {
+            FlowEventFamily.LIMIT_BUY,
+            FlowEventFamily.LIMIT_SELL,
+            FlowEventFamily.MARKET_BUY,
+            FlowEventFamily.MARKET_SELL,
+        }
+        limit = self.family in {
+            FlowEventFamily.LIMIT_BUY,
+            FlowEventFamily.LIMIT_SELL,
+        }
+        if submit != (self.quantity is not None):
+            raise ValueError("only Hawkes submit proposals carry quantity")
+        if self.quantity is not None:
+            _exact_int(self.quantity, "quantity", minimum=1)
+        if limit != (self.placement_depth_ticks is not None):
+            raise ValueError("only Hawkes limit proposals carry placement depth")
+        if self.placement_depth_ticks is not None:
+            _exact_int(self.placement_depth_ticks, "placement_depth_ticks")
+        if submit and self.cancel_target_order_id is not None:
+            raise ValueError("Hawkes submit proposal cannot carry a cancel target")
+        _optional_string(self.cancel_target_order_id, "cancel_target_order_id")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "cancel_target_order_id": self.cancel_target_order_id,
+            "family": self.family.value,
+            "observation_cutoff_us": self.observation_cutoff_us,
+            "placement_depth_ticks": self.placement_depth_ticks,
+            "proposal_id": self.proposal_id,
+            "proposal_sequence": self.proposal_sequence,
+            "quantity": self.quantity,
+            "scheduled_time_us": self.scheduled_time_us,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> HawkesFlowProposalV1:
+        validate_strict_json(payload)
+        _require_exact_fields(
+            payload,
+            {
+                "cancel_target_order_id",
+                "family",
+                "observation_cutoff_us",
+                "placement_depth_ticks",
+                "proposal_id",
+                "proposal_sequence",
+                "quantity",
+                "scheduled_time_us",
+                "schema_version",
+            },
+            "HawkesFlowProposalV1",
         )
         return cls(
             schema_version=_exact_int(payload["schema_version"], "schema_version"),
@@ -721,6 +1139,398 @@ class SimpleFlowOwnerV1:
         validate_strict_json(self.checkpoint_state())
 
 
+class HawkesFlowOwnerV1:
+    """Restorable Hawkes excitation owner with one isolated RNG substream."""
+
+    COMPONENT_ID = FLOW_HAWKES_COMPONENT
+
+    def __init__(
+        self,
+        plan: FullDayPlanV1,
+        configuration: HawkesFlowConfigurationV1,
+    ) -> None:
+        if type(plan) is not FullDayPlanV1:
+            raise TypeError("Hawkes-flow owner requires FullDayPlanV1")
+        if type(configuration) is not HawkesFlowConfigurationV1:
+            raise TypeError(
+                "Hawkes-flow owner requires HawkesFlowConfigurationV1"
+            )
+        self.configuration = configuration
+        self.model = HawkesFlowModel(
+            configuration.accepted_profile,
+            use_runtime_baseline=True,
+        )
+        self.rng_label = HAWKES_FLOW_RNG_LABEL
+        self.rng = SeededRng(plan.seed_policy.derive(self.rng_label))
+        self.last_observation: FlowObservationCutV1 | None = None
+        self.pending_proposal: HawkesFlowProposalV1 | None = None
+        self.proposal_sequence = 0
+        self.diagnostic_draw_sequence: list[dict[str, object]] = []
+        self.applied_count = 0
+        self.rejected_count = 0
+        self.last_rejection_reason: str | None = None
+        self._validate_plan_binding(plan)
+        self.assert_invariants(plan)
+
+    def _validate_plan_binding(self, plan: FullDayPlanV1) -> None:
+        try:
+            references = plan.configurations_for_component(self.COMPONENT_ID)
+        except KeyError as error:
+            raise ValueError("Hawkes-flow configuration is absent from the plan") from error
+        if references != (self.configuration.reference,):
+            raise ValueError("Hawkes-flow configuration differs from plan binding")
+        if self.rng_label not in {
+            row.semantic_path for row in plan.seed_policy.substreams
+        }:
+            raise ValueError("Hawkes-flow RNG label is undeclared")
+
+    def _baseline_intensities(self) -> dict[FlowEventFamily, float]:
+        return {
+            family: value / 1_000_000.0
+            for family, value in self.configuration.intensity_microevents_per_second.items()
+        }
+
+    def _intensity_state(self) -> dict[str, object]:
+        time_us = (
+            self.model.runtime_state()["state_time_us"]
+            if self.last_observation is None
+            else self.last_observation.simulation_time_us
+        )
+        if type(time_us) is not int:
+            raise RuntimeError("Hawkes model state time is not an integer")
+        current = self.model.current_intensities(
+            time_us,
+            self._baseline_intensities(),
+        )
+        return {
+            "baseline_microevents_per_second": {
+                family.value: value
+                for family, value in self.configuration.intensity_microevents_per_second.items()
+            },
+            "current_per_second_hex": {
+                family.value: _float_hex(current[family])
+                for family in FLOW_CHANNELS
+            },
+            "observation_time_us": time_us,
+        }
+
+    def plan_next(
+        self,
+        observation: FlowObservationCutV1,
+        *,
+        horizon_us: int,
+    ) -> HawkesFlowProposalV1 | None:
+        if type(observation) is not FlowObservationCutV1:
+            raise TypeError("Hawkes flow requires a typed observation cut")
+        _exact_int(horizon_us, "horizon_us")
+        if self.pending_proposal is not None:
+            raise RuntimeError("Hawkes flow already owns a pending proposal")
+        if observation.simulation_time_us > horizon_us:
+            raise ValueError("Hawkes observation lies beyond the horizon")
+        before = self.rng.state_sha256()
+        current_intensities = self.model.current_intensities(
+            observation.simulation_time_us,
+            self._baseline_intensities(),
+        )
+        arrival = self.model.schedule_next(
+            observation.simulation_time_us,
+            self._baseline_intensities(),
+            self.rng,
+        )
+        self.last_observation = observation
+        draw: dict[str, object] = {
+            "draw_sequence": len(self.diagnostic_draw_sequence) + 1,
+            "intensity_state_before_hex": {
+                family.value: _float_hex(current_intensities[family])
+                for family in FLOW_CHANNELS
+            },
+            "observation_cutoff_us": observation.simulation_time_us,
+            "rng_state_before_sha256": before,
+        }
+        if arrival is None or arrival.simulation_time_us > horizon_us:
+            draw.update(
+                {
+                    "family": None if arrival is None else arrival.family.value,
+                    "outcome": (
+                        "NO_POSITIVE_INTENSITY"
+                        if arrival is None
+                        else "OUT_OF_HORIZON"
+                    ),
+                    "scheduled_time_us": (
+                        None if arrival is None else arrival.simulation_time_us
+                    ),
+                }
+            )
+            draw["rng_state_after_sha256"] = self.rng.state_sha256()
+            self.diagnostic_draw_sequence.append(draw)
+            return None
+
+        family = arrival.family
+        quantity: int | None = None
+        placement_depth: int | None = None
+        cancel_target: str | None = None
+        if family in {
+            FlowEventFamily.LIMIT_BUY,
+            FlowEventFamily.LIMIT_SELL,
+            FlowEventFamily.MARKET_BUY,
+            FlowEventFamily.MARKET_SELL,
+        }:
+            quantity = self.rng.integer(
+                self.configuration.minimum_quantity,
+                self.configuration.maximum_quantity,
+            )
+        if family in {FlowEventFamily.LIMIT_BUY, FlowEventFamily.LIMIT_SELL}:
+            placement_depth = self.rng.integer(
+                self.configuration.minimum_placement_depth_ticks,
+                self.configuration.maximum_placement_depth_ticks,
+            )
+        if family is FlowEventFamily.CANCEL_BID:
+            candidates = observation.cancellable_bid_order_ids
+            selection_draw = self.rng.unit_interval()
+            cancel_target = (
+                None
+                if not candidates
+                else candidates[
+                    min(int(selection_draw * len(candidates)), len(candidates) - 1)
+                ]
+            )
+        elif family is FlowEventFamily.CANCEL_ASK:
+            candidates = observation.cancellable_ask_order_ids
+            selection_draw = self.rng.unit_interval()
+            cancel_target = (
+                None
+                if not candidates
+                else candidates[
+                    min(int(selection_draw * len(candidates)), len(candidates) - 1)
+                ]
+            )
+
+        sequence = self.proposal_sequence + 1
+        proposal = HawkesFlowProposalV1(
+            schema_version=1,
+            proposal_id=f"FLOW-HAWKES-P-{sequence:010d}",
+            proposal_sequence=sequence,
+            scheduled_time_us=arrival.simulation_time_us,
+            observation_cutoff_us=observation.simulation_time_us,
+            family=family,
+            quantity=quantity,
+            placement_depth_ticks=placement_depth,
+            cancel_target_order_id=cancel_target,
+        )
+        self.proposal_sequence = sequence
+        self.pending_proposal = proposal
+        draw.update(
+            {
+                "cancel_target_order_id": cancel_target,
+                "family": family.value,
+                "outcome": "PROPOSAL_CREATED",
+                "placement_depth_ticks": placement_depth,
+                "proposal_id": proposal.proposal_id,
+                "quantity": quantity,
+                "scheduled_time_us": proposal.scheduled_time_us,
+            }
+        )
+        draw["rng_state_after_sha256"] = self.rng.state_sha256()
+        self.diagnostic_draw_sequence.append(draw)
+        return proposal
+
+    def resolve_pending(self, *, applied: bool, rejection_reason: str | None) -> None:
+        if type(applied) is not bool:
+            raise TypeError("Hawkes proposal applied state must be boolean")
+        proposal = self.pending_proposal
+        if proposal is None:
+            raise RuntimeError("Hawkes flow has no pending proposal to resolve")
+        if applied:
+            if rejection_reason is not None:
+                raise ValueError("applied Hawkes proposal cannot carry rejection")
+            self.applied_count += 1
+        else:
+            self.rejected_count += 1
+            self.last_rejection_reason = _exact_string(
+                rejection_reason, "rejection_reason"
+            )
+        self.model.observe(proposal.family, proposal.scheduled_time_us)
+        self.pending_proposal = None
+
+    def checkpoint_state(self) -> dict[str, object]:
+        raw_runtime_state = self.model.runtime_state()
+        encoded_runtime_state = _encode_hawkes_runtime_state(raw_runtime_state)
+        state: dict[str, object] = {
+            "configuration": self.configuration.as_dict(),
+            "diagnostic_draw_sequence": list(self.diagnostic_draw_sequence),
+            "excitation_state": encoded_runtime_state["excitation"],
+            "intensity_state": self._intensity_state(),
+            "last_decay_time_us": encoded_runtime_state["state_time_us"],
+            "model_id_version": {
+                "model_id": HAWKES_FLOW_MODEL_ID,
+                "model_version": HAWKES_FLOW_MODEL_VERSION,
+                "runtime_state": encoded_runtime_state,
+            },
+            "observation_cutoff": (
+                None if self.last_observation is None else self.last_observation.as_dict()
+            ),
+            "pending_proposal": (
+                None if self.pending_proposal is None else self.pending_proposal.as_dict()
+            ),
+            "proposal_sequence": self.proposal_sequence,
+            "rejection_state": {
+                "applied_count": self.applied_count,
+                "last_rejection_reason": self.last_rejection_reason,
+                "rejected_count": self.rejected_count,
+            },
+            "rng_label": self.rng_label,
+            "rng_state": self.rng.runtime_state(),
+            "schema_version": HAWKES_FLOW_SCHEMA_VERSION,
+        }
+        validate_strict_json(state)
+        return state
+
+    def canonical_state_bytes(self) -> bytes:
+        return canonical_json_bytes(self.checkpoint_state())
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        plan: FullDayPlanV1,
+    ) -> HawkesFlowOwnerV1:
+        validate_strict_json(payload)
+        _require_exact_fields(
+            payload,
+            {
+                "configuration",
+                "diagnostic_draw_sequence",
+                "excitation_state",
+                "intensity_state",
+                "last_decay_time_us",
+                "model_id_version",
+                "observation_cutoff",
+                "pending_proposal",
+                "proposal_sequence",
+                "rejection_state",
+                "rng_label",
+                "rng_state",
+                "schema_version",
+            },
+            "HawkesFlowOwnerV1",
+        )
+        if payload["schema_version"] != HAWKES_FLOW_SCHEMA_VERSION:
+            raise ValueError("Hawkes-flow owner schema version is unsupported")
+        raw_configuration = payload["configuration"]
+        raw_model = payload["model_id_version"]
+        raw_rejection = payload["rejection_state"]
+        raw_rng = payload["rng_state"]
+        if not all(
+            isinstance(value, Mapping)
+            for value in (raw_configuration, raw_model, raw_rejection, raw_rng)
+        ):
+            raise TypeError("Hawkes-flow nested states must be objects")
+        configuration = HawkesFlowConfigurationV1.from_dict(raw_configuration)
+        owner = cls(plan, configuration)
+        _require_exact_fields(
+            raw_model,
+            {"model_id", "model_version", "runtime_state"},
+            "Hawkes-flow model identity",
+        )
+        raw_runtime_state = raw_model["runtime_state"]
+        if (
+            raw_model["model_id"] != HAWKES_FLOW_MODEL_ID
+            or raw_model["model_version"] != HAWKES_FLOW_MODEL_VERSION
+            or not isinstance(raw_runtime_state, Mapping)
+        ):
+            raise ValueError("Hawkes-flow model identity is unsupported")
+        owner.model = HawkesFlowModel.from_runtime_state(
+            _decode_hawkes_runtime_state(raw_runtime_state),
+            config=configuration.accepted_profile,
+        )
+        if payload["excitation_state"] != raw_runtime_state["excitation"]:
+            raise ValueError("Hawkes excitation state differs from model state")
+        if payload["last_decay_time_us"] != raw_runtime_state["state_time_us"]:
+            raise ValueError("Hawkes decay time differs from model state")
+        if payload["rng_label"] != HAWKES_FLOW_RNG_LABEL:
+            raise ValueError("Hawkes-flow RNG label is unsupported")
+        owner.rng = SeededRng.from_runtime_state(raw_rng)
+        raw_observation = payload["observation_cutoff"]
+        raw_pending = payload["pending_proposal"]
+        owner.last_observation = (
+            None
+            if raw_observation is None
+            else FlowObservationCutV1.from_dict(raw_observation)  # type: ignore[arg-type]
+        )
+        owner.pending_proposal = (
+            None
+            if raw_pending is None
+            else HawkesFlowProposalV1.from_dict(raw_pending)  # type: ignore[arg-type]
+        )
+        owner.proposal_sequence = _exact_int(
+            payload["proposal_sequence"], "proposal_sequence"
+        )
+        diagnostics = payload["diagnostic_draw_sequence"]
+        if type(diagnostics) is not list or any(
+            not isinstance(row, Mapping) for row in diagnostics
+        ):
+            raise TypeError("Hawkes-flow diagnostics must be an object array")
+        owner.diagnostic_draw_sequence = [dict(row) for row in diagnostics]
+        _require_exact_fields(
+            raw_rejection,
+            {"applied_count", "last_rejection_reason", "rejected_count"},
+            "Hawkes-flow rejection state",
+        )
+        owner.applied_count = _exact_int(raw_rejection["applied_count"], "applied_count")
+        owner.rejected_count = _exact_int(
+            raw_rejection["rejected_count"], "rejected_count"
+        )
+        owner.last_rejection_reason = _optional_string(
+            raw_rejection["last_rejection_reason"], "last_rejection_reason"
+        )
+        if payload["intensity_state"] != owner._intensity_state():
+            raise ValueError("Hawkes intensity state differs from restored model")
+        owner.assert_invariants(plan)
+        if owner.checkpoint_state() != dict(payload):
+            raise ValueError("Hawkes-flow checkpoint is not a canonical fixed point")
+        return owner
+
+    def assert_invariants(self, plan: FullDayPlanV1) -> None:
+        self._validate_plan_binding(plan)
+        if (
+            self.model.config.profile_id != self.configuration.accepted_profile_id
+            or _hawkes_profile_sha256(self.model.config)
+            != self.configuration.accepted_profile_sha256
+        ):
+            raise RuntimeError("Hawkes model differs from its accepted profile binding")
+        expected_seed = plan.seed_policy.derive(self.rng_label)
+        if self.rng.seed != expected_seed:
+            raise RuntimeError("Hawkes-flow RNG differs from the plan substream")
+        if self.proposal_sequence < 0:
+            raise RuntimeError("Hawkes proposal sequence is invalid")
+        resolved = self.applied_count + self.rejected_count
+        pending_count = 0 if self.pending_proposal is None else 1
+        if resolved + pending_count != self.proposal_sequence:
+            raise RuntimeError("Hawkes proposal lifecycle is not conserved")
+        model_state = self.model.runtime_state()
+        if model_state["observed_events"] != resolved:
+            raise RuntimeError("Hawkes excitation count differs from resolved proposals")
+        if self.pending_proposal is not None:
+            if (
+                self.pending_proposal.proposal_sequence != self.proposal_sequence
+                or self.last_observation is None
+                or self.pending_proposal.observation_cutoff_us
+                != self.last_observation.simulation_time_us
+                or model_state["state_time_us"] > self.pending_proposal.scheduled_time_us
+            ):
+                raise RuntimeError("Hawkes pending proposal differs from its cut/state")
+        for sequence, row in enumerate(self.diagnostic_draw_sequence, start=1):
+            if row.get("draw_sequence") != sequence:
+                raise RuntimeError("Hawkes diagnostic draw sequence has a gap")
+        if self.diagnostic_draw_sequence and (
+            self.diagnostic_draw_sequence[-1].get("rng_state_after_sha256")
+            != self.rng.state_sha256()
+        ):
+            raise RuntimeError("Hawkes diagnostic tail differs from RNG state")
+        validate_strict_json(self.checkpoint_state())
+
+
 class SimpleFlowComponentAdapterV1(FullDayComponentAdapterV1):
     component_id = FLOW_SIMPLE_COMPONENT
     active_predicate = component_configured_predicate(FLOW_SIMPLE_COMPONENT)
@@ -806,6 +1616,55 @@ class HawkesFlowComponentAdapterV1(_ContractOnlyFlowAdapterV1):
     owned_state_ids = (FLOW_HAWKES_COMPONENT,)
 
 
+class HawkesFlowComponentAdapterV2(FullDayComponentAdapterV1):
+    component_id = FLOW_HAWKES_COMPONENT
+    implementation_version = 2
+    active_predicate = component_configured_predicate(FLOW_HAWKES_COMPONENT)
+    dependencies = tuple(sorted({FULL_DAY_RUNTIME_COMPONENT, MECHANICS_COMPONENT}))
+    owned_resource_ids = tuple(
+        sorted(
+            {
+                f"{FLOW_HAWKES_COMPONENT}_MODEL_STATE",
+                f"{FLOW_HAWKES_COMPONENT}_PENDING_PROPOSAL",
+                f"{FLOW_HAWKES_COMPONENT}_RNG_SUBSTREAM",
+            }
+        )
+    )
+    borrowed_resource_ids = tuple(sorted({"ORDER_GATEWAY", "SIMULATION_CLOCK"}))
+    owned_state_ids = (FLOW_HAWKES_COMPONENT,)
+
+    @classmethod
+    def is_active(cls, plan: FullDayPlanV1) -> bool:
+        if type(plan) is not FullDayPlanV1:
+            raise TypeError("Hawkes-flow adapter requires FullDayPlanV1")
+        return cls.component_id in plan.selected_component_ids
+
+    def snapshot(self, owner: object) -> ComponentSnapshotV1:
+        if type(owner) is not HawkesFlowOwnerV1:
+            raise TypeError("Hawkes-flow adapter owner has the wrong type")
+        return ComponentSnapshotV1.create(
+            component_id=self.component_id,
+            component_schema_version=self.component_schema_version,
+            implementation_version=self.implementation_version,
+            dependencies=self.dependencies,
+            owned_state_ids=self.owned_state_ids,
+            state=owner.checkpoint_state(),
+        )
+
+    def validate(self, snapshot: ComponentSnapshotV1, **context: object) -> None:
+        self.restore(snapshot, **context)
+
+    def restore(self, snapshot: ComponentSnapshotV1, **context: object) -> object:
+        self._validate_snapshot_header(snapshot)
+        plan = context.get("plan")
+        if type(plan) is not FullDayPlanV1:
+            raise ValueError("Hawkes-flow restore requires the exact plan")
+        detached = snapshot.as_dict()["state"]
+        if not isinstance(detached, Mapping):  # pragma: no cover - snapshot contract
+            raise TypeError("Hawkes-flow snapshot state is not an object")
+        return HawkesFlowOwnerV1.from_checkpoint_state(detached, plan=plan)
+
+
 class QueueReactiveFlowComponentAdapterV1(_ContractOnlyFlowAdapterV1):
     component_id = FLOW_QUEUE_REACTIVE_COMPONENT
     active_predicate = component_configured_predicate(FLOW_QUEUE_REACTIVE_COMPONENT)
@@ -823,7 +1682,14 @@ class QueueReactiveFlowComponentAdapterV1(_ContractOnlyFlowAdapterV1):
 
 __all__ = [
     "FlowObservationCutV1",
+    "HAWKES_FLOW_MODEL_ID",
+    "HAWKES_FLOW_MODEL_VERSION",
+    "HAWKES_FLOW_RNG_LABEL",
     "HawkesFlowComponentAdapterV1",
+    "HawkesFlowComponentAdapterV2",
+    "HawkesFlowConfigurationV1",
+    "HawkesFlowOwnerV1",
+    "HawkesFlowProposalV1",
     "SIMPLE_FLOW_MODEL_ID",
     "SIMPLE_FLOW_MODEL_VERSION",
     "SIMPLE_FLOW_RNG_LABEL",
