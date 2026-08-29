@@ -70,10 +70,13 @@ PROVENANCE_PACKAGE_ROOTS = (
     "marketdata",
     "calibration",
     "scenarios",
+    "scenario_lang",
     "strategy",
+    "discovery",
     "player",
     "research",
     "full_day",
+    "mining",
 )
 _PROVENANCE_TOP_LEVEL_FILES = (
     "kirby2/__init__.py",

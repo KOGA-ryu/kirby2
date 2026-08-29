@@ -1,4 +1,4 @@
-"""Executable strategy-discovery audits for Work Orders 35-A through 35-D."""
+"""Executable strategy-discovery audits for Work Orders 35-A through 35-E."""
 
 from __future__ import annotations
 
@@ -75,8 +75,11 @@ from kirby2.discovery.partitions import (
     partition_manifest_round_trip,
 )
 from kirby2.discovery.evaluation import (
+    CandidatePartitionEvidenceV1,
+    ComponentDeltaV1,
     DevelopmentSyntheticScoreOracleV1,
     EvaluationAccessError,
+    RootDeltaV1,
     SyntheticOracleModeV1,
     require_compatible_evidence,
 )
@@ -113,12 +116,76 @@ from kirby2.discovery.search import (
     load_search_manifest,
     run_development_search,
 )
+from kirby2.discovery.observability import (
+    ENDOGENOUS_DIVERGENCE_CLAIM_SCOPE_V1,
+    FORBIDDEN_REFERENCE_FIELDS_V1,
+    OBSERVABLE_FEATURE_NAMES_V1,
+    TERMINAL_ROOT_ORDER_V1,
+    CandidateDecisionProjectionV1,
+    CandidatePermissionV1,
+    CandidateSignalV1,
+    DisciplineEligibilityV1,
+    DisciplineEvidenceStatusV1,
+    DisciplineReasonV1,
+    EndogenousDivergenceRecordV1,
+    MissingReferenceLabelError,
+    ObservableDecisionInputV1,
+    ObservationStatusV1,
+    ObservationUnavailableError,
+    RevealProtocolError,
+    RevealStageV1,
+    ScientificConclusionV1,
+    TerminalRevealControllerV1,
+    bind_reference_decision_label,
+    project_candidate_decision,
+    scientific_conclusion,
+    score_candidate_decision,
+    seal_terminal_material,
+    summarize_discipline,
+)
+from kirby2.discovery.overfit import (
+    POST_REVEAL_ADDITIONS_V1,
+    PRE_REVEAL_APPLICABILITY_V1,
+    PRE_REVEAL_SEALED_V1,
+    OverfitCellV1,
+    OverfitLabelV1,
+    OverfitPartitionEvidenceV1,
+    ThresholdSensitivityEvidenceV1,
+    ThresholdSettingMedianV1,
+    assess_post_reveal_overfit,
+    build_development_overfit_fixture,
+    excessive_trade_frequency,
+    one_scenario_dependence,
+    one_seed_dependence,
+    threshold_evidence_from_robustness,
+    threshold_sensitivity,
+    trade_suppression,
+)
+from kirby2.discovery.robustness import (
+    MANDATORY_ROBUSTNESS_FAMILIES_V1,
+    ROBUSTNESS_EXPECTED_CELL_COUNT_V1,
+    ROBUSTNESS_ROOTS_V1,
+    ROBUSTNESS_SETTINGS_V1,
+    PerturbationStatusV1,
+    RegimeProbabilityRowV1,
+    RegimeWeightV1,
+    RobustnessFamilyV1,
+    RobustnessOutcomeV1,
+    SyntheticRobustnessModeV1,
+    apply_robustness_setting,
+    build_robustness_probes,
+    build_synthetic_robustness_evidence,
+    controlled_robustness_environment,
+    derive_execution_timing,
+    qualify_adversarial,
+    qualify_holdout,
+    qualify_robustness,
+)
 from kirby2.experiments.models import (
     ExperimentManifest,
     ExperimentMode,
     StrategyVariant,
 )
-from kirby2.immutable import thaw_json
 from kirby2.research.models import ArtifactType
 from kirby2.research.store import RunStore
 from kirby2.strategy.language import (
@@ -176,6 +243,22 @@ WO35D_ACCESS_FIXTURE_SHA256 = (
 )
 WO35D_NO_WINNER_RUN_SHA256 = (
     "bed290d4e8bc95388f25677f15a6b65af0369a0c4b2958aec87bed43837dac91"
+)
+WO35E_AUDIT_CASE_COUNT = 5
+WO35E_PERTURBATION_FIXTURE_SHA256 = (
+    "5826e162b1b0876d49c02a8306712845ca0f014eaef3a5d65dd7ed5afcdc6471"
+)
+WO35E_ROBUSTNESS_FIXTURE_SHA256 = (
+    "48986e4fe0118cec5d6e48c41719a5a316f327043a1fa76c6a77b1385f0f97e7"
+)
+WO35E_OBSERVABILITY_FIXTURE_SHA256 = (
+    "e8c16437614a1bdb9a716ada713e2ba54d78d8611df4554fd297d9c99679a0e3"
+)
+WO35E_OVERFIT_FIXTURE_SHA256 = (
+    "94adb078dbe9256b2e4e6e191e9b794e772a30cfce54fba64410081a1bcff0ec"
+)
+WO35E_REVEAL_FIXTURE_SHA256 = (
+    "5907a21418b16db9476c2e96bc46dd6f202973abc3a5bce7fa9d39310de141e2"
 )
 
 _TRAFFIC_A = """\
@@ -2224,6 +2307,996 @@ def audit_wo35d_strategy_search() -> tuple[StrategyDiscoveryAuditCase, ...]:
     )
 
 
+def _robustness_perturbation_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    candidate_environment = controlled_robustness_environment(candidate=True)
+    base_environment = controlled_robustness_environment(candidate=False)
+    candidate = build_robustness_probes(candidate_environment)
+    base = build_robustness_probes(base_environment)
+    family_counts = tuple(
+        (
+            family.value,
+            sum(item.family is family for item in ROBUSTNESS_SETTINGS_V1),
+        )
+        for family in RobustnessFamilyV1
+    )
+    if len(candidate) != 17 or len(base) != 17:
+        failures.append("robustness registry does not contain 16 settings plus venue N/A")
+    for candidate_probe, base_probe in zip(candidate, base, strict=True):
+        if (
+            candidate_probe.setting != base_probe.setting
+            or candidate_probe.status is not base_probe.status
+            or candidate_probe.changed_paths != base_probe.changed_paths
+        ):
+            failures.append("candidate and base did not receive the same one-factor probe")
+    if tuple(count for _, count in family_counts) != (4, 2, 2, 2, 2, 2, 2, 1):
+        failures.append("robustness family setting counts changed")
+    if any(
+        item.status is not PerturbationStatusV1.APPLIED
+        for item in candidate[:-1]
+    ) or candidate[-1].status is not PerturbationStatusV1.NOT_APPLICABLE:
+        failures.append("mandatory families or single-venue declaration changed status")
+    threshold_paths = (
+        "/green/0/threshold_ticks",
+        "/green/1/threshold_ppm",
+        "/wait/0/threshold_ticks",
+    )
+    if any(item.changed_paths != threshold_paths for item in candidate[:4]):
+        failures.append("threshold robustness changed a duration or omitted a condition")
+    if any(item.changed_paths != ("/window_us",) for item in candidate[4:6]):
+        failures.append("rolling-window robustness changed more than the window")
+    latency_values = tuple(
+        (
+            item.environment.decision_latency_us,
+            item.environment.routing_latency_us,
+        )
+        for item in candidate[6:8]
+        if item.environment is not None
+    )
+    if latency_values != ((251, 0), (1001, 0)):
+        failures.append("latency robustness did not preserve zero routing latency")
+    latency_timings = tuple(
+        derive_execution_timing(
+            decision_time_us=10_000_000,
+            decision_latency_us=item.environment.decision_latency_us,
+            routing_latency_us=item.environment.routing_latency_us,
+            filled_entry_quantity=100,
+        )
+        for item in candidate[6:8]
+        if item.environment is not None
+    )
+    if tuple(
+        (item.entry_arrival_us, item.cancellation_us, item.exit_arrival_us)
+        for item in latency_timings
+    ) != (
+        (10_000_251, 12_000_251, 12_000_252),
+        (10_001_001, 12_001_001, 12_001_002),
+    ) or derive_execution_timing(
+        decision_time_us=10_000_000,
+        decision_latency_us=1,
+        routing_latency_us=0,
+        filled_entry_quantity=0,
+    ).exit_arrival_us is not None:
+        failures.append("latency robustness did not derive exact entry/cancel/exit times")
+    rebate_environment = replace(
+        base_environment,
+        maker_fee_milliticks_per_share=-500,
+        taker_fee_milliticks_per_share=100,
+    )
+    fee_plus_250 = next(
+        item
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.setting_id == "FEES_PLUS_250"
+    )
+    rebate_probe = apply_robustness_setting(rebate_environment, fee_plus_250)
+    if (
+        rebate_probe.environment is None
+        or rebate_probe.environment.maker_fee_milliticks_per_share != -250
+        or rebate_probe.environment.taker_fee_milliticks_per_share != 350
+    ):
+        failures.append("fee robustness did not make a rebate less favorable")
+    if any(
+        item.environment is None
+        or item.environment.liquidity != candidate_environment.liquidity
+        for item in candidate[10:12]
+    ):
+        failures.append("volume robustness changed the liquidity vector")
+    if any(
+        item.environment is None
+        or item.environment.volume != candidate_environment.volume
+        or item.environment.liquidity.cancellation_rate_ppm
+        != candidate_environment.liquidity.cancellation_rate_ppm
+        or item.environment.liquidity.placement_depth_offset_ticks
+        != candidate_environment.liquidity.placement_depth_offset_ticks
+        for item in candidate[12:14]
+    ):
+        failures.append("liquidity robustness changed an excluded vector field")
+    weak_regime = replace(
+        base_environment,
+        regime_rows=(
+            RegimeProbabilityRowV1(
+                "WEAK",
+                (
+                    RegimeWeightV1("DONOR", 200_000),
+                    RegimeWeightV1("RECEIVER", 800_000),
+                ),
+            ),
+        ),
+    )
+    min_to_max = next(
+        item
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.setting_id == "REGIME_MIN_TO_MAX"
+    )
+    donor_refusal = apply_robustness_setting(weak_regime, min_to_max)
+    if (
+        donor_refusal.status is not PerturbationStatusV1.INSUFFICIENT_EVIDENCE
+        or donor_refusal.environment is not None
+    ):
+        failures.append("at-most-200000 regime donor did not fail the whole setting")
+    threshold_110 = next(
+        item
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.setting_id == "THRESHOLD_1100000"
+    )
+    window_120 = next(
+        item
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.setting_id == "ROLLING_WINDOW_1200000"
+    )
+    threshold_bound_refusal = apply_robustness_setting(
+        replace(
+            base_environment,
+            green_spread_ticks=5,
+            green_imbalance_ppm=500_000,
+            wait_spread_ticks=10,
+        ),
+        threshold_110,
+    )
+    window_bound_refusal = apply_robustness_setting(
+        replace(base_environment, window_us=20_000_000),
+        window_120,
+    )
+    if any(
+        item.status is not PerturbationStatusV1.INVALID
+        or item.environment is not None
+        for item in (threshold_bound_refusal, window_bound_refusal)
+    ):
+        failures.append("out-of-bound threshold/window robustness was clamped")
+    venue = candidate[-1]
+    if venue.reason != "SINGLE_VENUE_CONTROLLED_SOURCE_V1" or venue.changed_paths:
+        failures.append("venue N/A was not capability-declared without a synthetic probe")
+    projection = {
+        "base": [item.as_dict() for item in base],
+        "candidate": [item.as_dict() for item in candidate],
+        "donor_refusal": donor_refusal.as_dict(),
+        "family_counts": [list(item) for item in family_counts],
+        "latency_timings": [item.as_dict() for item in latency_timings],
+        "latency_values": [list(item) for item in latency_values],
+        "rebate_probe": rebate_probe.as_dict(),
+        "threshold_bound_refusal": threshold_bound_refusal.as_dict(),
+        "window_bound_refusal": window_bound_refusal.as_dict(),
+    }
+    fixture_sha256 = hashlib.sha256(canonical_identity_bytes(projection)).hexdigest()
+    if fixture_sha256 != WO35E_PERTURBATION_FIXTURE_SHA256:
+        failures.append("WO35-E one-factor perturbations differ from their frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "e_one_factor_perturbations_and_single_venue_capability_are_exact",
+        (
+            f"fixture_sha256={fixture_sha256} settings=16 roots=4 expected_cells=64 "
+            f"families={','.join(f'{name}:{count}' for name, count in family_counts)} "
+            "paired_paths=IDENTICAL latency=251,1001 routing_zero=PRESERVED "
+            "entry_cancel_exit=EXACT rebate=LESS_FAVORABLE "
+            "bounds=REFUSED_WITHOUT_CLAMP "
+            "regime_donor_at_200000=INSUFFICIENT_EVIDENCE venue_mix=NOT_APPLICABLE"
+        ),
+        tuple(failures),
+    )
+
+
+def _robustness_qualification_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    modes = tuple(SyntheticRobustnessModeV1)
+    evidence = tuple(build_synthetic_robustness_evidence(item) for item in modes)
+    decisions = tuple(qualify_robustness(item) for item in evidence)
+    expected_outcomes = (
+        RobustnessOutcomeV1.PASSED,
+        RobustnessOutcomeV1.INSUFFICIENT_EVIDENCE,
+        RobustnessOutcomeV1.INSUFFICIENT_EVIDENCE,
+        RobustnessOutcomeV1.EXPERIMENT_INVALID,
+    )
+    if tuple(item.outcome for item in decisions) != expected_outcomes:
+        failures.append("robustness scientific and invalid outcomes changed")
+    passing = evidence[0]
+    passing_decision = decisions[0]
+    if (
+        tuple(item.family for item in passing.families)
+        != MANDATORY_ROBUSTNESS_FAMILIES_V1
+        or sum(len(item.cells) for item in passing.families)
+        != ROBUSTNESS_EXPECTED_CELL_COUNT_V1
+        or tuple(
+            (cell.root_seed, cell.setting_id)
+            for family in passing.families
+            for cell in family.cells
+        )
+        != tuple(
+            (root, setting.setting_id)
+            for family in MANDATORY_ROBUSTNESS_FAMILIES_V1
+            for root in ROBUSTNESS_ROOTS_V1
+            for setting in ROBUSTNESS_SETTINGS_V1
+            if setting.family is family
+        )
+    ):
+        failures.append("robustness evidence is not seven families and 64 ordered cells")
+    for family in passing.families:
+        medians = family.component_medians()
+        if (
+            medians[StrategyObjectiveIdV1.BALANCED_CLASSIFICATION] != 10_000
+            or medians[StrategyObjectiveIdV1.EXECUTION_OPPORTUNITY] != 10_000
+            or StrategyObjectiveIdV1.CROSS_CELL_STABILITY in medians
+            or len(medians) != 10
+        ):
+            failures.append("robustness family pooling or component inventory changed")
+    first_family = passing.families[0]
+    pooling_tamper_refused = _raises(
+        lambda: replace(
+            first_family,
+            cells=(
+                replace(
+                    first_family.cells[0],
+                    composite_delta=first_family.cells[0].composite_delta + 1,
+                ),
+                *first_family.cells[1:],
+            ),
+        ),
+        ValueError,
+    )
+    if not pooling_tamper_refused:
+        failures.append("robustness admitted a composite that bypassed pooled utilities")
+    if (
+        passing_decision.nonnegative_family_count != 7
+        or passing_decision.minimum_cell < -75_000
+    ):
+        failures.append("passing robustness reduction changed")
+    if not any("UNAVAILABLE_OBSERVATION" in item for item in decisions[2].reasons):
+        failures.append("unavailable robustness observation was not insufficient evidence")
+    if not any("REPLAY_INVALID" in item for item in decisions[3].reasons):
+        failures.append("replay-invalid robustness cell was not experiment-invalid")
+    projection = {
+        "decisions": [item.as_dict() for item in decisions],
+        "evidence_sha256": [item.evidence_sha256 for item in evidence],
+        "family_component_ids": [
+            sorted(item.value for item in family.component_medians())
+            for family in passing.families
+        ],
+        "mode_order": [item.value for item in modes],
+        "pooling_tamper_refused": pooling_tamper_refused,
+    }
+    fixture_sha256 = hashlib.sha256(canonical_identity_bytes(projection)).hexdigest()
+    if fixture_sha256 != WO35E_ROBUSTNESS_FIXTURE_SHA256:
+        failures.append("WO35-E robustness qualification differs from its frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "e_robustness_pools_exactly_and_fails_closed_by_failure_class",
+        (
+            f"fixture_sha256={fixture_sha256} families=7 cells=64 "
+            "classification_opportunity=FAMILY_POOLED pooling_bypass=REFUSED "
+            "stability=OMITTED "
+            "pass=PASSED brittle=INSUFFICIENT_EVIDENCE "
+            "unavailable=INSUFFICIENT_EVIDENCE replay=EXPERIMENT_INVALID"
+        ),
+        tuple(failures),
+    )
+
+
+def _observability_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    observation = ObservableDecisionInputV1(
+        "wo35e-observable-decision",
+        3_505_000,
+        1_000,
+        _digest("wo35e/observable-cut"),
+        ObservationStatusV1.AVAILABLE,
+        2,
+        200_000,
+        1_000_000,
+        8,
+        3,
+        0,
+        0,
+    )
+    label = bind_reference_decision_label(
+        label_id=observation.decision_id,
+        root_seed=observation.root_seed,
+        decision_time_us=observation.decision_time_us,
+        reference_state=CandidateSignalV1.GREEN,
+        opportunity=True,
+        source_event_ids=("source-event-0001", "source-event-0002"),
+        oracle_sha256=_digest("wo35e/reference-oracle"),
+    )
+    projection = project_candidate_decision(
+        observation,
+        label,
+        candidate_state=CandidateSignalV1.GREEN,
+        permission=CandidatePermissionV1.ALLOW,
+    )
+    scored = score_candidate_decision(projection, label)
+
+    def make_observation(
+        decision_id: str,
+        root_seed: int,
+        decision_time_us: int,
+    ) -> ObservableDecisionInputV1:
+        return ObservableDecisionInputV1(
+            decision_id,
+            root_seed,
+            decision_time_us,
+            _digest(f"wo35e/{decision_id}/cut"),
+            ObservationStatusV1.AVAILABLE,
+            3,
+            0,
+            900_000,
+            3,
+            4,
+            0,
+            0,
+        )
+
+    wait_observation = make_observation("wo35e-wait-decision", 3_505_001, 2_000)
+    wait_label = bind_reference_decision_label(
+        label_id=wait_observation.decision_id,
+        root_seed=wait_observation.root_seed,
+        decision_time_us=wait_observation.decision_time_us,
+        reference_state=CandidateSignalV1.WAIT,
+        opportunity=False,
+        source_event_ids=("source-event-0010",),
+        oracle_sha256=_digest("wo35e/reference-oracle"),
+    )
+    wait_projection = project_candidate_decision(
+        wait_observation,
+        wait_label,
+        candidate_state=CandidateSignalV1.WAIT,
+        permission=CandidatePermissionV1.DENY,
+    )
+    red_observation = make_observation("wo35e-red-decision", 3_505_002, 3_000)
+    red_label = bind_reference_decision_label(
+        label_id=red_observation.decision_id,
+        root_seed=red_observation.root_seed,
+        decision_time_us=red_observation.decision_time_us,
+        reference_state=CandidateSignalV1.RED,
+        opportunity=False,
+        source_event_ids=("source-event-0020",),
+        oracle_sha256=_digest("wo35e/reference-oracle"),
+    )
+    red_projection = project_candidate_decision(
+        red_observation,
+        red_label,
+        candidate_state=CandidateSignalV1.GREEN,
+        permission=CandidatePermissionV1.ALLOW,
+    )
+    discipline = summarize_discipline(
+        (projection, wait_projection, red_projection)
+    )
+    zero_eligible = summarize_discipline((projection,))
+
+    def recursive_keys(value: object) -> frozenset[str]:
+        keys: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                keys.add(str(key))
+                keys.update(recursive_keys(child))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                keys.update(recursive_keys(child))
+        return frozenset(keys)
+
+    leaked = recursive_keys(projection.as_dict()).intersection(
+        FORBIDDEN_REFERENCE_FIELDS_V1
+    )
+    if leaked or tuple(name for name, _ in observation.feature_values) != OBSERVABLE_FEATURE_NAMES_V1:
+        failures.append("candidate projection contains truth or differs from its whitelist")
+    if not (
+        scored.classification_correct
+        and not scored.false_green
+        and not scored.missed_opportunity
+    ):
+        failures.append("post-projection reference scoring changed")
+    if (
+        wait_projection.discipline_eligibility is not DisciplineEligibilityV1.ELIGIBLE
+        or wait_projection.discipline_violation
+        or wait_projection.discipline_reason is not DisciplineReasonV1.NONE
+        or red_projection.discipline_eligibility is not DisciplineEligibilityV1.ELIGIBLE
+        or not red_projection.discipline_violation
+        or red_projection.discipline_reason is not DisciplineReasonV1.ACTED_DURING_RED
+        or discipline.status is not DisciplineEvidenceStatusV1.MEASURED
+        or discipline.eligible_decisions != 2
+        or discipline.violations != 1
+        or discipline.utility != 500_000
+        or zero_eligible.status
+        is not DisciplineEvidenceStatusV1.INSUFFICIENT_EVIDENCE
+        or zero_eligible.utility is not None
+    ):
+        failures.append("typed discipline eligibility, violation, or zero-denominator rule changed")
+    unavailable = ObservableDecisionInputV1(
+        "wo35e-unavailable-decision",
+        3_505_003,
+        2_000,
+        _digest("wo35e/unavailable-cut"),
+        ObservationStatusV1.UNAVAILABLE,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    unavailable_refused = _raises(
+        lambda: project_candidate_decision(
+            unavailable,
+            label,
+            candidate_state=CandidateSignalV1.WAIT,
+            permission=CandidatePermissionV1.DENY,
+        ),
+        ObservationUnavailableError,
+    )
+    missing_label_refused = _raises(
+        lambda: project_candidate_decision(
+            observation,
+            None,
+            candidate_state=CandidateSignalV1.GREEN,
+            permission=CandidatePermissionV1.ALLOW,
+        ),
+        MissingReferenceLabelError,
+    )
+    hidden_injection_refused = _raises(
+        lambda: CandidateDecisionProjectionV1(
+            decision_id=projection.decision_id,
+            label_id=projection.label_id,
+            root_seed=projection.root_seed,
+            decision_time_us=projection.decision_time_us,
+            observable_cut_sha256=projection.observable_cut_sha256,
+            candidate_state=projection.candidate_state,
+            permission=projection.permission,
+            discipline_eligibility=projection.discipline_eligibility,
+            discipline_violation=projection.discipline_violation,
+            discipline_reason=projection.discipline_reason,
+            frozen_at_us=projection.frozen_at_us,
+            reference_state=CandidateSignalV1.GREEN,  # type: ignore[call-arg]
+        ),
+        TypeError,
+    )
+    label_tamper_refused = _raises(
+        lambda: replace(label, label_sha256="0" * 64),
+        ValueError,
+    )
+    divergence = EndogenousDivergenceRecordV1(
+        3_505_000,
+        _digest("wo35e/base-execution"),
+        _digest("wo35e/candidate-execution"),
+        observation.observable_cut_sha256,
+        15_000,
+    )
+    superiority_refused = _raises(
+        lambda: replace(divergence, real_market_superiority=True),
+        ValueError,
+    )
+    if not unavailable_refused:
+        failures.append("unavailable decision observation did not fail closed")
+    if not missing_label_refused:
+        failures.append("missing immutable reference label did not fail insufficient")
+    if not hidden_injection_refused or not label_tamper_refused:
+        failures.append("truth-only field injection reached the candidate projection")
+    if (
+        not superiority_refused
+        or divergence.claim_scope != ENDOGENOUS_DIVERGENCE_CLAIM_SCOPE_V1
+        or divergence.real_market_superiority
+    ):
+        failures.append("simulator divergence was allowed to overstate real-market evidence")
+    fixture_projection = {
+        "divergence": divergence.as_dict(),
+        "forbidden_fields": sorted(FORBIDDEN_REFERENCE_FIELDS_V1),
+        "hidden_injection_refused": hidden_injection_refused,
+        "label": label.as_dict(),
+        "label_tamper_refused": label_tamper_refused,
+        "missing_label_refused": missing_label_refused,
+        "projection": projection.as_dict(),
+        "projection_sha256": projection.projection_sha256,
+        "scored": {
+            "classification_correct": scored.classification_correct,
+            "false_green": scored.false_green,
+            "missed_opportunity": scored.missed_opportunity,
+        },
+        "discipline": {
+            "eligible_decisions": discipline.eligible_decisions,
+            "status": discipline.status.value,
+            "utility": discipline.utility,
+            "violations": discipline.violations,
+            "zero_eligible_status": zero_eligible.status.value,
+        },
+        "unavailable_refused": unavailable_refused,
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(fixture_projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35E_OBSERVABILITY_FIXTURE_SHA256:
+        failures.append("WO35-E observability boundary differs from its frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "e_decision_projection_excludes_truth_and_unavailable_inputs_fail_closed",
+        (
+            f"fixture_sha256={fixture_sha256} observable_features={len(observation.feature_values)} "
+            f"forbidden_fields={len(FORBIDDEN_REFERENCE_FIELDS_V1)} leaks={len(leaked)} "
+            "unavailable=REFUSED missing_label=INSUFFICIENT_EVIDENCE "
+            "discipline=2_ELIGIBLE_1_VIOLATION zero_eligible=INSUFFICIENT_EVIDENCE "
+            "hidden_injection=REFUSED label_tamper=REFUSED "
+            "endogenous_claim=SIMULATOR_COUNTERFACTUAL_ONLY"
+        ),
+        tuple(failures),
+    )
+
+
+def _overfit_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    fixture = build_development_overfit_fixture()
+    derived_threshold = threshold_evidence_from_robustness(
+        build_synthetic_robustness_evidence(SyntheticRobustnessModeV1.PASS)
+    )
+    expected_fixture_labels = (
+        OverfitLabelV1.TRAIN_VALIDATION_DIVERGENCE,
+        OverfitLabelV1.ONE_SEED_DEPENDENCE,
+        OverfitLabelV1.ONE_SCENARIO_DEPENDENCE,
+    )
+    if (
+        fixture.train.deltas != (100_000, 100_000, 100_000, 100_000)
+        or fixture.validation.deltas != (600_000, -20_000, -20_000, -20_000)
+        or fixture.assessment.labels != expected_fixture_labels
+        or not fixture.assessment.rejected
+    ):
+        failures.append("development training-star fixture was not labeled and rejected")
+    if tuple(item.setting_id for item in derived_threshold.settings) != tuple(
+        item.setting_id
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.family is RobustnessFamilyV1.THRESHOLD
+    ):
+        failures.append("overfit threshold medians did not derive from robustness cells")
+    threshold_ids = tuple(
+        item.setting_id
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.family is RobustnessFamilyV1.THRESHOLD
+    )
+    signed_threshold = ThresholdSensitivityEvidenceV1(
+        fixture.train.candidate_semantic_sha256,
+        tuple(
+            ThresholdSettingMedianV1(setting_id, value)
+            for setting_id, value in zip(
+                threshold_ids,
+                (-1, 0, 0, 1),
+                strict=True,
+            )
+        ),
+    )
+    ranged_threshold = ThresholdSensitivityEvidenceV1(
+        fixture.train.candidate_semantic_sha256,
+        tuple(
+            ThresholdSettingMedianV1(setting_id, value)
+            for setting_id, value in zip(
+                threshold_ids,
+                (1, 2, 3, 100_002),
+                strict=True,
+            )
+        ),
+    )
+    zero_positive = OverfitPartitionEvidenceV1(
+        fixture.train.candidate_semantic_sha256,
+        StrategyPartitionV1.VALIDATION,
+        (
+            OverfitCellV1(1, "A", 0),
+            OverfitCellV1(2, "B", -1),
+            OverfitCellV1(3, "B", -2),
+        ),
+        40,
+        40,
+        0,
+    )
+    if one_seed_dependence(zero_positive) or one_scenario_dependence(zero_positive):
+        failures.append("zero positive denominator fabricated dependence")
+    candidate = fixture.train.candidate_semantic_sha256
+
+    def partition_evidence(
+        partition: StrategyPartitionV1,
+        *,
+        root_start: int,
+        candidate_trades: int,
+        base_trades: int,
+        false_green_delta: int,
+    ) -> OverfitPartitionEvidenceV1:
+        deltas = (600_000, -20_000, -20_000, -20_000, -20_000, -20_000, -20_000, -20_000)
+        families = ("SOLE_POSITIVE_FAMILY",) + ("CONTROL_FAMILY",) * 7
+        return OverfitPartitionEvidenceV1(
+            candidate,
+            partition,
+            tuple(
+                OverfitCellV1(root_start + index, family, delta)
+                for index, (family, delta) in enumerate(
+                    zip(families, deltas, strict=True)
+                )
+            ),
+            candidate_trades,
+            base_trades,
+            false_green_delta,
+        )
+
+    holdout_suppressed = partition_evidence(
+        StrategyPartitionV1.HOLDOUT,
+        root_start=3_503_000,
+        candidate_trades=20,
+        base_trades=40,
+        false_green_delta=0,
+    )
+    holdout_excessive = partition_evidence(
+        StrategyPartitionV1.HOLDOUT,
+        root_start=3_503_000,
+        candidate_trades=81,
+        base_trades=50,
+        false_green_delta=-20_001,
+    )
+    adversarial_suppressed = partition_evidence(
+        StrategyPartitionV1.ADVERSARIAL_HOLDOUT,
+        root_start=3_504_000,
+        candidate_trades=20,
+        base_trades=40,
+        false_green_delta=0,
+    )
+    adversarial_excessive = partition_evidence(
+        StrategyPartitionV1.ADVERSARIAL_HOLDOUT,
+        root_start=3_504_000,
+        candidate_trades=81,
+        base_trades=50,
+        false_green_delta=-20_001,
+    )
+    first_post = assess_post_reveal_overfit(
+        fixture.assessment,
+        holdout_suppressed,
+        adversarial_excessive,
+        candidate_complexity_points=40,
+        base_complexity_points=10,
+    )
+    second_post = assess_post_reveal_overfit(
+        fixture.assessment,
+        holdout_excessive,
+        adversarial_suppressed,
+        candidate_complexity_points=40,
+        base_complexity_points=10,
+    )
+    post_union = tuple(
+        item
+        for item in POST_REVEAL_ADDITIONS_V1
+        if item in set(first_post.labels).union(second_post.labels)
+    )
+    if post_union != POST_REVEAL_ADDITIONS_V1:
+        failures.append("post-reveal suffix and complexity predicates are incomplete")
+    if (
+        first_post.labels[: len(fixture.assessment.labels)]
+        != fixture.assessment.labels
+        or first_post.preserved_pre_reveal_sha256
+        != fixture.assessment.assessment_sha256
+        or first_post.evaluated_labels
+        != PRE_REVEAL_APPLICABILITY_V1 + POST_REVEAL_ADDITIONS_V1
+        or fixture.assessment.sealed_not_evaluated != PRE_REVEAL_SEALED_V1
+    ):
+        failures.append("post-reveal assessment recalculated or replaced pre-reveal labels")
+    if not threshold_sensitivity(signed_threshold) or not threshold_sensitivity(
+        ranged_threshold
+    ):
+        failures.append("threshold both-sign or greater-than-100000 range rule changed")
+    if (
+        not trade_suppression(holdout_suppressed)
+        or not excessive_trade_frequency(adversarial_excessive)
+        or excessive_trade_frequency(holdout_suppressed)
+    ):
+        failures.append("trade suppression or excessive-frequency predicate changed")
+    fixture_projection = {
+        "development_fixture": fixture.as_dict(),
+        "development_fixture_sha256": fixture.fixture_sha256,
+        "derived_threshold": derived_threshold.as_dict(),
+        "first_post": first_post.as_dict(),
+        "post_union": [item.value for item in post_union],
+        "second_post": second_post.as_dict(),
+        "threshold_range": ranged_threshold.as_dict(),
+        "threshold_sign": signed_threshold.as_dict(),
+        "zero_positive_seed": one_seed_dependence(zero_positive),
+        "zero_positive_scenario": one_scenario_dependence(zero_positive),
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(fixture_projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35E_OVERFIT_FIXTURE_SHA256:
+        failures.append("WO35-E overfit predicates differ from their frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "e_all_overfit_predicates_apply_once_and_the_training_star_is_rejected",
+        (
+            f"fixture_sha256={fixture_sha256} development_sha256={fixture.fixture_sha256} "
+            f"pre_labels={','.join(item.value for item in fixture.assessment.labels)} "
+            f"post_additions={len(post_union)}/9 pre_preserved=YES "
+            "zero_positive_denominator=FALSE_WITHOUT_MISSING threshold_rules=2/2 "
+            "fixture_outcome=REJECTED"
+        ),
+        tuple(failures),
+    )
+
+
+def _terminal_evidence(
+    *,
+    candidate_semantic_sha256: str,
+    partition: StrategyPartitionV1,
+    roots: tuple[int, ...],
+    delta: int,
+    compatibility: EvidenceCompatibilityKeyV1,
+) -> CandidatePartitionEvidenceV1:
+    return CandidatePartitionEvidenceV1(
+        candidate_id="wo35e-terminal-candidate",
+        semantic_sha256=candidate_semantic_sha256,
+        partition=partition,
+        compatibility=compatibility,
+        root_deltas=tuple(RootDeltaV1(root, delta) for root in roots),
+        component_deltas=tuple(
+            ComponentDeltaV1(
+                item.objective_id,
+                (
+                    60_000
+                    if item.objective_id
+                    is StrategyObjectiveIdV1.BALANCED_CLASSIFICATION
+                    else 10_000
+                ),
+            )
+            for item in REQUIRED_OBJECTIVE_SPECS_V1
+        ),
+        candidate_trades=40,
+        base_trades=40,
+        complexity_points=30,
+        oracle_id="WO35E_SYNTHETIC_TERMINAL_ORACLE_V1",
+    )
+
+
+def _reveal_and_terminal_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    robustness = build_synthetic_robustness_evidence(SyntheticRobustnessModeV1.PASS)
+    robustness_decision = qualify_robustness(robustness)
+    material = seal_terminal_material(
+        candidate_semantic_sha256=robustness.candidate_semantic_sha256,
+        holdout_manifest_sha256=_digest("wo35e/holdout-manifest"),
+        holdout_member_inventory_sha256=_digest("wo35e/holdout-members"),
+        adversarial_manifest_sha256=_digest("wo35e/adversarial-manifest"),
+        adversarial_member_inventory_sha256=_digest("wo35e/adversarial-members"),
+        reveal_token="wo35e-one-time-token",
+    )
+
+    def controller() -> TerminalRevealControllerV1:
+        return TerminalRevealControllerV1(
+            candidate_semantic_sha256=robustness.candidate_semantic_sha256,
+            sealed_material_commitment_sha256=material.commitment_sha256,
+        )
+
+    main = controller()
+    pre_reveal_clean = (
+        main.stage is RevealStageV1.CANDIDATE_FROZEN
+        and not main.access_records
+        and not main.token_consumed
+        and not any(
+            slot in {"_holdout", "_adversarial", "_material"}
+            for slot in TerminalRevealControllerV1.__slots__
+        )
+    )
+    main.record_robustness(robustness, robustness_decision)
+    result = main.reveal(material, reveal_token="wo35e-one-time-token")
+    if (
+        not pre_reveal_clean
+        or main.stage is not RevealStageV1.TERMINAL_REVEALED
+        or not main.token_consumed
+        or len(main.access_records) != 1
+        or result.execution_order != TERMINAL_ROOT_ORDER_V1
+        or not result.access_recorded_before_exposure
+        or result.access_record.partitions
+        != (
+            StrategyPartitionV1.HOLDOUT,
+            StrategyPartitionV1.ADVERSARIAL_HOLDOUT,
+        )
+    ):
+        failures.append("valid atomic terminal reveal ordering or accounting changed")
+
+    early = controller()
+    try:
+        early.reveal(material, reveal_token="wo35e-one-time-token")
+    except RevealProtocolError as error:
+        early_code = error.code
+    else:
+        early_code = "GRANTED"
+        failures.append("terminal material was exposed before robustness")
+    failed_robustness = build_synthetic_robustness_evidence(
+        SyntheticRobustnessModeV1.BRITTLE
+    )
+    failed_decision = qualify_robustness(failed_robustness)
+    failed = controller()
+    failed.record_robustness(failed_robustness, failed_decision)
+    if (
+        failed.stage is not RevealStageV1.CLOSED_INSUFFICIENT_EVIDENCE
+        or failed.access_records
+        or failed.token_consumed
+    ):
+        failures.append("scientific robustness miss did not close without reveal")
+    forged_pass = controller()
+    try:
+        forged_pass.record_robustness(
+            failed_robustness,
+            replace(
+                failed_decision,
+                outcome=RobustnessOutcomeV1.PASSED,
+                reasons=(),
+            ),
+        )
+    except RevealProtocolError as error:
+        forged_pass_code = error.code
+    else:
+        forged_pass_code = "GRANTED"
+        failures.append("forged passing robustness decision opened the reveal gate")
+    invalid_robustness = build_synthetic_robustness_evidence(
+        SyntheticRobustnessModeV1.REPLAY_INVALID
+    )
+    invalid = controller()
+    invalid.record_robustness(
+        invalid_robustness,
+        qualify_robustness(invalid_robustness),
+    )
+    if invalid.stage is not RevealStageV1.EXPERIMENT_INVALID:
+        failures.append("replay-invalid robustness evidence was not experiment-invalid")
+    wrong_token = controller()
+    wrong_token.record_robustness(robustness, robustness_decision)
+    try:
+        wrong_token.reveal(material, reveal_token="wrong-token")
+    except RevealProtocolError as error:
+        wrong_token_code = error.code
+    else:
+        wrong_token_code = "GRANTED"
+        failures.append("wrong reveal token exposed terminal material")
+    repeated = controller()
+    repeated.record_robustness(robustness, robustness_decision)
+    repeated.reveal(material, reveal_token="wo35e-one-time-token")
+    try:
+        repeated.reveal(material, reveal_token="wo35e-one-time-token")
+    except RevealProtocolError as error:
+        repeat_code = error.code
+    else:
+        repeat_code = "GRANTED"
+        failures.append("terminal reveal token was reusable")
+    rerun = controller()
+    rerun.record_robustness(robustness, robustness_decision)
+    try:
+        rerun.record_robustness(robustness, robustness_decision)
+    except RevealProtocolError as error:
+        rerun_code = error.code
+    else:
+        rerun_code = "GRANTED"
+        failures.append("robustness could run twice after candidate freeze")
+    if (
+        early_code != "ROBUSTNESS_NOT_PASSED"
+        or early.stage is not RevealStageV1.EXPERIMENT_INVALID
+        or wrong_token_code != "REVEAL_TOKEN_MISMATCH"
+        or wrong_token.stage is not RevealStageV1.EXPERIMENT_INVALID
+        or wrong_token.access_records
+        or repeat_code != "REVEAL_ALREADY_CONSUMED"
+        or repeated.stage is not RevealStageV1.EXPERIMENT_INVALID
+        or rerun_code != "ROBUSTNESS_ALREADY_RECORDED"
+        or rerun.robustness_record_count != 1
+        or forged_pass_code != "ROBUSTNESS_BINDING_MISMATCH"
+        or forged_pass.stage is not RevealStageV1.EXPERIMENT_INVALID
+    ):
+        failures.append("reveal/access/rerun protocol violations did not fail invalid")
+
+    compatibility = EvidenceCompatibilityKeyV1(
+        "WO35E_TERMINAL_SCENARIOS_V1",
+        "WO35_OBJECTIVES_V1",
+        "WO35E_TERMINAL_EVIDENCE_V1",
+    )
+    validation = _terminal_evidence(
+        candidate_semantic_sha256=robustness.candidate_semantic_sha256,
+        partition=StrategyPartitionV1.VALIDATION,
+        roots=tuple(range(3_502_000, 3_502_008)),
+        delta=60_000,
+        compatibility=compatibility,
+    )
+    holdout = _terminal_evidence(
+        candidate_semantic_sha256=robustness.candidate_semantic_sha256,
+        partition=StrategyPartitionV1.HOLDOUT,
+        roots=tuple(range(3_503_000, 3_503_008)),
+        delta=40_000,
+        compatibility=compatibility,
+    )
+    adversarial = _terminal_evidence(
+        candidate_semantic_sha256=robustness.candidate_semantic_sha256,
+        partition=StrategyPartitionV1.ADVERSARIAL_HOLDOUT,
+        roots=tuple(range(3_504_000, 3_504_008)),
+        delta=80_000,
+        compatibility=compatibility,
+    )
+    holdout_decision = qualify_holdout(holdout, validation)
+    adversarial_decision = qualify_adversarial(
+        adversarial,
+        trained_candidate_count=64,
+    )
+    confirmed = scientific_conclusion(
+        candidate_selected=True,
+        validation_qualified=True,
+        robustness_qualified=robustness_decision.qualified,
+        holdout_qualified=holdout_decision.qualified,
+        adversarial_qualified=adversarial_decision.qualified,
+        reveal_stage=main.stage,
+    )
+    no_winner = scientific_conclusion(
+        candidate_selected=False,
+        validation_qualified=False,
+        robustness_qualified=False,
+        holdout_qualified=False,
+        adversarial_qualified=False,
+        reveal_stage=RevealStageV1.CANDIDATE_FROZEN,
+    )
+    insufficient = scientific_conclusion(
+        candidate_selected=True,
+        validation_qualified=True,
+        robustness_qualified=False,
+        holdout_qualified=False,
+        adversarial_qualified=False,
+        reveal_stage=RevealStageV1.CLOSED_INSUFFICIENT_EVIDENCE,
+    )
+    if (
+        not holdout_decision.qualified
+        or not adversarial_decision.qualified
+        or confirmed is not ScientificConclusionV1.CONFIRMED_WITHIN_DECLARED_SCOPE
+        or no_winner is not ScientificConclusionV1.NO_CANDIDATE_MET_CRITERIA
+        or insufficient is not ScientificConclusionV1.INSUFFICIENT_EVIDENCE
+    ):
+        failures.append("terminal partition or named-scope qualification changed")
+    fixture_projection = {
+        "access": result.access_record.as_dict(),
+        "access_sha256": result.access_record.access_sha256,
+        "adversarial": adversarial_decision.as_dict(),
+        "conclusions": [confirmed.value, no_winner.value, insufficient.value],
+        "early_code": early_code,
+        "execution_order": list(result.execution_order),
+        "forged_pass_code": forged_pass_code,
+        "holdout": holdout_decision.as_dict(),
+        "material_commitment_sha256": material.commitment_sha256,
+        "repeat_code": repeat_code,
+        "rerun_code": rerun_code,
+        "wrong_token_code": wrong_token_code,
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(fixture_projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35E_REVEAL_FIXTURE_SHA256:
+        failures.append("WO35-E reveal/terminal qualification differs from its fixture")
+    return StrategyDiscoveryAuditCase(
+        "e_robustness_precedes_one_atomic_reveal_and_terminal_claims_stay_named",
+        (
+            f"fixture_sha256={fixture_sha256} access_sha256={result.access_record.access_sha256} "
+            "pre_reveal_material=SEALED access_before_exposure=YES token_consumed=YES "
+            "root_order=HOLDOUT_THEN_ADVERSARIAL repeat=REFUSED rerun=REFUSED "
+            "robustness_miss=INSUFFICIENT_EVIDENCE protocol_violation=EXPERIMENT_INVALID "
+            "forged_robustness_pass=REFUSED "
+            "no_winner=VALID confirmed=CONFIRMED_WITHIN_DECLARED_SCOPE"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo35e_strategy_robustness() -> tuple[StrategyDiscoveryAuditCase, ...]:
+    return (
+        _robustness_perturbation_case(),
+        _robustness_qualification_case(),
+        _observability_case(),
+        _overfit_case(),
+        _reveal_and_terminal_case(),
+    )
+
+
 __all__ = [
     "WO35A_AUDIT_CASE_COUNT",
     "WO35A_CANONICALIZATION_POLICY_SHA256",
@@ -2243,9 +3316,16 @@ __all__ = [
     "WO35D_NO_WINNER_RUN_SHA256",
     "WO35D_OBJECTIVE_FIXTURE_SHA256",
     "WO35D_POLICY_FIXTURE_SHA256",
+    "WO35E_AUDIT_CASE_COUNT",
+    "WO35E_OBSERVABILITY_FIXTURE_SHA256",
+    "WO35E_OVERFIT_FIXTURE_SHA256",
+    "WO35E_PERTURBATION_FIXTURE_SHA256",
+    "WO35E_REVEAL_FIXTURE_SHA256",
+    "WO35E_ROBUSTNESS_FIXTURE_SHA256",
     "StrategyDiscoveryAuditCase",
     "audit_wo35a_strategy_discovery",
     "audit_wo35b_strategy_partitions",
     "audit_wo35c_strategy_mutations",
     "audit_wo35d_strategy_search",
+    "audit_wo35e_strategy_robustness",
 ]

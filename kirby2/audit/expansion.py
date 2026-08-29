@@ -137,6 +137,7 @@ REGISTERABLE_GATE_IDS = (
     "WO35-B",
     "WO35-C",
     "WO35-D",
+    "WO35-E",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3431,6 +3432,113 @@ def _audit_wo35d() -> ExpansionGateReport:
     )
 
 
+def _audit_wo35e() -> ExpansionGateReport:
+    from kirby2.audit.strategy_discovery import (
+        WO35E_AUDIT_CASE_COUNT,
+        WO35E_OBSERVABILITY_FIXTURE_SHA256,
+        WO35E_OVERFIT_FIXTURE_SHA256,
+        WO35E_PERTURBATION_FIXTURE_SHA256,
+        WO35E_REVEAL_FIXTURE_SHA256,
+        WO35E_ROBUSTNESS_FIXTURE_SHA256,
+        audit_wo35e_strategy_robustness,
+    )
+    from kirby2.discovery.observability import (
+        ENDOGENOUS_DIVERGENCE_CLAIM_SCOPE_V1,
+        OBSERVABILITY_SCHEMA_ID_V1,
+        TERMINAL_REVEAL_POLICY_ID_V1,
+        TERMINAL_REVEAL_SCHEMA_ID_V1,
+    )
+    from kirby2.discovery.overfit import (
+        DEVELOPMENT_OVERFIT_DATA_SOURCE_V1,
+        OVERFIT_POLICY_ID_V1,
+        OVERFIT_SCHEMA_ID_V1,
+        POST_REVEAL_ADDITIONS_V1,
+        PRE_REVEAL_APPLICABILITY_V1,
+    )
+    from kirby2.discovery.robustness import (
+        MANDATORY_ROBUSTNESS_FAMILIES_V1,
+        ROBUSTNESS_EXPECTED_CELL_COUNT_V1,
+        ROBUSTNESS_POLICY_ID_V1,
+        ROBUSTNESS_ROOTS_V1,
+        ROBUSTNESS_SCHEMA_ID_V1,
+        ROBUSTNESS_SETTINGS_V1,
+        SINGLE_VENUE_CAPABILITY_ID_V1,
+        RobustnessFamilyV1,
+    )
+
+    cases = audit_wo35e_strategy_robustness()
+    expected_names = (
+        "e_one_factor_perturbations_and_single_venue_capability_are_exact",
+        "e_robustness_pools_exactly_and_fails_closed_by_failure_class",
+        "e_decision_projection_excludes_truth_and_unavailable_inputs_fail_closed",
+        "e_all_overfit_predicates_apply_once_and_the_training_star_is_rejected",
+        "e_robustness_precedes_one_atomic_reveal_and_terminal_claims_stay_named",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO35E_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO35-E cases differ from the fixed robustness evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO35-E robustness cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    applicable_settings = tuple(
+        item
+        for item in ROBUSTNESS_SETTINGS_V1
+        if item.family is not RobustnessFamilyV1.VENUE_MIX
+    )
+    return ExpansionGateReport(
+        card_id="WO35-E",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("applicable_family_count", str(len(MANDATORY_ROBUSTNESS_FAMILIES_V1))),
+            ("applicable_setting_count", str(len(applicable_settings))),
+            ("audit_case_count", str(WO35E_AUDIT_CASE_COUNT)),
+            ("development_overfit_data_source", DEVELOPMENT_OVERFIT_DATA_SOURCE_V1),
+            ("endogenous_claim_scope", ENDOGENOUS_DIVERGENCE_CLAIM_SCOPE_V1),
+            ("expected_robustness_cells", str(ROBUSTNESS_EXPECTED_CELL_COUNT_V1)),
+            ("observability_fixture_sha256", WO35E_OBSERVABILITY_FIXTURE_SHA256),
+            ("observability_schema_id", OBSERVABILITY_SCHEMA_ID_V1),
+            ("overfit_fixture_sha256", WO35E_OVERFIT_FIXTURE_SHA256),
+            ("overfit_policy_id", OVERFIT_POLICY_ID_V1),
+            ("overfit_post_addition_count", str(len(POST_REVEAL_ADDITIONS_V1))),
+            ("overfit_pre_applicable_count", str(len(PRE_REVEAL_APPLICABILITY_V1))),
+            ("overfit_schema_id", OVERFIT_SCHEMA_ID_V1),
+            ("perturbation_fixture_sha256", WO35E_PERTURBATION_FIXTURE_SHA256),
+            ("real_partition_access_count", "0"),
+            ("reveal_fixture_sha256", WO35E_REVEAL_FIXTURE_SHA256),
+            ("robustness_fixture_sha256", WO35E_ROBUSTNESS_FIXTURE_SHA256),
+            ("robustness_policy_id", ROBUSTNESS_POLICY_ID_V1),
+            ("robustness_root_count", str(len(ROBUSTNESS_ROOTS_V1))),
+            ("robustness_schema_id", ROBUSTNESS_SCHEMA_ID_V1),
+            ("terminal_reveal_policy_id", TERMINAL_REVEAL_POLICY_ID_V1),
+            ("terminal_reveal_schema_id", TERMINAL_REVEAL_SCHEMA_ID_V1),
+            ("venue_mix_capability", SINGLE_VENUE_CAPABILITY_ID_V1),
+            ("venue_mix_status", "NOT_APPLICABLE"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3647,6 +3755,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-B", _audit_wo35b),
     ("WO35-C", _audit_wo35c),
     ("WO35-D", _audit_wo35d),
+    ("WO35-E", _audit_wo35e),
 )
 
 
