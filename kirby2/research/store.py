@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tempfile
 import re
 from contextlib import contextmanager
@@ -18,6 +20,7 @@ from .models import (
     RUN_MANIFEST_SCHEMA_VERSION,
     TABLE_SCHEMA_VERSION,
     ArtifactReference,
+    ArtifactType,
     RunManifest,
     RunType,
 )
@@ -38,6 +41,7 @@ from .tables import (
     artifact_registry_rows,
     attach_run_id,
     evidence_digest,
+    lesson_mining_artifact_registry_rows,
     read_parquet_table,
     qualification_artifact_registry_rows,
     write_parquet_tables,
@@ -364,6 +368,12 @@ class RunStore:
                 run_identity_match=manifest.run_id == run_id,
                 failures=report.failures,
             )
+        if manifest.run_type in {
+            RunType.LESSON_MINING,
+            RunType.LESSON_REVIEW,
+            RunType.LESSON_BUILD,
+        }:
+            return LessonMiningStore(self.root).verify_run(run_id)
         directory = self.run_directory(run_id)
         expected_artifact_schemas = {
             "configuration": RUN_CONFIGURATION_SCHEMA_VERSION,
@@ -679,6 +689,16 @@ class RunStore:
                 ]
             )
         )
+        expected_lesson_artifacts = tuple(
+            lesson_mining_artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -711,6 +731,14 @@ class RunStore:
                         "ORDER BY run_id, artifact_type, artifact_name"
                     ).fetchall()
                 )
+                actual_lesson_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM lesson_mining_artifacts "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
@@ -721,6 +749,7 @@ class RunStore:
             and actual_artifacts == expected_artifacts
             and actual_qualification_artifacts
             == expected_qualification_artifacts
+            and actual_lesson_artifacts == expected_lesson_artifacts
         )
 
     @contextmanager
@@ -784,6 +813,33 @@ class RunStore:
         finally:
             connection.close()
 
+    def query_lesson_mining_artifacts(
+        self, run_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return typed mining, review-sidecar, and lesson-build artifacts."""
+
+        self._ensure_catalog()
+        duckdb = _duckdb()
+        connection = duckdb.connect(str(self.catalog_path), read_only=True)
+        try:
+            if run_id is None:
+                cursor = connection.execute(
+                    "SELECT * FROM lesson_mining_artifacts "
+                    "ORDER BY run_id, artifact_type, artifact_name"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM lesson_mining_artifacts "
+                    "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
+                    [run_id],
+                )
+            columns = tuple(item[0] for item in cursor.description)
+            return tuple(
+                dict(zip(columns, row, strict=True)) for row in cursor.fetchall()
+            )
+        finally:
+            connection.close()
+
     def inspect_run(self, run_id: str) -> dict[str, Any]:
         self._ensure_catalog()
         duckdb = _duckdb()
@@ -807,6 +863,662 @@ class RunStore:
             "summary": summary,
             "verification": self.verify_run(run_id).as_dict(),
         }
+
+
+_LESSON_MINING_ARTIFACT_SPECS = (
+    (
+        "qualification_source_matrix",
+        "qualification-sources.toml",
+        ArtifactType.LESSON_MINING_SOURCE_MATRIX,
+        "application/toml",
+    ),
+    (
+        "source_validation",
+        "source-validation.json",
+        ArtifactType.LESSON_MINING_SOURCE_VALIDATION,
+        "application/json",
+    ),
+    (
+        "lesson_candidates",
+        "candidates.json",
+        ArtifactType.LESSON_MINING_CANDIDATES,
+        "application/json",
+    ),
+    (
+        "review_selection",
+        "selection.json",
+        ArtifactType.LESSON_MINING_SELECTION,
+        "application/json",
+    ),
+    (
+        "technical_review_packet",
+        "review-packet.json",
+        ArtifactType.LESSON_TECHNICAL_REVIEW_PACKET,
+        "application/json",
+    ),
+)
+_LESSON_REVIEW_ARTIFACT_SPECS = (
+    (
+        "lesson_review_sidecar",
+        "review-sidecar.json",
+        ArtifactType.LESSON_REVIEW_SIDECAR,
+        "application/json",
+    ),
+)
+_LESSON_BUILD_ARTIFACT_SPECS = (
+    (
+        "lesson_build_proposal",
+        "lesson-build.json",
+        ArtifactType.LESSON_BUILD_PROPOSAL,
+        "application/json",
+    ),
+)
+_LESSON_RUN_TYPES = frozenset(
+    {RunType.LESSON_MINING, RunType.LESSON_REVIEW, RunType.LESSON_BUILD}
+)
+
+
+class LessonMiningStore:
+    """Persist mining, review, and build runs without mutating earlier artifacts."""
+
+    def __init__(self, root: Path = DEFAULT_RESEARCH_STORE) -> None:
+        self.root = root
+        self.runs_directory = root / "runs"
+        self.staging_directory = root / ".staging"
+        self.runs_directory.mkdir(parents=True, exist_ok=True)
+        self.staging_directory.mkdir(parents=True, exist_ok=True)
+
+    def run_directory(self, run_id: str) -> Path:
+        if not re.fullmatch(r"run-[0-9a-f]{24}", run_id):
+            raise ValueError("invalid run ID")
+        return self.runs_directory / run_id
+
+    def load_manifest(self, run_id: str) -> RunManifest:
+        path = self.run_directory(run_id) / "manifest.toml"
+        if not path.is_file():
+            raise ValueError(f"unknown run ID: {run_id}")
+        manifest = RunManifest.from_dict(load_toml(path))
+        if manifest.run_type not in _LESSON_RUN_TYPES:
+            raise ValueError("run is not a lesson mining/review/build artifact")
+        return manifest
+
+    def record_mining_result(
+        self,
+        result,
+        *,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.mining.reviews import MiningQualificationResultV1
+
+        if not isinstance(result, MiningQualificationResultV1):
+            raise TypeError("lesson mining persistence requires a typed result")
+        if parent_run_id is not None and not re.fullmatch(
+            r"run-[0-9a-f]{24}", parent_run_id
+        ):
+            raise ValueError("lesson mining parent run ID is invalid")
+        payloads = result.artifact_payloads()
+        row_counts = {
+            "source-validation.json": len(result.source_materializations),
+            "candidates.json": result.candidate_count,
+            "selection.json": result.selection.selected_count,
+            "review-packet.json": len(result.review_packet.rows),
+        }
+        references = _lesson_artifact_references(
+            payloads,
+            _LESSON_MINING_ARTIFACT_SPECS,
+            row_counts,
+        )
+        configuration_digest, evidence_digest, result_digest = (
+            _lesson_mining_digests(payloads)
+        )
+        repository_path = repository or Path(__file__).resolve().parents[2]
+        source_bounds = tuple(
+            result.source_manifest.row(row_id).bounds
+            for row_id in result.active_source_rows
+        )
+        manifest = RunManifest.create(
+            parent_run_id=parent_run_id,
+            run_type=RunType.LESSON_MINING,
+            scenario_id="qualification-sources:" + result.source_manifest.manifest_sha256,
+            lesson_id=None,
+            seed=result.seed,
+            flow_model="LESSON_MINING_V1",
+            market_profile="PREREGISTERED_FIVE_SOURCE_QUALIFICATION_V1",
+            strategy_id="NONE",
+            hotkey_layout_id="NONE",
+            session_objective="QUALIFY_REVIEW_READY_LESSON_PROPOSALS",
+            simulation_start_us=min(int(item["source_start_us"]) for item in source_bounds),
+            simulation_end_us=max(int(item["source_end_us"]) for item in source_bounds),
+            software_version=software_version(),
+            git_commit=git_commit(repository_path),
+            schema_versions=_lesson_schema_versions(RunType.LESSON_MINING),
+            input_dataset_references=tuple(
+                f"{item.source_id}:{item.source_sha256}"
+                for item in result.source_materializations
+            ),
+            configuration_digest=configuration_digest,
+            evidence_digest=evidence_digest,
+            result_digest=result_digest,
+            creation_timestamp_utc=_utc_now(),
+            artifacts=references,
+        )
+        return self._persist(manifest, payloads)
+
+    def load_mining_result(self, run_id: str):
+        from kirby2.mining.reviews import replay_qualification_artifacts
+
+        manifest = self.load_manifest(run_id)
+        if manifest.run_type is not RunType.LESSON_MINING:
+            raise ValueError("run is not a lesson mining result")
+        directory = self.run_directory(run_id)
+        payloads = {
+            reference.relative_path: (directory / reference.relative_path).read_bytes()
+            for reference in manifest.artifacts
+        }
+        return replay_qualification_artifacts(payloads)
+
+    def list_candidates(self, run_id: str):
+        return self.load_mining_result(run_id).candidates
+
+    def find_candidate(self, candidate_id: str):
+        matches = []
+        for path in sorted(self.runs_directory.glob("run-*/manifest.toml")):
+            manifest = RunManifest.from_dict(load_toml(path))
+            if manifest.run_type is not RunType.LESSON_MINING:
+                continue
+            result = self.load_mining_result(manifest.run_id)
+            for candidate in result.candidates:
+                if candidate.candidate.candidate_id == candidate_id:
+                    matches.append((manifest.run_id, candidate))
+        if not matches:
+            raise ValueError(f"unknown lesson candidate ID: {candidate_id}")
+        snapshots = {
+            hashlib.sha256(candidate.candidate.canonical_bytes()).hexdigest()
+            for _run_id, candidate in matches
+        }
+        if len(snapshots) != 1:
+            raise RuntimeError("candidate ID resolves to inconsistent immutable snapshots")
+        return matches[0]
+
+    def review_history(self, candidate_id: str):
+        from kirby2.mining.reviews import LessonReviewSidecarV1
+
+        history = []
+        for path in sorted(self.runs_directory.glob("run-*/manifest.toml")):
+            manifest = RunManifest.from_dict(load_toml(path))
+            if manifest.run_type is not RunType.LESSON_REVIEW:
+                continue
+            reference = manifest.artifacts[0]
+            raw = (path.parent / reference.relative_path).read_bytes()
+            payload = json.loads(raw)
+            sidecar = LessonReviewSidecarV1.from_dict(payload)
+            if sidecar.canonical_bytes() != raw:
+                raise ValueError("stored lesson review sidecar is not canonical")
+            if sidecar.candidate_id == candidate_id:
+                history.append((manifest.run_id, sidecar))
+        ordered = tuple(
+            sorted(history, key=lambda item: (item[1].created_at_utc, item[0]))
+        )
+        previous = None
+        for _run_id, sidecar in ordered:
+            if previous is None:
+                if sidecar.superseded_review_id is not None:
+                    raise ValueError("first lesson review sidecar supersedes unknown history")
+            elif (
+                sidecar.superseded_review_id != previous.review_id
+                or sidecar.superseded_review_sha256 != previous.sidecar_sha256
+            ):
+                raise ValueError("lesson review sidecar chain is not contiguous")
+            previous = sidecar
+        return ordered
+
+    def record_review(
+        self,
+        candidate_id: str,
+        *,
+        decision,
+        reviewer_id: str,
+        reviewer_reference: str,
+        reviewer_authority,
+        rubric_version: str,
+        reasons: tuple[str, ...],
+        reason_codes: tuple[str, ...],
+        created_at_utc: str,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.mining.reviews import (
+            LessonReviewSidecarV1,
+            ReviewerAuthorityV1,
+        )
+
+        mining_run_id, reviewable = self.find_candidate(candidate_id)
+        candidate = reviewable.candidate
+        candidate_before = candidate.canonical_bytes()
+        history = self.review_history(candidate_id)
+        previous = None if not history else history[-1][1]
+        if previous is not None:
+            if created_at_utc <= previous.created_at_utc:
+                raise ValueError("new lesson review timestamp must follow prior history")
+            if (
+                reviewer_authority is ReviewerAuthorityV1.AUTOMATION
+                and previous.reviewer_authority
+                is ReviewerAuthorityV1.LOCAL_AUTHENTICATED
+            ):
+                raise PermissionError("automation cannot supersede a human review")
+        sidecar = LessonReviewSidecarV1(
+            candidate_id=candidate.candidate_id,
+            candidate_digest=candidate.candidate_digest,
+            mining_run_id=mining_run_id,
+            decision=decision,
+            reviewer_id=reviewer_id,
+            reviewer_reference=reviewer_reference,
+            reviewer_authority=reviewer_authority,
+            rubric_version=rubric_version,
+            reasons=reasons,
+            reason_codes=reason_codes,
+            created_at_utc=created_at_utc,
+            superseded_review_id=None if previous is None else previous.review_id,
+            superseded_review_sha256=(
+                None if previous is None else previous.sidecar_sha256
+            ),
+        )
+        payloads = {"review-sidecar.json": sidecar.canonical_bytes()}
+        references = _lesson_artifact_references(
+            payloads,
+            _LESSON_REVIEW_ARTIFACT_SPECS,
+            {"review-sidecar.json": 1},
+        )
+        digests = _lesson_review_digests(sidecar)
+        repository_path = repository or Path(__file__).resolve().parents[2]
+        manifest = RunManifest.create(
+            parent_run_id=mining_run_id,
+            run_type=RunType.LESSON_REVIEW,
+            scenario_id=None,
+            lesson_id=None,
+            seed=None,
+            flow_model="IMMUTABLE_LESSON_REVIEW_V1",
+            market_profile="NOT_APPLICABLE",
+            strategy_id="NONE",
+            hotkey_layout_id="NONE",
+            session_objective="RECORD_SEPARATE_LESSON_REVIEW_DECISION",
+            simulation_start_us=candidate.bounds.source_start_us,
+            simulation_end_us=candidate.bounds.source_end_us,
+            software_version=software_version(),
+            git_commit=git_commit(repository_path),
+            schema_versions=_lesson_schema_versions(RunType.LESSON_REVIEW),
+            input_dataset_references=(
+                f"candidate:{candidate.candidate_id}:{candidate.candidate_digest}",
+                *(
+                    ()
+                    if previous is None
+                    else (f"superseded-review:{previous.review_id}",)
+                ),
+            ),
+            configuration_digest=digests[0],
+            evidence_digest=digests[1],
+            result_digest=digests[2],
+            creation_timestamp_utc=sidecar.created_at_utc,
+            artifacts=references,
+        )
+        stored = self._persist(manifest, payloads)
+        if candidate.canonical_bytes() != candidate_before:
+            raise RuntimeError("recording review mutated immutable lesson candidate")
+        return stored
+
+    def build_lesson_proposal(
+        self,
+        candidate_id: str,
+        *,
+        created_at_utc: str,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.mining.reviews import (
+            LessonBuildProposalV1,
+            LessonReviewDecisionV1,
+        )
+
+        mining_run_id, reviewable = self.find_candidate(candidate_id)
+        history = self.review_history(candidate_id)
+        latest = None if not history else history[-1][1]
+        if latest is not None and latest.decision in {
+            LessonReviewDecisionV1.REJECTED,
+            LessonReviewDecisionV1.SUPERSEDED,
+        }:
+            raise PermissionError("latest human review does not permit a lesson build")
+        accepted = bool(
+            latest is not None
+            and latest.decision is LessonReviewDecisionV1.ACCEPTED
+        )
+        candidate = reviewable.candidate
+        proposal = LessonBuildProposalV1(
+            candidate_id=candidate.candidate_id,
+            candidate_digest=candidate.candidate_digest,
+            mining_run_id=mining_run_id,
+            technical_status=reviewable.technical_status,
+            human_acceptance_status="ACCEPTED" if accepted else "PENDING",
+            source_ancestry_sha256=candidate.source_ancestry.sha256,
+            candidate_snapshot_sha256=hashlib.sha256(
+                candidate.canonical_bytes()
+            ).hexdigest(),
+            created_at_utc=created_at_utc,
+        )
+        payloads = {"lesson-build.json": proposal.canonical_bytes()}
+        references = _lesson_artifact_references(
+            payloads,
+            _LESSON_BUILD_ARTIFACT_SPECS,
+            {"lesson-build.json": 1},
+        )
+        digests = _lesson_build_digests(proposal)
+        repository_path = repository or Path(__file__).resolve().parents[2]
+        manifest = RunManifest.create(
+            parent_run_id=mining_run_id,
+            run_type=RunType.LESSON_BUILD,
+            scenario_id=None,
+            lesson_id=None,
+            seed=None,
+            flow_model="MINED_LESSON_BUILD_V1",
+            market_profile="OUTCOME_CONDITIONED_WINDOW",
+            strategy_id="NONE",
+            hotkey_layout_id="NONE",
+            session_objective="BUILD_TECHNICAL_LESSON_PROPOSAL",
+            simulation_start_us=candidate.bounds.warmup_start_us,
+            simulation_end_us=candidate.bounds.post_end_us,
+            software_version=software_version(),
+            git_commit=git_commit(repository_path),
+            schema_versions=_lesson_schema_versions(RunType.LESSON_BUILD),
+            input_dataset_references=(
+                f"candidate:{candidate.candidate_id}:{candidate.candidate_digest}",
+            ),
+            configuration_digest=digests[0],
+            evidence_digest=digests[1],
+            result_digest=digests[2],
+            creation_timestamp_utc=proposal.created_at_utc,
+            artifacts=references,
+        )
+        return self._persist(manifest, payloads)
+
+    def load_review_sidecar(self, run_id: str):
+        from kirby2.mining.reviews import LessonReviewSidecarV1
+
+        manifest = self.load_manifest(run_id)
+        if manifest.run_type is not RunType.LESSON_REVIEW:
+            raise ValueError("run is not a lesson review")
+        raw = (self.run_directory(run_id) / manifest.artifacts[0].relative_path).read_bytes()
+        sidecar = LessonReviewSidecarV1.from_dict(json.loads(raw))
+        if sidecar.canonical_bytes() != raw:
+            raise ValueError("lesson review sidecar is not canonical")
+        return sidecar
+
+    def load_build_proposal(self, run_id: str):
+        from kirby2.mining.reviews import LessonBuildProposalV1
+
+        manifest = self.load_manifest(run_id)
+        if manifest.run_type is not RunType.LESSON_BUILD:
+            raise ValueError("run is not a lesson build")
+        raw = (self.run_directory(run_id) / manifest.artifacts[0].relative_path).read_bytes()
+        proposal = LessonBuildProposalV1.from_dict(json.loads(raw))
+        if proposal.canonical_bytes() != raw:
+            raise ValueError("lesson build proposal is not canonical")
+        return proposal
+
+    def verify_run(self, run_id: str) -> VerificationReport:
+        failures: list[str] = []
+        flags = {
+            "manifest_loaded": False,
+            "references_exist": False,
+            "artifact_digests_match": False,
+            "artifact_row_counts_match": False,
+            "event_sequence_complete": False,
+            "replay_configuration_available": False,
+            "replay_passed": False,
+            "result_digest_match": False,
+            "evidence_digest_match": False,
+            "schema_versions_supported": False,
+            "run_identity_match": False,
+        }
+        try:
+            manifest = self.load_manifest(run_id)
+            flags["manifest_loaded"] = True
+            flags["run_identity_match"] = manifest.run_id == run_id
+            if not flags["run_identity_match"]:
+                raise ValueError("lesson manifest run ID differs from directory")
+        except (OSError, TypeError, ValueError) as error:
+            failures.append(f"manifest invalid: {error}")
+            return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+        specs = _lesson_specs(manifest.run_type)
+        expected_inventory = tuple(
+            (name, path, artifact_type, media_type)
+            for name, path, artifact_type, media_type in specs
+        )
+        actual_inventory = tuple(
+            (
+                item.name,
+                item.relative_path,
+                item.artifact_type,
+                item.media_type,
+            )
+            for item in manifest.artifacts
+        )
+        flags["schema_versions_supported"] = (
+            manifest.schema_versions == _lesson_schema_versions(manifest.run_type)
+            and actual_inventory == expected_inventory
+            and all(item.schema_version == 1 for item in manifest.artifacts)
+        )
+        if not flags["schema_versions_supported"]:
+            failures.append("lesson typed artifact or schema inventory differs")
+        directory = self.run_directory(run_id)
+        payloads: dict[str, bytes] = {}
+        try:
+            for reference in manifest.artifacts:
+                path = directory / reference.relative_path
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(
+                        f"unsafe or missing lesson artifact: {reference.relative_path}"
+                    )
+                payloads[reference.relative_path] = path.read_bytes()
+            extras = {
+                path.name for path in directory.iterdir() if path.name != "manifest.toml"
+            } - {Path(name).name for name in payloads}
+            if extras:
+                raise ValueError("lesson run contains unregistered artifact files")
+            flags["references_exist"] = len(payloads) == len(specs)
+            flags["artifact_digests_match"] = all(
+                hashlib.sha256(payloads[item.relative_path]).hexdigest() == item.sha256
+                for item in manifest.artifacts
+            )
+            if not flags["artifact_digests_match"]:
+                failures.append("one or more lesson artifact digests differ")
+        except (OSError, ValueError) as error:
+            failures.append(f"lesson artifact inventory invalid: {error}")
+        try:
+            if manifest.run_type is RunType.LESSON_MINING:
+                result = self.load_mining_result(run_id)
+                expected_counts = {
+                    "qualification-sources.toml": None,
+                    "source-validation.json": len(result.source_materializations),
+                    "candidates.json": result.candidate_count,
+                    "selection.json": result.selection.selected_count,
+                    "review-packet.json": len(result.review_packet.rows),
+                }
+                digests = _lesson_mining_digests(payloads)
+                flags["event_sequence_complete"] = all(
+                    item.candidate.source_ancestry.source_id
+                    == result.source_manifest.row(item.recipe.row_id).identity["source_id"]
+                    for item in result.candidates
+                )
+                flags["replay_configuration_available"] = True
+                flags["replay_passed"] = True
+            elif manifest.run_type is RunType.LESSON_REVIEW:
+                sidecar = self.load_review_sidecar(run_id)
+                mining_run_id, candidate = self.find_candidate(sidecar.candidate_id)
+                if (
+                    mining_run_id != sidecar.mining_run_id
+                    or manifest.parent_run_id != mining_run_id
+                    or candidate.candidate.candidate_digest != sidecar.candidate_digest
+                ):
+                    raise ValueError("lesson review sidecar targets foreign candidate")
+                expected_counts = {"review-sidecar.json": 1}
+                digests = _lesson_review_digests(sidecar)
+                flags["event_sequence_complete"] = True
+                flags["replay_configuration_available"] = True
+                flags["replay_passed"] = True
+            else:
+                proposal = self.load_build_proposal(run_id)
+                mining_run_id, candidate = self.find_candidate(proposal.candidate_id)
+                if (
+                    mining_run_id != proposal.mining_run_id
+                    or manifest.parent_run_id != mining_run_id
+                    or candidate.candidate.candidate_digest != proposal.candidate_digest
+                ):
+                    raise ValueError("lesson build proposal targets foreign candidate")
+                expected_counts = {"lesson-build.json": 1}
+                digests = _lesson_build_digests(proposal)
+                flags["event_sequence_complete"] = True
+                flags["replay_configuration_available"] = True
+                flags["replay_passed"] = True
+            flags["artifact_row_counts_match"] = all(
+                reference.row_count == expected_counts[reference.relative_path]
+                for reference in manifest.artifacts
+            )
+            flags["evidence_digest_match"] = manifest.evidence_digest == digests[1]
+            flags["result_digest_match"] = manifest.result_digest == digests[2]
+            if manifest.configuration_digest != digests[0]:
+                failures.append("lesson configuration digest differs")
+            if not flags["artifact_row_counts_match"]:
+                failures.append("lesson artifact row counts differ")
+            if not flags["evidence_digest_match"]:
+                failures.append("lesson evidence digest differs")
+            if not flags["result_digest_match"]:
+                failures.append("lesson result digest differs")
+        except Exception as error:
+            failures.append(f"lesson artifact replay invalid: {error}")
+        return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+
+    def _persist(
+        self,
+        manifest: RunManifest,
+        payloads: dict[str, bytes],
+    ) -> RunManifest:
+        target = self.run_directory(manifest.run_id)
+        if target.exists():
+            existing = self.load_manifest(manifest.run_id)
+            if existing.identity_dict() != manifest.identity_dict():
+                raise RuntimeError("content-derived lesson run ID collision")
+            report = self.verify_run(manifest.run_id)
+            if not report.passed:
+                raise RuntimeError(
+                    "existing immutable lesson run is invalid: "
+                    + "; ".join(report.failures)
+                )
+            return existing
+        with tempfile.TemporaryDirectory(
+            dir=self.staging_directory,
+            prefix=f"{manifest.run_id}-",
+        ) as temporary:
+            staging = Path(temporary) / manifest.run_id
+            staging.mkdir()
+            for relative_path, raw in payloads.items():
+                path = staging / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw)
+            (staging / "manifest.toml").write_text(
+                manifest.to_toml(), encoding="utf-8"
+            )
+            staging.rename(target)
+        report = self.verify_run(manifest.run_id)
+        if not report.passed:
+            raise RuntimeError(
+                "new immutable lesson run failed verification: "
+                + "; ".join(report.failures)
+            )
+        RunStore(self.root).refresh_catalog()
+        return self.load_manifest(manifest.run_id)
+
+
+def _lesson_specs(run_type: RunType):
+    return {
+        RunType.LESSON_MINING: _LESSON_MINING_ARTIFACT_SPECS,
+        RunType.LESSON_REVIEW: _LESSON_REVIEW_ARTIFACT_SPECS,
+        RunType.LESSON_BUILD: _LESSON_BUILD_ARTIFACT_SPECS,
+    }[run_type]
+
+
+def _lesson_schema_versions(run_type: RunType) -> dict[str, int]:
+    key = {
+        RunType.LESSON_MINING: "lesson_mining",
+        RunType.LESSON_REVIEW: "lesson_review",
+        RunType.LESSON_BUILD: "lesson_build",
+    }[run_type]
+    return {key: 1, "run_manifest": RUN_MANIFEST_SCHEMA_VERSION}
+
+
+def _lesson_artifact_references(
+    payloads: dict[str, bytes],
+    specs,
+    row_counts: dict[str, int],
+) -> tuple[ArtifactReference, ...]:
+    expected_paths = {path for _name, path, _type, _media in specs}
+    if set(payloads) != expected_paths:
+        raise ValueError("lesson artifact payload inventory differs")
+    return tuple(
+        ArtifactReference(
+            name=name,
+            relative_path=relative_path,
+            sha256=hashlib.sha256(payloads[relative_path]).hexdigest(),
+            schema_version=1,
+            row_count=row_counts.get(relative_path),
+            media_type=media_type,
+            artifact_type=artifact_type,
+        )
+        for name, relative_path, artifact_type, media_type in specs
+    )
+
+
+def _lesson_mining_digests(payloads: dict[str, bytes]) -> tuple[str, str, str]:
+    source_sha = hashlib.sha256(payloads["qualification-sources.toml"]).hexdigest()
+    validation_sha = hashlib.sha256(payloads["source-validation.json"]).hexdigest()
+    candidates_sha = hashlib.sha256(payloads["candidates.json"]).hexdigest()
+    selection_sha = hashlib.sha256(payloads["selection.json"]).hexdigest()
+    packet_sha = hashlib.sha256(payloads["review-packet.json"]).hexdigest()
+    return (
+        canonical_digest(
+            {"policy": "LESSON_MINING_V1", "source_matrix_sha256": source_sha}
+        ),
+        canonical_digest(
+            {
+                "candidates_sha256": candidates_sha,
+                "source_validation_sha256": validation_sha,
+            }
+        ),
+        canonical_digest(
+            {
+                "review_packet_sha256": packet_sha,
+                "selection_sha256": selection_sha,
+            }
+        ),
+    )
+
+
+def _lesson_review_digests(sidecar) -> tuple[str, str, str]:
+    return (
+        canonical_digest(
+            {
+                "reviewer_authority": sidecar.reviewer_authority.value,
+                "rubric_version": sidecar.rubric_version,
+            }
+        ),
+        sidecar.candidate_digest,
+        sidecar.sidecar_sha256,
+    )
+
+
+def _lesson_build_digests(proposal) -> tuple[str, str, str]:
+    return (
+        proposal.candidate_snapshot_sha256,
+        proposal.source_ancestry_sha256,
+        proposal.proposal_sha256,
+    )
 
 
 def _sha256_text(text: str) -> str:
@@ -834,6 +1546,7 @@ def _duckdb():
 
 _CATALOG_VIEWS = (
     "full_day_qualification_artifacts",
+    "lesson_mining_artifacts",
     "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
@@ -891,6 +1604,21 @@ def _create_summary_views(connection) -> None:
             'FULL_DAY_QUALIFICATION_LEDGER',
             'FULL_DAY_REVEAL_TOKEN',
             'FULL_DAY_REVIEWER_SIDECAR'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW lesson_mining_artifacts AS
+        SELECT * FROM run_artifact_registry
+        WHERE artifact_type IN (
+            'LESSON_MINING_SOURCE_MATRIX',
+            'LESSON_MINING_SOURCE_VALIDATION',
+            'LESSON_MINING_CANDIDATES',
+            'LESSON_MINING_SELECTION',
+            'LESSON_TECHNICAL_REVIEW_PACKET',
+            'LESSON_REVIEW_SIDECAR',
+            'LESSON_BUILD_PROPOSAL'
         )
         """
     )

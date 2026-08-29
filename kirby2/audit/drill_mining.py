@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -120,6 +121,15 @@ WO33C_DIVERSITY_DIMENSION_COUNT = 6
 WO33C_REVIEW_TARGET_COUNT = 20
 WO33D_SOURCE_LINEAGE_FIELD_COUNT = 7
 WO33D_ASSESSMENT_FIELD_COUNT = 12
+WO33E_SOURCE_COUNT = 5
+WO33E_CANDIDATE_COUNT = 7
+WO33E_REVIEW_PACKET_COUNT = 7
+WO33E_REVIEW_SHORTFALL_COUNT = 13
+WO33E_EVENT_DISTINCT_COUNT = 0
+WO33E_DETECTOR_REPORT_COUNT = 110
+WO33E_DETECTOR_OPPORTUNITY_COUNT = 49
+WO33E_DETECTOR_FINDING_COUNT = 7
+WO33E_MINING_ARTIFACT_COUNT = 5
 
 WO33A1_THRESHOLD_MANIFEST_SHA256 = (
     "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
@@ -259,6 +269,294 @@ def audit_wo33d_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
         _d_deterministic_build_and_replay_case(candidate, recorded, lesson),
         _d_parent_linked_source_authoritative_overlay_case(lesson),
     )
+
+
+def audit_wo33e_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
+    """Execute source qualification, immutable persistence, and review boundaries."""
+
+    from kirby2.mining.commands import MINING_COMMAND_MODULE
+    from kirby2.mining.reviews import (
+        HUMAN_REVIEW_FIELDS_V1,
+        LESSON_REVIEW_RUBRIC_VERSION_V1,
+        OUTCOME_CONDITIONING_CAVEAT_V1,
+        LessonReviewDecisionV1,
+        ReviewerAuthorityV1,
+        qualify_lesson_candidates,
+    )
+    from kirby2.research.models import ArtifactType
+    from kirby2.research.store import LessonMiningStore, RunStore
+
+    repository = _a1_repository_root()
+    source_matrix = repository / "kirby2/mining/fixtures/qualification_sources.toml"
+    with tempfile.TemporaryDirectory(prefix="kirby2-wo33e-audit-") as temporary:
+        root = Path(temporary)
+        result = qualify_lesson_candidates(
+            repository=repository,
+            source_manifest_path=source_matrix,
+            materialization_root=root / "materialized-sources",
+            seed=42,
+        )
+        source_failures: list[str] = []
+        if len(result.source_materializations) != WO33E_SOURCE_COUNT:
+            source_failures.append("five-source materialization count differs")
+        expected_adapter_status = {
+            "quiet": "INCOMPLETE_EVENT_STREAM_NO_POLICY_ENUMERATION",
+            "event": "INCOMPLETE_EVENT_STREAM_NO_POLICY_ENUMERATION",
+            "hidden": "SOURCE_SHORTER_THAN_ONE_OBSERVABLE_BIN",
+            "fragmented": "SOURCE_SHORTER_THAN_ONE_OBSERVABLE_BIN",
+            "historical": "EXACT_RECONSTRUCTION_EVENT_STREAM_ENUMERATED",
+        }
+        for materialized in result.source_materializations:
+            row = result.source_manifest.row(materialized.row_id)
+            if (
+                materialized.source_sha256 != row.identity["source_sha256"]
+                or materialized.native_run_digest
+                != row.identity["expected_native_run_digest"]
+                or materialized.replay_digest
+                != row.identity["expected_replay_digest"]
+                or materialized.final_state_sha256
+                != row.identity["expected_final_state_sha256"]
+                or materialized.detector_adapter_status
+                != expected_adapter_status[materialized.row_id]
+                or materialized.detector_opportunity_count
+                != (49 if materialized.row_id == "historical" else 0)
+                or materialized.replay_status != "PASS"
+                or materialized.protected_seed_execution
+            ):
+                source_failures.append(
+                    f"{materialized.row_id} materialized replay identity differs"
+                )
+        if result.candidate_count != WO33E_CANDIDATE_COUNT:
+            source_failures.append("runtime finding candidate count differs")
+        if (
+            len(result.detector_executions) != WO33E_DETECTOR_REPORT_COUNT
+            or sum(
+                len(execution.opportunities)
+                for execution in result.detector_executions
+            )
+            != WO33E_DETECTOR_OPPORTUNITY_COUNT
+            or sum(
+                len(execution.report.findings)
+                for execution in result.detector_executions
+            )
+            != WO33E_DETECTOR_FINDING_COUNT
+        ):
+            source_failures.append("exact detector runtime accounting differs")
+        if any(
+            item.recipe.finding_sha256
+            not in {
+                finding.finding_sha256
+                for execution in result.detector_executions
+                for finding in execution.report.findings
+            }
+            or "DETECTOR_RUNTIME_EMITTED_FINDING"
+            not in item.technical_reason_codes
+            for item in result.candidates
+        ):
+            source_failures.append("candidate lacks an emitted runtime finding")
+
+        packet_failures: list[str] = []
+        packet = result.review_packet
+        if (
+            packet.selected_count != WO33E_REVIEW_PACKET_COUNT
+            or packet.shortfall_count != WO33E_REVIEW_SHORTFALL_COUNT
+            or len(packet.rows) != WO33E_REVIEW_PACKET_COUNT
+        ):
+            packet_failures.append("truthful technical review shortfall differs")
+        if (
+            packet.event_five_gate_passed
+            or result.event_materially_distinct_count
+            != WO33E_EVENT_DISTINCT_COUNT
+        ):
+            packet_failures.append("event-source material-distinct gate differs")
+        counts = dict(packet.mandatory_source_counts)
+        if counts != {
+            "event": 0,
+            "quiet": 0,
+            "hidden": 0,
+            "fragmented": 0,
+            "historical": 7,
+        }:
+            packet_failures.append("frozen source-stratum finding counts differ")
+        for row in packet.rows:
+            payload = row.as_dict()
+            if (
+                payload["human_review_status"] != "PENDING"
+                or any(payload[name] != "PENDING" for name in HUMAN_REVIEW_FIELDS_V1)
+                or payload["outcome_conditioning_caveat"]
+                != OUTCOME_CONDITIONING_CAVEAT_V1
+            ):
+                packet_failures.append(
+                    f"{row.candidate_id} fabricates or omits human review state"
+                )
+
+        store = LessonMiningStore(root / "research")
+        mining_manifest = store.record_mining_result(result, repository=repository)
+        reopened = store.load_mining_result(mining_manifest.run_id)
+        mining_verification = store.verify_run(mining_manifest.run_id)
+        catalog = RunStore(root / "research")
+        typed_rows = catalog.query_lesson_mining_artifacts(mining_manifest.run_id)
+        persistence_failures: list[str] = []
+        if not mining_verification.passed:
+            persistence_failures.extend(mining_verification.failures)
+        if reopened.artifact_payloads() != result.artifact_payloads():
+            persistence_failures.append("persisted qualification replay diverged")
+        expected_types = {
+            ArtifactType.LESSON_MINING_SOURCE_MATRIX.value,
+            ArtifactType.LESSON_MINING_SOURCE_VALIDATION.value,
+            ArtifactType.LESSON_MINING_CANDIDATES.value,
+            ArtifactType.LESSON_MINING_SELECTION.value,
+            ArtifactType.LESSON_TECHNICAL_REVIEW_PACKET.value,
+        }
+        if (
+            len(typed_rows) != WO33E_MINING_ARTIFACT_COUNT
+            or {str(row["artifact_type"]) for row in typed_rows} != expected_types
+        ):
+            persistence_failures.append("typed mining catalog projection differs")
+
+        selected = result.selection.selected[0]
+        selected_id = selected.candidate_id
+        before = selected.canonical_bytes()
+        review_manifest = store.record_review(
+            selected_id,
+            decision=LessonReviewDecisionV1.READY_FOR_HUMAN_REVIEW,
+            reviewer_id="kirby2-qualification",
+            reviewer_reference="automation:wo33e-audit",
+            reviewer_authority=ReviewerAuthorityV1.AUTOMATION,
+            rubric_version=LESSON_REVIEW_RUBRIC_VERSION_V1,
+            reasons=(
+                "Technical checks passed; every pedagogical judgment remains pending.",
+            ),
+            reason_codes=("HUMAN_REVIEW_PENDING", "TECHNICAL_CHECKS_PASSED"),
+            created_at_utc="2026-08-29T00:00:00Z",
+            repository=repository,
+        )
+        review_failures: list[str] = []
+        history = store.review_history(selected_id)
+        if (
+            not store.verify_run(review_manifest.run_id).passed
+            or len(history) != 1
+            or history[0][1].decision
+            is not LessonReviewDecisionV1.READY_FOR_HUMAN_REVIEW
+            or history[0][1].superseded_review_id is not None
+        ):
+            review_failures.append("immutable technical review sidecar differs")
+        _run_id, selected_reopened = store.find_candidate(selected_id)
+        if selected_reopened.candidate.canonical_bytes() != before:
+            review_failures.append("review sidecar mutated candidate bytes")
+        refusal_count = 0
+        hostile_reviews = (
+            lambda: store.record_review(
+                selected_id,
+                decision=LessonReviewDecisionV1.ACCEPTED,
+                reviewer_id="automation",
+                reviewer_reference="automation:hostile-accept",
+                reviewer_authority=ReviewerAuthorityV1.AUTOMATION,
+                rubric_version=LESSON_REVIEW_RUBRIC_VERSION_V1,
+                reasons=("Automation attempted acceptance.",),
+                reason_codes=("HOSTILE_AUTOMATION_ACCEPT",),
+                created_at_utc="2026-08-29T00:00:01Z",
+                repository=repository,
+            ),
+            lambda: store.record_review(
+                selected_id,
+                decision=LessonReviewDecisionV1.ACCEPTED,
+                reviewer_id="unauthenticated",
+                reviewer_reference="remote:missing-authentication",
+                reviewer_authority=ReviewerAuthorityV1.LOCAL_AUTHENTICATED,
+                rubric_version=LESSON_REVIEW_RUBRIC_VERSION_V1,
+                reasons=("Missing authenticated reviewer reference.",),
+                reason_codes=("MISSING_AUTHENTICATED_REFERENCE",),
+                created_at_utc="2026-08-29T00:00:01Z",
+                repository=repository,
+            ),
+        )
+        for hostile in hostile_reviews:
+            if _raises(hostile):
+                refusal_count += 1
+            else:
+                review_failures.append("hostile acceptance wrote a review sidecar")
+        if refusal_count != len(hostile_reviews):
+            review_failures.append("acceptance authority refusals differ")
+
+        build_manifest = store.build_lesson_proposal(
+            selected_id,
+            created_at_utc="2026-08-29T00:00:02Z",
+            repository=repository,
+        )
+        build = store.load_build_proposal(build_manifest.run_id)
+        workflow_failures: list[str] = []
+        if (
+            not store.verify_run(build_manifest.run_id).passed
+            or build.human_acceptance_status != "PENDING"
+            or build.as_dict()["outcome_conditioning_caveat"]
+            != OUTCOME_CONDITIONING_CAVEAT_V1
+        ):
+            workflow_failures.append("technical lesson build overstated acceptance")
+        command_names = tuple(command.name for command in MINING_COMMAND_MODULE.commands)
+        required_commands = (
+            "mine-drills",
+            "list-candidates",
+            "inspect-candidate",
+            "accept-candidate",
+            "build-lesson",
+        )
+        if command_names[:5] != required_commands:
+            workflow_failures.append("public mining command order or names differ")
+        accepted_count = sum(
+            sidecar.decision is LessonReviewDecisionV1.ACCEPTED
+            for _review_run_id, sidecar in store.review_history(selected_id)
+        )
+        if accepted_count != 0:
+            workflow_failures.append("automated audit created a human acceptance")
+
+        return (
+            DrillMiningAuditCase(
+                "e_exact_five_source_materialization_and_replay_identity",
+                (
+                    f"sources={len(result.source_materializations)}/5 "
+                    f"reports={len(result.detector_executions)}/110 "
+                    f"opportunities={sum(len(item.opportunities) for item in result.detector_executions)}/49 "
+                    f"findings={result.candidate_count}/7 protected_seed_execution=false "
+                    "native_and_replay_digests=exact detector_invocation=EXECUTED"
+                ),
+                tuple(source_failures),
+            ),
+            DrillMiningAuditCase(
+                "e_runtime_findings_form_truthful_shortfall_packet",
+                (
+                    f"selected={packet.selected_count}/20 shortfall={packet.shortfall_count} "
+                    f"event_materially_distinct={result.event_materially_distinct_count}/5 "
+                    "thresholds=unchanged human_fields=PENDING outcome_conditioning=explicit"
+                ),
+                tuple(packet_failures),
+            ),
+            DrillMiningAuditCase(
+                "e_typed_persistence_reopens_with_byte_identical_selection",
+                (
+                    f"run_id={mining_manifest.run_id} typed_artifacts={len(typed_rows)}/5 "
+                    f"packet_sha256={packet.packet_sha256} replay_parity=true"
+                ),
+                tuple(persistence_failures),
+            ),
+            DrillMiningAuditCase(
+                "e_review_sidecars_are_immutable_chained_and_authority_gated",
+                (
+                    f"review_history={len(history)} automation_decision=READY_FOR_HUMAN_REVIEW "
+                    f"hostile_acceptance_refusals={refusal_count}/2 candidate_unchanged=true"
+                ),
+                tuple(review_failures),
+            ),
+            DrillMiningAuditCase(
+                "e_cli_builds_proposals_without_claiming_human_acceptance",
+                (
+                    f"commands={len(command_names)} required_public=5 "
+                    f"build_run_id={build_manifest.run_id} human_acceptance=PENDING "
+                    "actual_human_inspection=PENDING five_accepted=PENDING"
+                ),
+                tuple(workflow_failures),
+            ),
+        )
 
 
 def _candidate_identity_and_ancestry_case() -> DrillMiningAuditCase:
@@ -4686,10 +4984,20 @@ __all__ = [
     "WO33C_REVIEW_TARGET_COUNT",
     "WO33D_ASSESSMENT_FIELD_COUNT",
     "WO33D_SOURCE_LINEAGE_FIELD_COUNT",
+    "WO33E_CANDIDATE_COUNT",
+    "WO33E_DETECTOR_FINDING_COUNT",
+    "WO33E_DETECTOR_OPPORTUNITY_COUNT",
+    "WO33E_DETECTOR_REPORT_COUNT",
+    "WO33E_EVENT_DISTINCT_COUNT",
+    "WO33E_MINING_ARTIFACT_COUNT",
+    "WO33E_REVIEW_PACKET_COUNT",
+    "WO33E_REVIEW_SHORTFALL_COUNT",
+    "WO33E_SOURCE_COUNT",
     "audit_drill_mining",
     "audit_wo33a1_drill_mining",
     "audit_wo33b1_drill_mining",
     "audit_wo33b2_drill_mining",
     "audit_wo33c_drill_mining",
     "audit_wo33d_drill_mining",
+    "audit_wo33e_drill_mining",
 ]

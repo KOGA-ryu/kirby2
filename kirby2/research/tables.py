@@ -240,6 +240,19 @@ FULL_DAY_QUALIFICATION_ARTIFACT_TYPES = frozenset(
 )
 
 
+LESSON_MINING_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.LESSON_MINING_SOURCE_MATRIX,
+        ArtifactType.LESSON_MINING_SOURCE_VALIDATION,
+        ArtifactType.LESSON_MINING_CANDIDATES,
+        ArtifactType.LESSON_MINING_SELECTION,
+        ArtifactType.LESSON_TECHNICAL_REVIEW_PACKET,
+        ArtifactType.LESSON_REVIEW_SIDECAR,
+        ArtifactType.LESSON_BUILD_PROPOSAL,
+    }
+)
+
+
 def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
     """Project typed immutable artifacts into the rebuildable research catalog."""
 
@@ -273,6 +286,18 @@ def qualification_artifact_registry_rows(
         row
         for row in artifact_registry_rows(manifests)
         if ArtifactType(str(row[1])) in FULL_DAY_QUALIFICATION_ARTIFACT_TYPES
+    ]
+
+
+def lesson_mining_artifact_registry_rows(
+    manifests: list[RunManifest],
+) -> list[tuple[object, ...]]:
+    """Project only explicitly typed lesson mining, review, and build artifacts."""
+
+    return [
+        row
+        for row in artifact_registry_rows(manifests)
+        if ArtifactType(str(row[1])) in LESSON_MINING_ARTIFACT_TYPES
     ]
 
 

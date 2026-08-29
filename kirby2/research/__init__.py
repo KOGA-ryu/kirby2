@@ -5,11 +5,13 @@ from .models import (
     RUN_MANIFEST_SCHEMA_VERSION,
     TABLE_SCHEMA_VERSION,
     ArtifactReference,
+    ArtifactType,
     RunManifest,
     RunType,
 )
 from .store import (
     DEFAULT_RESEARCH_STORE,
+    LessonMiningStore,
     SUPPORTED_SCHEMA_VERSIONS,
     RunStore,
     VerificationReport,
@@ -17,9 +19,11 @@ from .store import (
 
 __all__ = [
     "ArtifactReference",
+    "ArtifactType",
     "DEFAULT_RESEARCH_STORE",
     "RUN_CONFIGURATION_SCHEMA_VERSION",
     "RUN_MANIFEST_SCHEMA_VERSION",
+    "LessonMiningStore",
     "RunManifest",
     "RunStore",
     "RunType",

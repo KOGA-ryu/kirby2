@@ -128,6 +128,7 @@ REGISTERABLE_GATE_IDS = (
     "WO33-B2",
     "WO33-C",
     "WO33-D",
+    "WO33-E",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -2776,6 +2777,75 @@ def _audit_wo33d() -> ExpansionGateReport:
     )
 
 
+def _audit_wo33e() -> ExpansionGateReport:
+    from kirby2.audit.drill_mining import (
+        WO33E_CANDIDATE_COUNT,
+        WO33E_DETECTOR_FINDING_COUNT,
+        WO33E_DETECTOR_OPPORTUNITY_COUNT,
+        WO33E_DETECTOR_REPORT_COUNT,
+        WO33E_EVENT_DISTINCT_COUNT,
+        WO33E_MINING_ARTIFACT_COUNT,
+        WO33E_REVIEW_PACKET_COUNT,
+        WO33E_REVIEW_SHORTFALL_COUNT,
+        WO33E_SOURCE_COUNT,
+        audit_wo33e_drill_mining,
+    )
+
+    cases = audit_wo33e_drill_mining()
+    expected_names = (
+        "e_exact_five_source_materialization_and_replay_identity",
+        "e_runtime_findings_form_truthful_shortfall_packet",
+        "e_typed_persistence_reopens_with_byte_identical_selection",
+        "e_review_sidecars_are_immutable_chained_and_authority_gated",
+        "e_cli_builds_proposals_without_claiming_human_acceptance",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO33-E cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO33-E workflow cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO33-E",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("actual_human_inspection", "PENDING"),
+            ("candidate_count", str(WO33E_CANDIDATE_COUNT)),
+            ("detector_finding_count", str(WO33E_DETECTOR_FINDING_COUNT)),
+            (
+                "detector_opportunity_count",
+                str(WO33E_DETECTOR_OPPORTUNITY_COUNT),
+            ),
+            ("detector_report_count", str(WO33E_DETECTOR_REPORT_COUNT)),
+            ("event_materially_distinct_count", str(WO33E_EVENT_DISTINCT_COUNT)),
+            ("five_accepted_lessons", "PENDING"),
+            ("mining_artifact_count", str(WO33E_MINING_ARTIFACT_COUNT)),
+            ("review_packet_count", str(WO33E_REVIEW_PACKET_COUNT)),
+            ("review_shortfall_count", str(WO33E_REVIEW_SHORTFALL_COUNT)),
+            ("source_count", str(WO33E_SOURCE_COUNT)),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2983,6 +3053,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO33-B2", _audit_wo33b2),
     ("WO33-C", _audit_wo33c),
     ("WO33-D", _audit_wo33d),
+    ("WO33-E", _audit_wo33e),
 )
 
 
