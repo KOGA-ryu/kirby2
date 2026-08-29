@@ -33,6 +33,18 @@ _CONSOLIDATED = "CONSOLIDATED"
 DETECTOR_THRESHOLDS_MANIFEST_ID_V1 = "WO33_A1_DETECTOR_THRESHOLDS_V1"
 MINING_PLAN_MANIFEST_ID_V1 = "WO33_A1_MINING_PLAN_V1"
 QUALIFICATION_SOURCES_MANIFEST_ID_V1 = "WO33_A1_QUALIFICATION_SOURCES_V1"
+SESSION_PHASE_VALUES_V1 = frozenset(
+    {
+        "CLOSED",
+        "PREOPEN",
+        "OPENING_AUCTION",
+        "CONTINUOUS",
+        "HALTED",
+        "REOPENING_AUCTION",
+        "CLOSING_AUCTION",
+        "POSTCLOSE",
+    }
+)
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -174,6 +186,12 @@ class SourceWindowOutcomeV1(str, Enum):
     STASIS = "STASIS"
     NOT_APPLICABLE = "NOT_APPLICABLE"
     NOT_OBSERVABLE = "NOT_OBSERVABLE"
+
+
+class DifficultyEstimateStateV1(str, Enum):
+    """Calibration status for the transparent WO33-C heuristic."""
+
+    UNVALIDATED_ESTIMATE = "UNVALIDATED_ESTIMATE"
 
 
 class CandidatePresentationModeV1(str, Enum):
@@ -414,6 +432,14 @@ class RegimeSignatureV1:
             ("spread band", self.spread_band),
         ):
             _require_nfc(value, label)
+        if self.phase not in SESSION_PHASE_VALUES_V1:
+            raise ValueError("regime phase is not a closed session-phase value")
+        for label, value in (
+            ("volume", self.volume_band),
+            ("liquidity", self.liquidity_band),
+        ):
+            if value not in {"LOW", "NORMAL", "HIGH", "NOT_APPLICABLE"}:
+                raise ValueError(f"regime {label} band is not a closed V1 value")
         if self.spread_band not in {
             "ONE",
             "TWO",
@@ -918,6 +944,65 @@ class DifficultyProjectionV1:
             sum(weight * value for weight, value in components),
             sum(weight for weight, _ in components),
         )
+
+    @property
+    def estimate_state(self) -> DifficultyEstimateStateV1:
+        return DifficultyEstimateStateV1.UNVALIDATED_ESTIMATE
+
+    @property
+    def missing_components(self) -> tuple[str, ...]:
+        """Name every omitted nominal component in fixed policy order."""
+
+        values = {
+            "inverse_signal_duration_ppm": self.inverse_signal_duration_ppm,
+            "conflict_ppm": self.conflict_ppm,
+            "reaction_hardness_ppm": self.reaction_hardness_ppm,
+            "spread_hardness_ppm": self.spread_hardness_ppm,
+            "latency_hardness_ppm": self.latency_hardness_ppm,
+            "inverse_liquidity_ppm": self.inverse_liquidity_ppm,
+            "venue_hardness_ppm": self.venue_hardness_ppm,
+            "hidden_uncertainty_ppm": self.hidden_uncertainty_ppm,
+            "objective_depth_hardness_ppm": self.objective_depth_hardness_ppm,
+            "feature_hardness_ppm": self.feature_hardness_ppm,
+            "inverse_quality_ppm": self.inverse_quality_ppm,
+        }
+        return tuple(name for name in self._WEIGHTS if values[name] is None)
+
+    def inspection_projection(self) -> dict[str, object]:
+        """Expose the estimate label, omissions, inputs, and exact result.
+
+        This is deliberately separate from :meth:`as_dict`, whose exact key set is
+        part of candidate identity.  Review tooling can therefore make the
+        unvalidated status prominent without changing existing candidate digests.
+        """
+
+        component_payload = self.as_dict()
+        missing_inputs = tuple(
+            name
+            for name in (
+                "duration_legibility_ppm",
+                "conflict_ppm",
+                "spread_ticks",
+                "latency_us",
+                "three_level_depth",
+                "venue_count",
+                "hidden_uncertainty_ppm",
+                "objective_shares",
+                "executable_depth",
+            )
+            if component_payload[name] is None
+        )
+        return {
+            "calculation": "ROUND_DIV_EVEN_WEIGHTED_MEAN_APPLICABLE_ONLY",
+            "component_order": list(self._WEIGHTS),
+            "components": component_payload,
+            "estimate_state": self.estimate_state.value,
+            "missing_components": list(self.missing_components),
+            "missing_inputs": list(missing_inputs),
+            "policy_id": "LESSON_DIFFICULTY_V1",
+            "schema_version": MINING_SCHEMA_VERSION_V1,
+            "weights_ppm": dict(self._WEIGHTS),
+        }
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -2269,6 +2354,7 @@ __all__ = [
     "MINING_SCHEMA_VERSION_V1",
     "POLICY_SCALE_V1",
     "QUALIFICATION_SOURCES_MANIFEST_ID_V1",
+    "SESSION_PHASE_VALUES_V1",
     "CandidateBoundsV1",
     "CandidateDirectionV1",
     "CandidateKeyV1",
@@ -2283,6 +2369,7 @@ __all__ = [
     "CheckpointReferenceV1",
     "DetectorProjectionV1",
     "DetectorThresholdsManifestV1",
+    "DifficultyEstimateStateV1",
     "DifficultyProjectionV1",
     "EvidenceClassV1",
     "GroundTruthAccessGrantV1",

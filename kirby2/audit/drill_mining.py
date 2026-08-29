@@ -10,6 +10,12 @@ from pathlib import Path
 
 from kirby2.audit.historical_lessons import audit_historical_lessons
 from kirby2.mining import (
+    DIFFICULTY_ESTIMATE_STATE_V1,
+    DIVERSITY_DIMENSIONS_V1,
+    DIVERSITY_WEIGHTS_PPM_V1,
+    POSITIVE_INFINITY_V1,
+    RESERVED_COUNTS_V1,
+    REVIEW_TARGET_COUNT_V1,
     DETECTOR_IDS_V1,
     DETECTOR_REGISTRY_V1,
     SKILL_REGISTRY_V1,
@@ -45,10 +51,39 @@ from kirby2.mining import (
     SourceKindV1,
     SourceWindowOutcomeV1,
     QualificationSourcesManifestV1,
+    FrequencyReportV1,
+    SignalClauseOrientationV1,
+    aggressive_conflict_ppm,
+    and_legibility_ppm,
+    boolean_legibility_ppm,
+    build_difficulty_projection,
+    build_regime_signature_v1,
+    canonical_event_token_v1,
+    canonical_feature_value_v1,
     canonical_json_bytes,
+    compare_candidates,
+    coverage_counts_v1,
+    deduplicate_candidates,
+    difficulty_band_v1,
+    duration_legibility_ppm,
+    event_five_grams_v1,
+    event_price_relation_v1,
+    jaccard_ppm,
     load_mining_policy_bundle,
+    lower_bound_legibility_ppm,
+    marginal_diversity_v1,
+    observable_feature_token_v1,
+    observable_feature_tokens_v1,
+    or_legibility_ppm,
+    orient_signal_magnitude_v1,
+    rank_candidates,
     round_div_even,
+    select_technical_review_candidates,
     sha256_json,
+    spread_band_v1,
+    time_iou_ppm,
+    upper_bound_legibility_ppm,
+    source_window_outcome_v1,
 )
 
 
@@ -66,6 +101,9 @@ WO33B2_DETECTOR_COUNT = 7
 WO33B2_SYNTHETIC_REPORT_SHA256 = (
     "832b09a7b459a3d2404b3a39e3100d6405d8d392628e9c77d25e89536c3fcac2"
 )
+WO33C_DIFFICULTY_COMPONENT_COUNT = 11
+WO33C_DIVERSITY_DIMENSION_COUNT = 6
+WO33C_REVIEW_TARGET_COUNT = 20
 
 WO33A1_THRESHOLD_MANIFEST_SHA256 = (
     "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
@@ -179,6 +217,18 @@ def audit_wo33b2_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
             ancestry,
         ),
         _b2_hostile_contract_refusal_case(runtime, opportunities, ancestry),
+    )
+
+
+def audit_wo33c_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
+    """Exercise transparent ranking, semantic collapse, and fixed review selection."""
+
+    return (
+        _c_difficulty_and_frequency_case(),
+        _c_deterministic_ranking_case(),
+        _c_semantic_deduplication_case(),
+        _c_diversity_selection_case(),
+        _c_shortfall_and_hostile_quota_case(),
     )
 
 
@@ -2984,6 +3034,618 @@ def _b2_hostile_contract_refusal_case(
     )
 
 
+def _c_difficulty_and_frequency_case() -> DrillMiningAuditCase:
+    failures: list[str] = []
+    signal = and_legibility_ppm(
+        (
+            lower_bound_legibility_ppm(10, 10),
+            boolean_legibility_ppm(True),
+        )
+    )
+    duration = duration_legibility_ppm(20, 10)
+    conflict = aggressive_conflict_ppm(3, 1)
+    projection = build_difficulty_projection(
+        signal_legibility_ppm=signal,
+        duration_legibility_ppm=duration,
+        conflict_ppm=conflict,
+        reaction_us=1_000_000,
+        spread_ticks=None,
+        latency_us=None,
+        three_level_depth=None,
+        venue_count=None,
+        hidden_liquidity_relevant=True,
+        feature_count=2,
+        evidence_class=EvidenceClassV1.HISTORICAL_MARKET_BY_ORDER,
+    )
+    expected_missing = (
+        "spread_hardness_ppm",
+        "latency_hardness_ppm",
+        "inverse_liquidity_ppm",
+        "venue_hardness_ppm",
+        "objective_depth_hardness_ppm",
+    )
+    inspection = projection.inspection_projection()
+    components = projection.as_dict()
+    applicable = tuple(
+        (DifficultyProjectionV1._WEIGHTS[name], components[name])
+        for name in DifficultyProjectionV1._WEIGHTS
+        if components[name] is not None
+    )
+    expected_difficulty = round_div_even(
+        sum(weight * value for weight, value in applicable),
+        sum(weight for weight, _ in applicable),
+    )
+    if (
+        signal != 500_000
+        or duration != 1_000_000
+        or conflict != 250_000
+        or lower_bound_legibility_ppm(POSITIVE_INFINITY_V1, 10) != 1_000_000
+        or upper_bound_legibility_ppm(0, 10) != 1_000_000
+        or upper_bound_legibility_ppm(10, 10) != 500_000
+        or or_legibility_ppm((500_000, 750_000)) != 750_000
+        or orient_signal_magnitude_v1(
+            -10,
+            SignalClauseOrientationV1.NEGATIVE_UPPER_BOUND,
+        )
+        != 10
+        or orient_signal_magnitude_v1(
+            -10,
+            SignalClauseOrientationV1.ABSOLUTE_MAGNITUDE,
+        )
+        != 10
+        or orient_signal_magnitude_v1(
+            -10,
+            SignalClauseOrientationV1.DIRECTIONAL,
+            direction=CandidateDirectionV1.SELL,
+        )
+        != 10
+    ):
+        failures.append("difficulty clause legibility does not follow exact V1 arithmetic")
+    if (
+        inspection["estimate_state"] != DIFFICULTY_ESTIMATE_STATE_V1
+        or tuple(inspection["missing_components"]) != expected_missing
+        or projection.applicable_weight_sum != 570_000
+        or projection.difficulty_ppm != expected_difficulty
+        or len(DifficultyProjectionV1._WEIGHTS)
+        != WO33C_DIFFICULTY_COMPONENT_COUNT
+    ):
+        failures.append("difficulty estimate label, omissions, or weighted mean differs")
+
+    frequency_only = FrequencyReportV1(2, 8)
+    explicit = FrequencyReportV1(2, 8, "event")
+    rarity = explicit.as_rarity_projection()
+    if (
+        frequency_only.sample_frequency_ppm != 250_000
+        or frequency_only.rarity_ppm is not None
+        or explicit.rarity_ppm != 750_000
+        or rarity.sample_frequency_ppm != 250_000
+        or rarity.rarity_ppm != 750_000
+        or rarity.qualification_source_row != "event"
+    ):
+        failures.append("frequency or explicit-reference rarity reporting differs")
+    hostile = (
+        lambda: lower_bound_legibility_ppm(9, 10),
+        lambda: lower_bound_legibility_ppm("INFINITY", 10),
+        lambda: upper_bound_legibility_ppm(11, 10),
+        lambda: boolean_legibility_ppm(False),
+        lambda: duration_legibility_ppm(9, 10),
+        lambda: orient_signal_magnitude_v1(
+            10,
+            SignalClauseOrientationV1.DIRECTIONAL,
+            direction=CandidateDirectionV1.NOT_APPLICABLE,
+        ),
+        lambda: FrequencyReportV1(0, 0),
+        frequency_only.as_rarity_projection,
+    )
+    refusals = sum(_raises(probe) for probe in hostile)
+    if refusals != len(hostile):
+        failures.append("missing, unsatisfied, or unreferenced evidence entered scoring")
+    return DrillMiningAuditCase(
+        "c_difficulty_is_transparent_fixed_point_and_rarity_requires_reference",
+        (
+            f"components={len(DifficultyProjectionV1._WEIGHTS)}/11 "
+            f"applicable_weight={projection.applicable_weight_sum} "
+            f"missing={len(projection.missing_components)} "
+            f"estimate={projection.estimate_state.value} "
+            f"hard_refusals={refusals}/{len(hostile)} rarity_reference=explicit"
+        ),
+        tuple(failures),
+    )
+
+
+def _c_deterministic_ranking_case() -> DrillMiningAuditCase:
+    failures: list[str] = []
+    candidates = (
+        _sample_candidate(
+            source_ordinal=101,
+            event_ordinal=101,
+            signal_legibility_ppm=950_000,
+            qualifying_units=99,
+        ),
+        _sample_candidate(
+            source_ordinal=102,
+            event_ordinal=102,
+            signal_legibility_ppm=700_000,
+            qualifying_units=50,
+        ),
+        _sample_candidate(
+            source_ordinal=103,
+            event_ordinal=103,
+            signal_legibility_ppm=500_000,
+            qualifying_units=0,
+        ),
+    )
+    forward = rank_candidates(candidates)
+    reverse = rank_candidates(tuple(reversed(candidates)))
+    forward_ids = tuple(item.candidate.candidate_id for item in forward)
+    reverse_ids = tuple(item.candidate.candidate_id for item in reverse)
+    difficulties = tuple(
+        item.candidate.difficulty_projection.difficulty_ppm for item in forward
+    )
+    rarities = tuple(
+        item.candidate.rarity_projection.rarity_ppm for item in forward
+    )
+    if forward_ids != reverse_ids or difficulties != tuple(sorted(difficulties)):
+        failures.append("difficulty ranking changed with input iteration order")
+    if not (
+        rarities[0] < rarities[-1]
+        and tuple(item.ordinal for item in forward) == (1, 2, 3)
+        and all(
+            item.as_dict()["difficulty_estimate"]["estimate_state"]
+            == "UNVALIDATED_ESTIMATE"
+            for item in forward
+        )
+    ):
+        failures.append("ranking hid estimate status or allowed rarity to define order")
+    if not _raises(lambda: rank_candidates((candidates[0], candidates[0]))):
+        failures.append("ranking accepted repeated content-addressed identity")
+    return DrillMiningAuditCase(
+        "c_ranking_is_permutation_stable_visible_and_not_rarity_optimized",
+        (
+            f"ranked={len(forward)} order= difficulty,active_start,candidate_id "
+            f"difficulty_range={difficulties[0]}..{difficulties[-1]} "
+            "rarity_is_report_only=true estimate=UNVALIDATED_ESTIMATE"
+        ),
+        tuple(failures),
+    )
+
+
+def _c_bounds(active_start_us: int, post_end_us: int) -> CandidateBoundsV1:
+    return CandidateBoundsV1(
+        source_start_us=0,
+        source_end_us=10_000_000,
+        warmup_start_us=max(0, active_start_us - 100_000),
+        active_start_us=active_start_us,
+        active_end_us=active_start_us + 100_001,
+        post_end_us=post_end_us,
+    )
+
+
+def _c_semantic_deduplication_case() -> DrillMiningAuditCase:
+    failures: list[str] = []
+    first = _sample_candidate(
+        bounds=_c_bounds(2_000_000, 3_000_000),
+        source_ordinal=201,
+        event_ordinal=201,
+        signal_legibility_ppm=950_000,
+    )
+    middle = _sample_candidate(
+        bounds=_c_bounds(2_100_000, 3_100_000),
+        source_ordinal=201,
+        event_ordinal=201,
+        signal_legibility_ppm=700_000,
+    )
+    last = _sample_candidate(
+        bounds=_c_bounds(2_200_000, 3_200_000),
+        source_ordinal=201,
+        event_ordinal=201,
+        signal_legibility_ppm=500_000,
+    )
+    first_middle = compare_candidates(first, middle)
+    middle_last = compare_candidates(middle, last)
+    first_last = compare_candidates(first, last)
+    result = deduplicate_candidates((last, middle, first))
+    retained_ids = tuple(item.candidate_id for item in result.retained)
+    middle_decision = next(
+        item for item in result.decisions if item.candidate_id == middle.candidate_id
+    )
+    if not (
+        first_middle.is_duplicate
+        and middle_last.is_duplicate
+        and not first_last.is_duplicate
+        and retained_ids == (first.candidate_id, last.candidate_id)
+        and middle_decision.duplicate_of == first.candidate_id
+        and result.duplicate_count == 1
+    ):
+        failures.append("ordered greedy collapse did not resolve the A-B-C chain exactly")
+
+    foreign_ancestry = _sample_candidate(
+        bounds=middle.bounds,
+        source_ordinal=202,
+        event_ordinal=201,
+        signal_legibility_ppm=700_000,
+    )
+    foreign_regime = _sample_candidate(
+        bounds=middle.bounds,
+        source_ordinal=201,
+        event_ordinal=201,
+        phase="HALTED",
+        signal_legibility_ppm=700_000,
+    )
+    if (
+        compare_candidates(first, foreign_ancestry).is_duplicate
+        or compare_candidates(first, foreign_regime).is_duplicate
+    ):
+        failures.append("ancestry or regime mismatch was treated as a duplicate")
+
+    boundary_values = (
+        time_iou_ppm(0, 1_000_000, 0, 800_000),
+        time_iou_ppm(0, 1_000_000, 0, 799_999),
+        jaccard_ppm(set(range(9)), set(range(10))),
+        jaccard_ppm(set(range(17)), set(range(20))),
+        jaccard_ppm({"primary"}, {"primary", "supporting"}),
+        jaccard_ppm(set(), set()),
+        jaccard_ppm(set(), {"x"}),
+    )
+    if boundary_values != (
+        800_000,
+        799_999,
+        900_000,
+        850_000,
+        500_000,
+        1_000_000,
+        0,
+    ):
+        failures.append("deduplication fixed-point thresholds or empty-set rules differ")
+    event_tokens = tuple(
+        canonical_event_token_v1(
+            "TRADE",
+            "BUY" if index % 2 == 0 else "SELL",
+            98 + index,
+            99,
+            104,
+        )
+        for index in range(6)
+    )
+    grams = event_five_grams_v1(event_tokens)
+    regime = build_regime_signature_v1(
+        phase="CONTINUOUS",
+        regime_id=None,
+        volume_pressure_ppm=749_999,
+        liquidity_pressure_ppm=1_250_000,
+        spread_ticks=9,
+    )
+    if (
+        canonical_feature_value_v1(-2) != ("INTEGER", "-2")
+        or canonical_feature_value_v1(True) != ("FLAG", "true")
+        or observable_feature_token_v1("TRADE", "quantity", 10)
+        != "TRADE|quantity|INTEGER|10"
+        or observable_feature_tokens_v1(
+            (
+                "TRADE|quantity|INTEGER|10",
+                "BOOK_UPDATE|is_locked|FLAG|false",
+                "TRADE|quantity|INTEGER|10",
+            )
+        )
+        != (
+            "BOOK_UPDATE|is_locked|FLAG|false",
+            "TRADE|quantity|INTEGER|10",
+        )
+        or event_price_relation_v1(None, 99, 101) != "NO_PRICE"
+        or event_price_relation_v1(100, None, 101) != "NO_REFERENCE_QUOTE"
+        or tuple(
+            event_price_relation_v1(price, 99, 101)
+            for price in (98, 99, 100, 101, 102)
+        )
+        != ("BELOW_BID", "AT_BID", "INSIDE", "AT_ASK", "ABOVE_ASK")
+        or len(grams) != 2
+        or grams != tuple(sorted(grams, key=lambda row: canonical_json_bytes(list(row))))
+        or regime.as_dict()
+        != {
+            "liquidity_band": "NORMAL",
+            "phase": "CONTINUOUS",
+            "regime_id": "NOT_APPLICABLE",
+            "spread_band": "EXTREME",
+            "volume_band": "LOW",
+        }
+        or spread_band_v1(8) != "WIDE"
+    ):
+        failures.append("canonical feature, event-sequence, or regime construction differs")
+    hostile = (
+        lambda: time_iou_ppm(0, 0, 0, 1),
+        lambda: canonical_feature_value_v1(1.5),
+        lambda: observable_feature_token_v1("TRADE", "bad|path", 1),
+        lambda: observable_feature_tokens_v1(("TRADE|quantity|INTEGER|01",)),
+        lambda: event_price_relation_v1(100, 101, 100),
+        lambda: event_five_grams_v1(()),
+        lambda: build_regime_signature_v1(
+            phase="LUNCH",
+            regime_id="BALANCED",
+            volume_pressure_ppm=1_000_000,
+            liquidity_pressure_ppm=1_000_000,
+            spread_ticks=2,
+        ),
+    )
+    refusals = sum(_raises(probe) for probe in hostile)
+    if refusals != len(hostile):
+        failures.append("a malformed canonical deduplication input was accepted")
+    return DrillMiningAuditCase(
+        "c_semantic_deduplication_is_threshold_exact_and_one_pass_greedy",
+        (
+            "thresholds=iou800000,features900000,fivegram850000,objective500000 "
+            f"chain=A-retain,B-duplicate-of-A,C-retain duplicates={result.duplicate_count} "
+            f"ancestry=exact regime=exact canonical_input_refusals={refusals}/"
+            f"{len(hostile)} scenario_name=unused"
+        ),
+        tuple(failures),
+    )
+
+
+def _c_selection_pool() -> tuple[LessonCandidateV1, ...]:
+    candidates: list[LessonCandidateV1] = []
+    ordinal = 300
+    for _index in range(20):
+        ordinal += 1
+        candidates.append(
+            _sample_candidate(
+                source_row="quiet",
+                source_ordinal=ordinal,
+                event_ordinal=ordinal,
+                detector_id="STRONG_QUEUE_IMBALANCE",
+                phase="CONTINUOUS",
+                signal_legibility_ppm=1_000_000,
+                duration_legibility_ppm=1_000_000,
+                conflict_ppm=0,
+            )
+        )
+    event_rows = (
+        ("STRONG_QUEUE_IMBALANCE", "PREOPEN", SourceWindowOutcomeV1.CONTINUATION),
+        ("BID_ABSORPTION", "OPENING_AUCTION", SourceWindowOutcomeV1.REVERSAL),
+        ("FAILED_BREAKOUT", "CONTINUOUS", SourceWindowOutcomeV1.STASIS),
+        ("AGGRESSIVE_FLOW_BURST", "HALTED", SourceWindowOutcomeV1.CONTINUATION),
+        (
+            "LATENCY_SENSITIVE_OPPORTUNITY",
+            "REOPENING_AUCTION",
+            SourceWindowOutcomeV1.REVERSAL,
+        ),
+    )
+    for detector_id, phase, outcome in event_rows:
+        ordinal += 1
+        candidates.append(
+            _sample_candidate(
+                source_row="event",
+                source_ordinal=ordinal,
+                event_ordinal=ordinal,
+                detector_id=detector_id,
+                phase=phase,
+                source_window_outcome=outcome,
+                signal_legibility_ppm=500_000,
+            )
+        )
+    for source, detector_ids in (
+        (
+            "hidden",
+            ("HIDDEN_RESERVE_REFRESH", "ASK_ABSORPTION", "LIQUIDITY_VACUUM"),
+        ),
+        (
+            "fragmented",
+            (
+                "MULTI_VENUE_FRAGMENTATION",
+                "ROUTING_DILEMMA",
+                "CANCEL_FILL_RACE",
+            ),
+        ),
+    ):
+        for index, detector_id in enumerate(detector_ids):
+            ordinal += 1
+            candidates.append(
+                _sample_candidate(
+                    source_row=source,
+                    source_ordinal=ordinal,
+                    event_ordinal=ordinal,
+                    detector_id=detector_id,
+                    phase=("CLOSING_AUCTION", "POSTCLOSE", "CONTINUOUS")[index],
+                    source_window_outcome=(
+                        SourceWindowOutcomeV1.CONTINUATION,
+                        SourceWindowOutcomeV1.REVERSAL,
+                        SourceWindowOutcomeV1.STASIS,
+                    )[index],
+                    signal_legibility_ppm=500_000,
+                )
+            )
+    for index, detector_id in enumerate(
+        ("FAILED_BREAKOUT", "HALT_REOPENING", "MEAN_REVERSION_TRANSITION")
+    ):
+        ordinal += 1
+        candidates.append(
+            _sample_candidate(
+                source_row="historical",
+                source_ordinal=ordinal,
+                event_ordinal=ordinal,
+                source_kind=SourceKindV1.RECONSTRUCTION,
+                evidence_class=EvidenceClassV1.RECONSTRUCTION_COUNTERFACTUAL,
+                detector_id=detector_id,
+                phase=("PREOPEN", "HALTED", "POSTCLOSE")[index],
+                source_window_outcome=(
+                    SourceWindowOutcomeV1.REVERSAL,
+                    SourceWindowOutcomeV1.STASIS,
+                    SourceWindowOutcomeV1.CONTINUATION,
+                )[index],
+                signal_legibility_ppm=500_000,
+            )
+        )
+    return tuple(candidates)
+
+
+def _c_diversity_selection_case() -> DrillMiningAuditCase:
+    failures: list[str] = []
+    pool = _c_selection_pool()
+    selected = select_technical_review_candidates(pool)
+    repeated = select_technical_review_candidates(tuple(reversed(pool)))
+    selected_ids = tuple(item.candidate_id for item in selected.selected)
+    repeated_ids = tuple(item.candidate_id for item in repeated.selected)
+    baseline = tuple(item.candidate for item in rank_candidates(pool)[:20])
+    selected_coverage = dict(coverage_counts_v1(selected.selected))
+    baseline_coverage = dict(coverage_counts_v1(baseline))
+    reserved = {
+        item.source: item.selected_in_reserved_step
+        for item in selected.reserved_shortfalls
+    }
+    if (
+        selected_ids != repeated_ids
+        or selected.selected_count != REVIEW_TARGET_COUNT_V1
+        or selected.selected_count != WO33C_REVIEW_TARGET_COUNT
+        or selected.shortfall_count != 0
+        or not selected.event_five_gate_passed
+        or reserved != dict(RESERVED_COUNTS_V1)
+    ):
+        failures.append("stratified review selection is not exact or permutation stable")
+    if not (
+        selected_coverage["source"] == 5
+        and baseline_coverage["source"] == 1
+        and sum(selected_coverage.values()) > sum(baseline_coverage.values())
+    ):
+        failures.append("declared-metric diversity did not improve over difficulty order")
+    if (
+        len(DIVERSITY_DIMENSIONS_V1) != WO33C_DIVERSITY_DIMENSION_COUNT
+        or sum(DIVERSITY_WEIGHTS_PPM_V1.values()) != 1_000_000
+        or difficulty_band_v1(249_999) != "[0,250000)"
+        or difficulty_band_v1(250_000) != "[250000,500000)"
+        or difficulty_band_v1(1_000_000) != "[750000,1000000]"
+        or not _raises(
+            lambda: DIVERSITY_WEIGHTS_PPM_V1.__setitem__("source", 1)
+        )
+        or source_window_outcome_v1(CandidateDirectionV1.BUY, 200, 202)
+        is not SourceWindowOutcomeV1.CONTINUATION
+        or source_window_outcome_v1(CandidateDirectionV1.SELL, 202, 204)
+        is not SourceWindowOutcomeV1.REVERSAL
+        or source_window_outcome_v1(CandidateDirectionV1.BUY, 200, 201)
+        is not SourceWindowOutcomeV1.STASIS
+        or source_window_outcome_v1(CandidateDirectionV1.BUY, None, 202)
+        is not SourceWindowOutcomeV1.NOT_OBSERVABLE
+        or source_window_outcome_v1(
+            CandidateDirectionV1.NOT_APPLICABLE,
+            None,
+            None,
+        )
+        is not SourceWindowOutcomeV1.NOT_APPLICABLE
+    ):
+        failures.append("diversity dimensions, weights, or bands are not frozen")
+    for index, decision in enumerate(selected.decisions):
+        candidate = selected.selected[index]
+        score, novelty = marginal_diversity_v1(
+            candidate,
+            selected.selected[:index],
+        )
+        if score != decision.marginal_score_ppm or novelty != decision.novelty_ppm:
+            failures.append("a recorded marginal diversity score is not reproducible")
+            break
+    review_bytes = canonical_json_bytes(selected.technical_review_projection())
+    if any(
+        outcome.value.encode("ascii") in review_bytes
+        for outcome in (
+            SourceWindowOutcomeV1.CONTINUATION,
+            SourceWindowOutcomeV1.REVERSAL,
+            SourceWindowOutcomeV1.STASIS,
+        )
+    ):
+        failures.append("technical-review selection projection leaked future outcome")
+    return DrillMiningAuditCase(
+        "c_preregistered_greedy_selection_is_deterministic_and_more_diverse",
+        (
+            f"pool={len(pool)} selected={selected.selected_count}/20 "
+            f"dimensions={len(DIVERSITY_DIMENSIONS_V1)} weight_sum=1000000 "
+            f"source_coverage={baseline_coverage['source']}->{selected_coverage['source']} "
+            f"coverage_sum={sum(baseline_coverage.values())}->"
+            f"{sum(selected_coverage.values())} event_five=PASS outcome=WITHHELD"
+        ),
+        tuple(failures),
+    )
+
+
+def _c_shortfall_and_hostile_quota_case() -> DrillMiningAuditCase:
+    failures: list[str] = []
+    retained_event = _sample_candidate(
+        bounds=_c_bounds(4_000_000, 5_000_000),
+        source_row="event",
+        source_ordinal=501,
+        event_ordinal=501,
+        signal_legibility_ppm=900_000,
+    )
+    event_duplicate = _sample_candidate(
+        bounds=_c_bounds(4_050_000, 5_050_000),
+        source_row="event",
+        source_ordinal=501,
+        event_ordinal=501,
+        signal_legibility_ppm=500_000,
+    )
+    retained_quiet = _sample_candidate(
+        source_row="quiet",
+        source_ordinal=502,
+        event_ordinal=502,
+        detector_id="FAILED_BREAKOUT",
+    )
+    pool = (event_duplicate, retained_quiet, retained_event)
+    normal = select_technical_review_candidates(pool)
+    pressured = select_technical_review_candidates(pool, target_count=40)
+    normal_payload = normal.as_dict()
+    event_shortfall = next(
+        item for item in normal.reserved_shortfalls if item.source == "event"
+    )
+    if (
+        normal.selected_count != 2
+        or normal.shortfall_count != 18
+        or normal.deduplication.duplicate_count != 1
+        or event_duplicate.candidate_id
+        in {item.candidate_id for item in normal.selected}
+        or event_shortfall.shortfall_count != 4
+        or normal.event_five_gate_passed
+        or normal_payload["duplicates_admitted"] is not False
+        or normal_payload["thresholds_weakened"] is not False
+    ):
+        failures.append("normal quota concealed duplicate, event, or pool shortfall")
+    if (
+        pressured.selected_count != 2
+        or pressured.shortfall_count != 38
+        or pressured.deduplication.duplicate_count != 1
+        or pressured.deduplication.as_dict()["thresholds_ppm"]
+        != normal.deduplication.as_dict()["thresholds_ppm"]
+    ):
+        failures.append("larger quota altered validity or semantic duplicate thresholds")
+
+    hostile_source = _sample_candidate(
+        source_row="quiet-alias",
+        source_ordinal=503,
+        event_ordinal=503,
+    )
+    probes = (
+        lambda: select_technical_review_candidates(
+            (retained_event, retained_event)
+        ),
+        lambda: select_technical_review_candidates((hostile_source,)),
+        lambda: _sample_candidate(
+            source_row="quiet",
+            source_ordinal=504,
+            event_ordinal=504,
+            phase="LUNCH",
+        ),
+    )
+    refusals = sum(_raises(probe) for probe in probes)
+    if refusals != len(probes):
+        failures.append("identity, source-row, or phase aliases entered selection")
+    return DrillMiningAuditCase(
+        "c_quota_pressure_reports_shortfall_without_weakening_or_duplicates",
+        (
+            f"selected={normal.selected_count}/20 shortfall={normal.shortfall_count} "
+            f"pressured={pressured.selected_count}/40 "
+            f"pressured_shortfall={pressured.shortfall_count} duplicates=1_excluded "
+            f"event_reserved_shortfall={event_shortfall.shortfall_count} "
+            f"hostile_refusals={refusals}/{len(probes)} thresholds_unchanged=true"
+        ),
+        tuple(failures),
+    )
+
+
 def _b2_synthetic_reports():
     from kirby2.mining.runtime import B2_DETECTOR_IDS_V1, MiningDetectorRuntimeV1
 
@@ -3271,6 +3933,25 @@ def _sample_candidate(
     evidence_class: EvidenceClassV1 = EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
     source_kind: SourceKindV1 = SourceKindV1.RUN,
     detector_id: str = "STRONG_QUEUE_IMBALANCE",
+    source_row: str = "quiet",
+    source_ordinal: int = 1,
+    event_ordinal: int = 1,
+    phase: str = "CONTINUOUS",
+    regime_id: str = "BALANCED",
+    source_window_outcome: SourceWindowOutcomeV1 = (
+        SourceWindowOutcomeV1.CONTINUATION
+    ),
+    signal_legibility_ppm: int = 650_000,
+    duration_legibility_ppm: int | None = 800_000,
+    conflict_ppm: int | None = 100_000,
+    spread_ticks: int | None = 2,
+    latency_us: int | None = 250,
+    three_level_depth: int | None = 3_000,
+    venue_count: int | None = 1,
+    qualifying_units: int = 2,
+    eligible_units: int = 100,
+    feature_tokens: tuple[str, ...] | None = None,
+    event_five_grams: tuple[tuple[str, ...], ...] | None = None,
 ) -> LessonCandidateV1:
     selected_bounds = bounds or CandidateBoundsV1(
         source_start_us=0,
@@ -3281,48 +3962,69 @@ def _sample_candidate(
         post_end_us=5_000_000,
     )
     declaration = DETECTOR_REGISTRY_V1.require(detector_id, 1)
+    if type(source_ordinal) is not int or source_ordinal <= 0:
+        raise ValueError("sample source ordinal must be positive")
+    if type(event_ordinal) is not int or event_ordinal <= 0:
+        raise ValueError("sample event ordinal must be positive")
     source_id = {
-        SourceKindV1.RUN: "qualification-run-0001",
-        SourceKindV1.DATASET: "qualification-dataset-0001",
-        SourceKindV1.RECONSTRUCTION: "qualification-reconstruction-0001",
+        SourceKindV1.RUN: f"qualification-run-{source_ordinal:04d}",
+        SourceKindV1.DATASET: f"qualification-dataset-{source_ordinal:04d}",
+        SourceKindV1.RECONSTRUCTION: (
+            f"qualification-reconstruction-{source_ordinal:04d}"
+        ),
     }[source_kind]
+    source_digest_label = (
+        "source-run" if source_ordinal == 1 else f"source-run:{source_ordinal}"
+    )
+    checkpoint_digest_label = (
+        "checkpoint" if source_ordinal == 1 else f"checkpoint:{source_ordinal}"
+    )
+    prefix_digest_label = (
+        "event-prefix" if source_ordinal == 1 else f"event-prefix:{source_ordinal}"
+    )
     source_identity = SourceIdentityV1(
         source_kind,
         source_id,
-        _digest("source-run"),
+        _digest(source_digest_label),
     )
     checkpoint = CheckpointReferenceV1(
-        "checkpoint-0001",
-        _digest("checkpoint"),
+        f"checkpoint-{source_ordinal:04d}",
+        _digest(checkpoint_digest_label),
     )
     ancestry = SourceAncestryV1(
         source_kind=source_kind,
         source_id=source_id,
-        source_sha256=_digest("source-run"),
+        source_sha256=_digest(source_digest_label),
         checkpoint_id=checkpoint.checkpoint_id,
         checkpoint_sha256=checkpoint.checkpoint_sha256,
-        event_prefix_sha256=_digest("event-prefix"),
+        event_prefix_sha256=_digest(prefix_digest_label),
         parent_source_ancestry_sha256=None,
     )
-    observable = ObservableFeatureSummaryV1(
-        feature_tokens=(
-            "BOOK_UPDATE|best_ask_size|INTEGER|400",
-            "BOOK_UPDATE|best_bid_size|INTEGER|1600",
+    selected_feature_tokens = feature_tokens or (
+        "BOOK_UPDATE|best_ask_size|INTEGER|400",
+        "BOOK_UPDATE|best_bid_size|INTEGER|1600",
+    )
+    selected_event_five_grams = event_five_grams or (
+        (
+            "BOOK_UPDATE|BUY|AT_BID",
+            "BOOK_UPDATE|SELL|AT_ASK",
         ),
+    )
+    event_ids = (
+        f"event-{event_ordinal:04d}-0001",
+        f"event-{event_ordinal:04d}-0002",
+    )
+    observable = ObservableFeatureSummaryV1(
+        feature_tokens=selected_feature_tokens,
         regime_signature=RegimeSignatureV1(
-            phase="CONTINUOUS",
-            regime_id="BALANCED",
+            phase=phase,
+            regime_id=regime_id,
             volume_band="NORMAL",
             liquidity_band="NORMAL",
             spread_band="TWO",
         ),
-        event_five_grams=(
-            (
-                "BOOK_UPDATE|BUY|AT_BID",
-                "BOOK_UPDATE|SELL|AT_ASK",
-            ),
-        ),
-        contributing_source_event_ids=("event-0001", "event-0002"),
+        event_five_grams=selected_event_five_grams,
+        contributing_source_event_ids=event_ids,
     )
     threshold = _digest("thresholds")
     detector = DetectorProjectionV1(detector_id, 1, threshold)
@@ -3339,7 +4041,7 @@ def _sample_candidate(
         GroundTruthSummaryV1(
             detector_id,
             CandidateDirectionV1.BUY,
-            ("event-0002",),
+            (event_ids[-1],),
         )
         if evidence_class is EvidenceClassV1.SYNTHETIC_GROUND_TRUTH
         else None
@@ -3378,14 +4080,14 @@ def _sample_candidate(
         observable_feature_summary=observable,
         ground_truth_summary=ground_truth,
         difficulty_projection=DifficultyProjectionV1(
-            signal_legibility_ppm=650_000,
-            duration_legibility_ppm=800_000,
-            conflict_ppm=100_000,
+            signal_legibility_ppm=signal_legibility_ppm,
+            duration_legibility_ppm=duration_legibility_ppm,
+            conflict_ppm=conflict_ppm,
             reaction_us=reaction_us,
-            spread_ticks=2,
-            latency_us=250,
-            three_level_depth=3_000,
-            venue_count=1,
+            spread_ticks=spread_ticks,
+            latency_us=latency_us,
+            three_level_depth=three_level_depth,
+            venue_count=venue_count,
             hidden_uncertainty_ppm=(
                 {
                     EvidenceClassV1.SYNTHETIC_GROUND_TRUTH: 0,
@@ -3397,15 +4099,17 @@ def _sample_candidate(
             ),
             objective_shares=None,
             executable_depth=None,
-            feature_count=2,
+            feature_count=len(
+                {token.split("|", 3)[1] for token in selected_feature_tokens}
+            ),
             evidence_quality_ppm=evidence_class.evidence_quality_ppm,
         ),
         rarity_projection=RarityProjectionV1(
-            qualification_source_row="quiet-full-day",
-            qualifying_units=2,
-            eligible_units=100,
+            qualification_source_row=source_row,
+            qualifying_units=qualifying_units,
+            eligible_units=eligible_units,
         ),
-        source_window_outcome=SourceWindowOutcomeV1.CONTINUATION,
+        source_window_outcome=source_window_outcome,
         primary_skill_id=declaration.primary_skill_id,
         supporting_skill_ids=declaration.supporting_skill_ids,
         objective_projection=ObserveClassifyObjectiveV1(
@@ -3482,8 +4186,12 @@ __all__ = [
     "WO33B1_SYNTHETIC_REPORT_SHA256",
     "WO33B2_DETECTOR_COUNT",
     "WO33B2_SYNTHETIC_REPORT_SHA256",
+    "WO33C_DIFFICULTY_COMPONENT_COUNT",
+    "WO33C_DIVERSITY_DIMENSION_COUNT",
+    "WO33C_REVIEW_TARGET_COUNT",
     "audit_drill_mining",
     "audit_wo33a1_drill_mining",
     "audit_wo33b1_drill_mining",
     "audit_wo33b2_drill_mining",
+    "audit_wo33c_drill_mining",
 ]
