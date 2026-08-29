@@ -1,0 +1,123 @@
+schema_id = "KIRBY2_STRATEGY_SEARCH_MANIFEST_V1"
+schema_version = 1
+experiment_id = "bounded-search-no-winner-v1"
+protocol_id = "BOUNDED_SEARCH_CONTROLLED_V1"
+oracle_id = "NO_WINNER_SYNTHETIC_SCORE_ORACLE_V1"
+expected_outcome = "NO_CANDIDATE_MET_CRITERIA"
+policy = "GRID"
+policy_version = "STRATEGY_DISCOVERY_V1"
+budget = 64
+hard_budget = 64
+finalist_limit = 8
+base_strategy_source_sha256 = "1f0a39b847093703e58061e396fc80beb02509e3d3b128c3c8c5a22fd51d1df3"
+partition_manifest_sha256 = "163ec7759aad83ffa46089abaa2fcc6d18117bcf8074e2c5be07caf5a74a39c9"
+source_ancestry_sha256 = "c690db1199bcd41b37bbcfb8a3b00be3e6201ed7cae25c4d772971efb7a2a4a8"
+scenario_group_id = "CONTROLLED_ROOT_FAMILY_CELL_V1"
+objective_group_id = "BOUNDED_SEARCH_OBJECTIVES_V1"
+evidence_group_id = "REFERENCE_LABEL_CANDIDATE_PROJECTION_V1"
+real_partition_execution = false
+
+[partitions]
+train = [3501000, 3501001, 3501002, 3501003, 3501004, 3501005, 3501006, 3501007, 3501008, 3501009, 3501010, 3501011]
+validation = [3502000, 3502001, 3502002, 3502003, 3502004, 3502005, 3502006, 3502007]
+holdout = [3503000, 3503001, 3503002, 3503003, 3503004, 3503005, 3503006, 3503007]
+adversarial = [3504000, 3504001, 3504002, 3504003, 3504004, 3504005, 3504006, 3504007]
+robustness = [3505000, 3505001, 3505002, 3505003]
+
+[search_space]
+order = "NFC_UTF8_PATH_FIRST_SLOWEST_LAST_FASTEST_V1"
+
+[[search_space.parameters]]
+path = "/green/0/threshold_ticks"
+type = "INTEGER"
+domain = [1, 2, 3]
+base = 2
+
+[[search_space.parameters]]
+path = "/green/1/threshold_ppm"
+type = "INTEGER"
+domain = [100000, 200000, 300000, 400000]
+base = 200000
+
+[[search_space.parameters]]
+path = "/wait/0/threshold_ticks"
+type = "INTEGER"
+domain = [2, 4, 6]
+base = 4
+
+[[search_space.parameters]]
+path = "/window_us"
+type = "INTEGER"
+domain = [2000000, 5000000, 10000000]
+base = 5000000
+
+[objectives]
+protocol_sha256 = "06a52f96ce1aa3e12e7756f86ef92755f9078364b0ecc8d18a97795d3e50d032"
+required = ["BALANCED_CLASSIFICATION", "DISCIPLINE_COMPATIBILITY", "EXECUTION_OPPORTUNITY", "FALSE_GREEN", "MISSED_OPPORTUNITY", "ADVERSE_SELECTION", "TURNOVER", "SPREAD_PAID", "COMPLETION", "CROSS_CELL_STABILITY", "COMPLEXITY"]
+optional = ["PNL"]
+weights = [180000, 120000, 130000, 90000, 90000, 80000, 40000, 40000, 100000, 80000, 50000, 0]
+utility_rules = ["ROUNDED_THREE_CLASS_RECALL_MEAN_V1", "S_MINUS_VIOLATION_SHARE_V1", "HARMONIC_PRECISION_RECALL_V1", "S_MINUS_FALSE_GREEN_RATE_V1", "S_MINUS_MISSED_OPPORTUNITY_RATE_V1", "CAPPED_5000_MILLITICKS_COST_V1", "CAPPED_EXCESS_18_ROUND_TRIPS_V1", "CAPPED_5000_MILLITICKS_COST_V1", "COMPLETED_OVER_OBJECTIVE_SHARES_V1", "S_MINUS_CELL_MEDIAN_RANGE_V1", "S_MINUS_CAPPED_COMPLEXITY_POINTS_OVER_200_V1", "RECORDED_ZERO_WEIGHT_V1"]
+aggregation = "ROOT_COMPOSITE_THEN_MEDIAN_DELTA_MAD_V1"
+
+[validation]
+access_schedule_id = "VALIDATION_ONCE_AFTER_FINALISTS_V1"
+max_access_count = 1
+root_count = 8
+selection_rule = "QUALIFY_THEN_VALIDATION_STATISTIC_MEDIAN_TRAIN_COMPLEXITY_TIE_V1"
+
+[practical_effect]
+statistic_min = 30000
+positive_roots_min = 6
+classification_or_opportunity_min = 50000
+component_floor = -50000
+sensitive_component_floor = -20000
+candidate_trades_min = 30
+trade_ratio_min_ppm = 600000
+trade_ratio_max_ppm = 1600000
+
+[uncertainty]
+method = "MEDIAN_DELTA_MINUS_MAD_V1"
+reduction_order = "ASCENDING_ROOT_SEED_V1"
+
+[multiplicity]
+method = "5000_TIMES_CEIL_LOG2_ONE_PLUS_N_V1"
+penalty_step = 5000
+candidate_count = "UNIQUE_VALID_NON_BASE_TRAINED_V1"
+
+[complexity]
+dimensions = ["conditions", "features", "states", "transitions", "rolling_windows", "parameters"]
+coefficients = [4, 3, 8, 6, 2, 1]
+normalization_points = 200
+material_equivalence = "PREFER_LOWER_COMPLEXITY_V1"
+
+[robustness]
+mandatory_families = ["THRESHOLD", "ROLLING_WINDOW", "LATENCY", "FEES", "VOLUME", "LIQUIDITY", "REGIME_MIX"]
+venue_mix = "NOT_APPLICABLE_SINGLE_VENUE_V1"
+applicable_family_count = 7
+family_median_floor = -20000
+nonnegative_fraction_numerator = 3
+nonnegative_fraction_denominator = 4
+minimum_cell = -75000
+component_median_floor = -50000
+sensitive_component_floor = -20000
+trade_ratio_min_ppm = 600000
+trade_ratio_max_ppm = 1600000
+
+[holdout]
+reveal_policy = "ONE_ATOMIC_TOKEN_AFTER_ROBUSTNESS_V1"
+adversarial_rule = "FULL_VALIDATION_RULE_UNCHANGED_V1"
+mutation_after_result = "FORBIDDEN"
+rerun = "FORBIDDEN"
+
+[stopping]
+grid = "BUDGET_OR_EXHAUSTION_V1"
+random = "BUDGET_OR_EXHAUSTION_V1"
+coordinate = "PASSES_4_OR_TWO_NO_MOVE_10000_V1"
+beam = "DEPTH_4_EMPTY_OR_TWO_NONIMPROVING_10000_V1"
+evolutionary = "GENERATIONS_8_OR_TWO_NONIMPROVING_10000_V1"
+
+[tie_break]
+policy = "STRATEGY_DISCOVERY_V1"
+root_seed = 3599001
+final_training_context = "WO35/TRAINING_FINALISTS"
+validation_context = "WO35/VALIDATION_RANKING"

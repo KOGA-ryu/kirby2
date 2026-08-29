@@ -1,4 +1,4 @@
-"""Executable strategy-discovery audits for Work Orders 35-A through 35-C."""
+"""Executable strategy-discovery audits for Work Orders 35-A through 35-D."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from kirby2.immutable import thaw_json
 from kirby2.discovery.ast import (
     StrategyAstV1,
     parse_strategy_ast,
@@ -28,6 +29,7 @@ from kirby2.discovery.lineage import (
 )
 from kirby2.discovery.diffs import (
     STRATEGY_COMPLEXITY_SCHEMA_ID_V1,
+    StrategyComplexityV1,
     StrategyComplexityDeltaV1,
     strategy_complexity,
 )
@@ -71,6 +73,45 @@ from kirby2.discovery.partitions import (
     StrategyPartitionV1,
     ValidationScheduleV1,
     partition_manifest_round_trip,
+)
+from kirby2.discovery.evaluation import (
+    DevelopmentSyntheticScoreOracleV1,
+    EvaluationAccessError,
+    SyntheticOracleModeV1,
+    require_compatible_evidence,
+)
+from kirby2.discovery.objectives import (
+    ALL_OBJECTIVE_SPECS_V1,
+    EvidenceCompatibilityKeyV1,
+    ObjectiveApplicabilityV1,
+    ObjectiveValueV1,
+    REQUIRED_OBJECTIVE_SPECS_V1,
+    StrategyObjectiveIdV1,
+    balanced_classification_utility,
+    common_tie_digest,
+    completion_utility,
+    complexity_points,
+    cross_cell_stability_utility,
+    discipline_compatibility_utility,
+    execution_opportunity_utility,
+    false_green_utility,
+    materially_equivalent,
+    median_and_mad,
+    missed_opportunity_utility,
+    multiplicity_penalty,
+    objective_protocol_projection,
+    root_composite,
+    signed_cost_utility,
+    turnover_utility,
+)
+from kirby2.discovery.search import (
+    CONTROLLED_BASE_SOURCE_SHA256_V1,
+    STRATEGY_VECTOR_ORDER_V1,
+    SearchOutcomeV1,
+    SearchPolicyV1,
+    StrategySearchManifestV1,
+    load_search_manifest,
+    run_development_search,
 )
 from kirby2.experiments.models import (
     ExperimentManifest,
@@ -119,6 +160,22 @@ WO35C_BATCH_SHA256 = (
 )
 WO35C_ACCOUNTING_SHA256 = (
     "cb62a448fc87401c68c318eab155233bd66a7f1aa470881ffb06cbdc70c3ca5a"
+)
+WO35D_AUDIT_CASE_COUNT = 5
+WO35D_MANIFEST_FIXTURE_SHA256 = (
+    "3965babf238cf8a1fc57ddf96cd4e25a8eba137197da74ff765409eb159ee127"
+)
+WO35D_POLICY_FIXTURE_SHA256 = (
+    "b6d2fd6e83e5064a588f4c3f0e62c4f07c7e3388aa6bf8f6f8aaae3ec95147d3"
+)
+WO35D_OBJECTIVE_FIXTURE_SHA256 = (
+    "80e118a3bb25da94d74cec4584258ee52d78a006d9e97d773ee3ef38fe84520d"
+)
+WO35D_ACCESS_FIXTURE_SHA256 = (
+    "9f70f10834b939ff4f063109d61b882bbce113f3cee3c169bfcd96be7ae432ed"
+)
+WO35D_NO_WINNER_RUN_SHA256 = (
+    "bed290d4e8bc95388f25677f15a6b65af0369a0c4b2958aec87bed43837dac91"
 )
 
 _TRAFFIC_A = """\
@@ -1700,6 +1757,473 @@ def audit_wo35c_strategy_mutations() -> tuple[StrategyDiscoveryAuditCase, ...]:
     )
 
 
+def _search_example_path(name: str) -> Path:
+    return Path(__file__).resolve().parents[1] / "discovery" / "examples" / name
+
+
+def _load_search_examples() -> tuple[StrategySearchManifestV1, StrategySearchManifestV1]:
+    return (
+        load_search_manifest(_search_example_path("bounded_search.toml")),
+        load_search_manifest(_search_example_path("no_winner.toml")),
+    )
+
+
+def _normalized_manifest_payload(payload: object) -> dict[str, object]:
+    normalized = thaw_json(payload)
+    if type(normalized) is not dict:
+        raise TypeError("search manifest payload must thaw to an object")
+    normalized["experiment_id"] = "FIXTURE_ID"
+    normalized["oracle_id"] = "FIXTURE_ORACLE"
+    normalized["expected_outcome"] = "FIXTURE_OUTCOME"
+    return normalized
+
+
+def _search_manifest_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    bounded, no_winner = _load_search_examples()
+    bounded_raw = _search_example_path("bounded_search.toml").read_bytes()
+    space = bounded.search_space
+    universe = space.universe()
+    raw_vector_count = 1
+    for parameter in space.parameters:
+        raw_vector_count *= len(parameter.domain)
+    if raw_vector_count != 108 or len(universe) != 95:
+        failures.append("controlled grid did not retain 95 unique non-base semantics")
+    if len({item.semantic_sha256 for item in universe}) != len(universe):
+        failures.append("controlled universe retained a semantic duplicate")
+    if len({item.vector.canonical_bytes for item in universe}) != len(universe):
+        failures.append("controlled universe retained a duplicate canonical vector")
+    if any(
+        item.vector.canonical_bytes.endswith(b"\n")
+        or not item.vector.canonical_bytes.startswith(b"[[\"")
+        for item in universe
+    ):
+        failures.append("canonical vectors are not exact no-LF compact JSON arrays")
+    if _normalized_manifest_payload(bounded.payload) != _normalized_manifest_payload(
+        no_winner.payload
+    ):
+        failures.append("no-winner fixture changed a preregistered search threshold")
+    if bounded.search_space.parameters != no_winner.search_space.parameters:
+        failures.append("example manifests do not bind the same controlled search space")
+    if bounded.policy is not SearchPolicyV1.GRID or no_winner.policy is not SearchPolicyV1.GRID:
+        failures.append("committed examples do not each select exactly GRID")
+    if bounded.budget != 64 or no_winner.budget != 64:
+        failures.append("committed examples do not bind budget 64")
+    hostile_manifests = (
+        bounded_raw.replace(b"budget = 64", b"budget = 65", 1),
+        bounded_raw.replace(b"statistic_min = 30000", b"statistic_min = 29999", 1),
+        bounded_raw.replace(
+            b"schema_version = 1\n",
+            b"schema_version = 1\nunexpected = true\n",
+            1,
+        ),
+    )
+    hostile_refusals = 0
+    for raw in hostile_manifests:
+        try:
+            StrategySearchManifestV1.from_toml_bytes(raw)
+        except (TypeError, ValueError):
+            hostile_refusals += 1
+    try:
+        bounded.payload["budget"] = 1  # type: ignore[index]
+    except TypeError:
+        hostile_refusals += 1
+    if hostile_refusals != 4:
+        failures.append("search manifest mutation or threshold tampering was admitted")
+    fixture_projection = {
+        "bounded_manifest_sha256": bounded.manifest_sha256,
+        "base_source_sha256": CONTROLLED_BASE_SOURCE_SHA256_V1,
+        "no_winner_manifest_sha256": no_winner.manifest_sha256,
+        "parameter_paths": [item.path for item in space.parameters],
+        "raw_vectors": raw_vector_count,
+        "retained_non_base": len(universe),
+        "hostile_refusals": hostile_refusals,
+        "vector_order": STRATEGY_VECTOR_ORDER_V1,
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(fixture_projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35D_MANIFEST_FIXTURE_SHA256:
+        failures.append("WO35-D manifests differ from their frozen fixture digest")
+    return StrategyDiscoveryAuditCase(
+        "d_manifests_preregister_the_exact_bounded_protocol",
+        (
+            f"fixture_sha256={fixture_sha256} bounded_sha256={bounded.manifest_sha256} "
+            f"no_winner_sha256={no_winner.manifest_sha256} raw_vectors={raw_vector_count} "
+            f"valid_including_base={len(universe) + 1} non_base={len(universe)} "
+            f"hostile_refusals={hostile_refusals}/4 policy=GRID budget=64 "
+            "real_partition_execution=FORBIDDEN"
+        ),
+        tuple(failures),
+    )
+
+
+def _search_policy_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    bounded, _ = _load_search_examples()
+    rows: list[dict[str, object]] = []
+    for policy in SearchPolicyV1:
+        first = run_development_search(bounded, policy=policy)
+        repeated = run_development_search(bounded, policy=policy)
+        if first.run_sha256 != repeated.run_sha256 or first.as_dict() != repeated.as_dict():
+            failures.append(f"{policy.value} changed across identical repeated searches")
+        identities = tuple(item.candidate.semantic_sha256 for item in first.evaluated)
+        if len(identities) != len(set(identities)):
+            failures.append(f"{policy.value} evaluated a semantic duplicate")
+        if not 1 <= len(first.evaluated) <= first.effective_budget <= 64:
+            failures.append(f"{policy.value} violated its effective budget")
+        if first.outcome is not SearchOutcomeV1.CANDIDATE_SELECTED:
+            failures.append(f"{policy.value} did not complete controlled selection")
+        bounded_seven = run_development_search(
+            bounded,
+            policy=policy,
+            cli_budget=7,
+        )
+        if bounded_seven.effective_budget != 7 or len(bounded_seven.evaluated) > 7:
+            failures.append(f"{policy.value} ignored the smaller CLI budget")
+        rows.append(
+            {
+                "evaluated": len(first.evaluated),
+                "outcome": first.outcome.value,
+                "policy": policy.value,
+                "run_sha256": first.run_sha256,
+                "selected": first.selected_semantic_sha256,
+                "stop_reason": first.stop_reason.value,
+                "trace": list(first.policy_trace),
+            }
+        )
+    fixture_sha256 = hashlib.sha256(canonical_identity_bytes(rows)).hexdigest()
+    if fixture_sha256 != WO35D_POLICY_FIXTURE_SHA256:
+        failures.append("WO35-D policy results differ from the frozen fixture digest")
+    counts = ",".join(f"{item['policy']}={item['evaluated']}" for item in rows)
+    return StrategyDiscoveryAuditCase(
+        "d_all_five_policies_are_repeatable_unique_and_budget_bounded",
+        (
+            f"policy_fixture_sha256={fixture_sha256} policies={len(rows)} "
+            f"evaluations={counts} repeated=IDENTICAL cli_budget_7=ENFORCED "
+            "combined_meta_search=ABSENT"
+        ),
+        tuple(failures),
+    )
+
+
+def _search_objective_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    required_ids = tuple(item.objective_id for item in REQUIRED_OBJECTIVE_SPECS_V1)
+    all_ids = tuple(item.objective_id for item in ALL_OBJECTIVE_SPECS_V1)
+    weight_sum = sum(item.weight for item in REQUIRED_OBJECTIVE_SPECS_V1)
+    complexity = StrategyComplexityV1(1, 2, 3, 4, 5, 6)
+    median, mad = median_and_mad((1, 2, 100, 101))
+    objective_values = tuple(
+        ObjectiveValueV1(
+            item.objective_id,
+            ObjectiveApplicabilityV1.APPLICABLE,
+            500_000 if item.objective_id is not StrategyObjectiveIdV1.PNL else 1_000_000,
+        )
+        for item in ALL_OBJECTIVE_SPECS_V1
+    )
+    composite = root_composite(objective_values)
+    tie_a = common_tie_digest(
+        context_id="WO35/TRAINING_FINALISTS",
+        semantic_sha256="01" * 32,
+    )
+    tie_b = common_tie_digest(
+        context_id="WO35/TRAINING_FINALISTS",
+        semantic_sha256="01" * 32,
+    )
+    utility_fixture = {
+        "balanced_classification": balanced_classification_utility(
+            correct_green=4,
+            reference_green=4,
+            correct_wait=3,
+            reference_wait=3,
+            correct_red=2,
+            reference_red=2,
+        ),
+        "completion": completion_utility(
+            completed_shares=50,
+            objective_shares=100,
+        ),
+        "discipline": discipline_compatibility_utility(
+            violations=1,
+            eligible=4,
+        ),
+        "false_green": false_green_utility(false_green=1, non_green=4),
+        "missed_opportunity": missed_opportunity_utility(
+            missed=1,
+            true_opportunities=4,
+        ),
+        "opportunity": execution_opportunity_utility(
+            true_positive=1,
+            predicted_green_allow=2,
+            true_opportunities=4,
+        ),
+        "signed_cost": signed_cost_utility(2_500),
+        "stability": cross_cell_stability_utility((400_000, 600_000)),
+        "turnover_complete": turnover_utility(
+            traded_shares=200,
+            objective_shares=100,
+        ),
+        "turnover_cap": turnover_utility(
+            traded_shares=2_000,
+            objective_shares=100,
+        ),
+    }
+    if len(required_ids) != 11 or len(all_ids) != 12 or len(set(all_ids)) != 12:
+        failures.append("objective inventory is incomplete or duplicated")
+    if weight_sum != 1_000_000 or ALL_OBJECTIVE_SPECS_V1[-1].weight != 0:
+        failures.append("non-P&L weights do not sum to S or P&L is weighted")
+    if complexity_points(complexity) != 74:
+        failures.append("six-dimensional complexity coefficients changed")
+    if (median, mad) != (2, 1):
+        failures.append("nearest-rank P50 or MAD arithmetic changed")
+    if multiplicity_penalty(64) != 35_000:
+        failures.append("budget-64 multiplicity penalty is not 35000")
+    if composite != 500_000:
+        failures.append("zero-weight P&L changed the weighted root composite")
+    if tie_a != tie_b or len(tie_a) != 32:
+        failures.append("common tie digest is not stable SHA-256 bytes")
+    if not materially_equivalent(100_000, 129_999) or materially_equivalent(
+        100_000,
+        130_000,
+    ):
+        failures.append("minimum practical-effect boundary changed")
+    if utility_fixture != {
+        "balanced_classification": 1_000_000,
+        "completion": 500_000,
+        "discipline": 750_000,
+        "false_green": 750_000,
+        "missed_opportunity": 750_000,
+        "opportunity": 333_333,
+        "signed_cost": 500_000,
+        "stability": 800_000,
+        "turnover_complete": 1_000_000,
+        "turnover_cap": 0,
+    }:
+        failures.append("an exact section-5.7.6 utility formula changed")
+    projection = {
+        "all_ids": [item.value for item in all_ids],
+        "complexity_fixture": complexity.as_dict(),
+        "complexity_points": complexity_points(complexity),
+        "material_equivalence": [True, False],
+        "median": median,
+        "mad": mad,
+        "multiplicity_64": multiplicity_penalty(64),
+        "objective_protocol": objective_protocol_projection(),
+        "root_composite": composite,
+        "tie_digest": tie_a.hex(),
+        "utility_fixture": utility_fixture,
+        "weight_sum": weight_sum,
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35D_OBJECTIVE_FIXTURE_SHA256:
+        failures.append("WO35-D objective arithmetic differs from its frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "d_objectives_uncertainty_multiplicity_and_complexity_are_exact",
+        (
+            f"objective_fixture_sha256={fixture_sha256} required={len(required_ids)} "
+            f"optional_pnl_weight=0 weight_sum={weight_sum} median={median} mad={mad} "
+            f"multiplicity_n64={multiplicity_penalty(64)} complexity_points=74 "
+            "utility_formulas=10/10 material_equivalence_prefers=SIMPLER"
+        ),
+        tuple(failures),
+    )
+
+
+def _search_access_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    bounded, _ = _load_search_examples()
+    candidates = bounded.search_space.universe()[:2]
+    oracle = DevelopmentSyntheticScoreOracleV1(
+        mode=SyntheticOracleModeV1.CONTROLLED,
+        compatibility=bounded.compatibility,
+        train_budget=1,
+    )
+    refusal_codes: list[str] = []
+
+    def refuse(call: object) -> None:
+        try:
+            call()  # type: ignore[operator]
+        except EvaluationAccessError as error:
+            refusal_codes.append(error.code)
+        else:
+            failures.append("a forbidden synthetic-oracle access was admitted")
+
+    first, second = candidates
+    common_first = {
+        "candidate_id": first.candidate_id,
+        "semantic_sha256": first.semantic_sha256,
+        "vector_values": first.oracle_values,
+        "complexity_points": first.complexity_points,
+    }
+    common_second = {
+        "candidate_id": second.candidate_id,
+        "semantic_sha256": second.semantic_sha256,
+        "vector_values": second.oracle_values,
+        "complexity_points": second.complexity_points,
+    }
+    refuse(
+        lambda: oracle.evaluate(
+            **common_first,
+            partition=StrategyPartitionV1.VALIDATION,
+        )
+    )
+    oracle.evaluate(**common_first, partition=StrategyPartitionV1.TRAIN)
+    refuse(
+        lambda: oracle.evaluate(
+            **common_second,
+            partition=StrategyPartitionV1.TRAIN,
+        )
+    )
+    oracle.freeze_validation((first.semantic_sha256,))
+    refuse(
+        lambda: oracle.evaluate(
+            **common_first,
+            partition=StrategyPartitionV1.HOLDOUT,
+        )
+    )
+    refuse(
+        lambda: oracle.evaluate(
+            **common_first,
+            partition=StrategyPartitionV1.ADVERSARIAL_HOLDOUT,
+        )
+    )
+    refuse(
+        lambda: oracle.evaluate(
+            **common_first,
+            partition=StrategyPartitionV1.ROBUSTNESS,
+        )
+    )
+    refuse(
+        lambda: oracle.evaluate(
+            **common_second,
+            partition=StrategyPartitionV1.VALIDATION,
+        )
+    )
+    refuse(
+        lambda: oracle.evaluate(
+            **common_second,
+            partition=StrategyPartitionV1.TRAIN,
+        )
+    )
+    validation = oracle.evaluate(
+        **common_first,
+        partition=StrategyPartitionV1.VALIDATION,
+    )
+    refuse(lambda: oracle.freeze_validation((first.semantic_sha256,)))
+    incompatible = replace(
+        validation,
+        compatibility=EvidenceCompatibilityKeyV1(
+            "OTHER_SCENARIO_GROUP_V1",
+            validation.compatibility.objective_group_id,
+            validation.compatibility.evidence_group_id,
+        ),
+    )
+    try:
+        require_compatible_evidence((validation, incompatible))
+    except ValueError:
+        comparison_refused = True
+    else:
+        comparison_refused = False
+        failures.append("incompatible scenario/objective/evidence groups were compared")
+    expected_codes = (
+        "VALIDATION_BEFORE_FINALIST_FREEZE",
+        "TRAIN_BUDGET_EXHAUSTED",
+        "REAL_PARTITION_FORBIDDEN",
+        "REAL_PARTITION_FORBIDDEN",
+        "REAL_PARTITION_FORBIDDEN",
+        "VALIDATION_NON_FINALIST",
+        "TRAINING_AFTER_FINALIST_FREEZE",
+        "VALIDATION_ALREADY_FROZEN",
+    )
+    if tuple(refusal_codes) != expected_codes:
+        failures.append("search access refusal codes or ordering changed")
+    if (
+        oracle.train_evaluation_count != 1
+        or oracle.validation_evaluation_count != 1
+        or oracle.real_partition_access_count != 0
+    ):
+        failures.append("synthetic oracle access accounting changed")
+    projection = {
+        "access_log": [list(item) for item in oracle.access_log],
+        "comparison_refused": comparison_refused,
+        "real_partition_access_count": oracle.real_partition_access_count,
+        "refusal_codes": refusal_codes,
+        "train_count": oracle.train_evaluation_count,
+        "validation_count": oracle.validation_evaluation_count,
+    }
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(projection)
+    ).hexdigest()
+    if fixture_sha256 != WO35D_ACCESS_FIXTURE_SHA256:
+        failures.append("WO35-D access boundary differs from its frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "d_budget_validation_and_real_partition_access_fail_closed",
+        (
+            f"access_fixture_sha256={fixture_sha256} refusals={len(refusal_codes)} "
+            "train_first_time=1/1 validation=AFTER_FREEZE_ONLY "
+            "incompatible_comparison=REFUSED real_partition_access_count=0"
+        ),
+        tuple(failures),
+    )
+
+
+def _search_no_winner_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    bounded, no_winner = _load_search_examples()
+    first = run_development_search(no_winner)
+    repeated = run_development_search(no_winner)
+    controlled = run_development_search(bounded)
+    if first.run_sha256 != repeated.run_sha256:
+        failures.append("no-winner search changed across identical repetitions")
+    if (
+        first.outcome is not SearchOutcomeV1.NO_CANDIDATE_MET_CRITERIA
+        or first.selected_semantic_sha256 is not None
+        or any(item.qualification.qualified for item in first.finalists)
+    ):
+        failures.append("no-winner fixture selected or qualified a candidate")
+    if first.run_sha256 != WO35D_NO_WINNER_RUN_SHA256:
+        failures.append("no-winner run differs from its frozen result digest")
+    if _normalized_manifest_payload(bounded.payload) != _normalized_manifest_payload(
+        no_winner.payload
+    ):
+        failures.append("no-winner completion changed a threshold or protocol field")
+    if (
+        controlled.training_star_semantic_sha256
+        == controlled.selected_semantic_sha256
+        or controlled.finalists[0].qualification.qualified
+    ):
+        failures.append("controlled training star did not remain distinct and fail validation")
+    if (
+        len(first.evaluated) != 64
+        or len(first.finalists) != 8
+        or first.real_partition_access_count != 0
+    ):
+        failures.append("no-winner fixture did not close at the declared budget/access bounds")
+    return StrategyDiscoveryAuditCase(
+        "d_no_candidate_is_a_terminal_success_without_threshold_relaxation",
+        (
+            f"run_sha256={first.run_sha256} evaluated={len(first.evaluated)}/64 "
+            f"finalists={len(first.finalists)} qualified=0 outcome={first.outcome.value} "
+            "threshold_changes=0 training_star_validation=FAILED "
+            "real_partition_access_count=0"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo35d_strategy_search() -> tuple[StrategyDiscoveryAuditCase, ...]:
+    return (
+        _search_manifest_case(),
+        _search_policy_case(),
+        _search_objective_case(),
+        _search_access_case(),
+        _search_no_winner_case(),
+    )
+
+
 __all__ = [
     "WO35A_AUDIT_CASE_COUNT",
     "WO35A_CANONICALIZATION_POLICY_SHA256",
@@ -1713,8 +2237,15 @@ __all__ = [
     "WO35C_BATCH_SHA256",
     "WO35C_FIXTURE_SHA256",
     "WO35C_OPERATOR_REGISTRY_SHA256",
+    "WO35D_ACCESS_FIXTURE_SHA256",
+    "WO35D_AUDIT_CASE_COUNT",
+    "WO35D_MANIFEST_FIXTURE_SHA256",
+    "WO35D_NO_WINNER_RUN_SHA256",
+    "WO35D_OBJECTIVE_FIXTURE_SHA256",
+    "WO35D_POLICY_FIXTURE_SHA256",
     "StrategyDiscoveryAuditCase",
     "audit_wo35a_strategy_discovery",
     "audit_wo35b_strategy_partitions",
     "audit_wo35c_strategy_mutations",
+    "audit_wo35d_strategy_search",
 ]

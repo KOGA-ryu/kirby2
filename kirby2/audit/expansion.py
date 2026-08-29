@@ -136,6 +136,7 @@ REGISTERABLE_GATE_IDS = (
     "WO35-A",
     "WO35-B",
     "WO35-C",
+    "WO35-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3336,6 +3337,100 @@ def _audit_wo35c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo35d() -> ExpansionGateReport:
+    from kirby2.audit.strategy_discovery import (
+        WO35D_ACCESS_FIXTURE_SHA256,
+        WO35D_AUDIT_CASE_COUNT,
+        WO35D_MANIFEST_FIXTURE_SHA256,
+        WO35D_NO_WINNER_RUN_SHA256,
+        WO35D_OBJECTIVE_FIXTURE_SHA256,
+        WO35D_POLICY_FIXTURE_SHA256,
+        audit_wo35d_strategy_search,
+    )
+    from kirby2.discovery.evaluation import (
+        SYNTHETIC_ORACLE_DATA_SOURCE_V1,
+        SYNTHETIC_ORACLE_SCHEMA_ID_V1,
+        VALIDATION_QUALIFICATION_RULE_ID_V1,
+    )
+    from kirby2.discovery.objectives import (
+        ALL_OBJECTIVE_SPECS_V1,
+        STRATEGY_OBJECTIVE_PROTOCOL_ID_V1,
+        STRATEGY_OBJECTIVE_SCHEMA_ID_V1,
+    )
+    from kirby2.discovery.search import (
+        MAX_SEARCH_BUDGET_V1,
+        STRATEGY_SEARCH_MANIFEST_SCHEMA_ID_V1,
+        STRATEGY_SEARCH_RUN_SCHEMA_ID_V1,
+        SearchPolicyV1,
+        load_search_manifest,
+    )
+
+    cases = audit_wo35d_strategy_search()
+    expected_names = (
+        "d_manifests_preregister_the_exact_bounded_protocol",
+        "d_all_five_policies_are_repeatable_unique_and_budget_bounded",
+        "d_objectives_uncertainty_multiplicity_and_complexity_are_exact",
+        "d_budget_validation_and_real_partition_access_fail_closed",
+        "d_no_candidate_is_a_terminal_success_without_threshold_relaxation",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO35D_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO35-D cases differ from the fixed search evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO35-D search cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    examples = Path(__file__).resolve().parents[1] / "discovery" / "examples"
+    bounded = load_search_manifest(examples / "bounded_search.toml")
+    no_winner = load_search_manifest(examples / "no_winner.toml")
+    return ExpansionGateReport(
+        card_id="WO35-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("access_fixture_sha256", WO35D_ACCESS_FIXTURE_SHA256),
+            ("audit_case_count", str(WO35D_AUDIT_CASE_COUNT)),
+            ("bounded_manifest_sha256", bounded.manifest_sha256),
+            ("manifest_fixture_sha256", WO35D_MANIFEST_FIXTURE_SHA256),
+            ("manifest_schema_id", STRATEGY_SEARCH_MANIFEST_SCHEMA_ID_V1),
+            ("max_budget", str(MAX_SEARCH_BUDGET_V1)),
+            ("no_winner_manifest_sha256", no_winner.manifest_sha256),
+            ("no_winner_run_sha256", WO35D_NO_WINNER_RUN_SHA256),
+            ("objective_count", str(len(ALL_OBJECTIVE_SPECS_V1))),
+            ("objective_fixture_sha256", WO35D_OBJECTIVE_FIXTURE_SHA256),
+            ("objective_protocol_id", STRATEGY_OBJECTIVE_PROTOCOL_ID_V1),
+            ("objective_schema_id", STRATEGY_OBJECTIVE_SCHEMA_ID_V1),
+            ("oracle_data_source", SYNTHETIC_ORACLE_DATA_SOURCE_V1),
+            ("oracle_schema_id", SYNTHETIC_ORACLE_SCHEMA_ID_V1),
+            ("policies", ",".join(item.value for item in SearchPolicyV1)),
+            ("policy_fixture_sha256", WO35D_POLICY_FIXTURE_SHA256),
+            ("real_partition_access_count", "0"),
+            ("run_schema_id", STRATEGY_SEARCH_RUN_SCHEMA_ID_V1),
+            ("validation_rule_id", VALIDATION_QUALIFICATION_RULE_ID_V1),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3551,6 +3646,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-A", _audit_wo35a),
     ("WO35-B", _audit_wo35b),
     ("WO35-C", _audit_wo35c),
+    ("WO35-D", _audit_wo35d),
 )
 
 
