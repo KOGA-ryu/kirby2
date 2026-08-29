@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
+import os
 import re
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kirby2.session.live import LiveMarketSession
 from kirby2.session.replay import RECORDING_SCHEMA_VERSION, SessionRecording, replay_recording
@@ -48,6 +49,11 @@ from .tables import (
     write_parquet_tables,
 )
 from .toml_codec import canonical_digest, canonical_toml, file_sha256, load_toml
+
+if TYPE_CHECKING:
+    from kirby2.discovery.access import PartitionAccessRecordV1
+    from kirby2.discovery.experiment import StrategyDiscoveryExperimentV1
+    from kirby2.discovery.partitions import PartitionManifestV1
 
 
 DEFAULT_RESEARCH_STORE = Path(".kirby2") / "research"
@@ -133,8 +139,420 @@ class RunStore:
         self.runs_directory = self.root / "runs"
         self.staging_directory = self.root / ".staging"
         self.catalog_path = self.root / "catalog.duckdb"
+        self.strategy_discovery_directory = self.root / "strategy-discovery"
+        self.strategy_partition_directory = (
+            self.strategy_discovery_directory / "partitions"
+        )
+        self.strategy_experiment_state_directory = (
+            self.strategy_discovery_directory / "states"
+        )
+        self.strategy_access_directory = (
+            self.strategy_discovery_directory / "access"
+        )
         self.runs_directory.mkdir(parents=True, exist_ok=True)
         self.staging_directory.mkdir(parents=True, exist_ok=True)
+        self.strategy_partition_directory.mkdir(parents=True, exist_ok=True)
+        self.strategy_experiment_state_directory.mkdir(parents=True, exist_ok=True)
+        self.strategy_access_directory.mkdir(parents=True, exist_ok=True)
+
+    def record_strategy_partition_manifest(
+        self,
+        manifest: PartitionManifestV1,
+    ) -> ArtifactReference:
+        """Persist one canonical sealed-partition manifest without overwriting."""
+
+        with self._strategy_discovery_lock():
+            return self._record_strategy_partition_manifest_unlocked(manifest)
+
+    def _record_strategy_partition_manifest_unlocked(
+        self,
+        manifest: PartitionManifestV1,
+    ) -> ArtifactReference:
+
+        from kirby2.discovery.partitions import PartitionManifestV1
+
+        if not isinstance(manifest, PartitionManifestV1):
+            raise TypeError("strategy partition artifact requires PartitionManifestV1")
+        raw = manifest.canonical_bytes()
+        path = self.strategy_partition_directory / f"{manifest.manifest_sha256}.json"
+        for existing_path in sorted(self.strategy_partition_directory.glob("*.json")):
+            existing = self.load_strategy_partition_manifest(existing_path.stem)
+            if (
+                existing.experiment_id == manifest.experiment_id
+                and existing.experiment_version == manifest.experiment_version
+                and existing.manifest_sha256 != manifest.manifest_sha256
+            ):
+                raise RuntimeError(
+                    "sealed partition manifest identity is immutable per experiment version"
+                )
+        self._record_strategy_discovery_bytes(path, raw)
+        return self._strategy_discovery_reference(
+            path,
+            raw,
+            name=f"strategy-partitions-{manifest.manifest_sha256[:16]}",
+            artifact_type=ArtifactType.STRATEGY_PARTITION_MANIFEST,
+            schema_version=manifest.schema_version,
+            row_count=len(manifest.members),
+        )
+
+    def load_strategy_partition_manifest(
+        self,
+        manifest_sha256: str,
+    ) -> PartitionManifestV1:
+        from kirby2.discovery.partitions import PartitionManifestV1
+
+        _require_strategy_discovery_digest(manifest_sha256, "partition manifest")
+        path = self.strategy_partition_directory / f"{manifest_sha256}.json"
+        raw = self._read_strategy_discovery_bytes(path)
+        manifest = PartitionManifestV1.from_json_bytes(raw)
+        if manifest.manifest_sha256 != manifest_sha256:
+            raise RuntimeError("stored partition manifest identity does not match its path")
+        return manifest
+
+    def record_strategy_access_record(
+        self,
+        record: PartitionAccessRecordV1,
+    ) -> ArtifactReference:
+        """Append one grant or refusal to an experiment's single access chain."""
+
+        with self._strategy_discovery_lock():
+            return self._record_strategy_access_record_unlocked(record)
+
+    def _record_strategy_access_record_unlocked(
+        self,
+        record: PartitionAccessRecordV1,
+    ) -> ArtifactReference:
+
+        from kirby2.discovery.access import (
+            PartitionAccessRecordV1,
+            request_partition_access,
+        )
+
+        if not isinstance(record, PartitionAccessRecordV1):
+            raise TypeError("strategy access artifact requires PartitionAccessRecordV1")
+        manifest = self.load_strategy_partition_manifest(
+            record.partition_manifest_sha256
+        )
+        path = self.strategy_access_directory / f"{record.access_sha256}.json"
+        raw = record.canonical_bytes()
+        before = self.load_strategy_experiment_state(record.state_before_sha256)
+        if (
+            before.experiment_id != record.experiment_id
+            or before.experiment_version != record.experiment_version
+            or before.partition_manifest_sha256 != record.partition_manifest_sha256
+            or before.phase is not record.phase_before
+        ):
+            raise RuntimeError("strategy access record does not match its stored prior state")
+        expected = request_partition_access(
+            manifest,
+            before,
+            partition=record.partition,
+            purpose=record.purpose,
+            member_ids=record.requested_member_ids,
+            validation_schedule_id=record.validation_schedule_id,
+        )
+        if expected.record != record:
+            raise RuntimeError("strategy access record differs from the enforced decision")
+        if path.exists() or path.is_symlink():
+            existing = self._read_strategy_discovery_bytes(path)
+            if existing != raw:
+                raise RuntimeError("immutable strategy access artifact differs")
+            return self._strategy_discovery_reference(
+                path,
+                raw,
+                name=f"strategy-access-{record.access_sha256[:16]}",
+                artifact_type=ArtifactType.STRATEGY_ACCESS_RECORD,
+                schema_version=record.schema_version,
+                row_count=1,
+            )
+        records = self.query_strategy_access_records(
+            record.experiment_id,
+            record.experiment_version,
+        )
+        expected_previous = None if not records else records[-1].access_sha256
+        if (
+            record.access_ordinal != len(records) + 1
+            or record.previous_access_sha256 != expected_previous
+            or before.access_record_sha256
+            != tuple(item.access_sha256 for item in records)
+        ):
+            raise RuntimeError("strategy access record would fork or skip the access chain")
+        self._record_strategy_discovery_bytes(path, raw)
+        return self._strategy_discovery_reference(
+            path,
+            raw,
+            name=f"strategy-access-{record.access_sha256[:16]}",
+            artifact_type=ArtifactType.STRATEGY_ACCESS_RECORD,
+            schema_version=record.schema_version,
+            row_count=1,
+        )
+
+    def load_strategy_access_record(
+        self,
+        access_sha256: str,
+    ) -> PartitionAccessRecordV1:
+        from kirby2.discovery.access import PartitionAccessRecordV1
+
+        _require_strategy_discovery_digest(access_sha256, "partition access")
+        path = self.strategy_access_directory / f"{access_sha256}.json"
+        raw = self._read_strategy_discovery_bytes(path)
+        record = PartitionAccessRecordV1.from_json_bytes(raw)
+        if record.access_sha256 != access_sha256:
+            raise RuntimeError("stored strategy access identity does not match its path")
+        return record
+
+    def query_strategy_access_records(
+        self,
+        experiment_id: str,
+        experiment_version: int,
+    ) -> tuple[PartitionAccessRecordV1, ...]:
+        if type(experiment_id) is not str or not experiment_id:
+            raise ValueError("strategy access query experiment ID must be nonempty")
+        if type(experiment_version) is not int or experiment_version <= 0:
+            raise ValueError("strategy access query experiment version must be positive")
+        records = []
+        for path in sorted(self.strategy_access_directory.glob("*.json")):
+            record = self.load_strategy_access_record(path.stem)
+            if (
+                record.experiment_id == experiment_id
+                and record.experiment_version == experiment_version
+            ):
+                records.append(record)
+        records.sort(key=lambda item: (item.access_ordinal, item.access_sha256))
+        previous = None
+        for expected_ordinal, record in enumerate(records, start=1):
+            if (
+                record.access_ordinal != expected_ordinal
+                or record.previous_access_sha256 != previous
+            ):
+                raise RuntimeError("stored strategy access chain is forked or incomplete")
+            previous = record.access_sha256
+        return tuple(records)
+
+    def record_strategy_experiment_state(
+        self,
+        state: StrategyDiscoveryExperimentV1,
+    ) -> ArtifactReference:
+        """Persist a lifecycle snapshot only when it matches the access ledger."""
+
+        with self._strategy_discovery_lock():
+            return self._record_strategy_experiment_state_unlocked(state)
+
+    def _record_strategy_experiment_state_unlocked(
+        self,
+        state: StrategyDiscoveryExperimentV1,
+    ) -> ArtifactReference:
+
+        from kirby2.discovery.experiment import StrategyDiscoveryExperimentV1
+
+        if not isinstance(state, StrategyDiscoveryExperimentV1):
+            raise TypeError(
+                "strategy experiment artifact requires StrategyDiscoveryExperimentV1"
+            )
+        manifest = self.load_strategy_partition_manifest(
+            state.partition_manifest_sha256
+        )
+        if (
+            manifest.experiment_id != state.experiment_id
+            or manifest.experiment_version != state.experiment_version
+        ):
+            raise RuntimeError("strategy experiment state is bound to another manifest")
+        path = self.strategy_experiment_state_directory / f"{state.state_sha256}.json"
+        raw = state.canonical_bytes()
+        if path.exists() or path.is_symlink():
+            existing = self._read_strategy_discovery_bytes(path)
+            if existing != raw:
+                raise RuntimeError("immutable strategy experiment state differs")
+            return self._strategy_discovery_reference(
+                path,
+                raw,
+                name=f"strategy-state-{state.state_sha256[:16]}",
+                artifact_type=ArtifactType.STRATEGY_EXPERIMENT_STATE,
+                schema_version=state.schema_version,
+                row_count=1,
+            )
+        records = self.query_strategy_access_records(
+            state.experiment_id,
+            state.experiment_version,
+        )
+        record_digests = tuple(item.access_sha256 for item in records)
+        if state.access_record_sha256 != record_digests:
+            raise RuntimeError("strategy experiment state omits or forks access history")
+        if records and records[-1].phase_after is not state.phase:
+            candidate_freeze_transition = (
+                records[-1].phase_after.value == "SEARCH_OPEN"
+                and state.phase.value == "CANDIDATES_FROZEN"
+                and state.candidate_freeze is not None
+            )
+            if not candidate_freeze_transition:
+                raise RuntimeError(
+                    "strategy experiment phase differs from its access ledger"
+                )
+        expected_train_count = sum(
+            item.decision.value == "GRANTED" and item.purpose.value == "SEARCH_TRAIN"
+            for item in records
+        )
+        expected_validation_counts: dict[str, int] = {}
+        for item in records:
+            if (
+                item.decision.value == "GRANTED"
+                and item.purpose.value == "SEARCH_VALIDATION"
+                and item.validation_schedule_id is not None
+            ):
+                expected_validation_counts[item.validation_schedule_id] = (
+                    expected_validation_counts.get(item.validation_schedule_id, 0) + 1
+                )
+        if state.train_access_count != expected_train_count or {
+            item.schedule_id: item.count for item in state.validation_access_counts
+        } != expected_validation_counts:
+            raise RuntimeError("strategy experiment access counters are not ledger-derived")
+        revealed = tuple(
+            item.access_sha256
+            for item in records
+            if item.decision.value == "GRANTED"
+            and item.purpose.value == "HOLDOUT_REVEAL"
+        )
+        if len(revealed) > 1 or state.reveal_access_sha256 != (
+            None if not revealed else revealed[0]
+        ):
+            raise RuntimeError("strategy experiment reveal identity is not ledger-derived")
+        for existing_path in sorted(
+            self.strategy_experiment_state_directory.glob("*.json")
+        ):
+            existing_state = self.load_strategy_experiment_state(existing_path.stem)
+            if (
+                existing_state.experiment_id != state.experiment_id
+                or existing_state.experiment_version != state.experiment_version
+            ):
+                continue
+            if (
+                existing_state.candidate_freeze_sha256 is not None
+                and state.candidate_freeze_sha256 is not None
+                and existing_state.candidate_freeze_sha256
+                != state.candidate_freeze_sha256
+            ):
+                raise RuntimeError("stored strategy candidate freeze is immutable")
+            if (
+                existing_state.reveal_access_sha256 is not None
+                and state.reveal_access_sha256 is not None
+                and existing_state.reveal_access_sha256
+                != state.reveal_access_sha256
+            ):
+                raise RuntimeError("stored strategy reveal identity is immutable")
+            if (
+                existing_state.terminal_outcome is not None
+                and existing_state.terminal_outcome.value in {"PASSED", "FAILED"}
+                and state.terminal_outcome != existing_state.terminal_outcome
+            ):
+                raise RuntimeError("stored terminal evaluation outcome is immutable")
+        self._record_strategy_discovery_bytes(path, raw)
+        return self._strategy_discovery_reference(
+            path,
+            raw,
+            name=f"strategy-state-{state.state_sha256[:16]}",
+            artifact_type=ArtifactType.STRATEGY_EXPERIMENT_STATE,
+            schema_version=state.schema_version,
+            row_count=1,
+        )
+
+    def load_strategy_experiment_state(
+        self,
+        state_sha256: str,
+    ) -> StrategyDiscoveryExperimentV1:
+        from kirby2.discovery.experiment import StrategyDiscoveryExperimentV1
+
+        _require_strategy_discovery_digest(state_sha256, "strategy experiment state")
+        path = self.strategy_experiment_state_directory / f"{state_sha256}.json"
+        raw = self._read_strategy_discovery_bytes(path)
+        state = StrategyDiscoveryExperimentV1.from_json_bytes(raw)
+        if state.state_sha256 != state_sha256:
+            raise RuntimeError("stored strategy state identity does not match its path")
+        return state
+
+    def _strategy_discovery_reference(
+        self,
+        path: Path,
+        raw: bytes,
+        *,
+        name: str,
+        artifact_type: ArtifactType,
+        schema_version: int,
+        row_count: int | None,
+    ) -> ArtifactReference:
+        return ArtifactReference(
+            name=name,
+            relative_path=path.relative_to(self.root).as_posix(),
+            sha256=hashlib.sha256(raw).hexdigest(),
+            schema_version=schema_version,
+            row_count=row_count,
+            media_type="application/json",
+            artifact_type=artifact_type,
+        )
+
+    def _record_strategy_discovery_bytes(self, path: Path, raw: bytes) -> None:
+        self._assert_strategy_discovery_path(path)
+        if type(raw) is not bytes:
+            raise TypeError("strategy discovery artifacts must be exact bytes")
+        if path.exists() or path.is_symlink():
+            existing = self._read_strategy_discovery_bytes(path)
+            if existing != raw:
+                raise RuntimeError("immutable strategy discovery artifact differs")
+            return
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=f".{path.stem}-",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary_path, path)
+            except FileExistsError:
+                if self._read_strategy_discovery_bytes(path) != raw:
+                    raise RuntimeError("concurrent immutable strategy artifact differs")
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+    def _read_strategy_discovery_bytes(self, path: Path) -> bytes:
+        self._assert_strategy_discovery_path(path)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"unknown or unsafe strategy discovery artifact: {path.name}")
+        return path.read_bytes()
+
+    def _assert_strategy_discovery_path(self, path: Path) -> None:
+        allowed_directories = {
+            self.strategy_partition_directory,
+            self.strategy_experiment_state_directory,
+            self.strategy_access_directory,
+        }
+        if path.parent not in allowed_directories:
+            raise ValueError("strategy discovery artifact path is outside its store")
+        if any(
+            candidate.is_symlink()
+            for candidate in (
+                self.strategy_discovery_directory,
+                path.parent,
+            )
+        ):
+            raise ValueError("strategy discovery artifact directories cannot be symlinks")
+
+    @contextmanager
+    def _strategy_discovery_lock(self):
+        import fcntl
+
+        lock_path = self.root / "strategy-discovery.lock"
+        with lock_path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def record_session(
         self,
@@ -1905,6 +2323,11 @@ def _lesson_build_digests(proposal) -> tuple[str, str, str]:
         proposal.source_ancestry_sha256,
         proposal.proposal_sha256,
     )
+
+
+def _require_strategy_discovery_digest(value: object, context: str) -> None:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{context} identity must be lowercase SHA-256")
 
 
 def _sha256_text(text: str) -> str:

@@ -134,6 +134,7 @@ REGISTERABLE_GATE_IDS = (
     "WO34-C",
     "WO34-D",
     "WO35-A",
+    "WO35-B",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3182,6 +3183,76 @@ def _audit_wo35a() -> ExpansionGateReport:
     )
 
 
+def _audit_wo35b() -> ExpansionGateReport:
+    from kirby2.audit.strategy_discovery import (
+        WO35B_ACCESS_POLICY_SHA256,
+        WO35B_AUDIT_CASE_COUNT,
+        WO35B_FIXTURE_SHA256,
+        audit_wo35b_strategy_partitions,
+    )
+    from kirby2.discovery.access import PARTITION_ACCESS_SCHEMA_ID_V1
+    from kirby2.discovery.experiment import EXPERIMENT_STATE_SCHEMA_ID_V1
+    from kirby2.discovery.partitions import (
+        PARTITION_MANIFEST_SCHEMA_ID_V1,
+        PARTITION_MANIFEST_SCHEMA_VERSION_V1,
+    )
+
+    cases = audit_wo35b_strategy_partitions()
+    expected_names = (
+        "b_partition_manifest_is_canonical_sealed_and_ancestry_disjoint",
+        "b_search_access_obeys_predeclared_validation_schedule",
+        "b_candidate_freeze_and_one_shot_reveal_are_terminal",
+        "b_successor_requires_new_untouched_terminal_partitions",
+        "b_research_store_persists_immutable_audit_visible_access",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO35B_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO35-B cases differ from the fixed partition evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO35-B partition cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO35-B",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("access_policy_sha256", WO35B_ACCESS_POLICY_SHA256),
+            ("access_schema_id", PARTITION_ACCESS_SCHEMA_ID_V1),
+            ("audit_case_count", str(WO35B_AUDIT_CASE_COUNT)),
+            ("experiment_state_schema_id", EXPERIMENT_STATE_SCHEMA_ID_V1),
+            ("fixture_sha256", WO35B_FIXTURE_SHA256),
+            ("holdout_reveal", "ONE_SHOT_TERMINAL"),
+            ("partition_manifest_schema_id", PARTITION_MANIFEST_SCHEMA_ID_V1),
+            (
+                "partition_manifest_schema_version",
+                str(PARTITION_MANIFEST_SCHEMA_VERSION_V1),
+            ),
+            ("partition_roles", "TRAIN,VALIDATION,HOLDOUT,ADVERSARIAL,ROBUSTNESS"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3395,6 +3466,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO34-C", _audit_wo34c),
     ("WO34-D", _audit_wo34d),
     ("WO35-A", _audit_wo35a),
+    ("WO35-B", _audit_wo35b),
 )
 
 

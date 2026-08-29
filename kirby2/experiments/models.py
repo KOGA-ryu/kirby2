@@ -14,7 +14,9 @@ from kirby2.exchange import Side
 from kirby2.strategy import TrafficState, parse_strategy
 
 if TYPE_CHECKING:
+    from kirby2.discovery.experiment import ExperimentPartitionBindingV1
     from kirby2.discovery.identity import StrategyIdentityV1
+    from kirby2.discovery.partitions import PartitionManifestV1
 
 
 EXPERIMENT_MANIFEST_SCHEMA_VERSION = 1
@@ -168,6 +170,28 @@ class ExperimentManifest:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+
+    def bind_discovery_partitions(
+        self,
+        partition_manifest: PartitionManifestV1,
+    ) -> ExperimentPartitionBindingV1:
+        """Bind legacy experiment bytes to a sealed discovery partition manifest."""
+
+        from kirby2.discovery.experiment import ExperimentPartitionBindingV1
+        from kirby2.discovery.partitions import PartitionManifestV1
+
+        if not isinstance(partition_manifest, PartitionManifestV1):
+            raise TypeError("discovery partition binding requires PartitionManifestV1")
+        if partition_manifest.experiment_id != self.experiment_id:
+            raise ValueError("experiment and discovery partition IDs do not match")
+        return ExperimentPartitionBindingV1(
+            experiment_id=self.experiment_id,
+            experiment_manifest_sha256=self.sha256,
+            partition_manifest_sha256=partition_manifest.manifest_sha256,
+            strategy_semantic_sha256=tuple(
+                strategy.semantic_ast_sha256 for strategy in self.strategies
+            ),
+        )
 
     @classmethod
     def load(cls, path: Path) -> ExperimentManifest:
