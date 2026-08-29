@@ -135,6 +135,7 @@ REGISTERABLE_GATE_IDS = (
     "WO34-D",
     "WO35-A",
     "WO35-B",
+    "WO35-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3253,6 +3254,88 @@ def _audit_wo35b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo35c() -> ExpansionGateReport:
+    from kirby2.audit.strategy_discovery import (
+        WO35C_ACCOUNTING_SHA256,
+        WO35C_AUDIT_CASE_COUNT,
+        WO35C_BATCH_SHA256,
+        WO35C_FIXTURE_SHA256,
+        WO35C_OPERATOR_REGISTRY_SHA256,
+        audit_wo35c_strategy_mutations,
+    )
+    from kirby2.discovery.diffs import (
+        STRATEGY_COMPLEXITY_SCHEMA_ID_V1,
+        STRATEGY_MUTATION_DIFF_SCHEMA_ID_V1,
+    )
+    from kirby2.discovery.generation import (
+        STRATEGY_MUTATION_BATCH_SCHEMA_ID_V1,
+        STRATEGY_MUTATION_GENERATION_ORDER_V1,
+        STRATEGY_MUTATION_SUBSTREAM_LABEL_V1,
+    )
+    from kirby2.discovery.lineage import STRATEGY_LINEAGE_SCHEMA_ID_V1
+    from kirby2.discovery.mutations import (
+        REQUIRED_MUTATION_OPERATORS_V1,
+        STRATEGY_MUTATION_SCHEMA_ID_V1,
+    )
+
+    cases = audit_wo35c_strategy_mutations()
+    expected_names = (
+        "c_required_operator_registry_is_complete_declared_and_bounded",
+        "c_every_operator_has_deterministic_valid_and_invalid_fixtures",
+        "c_semantic_diff_complexity_and_lineage_agree_exactly",
+        "c_generation_order_substreams_and_duplicates_are_deterministic",
+        "c_lookahead_observability_permissions_and_resources_fail_closed",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO35C_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO35-C cases differ from the fixed mutation evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO35-C mutation cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO35-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("accounting_sha256", WO35C_ACCOUNTING_SHA256),
+            ("audit_case_count", str(WO35C_AUDIT_CASE_COUNT)),
+            ("batch_fixture_sha256", WO35C_BATCH_SHA256),
+            ("batch_schema_id", STRATEGY_MUTATION_BATCH_SCHEMA_ID_V1),
+            ("complexity_schema_id", STRATEGY_COMPLEXITY_SCHEMA_ID_V1),
+            ("diff_schema_id", STRATEGY_MUTATION_DIFF_SCHEMA_ID_V1),
+            ("fixture_sha256", WO35C_FIXTURE_SHA256),
+            ("generation_order", STRATEGY_MUTATION_GENERATION_ORDER_V1),
+            ("lineage_schema_id", STRATEGY_LINEAGE_SCHEMA_ID_V1),
+            ("mutation_schema_id", STRATEGY_MUTATION_SCHEMA_ID_V1),
+            ("operator_count", str(len(REQUIRED_MUTATION_OPERATORS_V1))),
+            ("operator_registry_sha256", WO35C_OPERATOR_REGISTRY_SHA256),
+            ("rejected_evaluation_eligibility", "NEVER"),
+            ("substream_policy", STRATEGY_MUTATION_SUBSTREAM_LABEL_V1),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3467,6 +3550,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO34-D", _audit_wo34d),
     ("WO35-A", _audit_wo35a),
     ("WO35-B", _audit_wo35b),
+    ("WO35-C", _audit_wo35c),
 )
 
 

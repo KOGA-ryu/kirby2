@@ -1,4 +1,4 @@
-"""Executable WO35-A audit for canonical strategy identity and lineage."""
+"""Executable strategy-discovery audits for Work Orders 35-A through 35-C."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from kirby2.discovery.ast import (
+    StrategyAstV1,
     parse_strategy_ast,
     render_canonical_strategy_ast,
     strategy_ast_round_trip,
@@ -23,6 +24,29 @@ from kirby2.discovery.identity import (
 from kirby2.discovery.lineage import (
     StrategyRngSubstreamV1,
     build_strategy_lineage_node,
+    semantic_strategy_diff,
+)
+from kirby2.discovery.diffs import (
+    STRATEGY_COMPLEXITY_SCHEMA_ID_V1,
+    StrategyComplexityDeltaV1,
+    strategy_complexity,
+)
+from kirby2.discovery.generation import (
+    STRATEGY_MUTATION_GENERATION_ORDER_V1,
+    STRATEGY_MUTATION_SUBSTREAM_LABEL_V1,
+    MutationGenerationContextV1,
+    generate_mutation_batch,
+    labeled_substream_uint64,
+)
+from kirby2.discovery.mutations import (
+    REQUIRED_MUTATION_OPERATORS_V1,
+    MutationOperationIdV1,
+    MutationRejectionReasonV1,
+    MutationRequestV1,
+    MutationResourceLimitsV1,
+    MutationStatusV1,
+    StrategyMutationResultV1,
+    apply_strategy_mutation,
 )
 from kirby2.discovery.access import (
     PartitionAccessDecisionV1,
@@ -57,10 +81,13 @@ from kirby2.immutable import thaw_json
 from kirby2.research.models import ArtifactType
 from kirby2.research.store import RunStore
 from kirby2.strategy.language import (
+    ComparisonOperator,
+    FeatureName,
     RuleSyntaxError,
     parse_strategy_semantic_ast,
     render_canonical_strategy_source,
 )
+from kirby2.strategy.state_machine import PositionFeature
 
 
 WO35A_AUDIT_CASE_COUNT = 5
@@ -79,6 +106,19 @@ WO35B_FIXTURE_SHA256 = (
 )
 WO35B_ACCESS_POLICY_SHA256 = (
     "8e7ef0a44e5780502b8b1d453b19cdafa757aa3de39f997a608e0754ec31d635"
+)
+WO35C_AUDIT_CASE_COUNT = 5
+WO35C_OPERATOR_REGISTRY_SHA256 = (
+    "40f0e73d38c3d8e4256abb8b320ff953a8538621e990a38ef82b35e46bf5d31c"
+)
+WO35C_FIXTURE_SHA256 = (
+    "efc7fbd7d1d2ce7b6fe9d3134002efbab2b4dd82b43a76639c0f339412fe36c5"
+)
+WO35C_BATCH_SHA256 = (
+    "d07b5df16b6a11972d5ed4e24b13040965f750e07ce533641a88bf4d222e44a0"
+)
+WO35C_ACCOUNTING_SHA256 = (
+    "cb62a448fc87401c68c318eab155233bd66a7f1aa470881ffb06cbdc70c3ca5a"
 )
 
 _TRAFFIC_A = """\
@@ -159,6 +199,24 @@ transition IDLE -> HALT when
 transition IDLE -> ARMED when
     spread_ticks <= 2
     book_imbalance >= 0
+"""
+
+_MUTATION_MACHINE = """\
+machine mutation_probe
+window 1s
+unavailable REFUSE
+initial IDLE
+state IDLE signal WAIT entry DENY exit ALLOW
+state ARMED signal GREEN entry ALLOW exit ALLOW
+state HALT signal RED entry DENY exit ALLOW cooldown 1s
+transition IDLE -> ARMED when for 500ms
+    spread_ticks <= 2
+    book_imbalance >= 0
+transition ARMED -> IDLE when events 2 within 1s
+    aggressive_sell_volume >= 1
+transition ARMED -> HALT when
+    spread_ticks > 5
+transition HALT -> IDLE after entry
 """
 
 _ACTUAL_FIXTURE_SHA256 = hashlib.sha256(
@@ -1057,6 +1115,591 @@ def audit_wo35b_strategy_partitions() -> tuple[StrategyDiscoveryAuditCase, ...]:
     )
 
 
+def _exact_decimal(coefficient: int, scale: int = 0) -> dict[str, int]:
+    return {"coefficient": coefficient, "scale": scale}
+
+
+def _comparison(
+    feature: str,
+    operator: ComparisonOperator,
+    coefficient: int,
+    scale: int = 0,
+) -> dict[str, object]:
+    return {
+        "feature": feature,
+        "operator": operator.value,
+        "threshold": _exact_decimal(coefficient, scale),
+    }
+
+
+def _mutation_available_features() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {item.value for item in FeatureName}
+            | {item.value for item in PositionFeature}
+        )
+    )
+
+
+def _mutation_valid_fixtures() -> tuple[
+    tuple[StrategyAstV1, MutationRequestV1],
+    ...,
+]:
+    traffic = parse_strategy_ast(_TRAFFIC_A)
+    machine = parse_strategy_ast(_MUTATION_MACHINE)
+    return (
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.THRESHOLD,
+                1,
+                {
+                    "path": "/green_conditions/0",
+                    "threshold": _exact_decimal(25, 2),
+                },
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.ROLLING_WINDOW,
+                1,
+                {"window_us": 6_000_000},
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.REQUIRED_DURATION,
+                1,
+                {"duration_us": 600_000, "transition_index": 0},
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.ADD_CONDITION,
+                1,
+                {
+                    "collection_path": "/green_conditions",
+                    "condition": _comparison(
+                        FeatureName.RELATIVE_VOLUME.value,
+                        ComparisonOperator.GREATER_EQUAL,
+                        1,
+                    ),
+                },
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.REMOVE_CONDITION,
+                1,
+                {"path": "/green_conditions/0"},
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.FEATURE_REPLACEMENT,
+                1,
+                {
+                    "feature": FeatureName.RELATIVE_VOLUME.value,
+                    "path": "/green_conditions/0",
+                },
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.LOGICAL_OPERATOR,
+                1,
+                {
+                    "operator": ComparisonOperator.GREATER.value,
+                    "path": "/green_conditions/0",
+                },
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.TRANSITION_CONDITION,
+                1,
+                {
+                    "condition": _comparison(
+                        FeatureName.AGGRESSIVE_BUY_VOLUME.value,
+                        ComparisonOperator.GREATER_EQUAL,
+                        1,
+                    ),
+                    "path": "/transitions/0/conditions/0",
+                },
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.COOLDOWN,
+                1,
+                {"cooldown_us": 500_000, "state_name": "IDLE"},
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.STATE_TIMEOUT,
+                1,
+                {"timeout_us": 2_000_000, "transition_index": 3},
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.CONFIRMATION_COUNT,
+                1,
+                {"event_count": 3, "transition_index": 1},
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.INVALIDATION_RULE,
+                1,
+                {
+                    "condition": _comparison(
+                        FeatureName.BOOK_IMBALANCE.value,
+                        ComparisonOperator.LESS_EQUAL,
+                        -5,
+                        1,
+                    ),
+                    "transition_index": 2,
+                },
+            ),
+        ),
+        (
+            machine,
+            MutationRequestV1(
+                MutationOperationIdV1.POSITION_CONSTRAINT,
+                1,
+                {
+                    "feature": PositionFeature.POSITION.value,
+                    "operator": ComparisonOperator.LESS_EQUAL.value,
+                    "threshold": _exact_decimal(10),
+                    "transition_index": 0,
+                },
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.SPREAD_LIMIT,
+                1,
+                {
+                    "collection_path": "/wait_conditions",
+                    "max_spread_ticks": _exact_decimal(3),
+                },
+            ),
+        ),
+        (
+            traffic,
+            MutationRequestV1(
+                MutationOperationIdV1.VOLUME_REQUIREMENT,
+                1,
+                {
+                    "collection_path": "/green_conditions",
+                    "feature": FeatureName.AGGRESSIVE_BUY_VOLUME.value,
+                    "minimum": _exact_decimal(10),
+                },
+            ),
+        ),
+    )
+
+
+def _mutation_fixture_sha256() -> str:
+    return hashlib.sha256(
+        canonical_identity_bytes(
+            [
+                {
+                    "parent_semantic_sha256": strategy_semantic_sha256(parent),
+                    "request": request.as_dict(),
+                }
+                for parent, request in _mutation_valid_fixtures()
+            ]
+        )
+    ).hexdigest()
+
+
+def _apply_audit_mutation(
+    parent: StrategyAstV1,
+    request: MutationRequestV1,
+    label: str,
+) -> StrategyMutationResultV1:
+    return apply_strategy_mutation(
+        parent,
+        request,
+        rng_substream=StrategyRngSubstreamV1(35_000_003, label),
+        available_features=_mutation_available_features(),
+    )
+
+
+def _mutation_registry_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    operation_ids = tuple(item.operation_id for item in REQUIRED_MUTATION_OPERATORS_V1)
+    registry_sha256 = hashlib.sha256(
+        canonical_identity_bytes([item.as_dict() for item in REQUIRED_MUTATION_OPERATORS_V1])
+    ).hexdigest()
+    if operation_ids != tuple(MutationOperationIdV1):
+        failures.append("required mutation operator inventory is incomplete or reordered")
+    if len(REQUIRED_MUTATION_OPERATORS_V1) != 15:
+        failures.append("required mutation operator inventory does not contain 15 IDs")
+    if any(
+        not item.input_node_kinds
+        or not item.parameter_domain
+        or not item.semantic_validation
+        or not item.machine_reason
+        or not item.human_reason
+        or not item.inverse_description
+        or not item.diff_description
+        or item.complexity_delta_rule != "EXACT_CHILD_MINUS_PARENT_V1"
+        for item in REQUIRED_MUTATION_OPERATORS_V1
+    ):
+        failures.append("an operator omitted a bounded declaration or explanation")
+    if registry_sha256 != WO35C_OPERATOR_REGISTRY_SHA256:
+        failures.append("WO35-C operator registry differs from its frozen digest")
+    return StrategyDiscoveryAuditCase(
+        "c_required_operator_registry_is_complete_declared_and_bounded",
+        (
+            f"operators={len(operation_ids)} registry_sha256={registry_sha256} "
+            "domains=BOUNDED observability=DECLARED semantic_validation=DECLARED "
+            "inverse=DECLARED "
+            "complexity_rule=EXACT_CHILD_MINUS_PARENT_V1"
+        ),
+        tuple(failures),
+    )
+
+
+def _mutation_fixture_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    accepted_ids: list[str] = []
+    rejected_ids: list[str] = []
+    for parent, request in _mutation_valid_fixtures():
+        label = f"audit/wo35c/{request.operation_id.value.lower()}"
+        first = _apply_audit_mutation(parent, request, label)
+        repeated = _apply_audit_mutation(parent, request, label)
+        if (
+            first.record.status is not MutationStatusV1.ACCEPTED
+            or not first.record.evaluation_eligible
+        ):
+            failures.append(f"{request.operation_id.value} valid fixture was rejected")
+        elif first.record.canonical_bytes() != repeated.record.canonical_bytes():
+            failures.append(f"{request.operation_id.value} valid fixture was unstable")
+        else:
+            accepted_ids.append(request.operation_id.value)
+        invalid_parameters = thaw_json(request.parameters)
+        invalid_parameters["unexpected_parameter"] = True
+        invalid_request = MutationRequestV1(
+            request.operation_id,
+            request.operation_version,
+            invalid_parameters,
+        )
+        invalid = _apply_audit_mutation(parent, invalid_request, label + "/invalid")
+        invalid_repeated = _apply_audit_mutation(
+            parent,
+            invalid_request,
+            label + "/invalid",
+        )
+        if (
+            invalid.record.status is not MutationStatusV1.REJECTED
+            or invalid.record.evaluation_eligible
+            or invalid.record.canonical_bytes()
+            != invalid_repeated.record.canonical_bytes()
+        ):
+            failures.append(f"{request.operation_id.value} invalid fixture was unstable")
+        else:
+            rejected_ids.append(request.operation_id.value)
+    fixture_sha256 = _mutation_fixture_sha256()
+    if fixture_sha256 != WO35C_FIXTURE_SHA256:
+        failures.append("WO35-C mutation fixtures differ from their frozen digest")
+    return StrategyDiscoveryAuditCase(
+        "c_every_operator_has_deterministic_valid_and_invalid_fixtures",
+        (
+            f"valid={len(accepted_ids)}/15 invalid={len(rejected_ids)}/15 "
+            f"fixture_sha256={fixture_sha256} typed_children=ONLY"
+        ),
+        tuple(failures),
+    )
+
+
+def _mutation_accounting_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    record_digests: list[str] = []
+    for parent, request in _mutation_valid_fixtures():
+        result = _apply_audit_mutation(
+            parent,
+            request,
+            f"audit/wo35c/accounting/{request.operation_id.value.lower()}",
+        )
+        record = result.record
+        expected_delta = StrategyComplexityDeltaV1.between(
+            strategy_complexity(parent),
+            strategy_complexity(result.child),
+        )
+        if (
+            record.mutation_diff.semantic_diff
+            != semantic_strategy_diff(parent, result.child)
+            or record.lineage.semantic_diff != record.mutation_diff.semantic_diff
+            or record.complexity_before != strategy_complexity(parent)
+            or record.complexity_after != strategy_complexity(result.child)
+            or record.complexity_delta != expected_delta
+            or record.parent_semantic_sha256 != strategy_semantic_sha256(parent)
+            or record.child_semantic_sha256
+            != strategy_semantic_sha256(result.child)
+            or strategy_ast_round_trip(result.child) != result.child
+        ):
+            failures.append(f"{request.operation_id.value} accounting disagrees")
+        record_digests.append(record.record_sha256)
+    accounting_sha256 = hashlib.sha256(
+        canonical_identity_bytes(record_digests)
+    ).hexdigest()
+    if accounting_sha256 != WO35C_ACCOUNTING_SHA256:
+        failures.append("WO35-C mutation accounting differs from its frozen digest")
+    return StrategyDiscoveryAuditCase(
+        "c_semantic_diff_complexity_and_lineage_agree_exactly",
+        (
+            f"records={len(record_digests)} accounting_sha256={accounting_sha256} "
+            f"complexity_schema={STRATEGY_COMPLEXITY_SCHEMA_ID_V1} "
+            "round_trip=15/15 lineage_diff=15/15 exact_delta=15/15"
+        ),
+        tuple(failures),
+    )
+
+
+def _mutation_generation_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    traffic = parse_strategy_ast(_TRAFFIC_A)
+    fixtures = tuple(
+        request
+        for parent, request in _mutation_valid_fixtures()
+        if parent.kind == traffic.kind
+        and request.operation_id
+        in {
+            MutationOperationIdV1.THRESHOLD,
+            MutationOperationIdV1.ROLLING_WINDOW,
+            MutationOperationIdV1.ADD_CONDITION,
+        }
+    )
+    requests = (*fixtures, fixtures[0])
+    context = MutationGenerationContextV1(
+        root_seed=35_000_003,
+        available_features=_mutation_available_features(),
+    )
+    batch = generate_mutation_batch(traffic, requests, context=context)
+    reversed_batch = generate_mutation_batch(
+        traffic,
+        tuple(reversed(requests)),
+        context=context,
+    )
+    reordered_context_batch = generate_mutation_batch(
+        traffic,
+        requests,
+        context=MutationGenerationContextV1(
+            root_seed=35_000_003,
+            available_features=tuple(reversed(_mutation_available_features())),
+        ),
+    )
+    statuses = tuple(item.record.status for item in batch.results)
+    reasons = tuple(item.record.rejection_reason for item in batch.results)
+    draws = tuple(
+        labeled_substream_uint64(item.record.rng_substream)
+        for item in batch.results
+    )
+    if (
+        batch.canonical_bytes() != reversed_batch.canonical_bytes()
+        or batch.canonical_bytes() != reordered_context_batch.canonical_bytes()
+    ):
+        failures.append("input permutation changed the canonical mutation batch")
+    if statuses.count(MutationStatusV1.ACCEPTED) != 3 or reasons.count(
+        MutationRejectionReasonV1.DUPLICATE
+    ) != 1:
+        failures.append("duplicate generation did not accept once and reject once")
+    if len(set(draws)) != len(draws):
+        failures.append("labeled mutation substreams were not independent")
+    if batch.batch_sha256 != WO35C_BATCH_SHA256:
+        failures.append("WO35-C generated batch differs from its frozen digest")
+    return StrategyDiscoveryAuditCase(
+        "c_generation_order_substreams_and_duplicates_are_deterministic",
+        (
+            f"batch_sha256={batch.batch_sha256} accepted={len(batch.accepted)} "
+            f"rejected={len(batch.rejected)} ordering={STRATEGY_MUTATION_GENERATION_ORDER_V1} "
+            f"substreams={STRATEGY_MUTATION_SUBSTREAM_LABEL_V1} "
+            "request_and_feature_permutation=STABLE"
+        ),
+        tuple(failures),
+    )
+
+
+def _permission_projection(ast: StrategyAstV1) -> object:
+    if hasattr(ast, "states"):
+        return tuple(
+            (state.name, state.entry_permission.value, state.exit_permission.value)
+            for state in ast.states
+        )
+    return ast.unavailable_policy.value
+
+
+def _mutation_refusal_case() -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    traffic = parse_strategy_ast(_TRAFFIC_A)
+    base_feature_request = MutationRequestV1(
+        MutationOperationIdV1.FEATURE_REPLACEMENT,
+        1,
+        {"feature": FeatureName.RELATIVE_VOLUME.value, "path": "/green_conditions/0"},
+    )
+    future_request = MutationRequestV1(
+        MutationOperationIdV1.FEATURE_REPLACEMENT,
+        1,
+        {"feature": "future_midprice", "path": "/green_conditions/0"},
+    )
+    no_op_request = MutationRequestV1(
+        MutationOperationIdV1.THRESHOLD,
+        1,
+        {
+            "path": "/green_conditions/0",
+            "threshold": _exact_decimal(2, 1),
+        },
+    )
+    invalid_child_request = MutationRequestV1(
+        MutationOperationIdV1.REMOVE_CONDITION,
+        1,
+        {"path": "/wait_conditions/0"},
+    )
+    resource_request = MutationRequestV1(
+        MutationOperationIdV1.ADD_CONDITION,
+        1,
+        {
+            "collection_path": "/green_conditions",
+            "condition": _comparison(
+                FeatureName.RELATIVE_VOLUME.value,
+                ComparisonOperator.GREATER_EQUAL,
+                1,
+            ),
+        },
+    )
+    arbitrary_request = MutationRequestV1(
+        MutationOperationIdV1.THRESHOLD,
+        1,
+        {
+            "callable": "__import__('os').system('false')",
+            "path": "/green_conditions/0",
+            "threshold": _exact_decimal(25, 2),
+        },
+    )
+    common = {
+        "parent": traffic,
+        "rng_substream": StrategyRngSubstreamV1(35_000_003, "audit/wo35c/refusal"),
+        "known_semantic_sha256": (),
+    }
+    refusals = (
+        apply_strategy_mutation(
+            request=future_request,
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=base_feature_request,
+            available_features=(
+                FeatureName.BOOK_IMBALANCE.value,
+                FeatureName.SPREAD_TICKS.value,
+            ),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=resource_request,
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(max_conditions=3),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=no_op_request,
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=invalid_child_request,
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=replace(base_feature_request, operation_version=99),
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+        apply_strategy_mutation(
+            request=arbitrary_request,
+            available_features=_mutation_available_features(),
+            resource_limits=MutationResourceLimitsV1(),
+            **common,
+        ),
+    )
+    expected_reasons = (
+        MutationRejectionReasonV1.FUTURE_DEPENDENT,
+        MutationRejectionReasonV1.UNAVAILABLE_FEATURE,
+        MutationRejectionReasonV1.RESOURCE_EXCESSIVE,
+        MutationRejectionReasonV1.NO_OP,
+        MutationRejectionReasonV1.INVALID_CHILD,
+        MutationRejectionReasonV1.UNSUPPORTED_OPERATION_VERSION,
+        MutationRejectionReasonV1.INVALID_PARAMETER,
+    )
+    if tuple(item.record.rejection_reason for item in refusals) != expected_reasons:
+        failures.append("mutation refusal reasons differ from the fail-closed contract")
+    if any(
+        item.record.status is not MutationStatusV1.REJECTED
+        or item.record.evaluation_eligible
+        or item.record.lineage.valid
+        or _permission_projection(item.child) != _permission_projection(traffic)
+        for item in refusals
+    ):
+        failures.append("a refused child became eligible or widened permissions")
+    accepted_permissions = tuple(
+        (
+            _permission_projection(parent),
+            _permission_projection(
+                _apply_audit_mutation(
+                    parent,
+                    request,
+                    f"audit/wo35c/permission/{request.operation_id.value.lower()}",
+                ).child
+            ),
+        )
+        for parent, request in _mutation_valid_fixtures()
+    )
+    if any(before != after for before, after in accepted_permissions):
+        failures.append("a supported mutation changed the permission projection")
+    return StrategyDiscoveryAuditCase(
+        "c_lookahead_observability_permissions_and_resources_fail_closed",
+        (
+            "future=REFUSED unavailable=REFUSED excessive=REFUSED no_op=REFUSED "
+            "invalid_child=REFUSED unsupported_version=REFUSED arbitrary_code=REFUSED "
+            "permissions=PRESERVED evaluation_eligible=0/7"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo35c_strategy_mutations() -> tuple[StrategyDiscoveryAuditCase, ...]:
+    return (
+        _mutation_registry_case(),
+        _mutation_fixture_case(),
+        _mutation_accounting_case(),
+        _mutation_generation_case(),
+        _mutation_refusal_case(),
+    )
+
+
 __all__ = [
     "WO35A_AUDIT_CASE_COUNT",
     "WO35A_CANONICALIZATION_POLICY_SHA256",
@@ -1065,7 +1708,13 @@ __all__ = [
     "WO35B_ACCESS_POLICY_SHA256",
     "WO35B_AUDIT_CASE_COUNT",
     "WO35B_FIXTURE_SHA256",
+    "WO35C_AUDIT_CASE_COUNT",
+    "WO35C_ACCOUNTING_SHA256",
+    "WO35C_BATCH_SHA256",
+    "WO35C_FIXTURE_SHA256",
+    "WO35C_OPERATOR_REGISTRY_SHA256",
     "StrategyDiscoveryAuditCase",
     "audit_wo35a_strategy_discovery",
     "audit_wo35b_strategy_partitions",
+    "audit_wo35c_strategy_mutations",
 ]
