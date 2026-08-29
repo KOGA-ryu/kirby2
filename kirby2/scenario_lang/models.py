@@ -20,6 +20,22 @@ from types import MappingProxyType
 
 SCENARIO_SOURCE_SCHEMA_VERSION = 1
 SCENARIO_PLAN_ENVELOPE_SCHEMA_VERSION = 1
+SCENARIO_COMPILED_ARTIFACT_SCHEMA_VERSION = 1
+SCENARIO_COMPILER_VERSION = 1
+SCENARIO_SEED_POLICY_SCHEMA_VERSION = 1
+SCENARIO_SEED_DERIVATION_POLICY_VERSION = 1
+SCENARIO_EXECUTION_INELIGIBLE_REASON_V1 = "VALIDATOR_NOT_IMPLEMENTED"
+SCENARIO_COMPILATION_PHASES_V1 = (
+    "PARSE",
+    "IMPORT_RESOLUTION",
+    "INHERITANCE",
+    "DEFAULT_MATERIALIZATION",
+    "UNIT_NORMALIZATION",
+    "REFERENCE_BINDING",
+    "CANONICALIZATION",
+    "IMMUTABLE_ARTIFACT_CREATION",
+)
+SCENARIO_PENDING_COMPILATION_PHASES_V1 = ("CAPABILITY_VALIDATION",)
 
 SCENARIO_SOURCE_SECTION_NAMES = (
     "metadata",
@@ -189,6 +205,132 @@ DEFINITION_MERGE_POLICIES_V1: Mapping[
 class ScenarioSourceOriginV1(str, Enum):
     SOURCE_ROOT = "SOURCE_ROOT"
     PACK_NAMESPACE = "PACK_NAMESPACE"
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioSubstreamSeedV1:
+    semantic_path: str
+    derived_seed: int
+
+    def __post_init__(self) -> None:
+        _validate_identifier(self.semantic_path, "scenario RNG substream path")
+        if (
+            type(self.derived_seed) is not int
+            or not 0 <= self.derived_seed <= 2**63 - 1
+        ):
+            raise ValueError("scenario substream seed must lie in [0, 2**63-1]")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "derived_seed": self.derived_seed,
+            "semantic_path": self.semantic_path,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ScenarioSubstreamSeedV1:
+        _require_exact_fields(
+            payload,
+            {"derived_seed", "semantic_path"},
+            "scenario substream seed",
+        )
+        return cls(
+            semantic_path=_exact_str(payload, "semantic_path"),
+            derived_seed=_exact_int(payload, "derived_seed"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioCompiledSeedPolicyV1:
+    schema_version: int
+    policy_version: int
+    source_root_seed: int
+    selected_root_seed: int
+    cli_override_allowed: bool
+    cli_override_applied: bool
+    substreams: tuple[ScenarioSubstreamSeedV1, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != SCENARIO_SEED_POLICY_SCHEMA_VERSION
+        ):
+            raise ValueError("scenario seed-policy schema version must be exactly 1")
+        if (
+            type(self.policy_version) is not int
+            or self.policy_version != SCENARIO_SEED_DERIVATION_POLICY_VERSION
+        ):
+            raise ValueError("scenario seed derivation policy version must be exactly 1")
+        for name in ("source_root_seed", "selected_root_seed"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ValueError(f"scenario {name} must lie in [0, 2**63-1]")
+        if type(self.cli_override_allowed) is not bool:
+            raise TypeError("scenario CLI seed override permission must be a bool")
+        if type(self.cli_override_applied) is not bool:
+            raise TypeError("scenario CLI seed override state must be a bool")
+        if self.cli_override_applied and not self.cli_override_allowed:
+            raise ValueError("scenario CLI seed override was applied without permission")
+        if not self.cli_override_applied and (
+            self.selected_root_seed != self.source_root_seed
+        ):
+            raise ValueError("scenario selected seed differs without an applied override")
+        if type(self.substreams) is not tuple or not self.substreams or any(
+            type(item) is not ScenarioSubstreamSeedV1 for item in self.substreams
+        ):
+            raise TypeError("scenario seed policy requires typed substreams")
+        paths = tuple(item.semantic_path for item in self.substreams)
+        if paths != tuple(sorted(set(paths))):
+            raise ValueError("scenario substream paths must be unique and sorted")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "cli_override_allowed": self.cli_override_allowed,
+            "cli_override_applied": self.cli_override_applied,
+            "policy_version": self.policy_version,
+            "schema_version": self.schema_version,
+            "selected_root_seed": self.selected_root_seed,
+            "source_root_seed": self.source_root_seed,
+            "substreams": [item.as_dict() for item in self.substreams],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ScenarioCompiledSeedPolicyV1:
+        _require_exact_fields(
+            payload,
+            {
+                "cli_override_allowed",
+                "cli_override_applied",
+                "policy_version",
+                "schema_version",
+                "selected_root_seed",
+                "source_root_seed",
+                "substreams",
+            },
+            "compiled scenario seed policy",
+        )
+        raw_substreams = payload["substreams"]
+        if type(raw_substreams) is not list or any(
+            not isinstance(item, Mapping) for item in raw_substreams
+        ):
+            raise TypeError("compiled scenario substreams must be an object array")
+        allowed = payload["cli_override_allowed"]
+        applied = payload["cli_override_applied"]
+        if type(allowed) is not bool or type(applied) is not bool:
+            raise TypeError("compiled scenario override flags must be bools")
+        return cls(
+            schema_version=_exact_int(payload, "schema_version"),
+            policy_version=_exact_int(payload, "policy_version"),
+            source_root_seed=_exact_int(payload, "source_root_seed"),
+            selected_root_seed=_exact_int(payload, "selected_root_seed"),
+            cli_override_allowed=allowed,
+            cli_override_applied=applied,
+            substreams=tuple(
+                ScenarioSubstreamSeedV1.from_dict(item) for item in raw_substreams
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,6 +1112,39 @@ def canonical_native_payload_bytes(
     return canonical
 
 
+def parse_native_payload_v1(
+    target_kind: ScenarioTargetKindV1 | str,
+    payload: Mapping[str, object],
+) -> object:
+    """Parse one native payload through the closed WO32 target inventory."""
+
+    try:
+        kind = ScenarioTargetKindV1(target_kind)
+    except (TypeError, ValueError) as error:
+        raise ValueError("unsupported scenario target kind") from error
+    if not isinstance(payload, Mapping):
+        raise TypeError("native scenario payload must be an object")
+    return _native_payload_from_mapping(kind, payload)
+
+
+def parse_native_payload_bytes_v1(
+    target_kind: ScenarioTargetKindV1 | str,
+    raw: bytes,
+) -> object:
+    """Restore one exact native payload from canonical UTF-8 JSON bytes."""
+
+    try:
+        kind = ScenarioTargetKindV1(target_kind)
+    except (TypeError, ValueError) as error:
+        raise ValueError("unsupported scenario target kind") from error
+    if type(raw) is not bytes:
+        raise TypeError("native scenario payload input must be exact bytes")
+    restored = _native_payload_from_bytes(kind, raw)
+    if canonical_native_payload_bytes(kind, restored) != raw:
+        raise ValueError("native scenario payload bytes are not canonical")
+    return restored
+
+
 def _native_payload_type(target_kind: ScenarioTargetKindV1) -> type[object]:
     if target_kind is ScenarioTargetKindV1.FULL_DAY_PLAN_V1:
         from kirby2.full_day.models import FullDayPlanV1
@@ -1037,6 +1212,348 @@ def _canonical_native_json_bytes(value: object) -> bytes:
     return text.encode("utf-8")
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class CompiledScenarioArtifactV1:
+    """Self-verifying immutable WO32-C artifact.
+
+    The native envelope is embedded as canonical JSON text so legacy native plans
+    may retain their already-governed finite floats without admitting floats into
+    the scenario compiler's strict outer identity domain.
+    """
+
+    schema_version: int
+    compiler_version: int
+    source_schema_version: int
+    target_kind: ScenarioTargetKindV1
+    target_version: int
+    adapter_id: str
+    adapter_version: int
+    source_bundle_digest: str
+    semantic_plan_digest: str
+    native_plan_digest: str
+    compiled_artifact_digest: str
+    run_identity_digest: str
+    execution_eligible: bool
+    execution_reason_code: str
+    _canonical_bytes: bytes
+
+    def __init__(self, canonical_bytes: bytes) -> None:
+        if type(canonical_bytes) is not bytes:
+            raise TypeError("compiled scenario artifact requires exact bytes")
+        payload = _strict_json_object(canonical_bytes, "compiled scenario artifact")
+        from .identity import (
+            canonical_semantic_plan_bytes,
+            compiled_artifact_digest,
+            semantic_plan_digest,
+        )
+
+        if canonical_semantic_plan_bytes(payload) != canonical_bytes:
+            raise ValueError("compiled scenario artifact bytes are not canonical")
+        _require_exact_fields(
+            payload,
+            {
+                "adapter_id",
+                "adapter_operations",
+                "adapter_version",
+                "capability_decisions",
+                "compiled_artifact_digest",
+                "compiler_version",
+                "completed_phases",
+                "execution_eligible",
+                "execution_reason_code",
+                "materialized_plan",
+                "native_plan_digest",
+                "native_plan_envelope_json",
+                "pending_phases",
+                "provenance",
+                "required_capability_declarations",
+                "run_identity_digest",
+                "schema_version",
+                "seed_policy",
+                "semantic_plan_digest",
+                "source_bundle_digest",
+                "source_schema_version",
+                "target_kind",
+                "target_version",
+                "warnings",
+            },
+            "compiled scenario artifact",
+        )
+        schema_version = _exact_int(payload, "schema_version")
+        compiler_version = _exact_int(payload, "compiler_version")
+        source_schema_version = _exact_int(payload, "source_schema_version")
+        if schema_version != SCENARIO_COMPILED_ARTIFACT_SCHEMA_VERSION:
+            raise ValueError("compiled scenario artifact schema version must be 1")
+        if compiler_version != SCENARIO_COMPILER_VERSION:
+            raise ValueError("compiled scenario compiler version must be 1")
+        if source_schema_version != SCENARIO_SOURCE_SCHEMA_VERSION:
+            raise ValueError("compiled scenario source schema version must be 1")
+        raw_target_kind = _exact_str(payload, "target_kind")
+        try:
+            target_kind = ScenarioTargetKindV1(raw_target_kind)
+        except ValueError as error:
+            raise ValueError("compiled scenario target kind is unsupported") from error
+        target_version = _exact_int(payload, "target_version")
+        adapter_id = _exact_str(payload, "adapter_id")
+        adapter_version = _exact_int(payload, "adapter_version")
+        target_contract = SCENARIO_TARGET_CONTRACTS_V1[target_kind]
+        if (
+            target_version != target_contract.target_version
+            or adapter_id != target_contract.adapter_id
+            or adapter_version != target_contract.adapter_version
+        ):
+            raise ValueError("compiled scenario target contract is inconsistent")
+
+        operations = payload["adapter_operations"]
+        if not isinstance(operations, Mapping):
+            raise TypeError("compiled scenario adapter operations must be an object")
+        _require_exact_fields(
+            operations,
+            {"parse", "persist", "replay", "run", "validate"},
+            "compiled scenario adapter operations",
+        )
+        for operation_name, operation_id in operations.items():
+            _validate_identifier(
+                operation_id,
+                f"compiled scenario {operation_name} adapter ID",
+            )
+        expected_operations = {
+            operation_name: f"{adapter_id}_{operation_name.upper()}_V1"
+            for operation_name in ("parse", "persist", "replay", "run", "validate")
+        }
+        if dict(operations) != expected_operations:
+            raise ValueError("compiled scenario adapter operations are not the closed V1 set")
+
+        completed_phases = payload["completed_phases"]
+        pending_phases = payload["pending_phases"]
+        if (
+            type(completed_phases) is not list
+            or tuple(completed_phases) != SCENARIO_COMPILATION_PHASES_V1
+            or type(pending_phases) is not list
+            or tuple(pending_phases) != SCENARIO_PENDING_COMPILATION_PHASES_V1
+        ):
+            raise ValueError("compiled scenario phase inventory is inconsistent")
+
+        execution_eligible = payload["execution_eligible"]
+        execution_reason_code = _exact_str(payload, "execution_reason_code")
+        if type(execution_eligible) is not bool:
+            raise TypeError("compiled scenario execution eligibility must be a bool")
+        if execution_eligible or (
+            execution_reason_code != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+        ):
+            raise ValueError("WO32-C artifacts must fail closed before validation")
+
+        for key in (
+            "source_bundle_digest",
+            "semantic_plan_digest",
+            "native_plan_digest",
+            "compiled_artifact_digest",
+            "run_identity_digest",
+        ):
+            _validate_sha256(payload[key], f"compiled scenario {key}")
+        source_digest = _exact_str(payload, "source_bundle_digest")
+        semantic_digest = _exact_str(payload, "semantic_plan_digest")
+        native_digest = _exact_str(payload, "native_plan_digest")
+        artifact_digest = _exact_str(payload, "compiled_artifact_digest")
+        run_digest = _exact_str(payload, "run_identity_digest")
+
+        materialized_plan = payload["materialized_plan"]
+        provenance = payload["provenance"]
+        if not isinstance(materialized_plan, Mapping):
+            raise TypeError("compiled scenario materialized plan must be an object")
+        if not isinstance(provenance, Mapping):
+            raise TypeError("compiled scenario provenance must be an object")
+        if semantic_plan_digest(materialized_plan) != semantic_digest:
+            raise ValueError("compiled scenario semantic plan digest does not match")
+        import_provenance = provenance.get("import_bundle")
+        if (
+            not isinstance(import_provenance, Mapping)
+            or import_provenance.get("source_bundle_digest") != source_digest
+        ):
+            raise ValueError("compiled scenario source digest is absent from provenance")
+
+        raw_envelope_json = _exact_str(payload, "native_plan_envelope_json")
+        envelope_bytes = raw_envelope_json.encode("utf-8")
+        envelope_payload = _strict_json_object(
+            envelope_bytes,
+            "compiled native plan envelope",
+        )
+        if _canonical_native_json_bytes(envelope_payload) != envelope_bytes:
+            raise ValueError("compiled native plan envelope is not canonical")
+        envelope = ScenarioPlanEnvelopeV1.from_dict(envelope_payload)
+        if (
+            envelope.canonical_bytes() != envelope_bytes
+            or envelope.target_kind is not target_kind
+            or envelope.target_version != target_version
+            or envelope.adapter_id != adapter_id
+            or envelope.adapter_version != adapter_version
+            or envelope.native_plan_digest != native_digest
+        ):
+            raise ValueError("compiled native plan envelope is inconsistent")
+
+        seed_payload = payload["seed_policy"]
+        if not isinstance(seed_payload, Mapping):
+            raise TypeError("compiled scenario seed policy must be an object")
+        seed_policy = ScenarioCompiledSeedPolicyV1.from_dict(seed_payload)
+        from .seeds import (
+            scenario_run_identity_digest,
+            validate_compiled_seed_policy,
+        )
+
+        validate_compiled_seed_policy(seed_policy)
+        if scenario_run_identity_digest(native_digest, seed_policy) != run_digest:
+            raise ValueError("compiled scenario run identity digest does not match")
+
+        declarations = payload["required_capability_declarations"]
+        decisions = payload["capability_decisions"]
+        if type(declarations) is not list or any(
+            not isinstance(item, Mapping) for item in declarations
+        ):
+            raise TypeError("compiled capability declarations must be an object array")
+        if type(decisions) is not list or any(
+            not isinstance(item, Mapping) for item in decisions
+        ):
+            raise TypeError("compiled capability decisions must be an object array")
+        declaration_ids: list[str] = []
+        for declaration in declarations:
+            _require_exact_fields(
+                declaration,
+                {"declaration_id", "record"},
+                "compiled capability declaration",
+            )
+            declaration_ids.append(
+                _validate_identifier(
+                    _exact_str(declaration, "declaration_id"),
+                    "compiled capability declaration ID",
+                )
+            )
+            if not isinstance(declaration["record"], Mapping):
+                raise TypeError("compiled capability declaration record must be an object")
+        decision_ids: list[str] = []
+        for decision in decisions:
+            _require_exact_fields(
+                decision,
+                {"decision", "declaration_id", "reason_code"},
+                "compiled capability decision",
+            )
+            decision_ids.append(_exact_str(decision, "declaration_id"))
+            if (
+                _exact_str(decision, "decision") != "PENDING_VALIDATOR"
+                or _exact_str(decision, "reason_code")
+                != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+            ):
+                raise ValueError("WO32-C capability decisions must remain pending")
+        if (
+            declaration_ids != sorted(set(declaration_ids))
+            or decision_ids != declaration_ids
+        ):
+            raise ValueError("compiled capability declaration inventory is inconsistent")
+
+        warnings = payload["warnings"]
+        if type(warnings) is not list or any(
+            type(item) is not str or not item for item in warnings
+        ):
+            raise TypeError("compiled scenario warnings must be nonempty strings")
+        if warnings != sorted(set(warnings)):
+            raise ValueError("compiled scenario warnings must be unique and sorted")
+
+        identity_body = dict(payload)
+        del identity_body["compiled_artifact_digest"]
+        del identity_body["provenance"]
+        expected_artifact_digest = compiled_artifact_digest(
+            canonical_semantic_plan_bytes(identity_body),
+            provenance,
+        )
+        if artifact_digest != expected_artifact_digest:
+            raise ValueError("compiled scenario artifact digest does not match")
+
+        object.__setattr__(self, "schema_version", schema_version)
+        object.__setattr__(self, "compiler_version", compiler_version)
+        object.__setattr__(self, "source_schema_version", source_schema_version)
+        object.__setattr__(self, "target_kind", target_kind)
+        object.__setattr__(self, "target_version", target_version)
+        object.__setattr__(self, "adapter_id", adapter_id)
+        object.__setattr__(self, "adapter_version", adapter_version)
+        object.__setattr__(self, "source_bundle_digest", source_digest)
+        object.__setattr__(self, "semantic_plan_digest", semantic_digest)
+        object.__setattr__(self, "native_plan_digest", native_digest)
+        object.__setattr__(self, "compiled_artifact_digest", artifact_digest)
+        object.__setattr__(self, "run_identity_digest", run_digest)
+        object.__setattr__(self, "execution_eligible", execution_eligible)
+        object.__setattr__(self, "execution_reason_code", execution_reason_code)
+        object.__setattr__(self, "_canonical_bytes", canonical_bytes)
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> CompiledScenarioArtifactV1:
+        return cls(raw)
+
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    def as_dict(self) -> dict[str, object]:
+        return _strict_json_object(self._canonical_bytes, "compiled scenario artifact")
+
+    @property
+    def materialized_plan(self) -> dict[str, object]:
+        value = self.as_dict()["materialized_plan"]
+        if not isinstance(value, dict):  # validated during construction
+            raise AssertionError("compiled materialized plan ceased to be an object")
+        return value
+
+    @property
+    def provenance(self) -> dict[str, object]:
+        value = self.as_dict()["provenance"]
+        if not isinstance(value, dict):  # validated during construction
+            raise AssertionError("compiled scenario provenance ceased to be an object")
+        return value
+
+    @property
+    def seed_policy(self) -> ScenarioCompiledSeedPolicyV1:
+        value = self.as_dict()["seed_policy"]
+        if not isinstance(value, Mapping):  # validated during construction
+            raise AssertionError("compiled scenario seed policy ceased to be an object")
+        return ScenarioCompiledSeedPolicyV1.from_dict(value)
+
+    @property
+    def plan_envelope(self) -> ScenarioPlanEnvelopeV1:
+        raw = self.as_dict()["native_plan_envelope_json"]
+        if type(raw) is not str:  # validated during construction
+            raise AssertionError("compiled native envelope ceased to be text")
+        payload = _strict_json_object(
+            raw.encode("utf-8"),
+            "compiled native plan envelope",
+        )
+        return ScenarioPlanEnvelopeV1.from_dict(payload)
+
+
+def _strict_json_object(raw: bytes, context: str) -> dict[str, object]:
+    if type(raw) is not bytes:
+        raise TypeError(f"{context} requires exact bytes")
+
+    def object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{context} contains duplicate object keys")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"{context} contains non-finite number {value}")
+
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=object_from_pairs,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{context} must be valid UTF-8 JSON") from error
+    if not isinstance(payload, dict):
+        raise TypeError(f"{context} must contain an object")
+    return payload
+
+
 def _require_exact_fields(
     payload: Mapping[str, object],
     expected: set[str] | frozenset[str],
@@ -1068,18 +1585,27 @@ def _exact_str(payload: Mapping[str, object], key: str) -> str:
 
 
 __all__ = [
+    "CompiledScenarioArtifactV1",
     "DEFINITION_MERGE_POLICIES_V1",
     "DEFINITION_SECTION_BY_TYPE_V1",
     "DEFINITION_TYPE_BY_SECTION_V1",
     "ExactFixedPointV1",
     "SCENARIO_BEHAVIOR_SECTION_NAMES",
+    "SCENARIO_COMPILED_ARTIFACT_SCHEMA_VERSION",
+    "SCENARIO_COMPILATION_PHASES_V1",
+    "SCENARIO_COMPILER_VERSION",
+    "SCENARIO_EXECUTION_INELIGIBLE_REASON_V1",
+    "SCENARIO_PENDING_COMPILATION_PHASES_V1",
     "SCENARIO_PLAN_ENVELOPE_SCHEMA_VERSION",
+    "SCENARIO_SEED_DERIVATION_POLICY_VERSION",
+    "SCENARIO_SEED_POLICY_SCHEMA_VERSION",
     "SCENARIO_SOURCE_SCHEMA_VERSION",
     "SCENARIO_SOURCE_SECTION_NAMES",
     "SCENARIO_TARGET_CONTRACTS_V1",
     "ScenarioFieldV1",
     "ScenarioDefinitionMergePolicyV1",
     "ScenarioDefinitionTypeV1",
+    "ScenarioCompiledSeedPolicyV1",
     "ScenarioImportBundleV1",
     "ScenarioImportEdgeV1",
     "ScenarioImportV1",
@@ -1092,6 +1618,7 @@ __all__ = [
     "ScenarioSourceDocumentV1",
     "ScenarioSourceOriginV1",
     "ScenarioSourceV1",
+    "ScenarioSubstreamSeedV1",
     "ScenarioTargetContractV1",
     "ScenarioTargetKindV1",
     "ScenarioValueKindV1",
@@ -1099,4 +1626,6 @@ __all__ = [
     "ResolvedScenarioDefinitionV1",
     "VolumeMultiplierV1",
     "canonical_native_payload_bytes",
+    "parse_native_payload_bytes_v1",
+    "parse_native_payload_v1",
 ]

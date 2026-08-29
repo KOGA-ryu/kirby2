@@ -12,6 +12,19 @@ from tempfile import TemporaryDirectory
 from typing import Callable
 
 from kirby2.research.toml_codec import canonical_toml
+from kirby2.scenario_lang.compiler import (
+    DEFAULT_SCENARIO_TARGET_REGISTRY,
+    ScenarioExecutionRefused,
+    ScenarioTargetRegistry,
+    compile_resolved_scenario,
+    compile_scenario,
+    replay_compiled_scenario,
+    run_compiled_scenario,
+)
+from kirby2.scenario_lang.defaults import (
+    SCENARIO_SEED_POLICY_LOGICAL_NAME_V1,
+    SCENARIO_SEED_POLICY_RECORD_TYPE_V1,
+)
 from kirby2.scenario_lang.identity import (
     SourceBundleEntryV1,
     canonical_semantic_plan_bytes,
@@ -29,9 +42,13 @@ from kirby2.scenario_lang.models import (
     DEFINITION_SECTION_BY_TYPE_V1,
     DEFINITION_MERGE_POLICIES_V1,
     SCENARIO_BEHAVIOR_SECTION_NAMES,
+    SCENARIO_COMPILATION_PHASES_V1,
+    SCENARIO_EXECUTION_INELIGIBLE_REASON_V1,
+    SCENARIO_PENDING_COMPILATION_PHASES_V1,
     SCENARIO_SOURCE_SECTION_NAMES,
     SCENARIO_TARGET_CONTRACTS_V1,
     ExactFixedPointV1,
+    CompiledScenarioArtifactV1,
     ScenarioDefinitionTypeV1,
     ScenarioFieldV1,
     ScenarioImportV1,
@@ -46,6 +63,10 @@ from kirby2.scenario_lang.models import (
     VolumeMultiplierV1,
 )
 from kirby2.scenario_lang.resolution import resolve_scenario_bundle
+from kirby2.scenario_lang.seeds import (
+    derive_scenario_substream_seed,
+    scenario_run_identity_digest,
+)
 from kirby2.scenario_lang.schema import (
     canonical_scenario_source_bytes,
     parse_canonical_scenario_source,
@@ -57,6 +78,7 @@ from kirby2.scenario_lang.schema import (
 WO32A_STRICT_REFUSAL_COUNT = 13
 WO32B_IMPORT_REFUSAL_COUNT = 18
 WO32B_DEFINITION_REFUSAL_COUNT = 9
+WO32C_COMPILER_REFUSAL_COUNT = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +132,7 @@ def audit_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
     return (
         *audit_wo32a_scenario_language(),
         *audit_wo32b_scenario_language(),
+        *audit_wo32c_scenario_language(),
     )
 
 
@@ -122,6 +145,18 @@ def audit_wo32b_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
         _definition_inheritance_merge_case(),
         _hostile_import_graph_case(),
         _hostile_definition_resolution_case(),
+    )
+
+
+def audit_wo32c_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
+    """Exercise immutable compilation, target dispatch, and seed ownership."""
+
+    return (
+        _compiler_phase_and_artifact_case(),
+        _compiler_determinism_case(),
+        _compiler_seed_policy_case(),
+        _target_registry_and_runtime_case(),
+        _hostile_compiler_refusal_case(),
     )
 
 
@@ -1334,6 +1369,744 @@ def _hostile_definition_resolution_case() -> ScenarioLanguageAuditCase:
     )
 
 
+def _compiler_phase_and_artifact_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32c-artifact-") as temp:
+        source_root, pack_root, unused_pack = _write_compiler_fixture(Path(temp))
+        artifact = compile_scenario(
+            source_root,
+            "main.toml",
+            _balanced_native_scenario(),
+            activated_pack_namespaces={
+                "audit_pack": pack_root,
+                "unused_pack": unused_pack,
+            },
+        )
+        payload = artifact.as_dict()
+        if tuple(payload["completed_phases"]) != SCENARIO_COMPILATION_PHASES_V1:
+            failures.append("compiled artifact omitted or reordered a compiler phase")
+        if tuple(payload["pending_phases"]) != (
+            SCENARIO_PENDING_COMPILATION_PHASES_V1
+        ):
+            failures.append("compiled artifact did not retain capability validation")
+        if artifact.execution_eligible or (
+            artifact.execution_reason_code
+            != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+        ):
+            failures.append("WO32-C artifact did not fail closed")
+        if payload["source_bundle_digest"] != artifact.source_bundle_digest:
+            failures.append("artifact source digest property is inconsistent")
+        if payload["semantic_plan_digest"] != artifact.semantic_plan_digest:
+            failures.append("artifact semantic digest property is inconsistent")
+        if payload["native_plan_digest"] != artifact.native_plan_digest:
+            failures.append("artifact native digest property is inconsistent")
+        if payload["compiled_artifact_digest"] != artifact.compiled_artifact_digest:
+            failures.append("artifact self digest property is inconsistent")
+        provenance = artifact.provenance
+        import_graph = provenance["import_bundle"]
+        if len(import_graph["documents"]) != 2 or len(import_graph["edges"]) != 1:
+            failures.append("compiled provenance omitted the ordered import graph")
+        if any(not row["raw_sha256"] for row in import_graph["documents"]):
+            failures.append("compiled provenance omitted a source byte digest")
+
+        materialized = artifact.materialized_plan
+        applied_defaults = materialized["applied_defaults"]
+        if len(applied_defaults) != 4:
+            failures.append("empty source seed policy did not materialize four defaults")
+        definitions = materialized["resolved_definitions"]
+        if len(definitions) != 1:
+            failures.append("compiler did not select exactly the root definition")
+        else:
+            record = definitions[0]["record"]
+            if "extends" in record or "reference" in record:
+                failures.append("compiled definition retained an unresolved source link")
+            fields = {field["name"]: field for field in record["fields"]}
+            if fields.get("decision_interval") != {
+                "duration_us": 250_000,
+                "name": "decision_interval",
+            }:
+                failures.append("compiler did not normalize duration_ms to duration_us")
+        root = materialized["root_source"]
+        flow_record = root["flow_model"]["records"][0]
+        if "reference" in flow_record or "bound_reference" not in flow_record:
+            failures.append("compiler did not fully bind the root record reference")
+        declarations = payload["required_capability_declarations"]
+        decisions = payload["capability_decisions"]
+        if len(declarations) != 1 or len(decisions) != 1:
+            failures.append("compiled artifact omitted required capability evidence")
+        elif (
+            decisions[0]["decision"] != "PENDING_VALIDATOR"
+            or decisions[0]["declaration_id"]
+            != declarations[0]["declaration_id"]
+        ):
+            failures.append("compiled capability decision is not pending and paired")
+        if set(payload["adapter_operations"]) != {
+            "parse",
+            "persist",
+            "replay",
+            "run",
+            "validate",
+        }:
+            failures.append("compiled target adapter inventory is incomplete")
+        if artifact.plan_envelope.native_plan_digest != artifact.native_plan_digest:
+            failures.append("embedded native plan digest differs from the artifact")
+    return ScenarioLanguageAuditCase(
+        "scenario_compiler_phase_and_artifact_inventory",
+        (
+            "phases=8 pending=CAPABILITY_VALIDATION defaults=4 "
+            "references=bound units=normalized capabilities=pending"
+        ),
+        tuple(failures),
+    )
+
+
+def _compiler_determinism_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32c-determinism-a-") as first_temp, (
+        TemporaryDirectory(prefix="kirby2-wo32c-determinism-b-")
+    ) as second_temp:
+        first_root = Path(first_temp)
+        second_root = Path(second_temp)
+        first_source, first_pack, first_unused = _write_compiler_fixture(
+            first_root,
+            unrelated_id="audit_unrelated_first_v1",
+        )
+        second_source, second_pack, second_unused = _write_compiler_fixture(
+            second_root,
+            unrelated_id="audit_unrelated_second_v1",
+        )
+        (first_root / "ambient").mkdir()
+        (second_root / "ambient").mkdir()
+        _write_document(first_root / "ambient" / "definition.toml", b"first\n")
+        _write_document(second_root / "ambient" / "definition.toml", b"second\n")
+        before_first = _filesystem_snapshot(first_root)
+        before_second = _filesystem_snapshot(second_root)
+        prior_cwd = Path.cwd()
+        try:
+            os.chdir(first_root / "ambient")
+            first = compile_scenario(
+                first_source,
+                "main.toml",
+                _balanced_native_scenario(),
+                activated_pack_namespaces={
+                    "unused_pack": first_unused,
+                    "audit_pack": first_pack,
+                },
+                warnings=("ZETA_AUDIT_WARNING", "ALPHA_AUDIT_WARNING"),
+            )
+            os.chdir(second_root / "ambient")
+            second = compile_scenario(
+                second_source,
+                "main.toml",
+                _balanced_native_scenario(),
+                activated_pack_namespaces={
+                    "audit_pack": second_pack,
+                    "unused_pack": second_unused,
+                },
+                warnings=("ALPHA_AUDIT_WARNING", "ZETA_AUDIT_WARNING"),
+            )
+        finally:
+            os.chdir(prior_cwd)
+        repeated = compile_scenario(
+            first_source,
+            "main.toml",
+            _balanced_native_scenario(),
+            activated_pack_namespaces={
+                "audit_pack": first_pack,
+                "unused_pack": first_unused,
+            },
+            warnings=("ALPHA_AUDIT_WARNING", "ZETA_AUDIT_WARNING"),
+        )
+        if first.canonical_bytes() != second.canonical_bytes():
+            failures.append("relocation, mapping order, or ambient files changed artifact bytes")
+        if first.canonical_bytes() != repeated.canonical_bytes():
+            failures.append("recompiling identical inputs changed artifact bytes")
+        if first.compiled_artifact_digest != second.compiled_artifact_digest:
+            failures.append("relocation changed compiled artifact identity")
+        if _filesystem_snapshot(first_root) != before_first:
+            failures.append("compiler wrote into the first source or ambient tree")
+        if _filesystem_snapshot(second_root) != before_second:
+            failures.append("compiler wrote into the second source or ambient tree")
+    return ScenarioLanguageAuditCase(
+        "scenario_compiler_determinism_and_ambient_independence",
+        (
+            "recompilation=byte_identical relocation=true mapping_order=true "
+            "unrelated_definitions=true ambient_defaults=false writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _compiler_seed_policy_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32c-seeds-") as temp:
+        source_root, pack_root, unused_pack = _write_compiler_fixture(
+            Path(temp),
+            allow_override=True,
+        )
+        packs = {"audit_pack": pack_root, "unused_pack": unused_pack}
+        native = _balanced_native_scenario()
+        source_selected = compile_scenario(
+            source_root,
+            "main.toml",
+            native,
+            activated_pack_namespaces=packs,
+        )
+        overridden = compile_scenario(
+            source_root,
+            "main.toml",
+            _balanced_native_scenario(),
+            activated_pack_namespaces=packs,
+            cli_seed_override=99,
+        )
+        repeated_override = compile_scenario(
+            source_root,
+            "main.toml",
+            _balanced_native_scenario(),
+            activated_pack_namespaces=packs,
+            cli_seed_override=99,
+        )
+        if source_selected.seed_policy.selected_root_seed != 17:
+            failures.append("source-selected seed was not retained")
+        if (
+            overridden.seed_policy.selected_root_seed != 99
+            or not overridden.seed_policy.cli_override_applied
+            or not overridden.seed_policy.cli_override_allowed
+        ):
+            failures.append("permitted CLI seed override was not materialized")
+        if overridden.run_identity_digest == source_selected.run_identity_digest:
+            failures.append("selected seed did not enter run identity")
+        if overridden.compiled_artifact_digest == source_selected.compiled_artifact_digest:
+            failures.append("selected seed did not enter compiled artifact identity")
+        if overridden.source_bundle_digest != source_selected.source_bundle_digest:
+            failures.append("seed override changed source provenance identity")
+        if overridden.semantic_plan_digest != source_selected.semantic_plan_digest:
+            failures.append("seed override changed the source semantic plan")
+        if overridden.native_plan_digest != source_selected.native_plan_digest:
+            failures.append("seed override changed the native plan")
+        if overridden.canonical_bytes() != repeated_override.canonical_bytes():
+            failures.append("same CLI seed override did not reproduce artifact bytes")
+        if overridden.run_identity_digest != scenario_run_identity_digest(
+            overridden.native_plan_digest,
+            overridden.seed_policy,
+        ):
+            failures.append("artifact run identity differs from the V1 derivation")
+        for substream in overridden.seed_policy.substreams:
+            expected = derive_scenario_substream_seed(
+                99,
+                overridden.seed_policy.policy_version,
+                substream.semantic_path,
+            )
+            if substream.derived_seed != expected:
+                failures.append(
+                    f"substream {substream.semantic_path} has the wrong derived seed"
+                )
+    return ScenarioLanguageAuditCase(
+        "scenario_compiler_seed_override_and_substreams",
+        (
+            "source_seed=17 override_seed=99 policy_version=1 "
+            "substreams=2 run_identity=seed_bound"
+        ),
+        tuple(failures),
+    )
+
+
+def _target_registry_and_runtime_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    payloads = _compiler_native_payloads()
+    direct_run_refusals = 0
+    for target_kind in ScenarioTargetKindV1:
+        adapter = DEFAULT_SCENARIO_TARGET_REGISTRY.adapter(target_kind)
+        native = payloads[target_kind]
+        persisted = adapter.persist(native)
+        restored = adapter.replay(persisted)
+        parsed = adapter.parse(native.as_dict())
+        if adapter.validate(restored) != persisted or adapter.persist(parsed) != persisted:
+            failures.append(f"{target_kind.value} adapter did not round trip")
+        try:
+            adapter.run(
+                native,
+                _compiler_seed_policy_fixture(),
+            )
+        except ScenarioExecutionRefused as error:
+            if error.reason_code == SCENARIO_EXECUTION_INELIGIBLE_REASON_V1:
+                direct_run_refusals += 1
+            else:
+                failures.append(f"{target_kind.value} refused with the wrong reason")
+        else:
+            failures.append(f"{target_kind.value} native run adapter executed early")
+
+    duplicate_registry = ScenarioTargetRegistry()
+    first_adapter = DEFAULT_SCENARIO_TARGET_REGISTRY.adapter(
+        ScenarioTargetKindV1.FULL_DAY_PLAN_V1
+    )
+    duplicate_registry.register(first_adapter)
+    refusal = _expect_refusal(
+        lambda: duplicate_registry.register(first_adapter),
+        "duplicate target adapter",
+    )
+    if refusal is not None:
+        failures.append(refusal)
+    refusal = _expect_refusal(
+        lambda: DEFAULT_SCENARIO_TARGET_REGISTRY.register(first_adapter),
+        "sealed target registry mutation",
+    )
+    if refusal is not None:
+        failures.append(refusal)
+
+    with TemporaryDirectory(prefix="kirby2-wo32c-runtime-") as temp:
+        source_root, pack_root, unused_pack = _write_compiler_fixture(Path(temp))
+        native = _balanced_native_scenario()
+        artifact = compile_scenario(
+            source_root,
+            "main.toml",
+            native,
+            activated_pack_namespaces={
+                "audit_pack": pack_root,
+                "unused_pack": unused_pack,
+            },
+        )
+        original_bytes = artifact.canonical_bytes()
+        native.parameter_overrides["caller_mutation"] = 1.0
+        detached_native = artifact.plan_envelope.payload
+        detached_native.parameter_overrides["detached_mutation"] = 2.0
+        detached_artifact = artifact.as_dict()
+        detached_artifact["warnings"].append("DETACHED_MUTATION")
+        if artifact.canonical_bytes() != original_bytes:
+            failures.append("runtime/native caller mutation changed immutable artifact")
+        try:
+            artifact.execution_eligible = True
+        except (AttributeError, TypeError):
+            pass
+        else:
+            failures.append("compiled artifact accepted direct mutation")
+        restored = replay_compiled_scenario(original_bytes)
+        if restored != artifact or restored.canonical_bytes() != original_bytes:
+            failures.append("compiled artifact replay was not byte-identical")
+        before = _filesystem_snapshot(Path(temp))
+        try:
+            run_compiled_scenario(artifact)
+        except ScenarioExecutionRefused as error:
+            if error.reason_code != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1:
+                failures.append("compiled runtime refusal used the wrong reason code")
+        else:
+            failures.append("unvalidated compiled artifact reached a runtime adapter")
+        if _filesystem_snapshot(Path(temp)) != before:
+            failures.append("refused runtime attempt wrote to the fixture tree")
+    if direct_run_refusals != len(ScenarioTargetKindV1):
+        failures.append("one or more direct target run adapters did not fail closed")
+    return ScenarioLanguageAuditCase(
+        "scenario_target_registry_and_fail_closed_runtime",
+        (
+            f"targets={len(payloads)} operations=5 direct_run_refusals="
+            f"{direct_run_refusals}/5 immutable=true runtime_writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _hostile_compiler_refusal_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    refusals = 0
+    native = _balanced_native_scenario()
+    with TemporaryDirectory(prefix="kirby2-wo32c-hostile-") as temp:
+        fixture_root = Path(temp)
+
+        def source_refusal(
+            case_name: str,
+            sections: dict[str, tuple[ScenarioRecordV1, ...]],
+            *,
+            native_payload: object | None = None,
+            cli_seed_override: int | None = None,
+            target_registry: ScenarioTargetRegistry = DEFAULT_SCENARIO_TARGET_REGISTRY,
+        ) -> None:
+            nonlocal refusals
+            case_root = fixture_root / case_name
+            source_root = case_root / "source"
+            _write_document(
+                source_root / "main.toml",
+                _source_document_bytes(
+                    f"audit_compiler_{case_name}_v1",
+                    sections=sections,
+                ),
+            )
+            refusals += _record_read_only_refusal(
+                failures,
+                case_name.replace("_", " "),
+                case_root,
+                lambda: compile_scenario(
+                    source_root,
+                    "main.toml",
+                    native if native_payload is None else native_payload,
+                    cli_seed_override=cli_seed_override,
+                    target_registry=target_registry,
+                ),
+            )
+
+        source_refusal(
+            "unsafe_expression_record",
+            {
+                "flow_model": (
+                    _record("unsafe", record_type="PYTHON-EXPRESSION-V1"),
+                )
+            },
+        )
+        source_refusal(
+            "unsafe_python_field",
+            {
+                "flow_model": (
+                    _record(
+                        "unsafe",
+                        fields=(
+                            _field(
+                                "python_symbol",
+                                ScenarioValueKindV1.TEXT,
+                                "os.system",
+                            ),
+                        ),
+                    ),
+                )
+            },
+        )
+        source_refusal(
+            "unknown_reference",
+            {"flow_model": (_record("flow", reference="market:missing"),)},
+        )
+        source_refusal(
+            "reference_cycle",
+            {
+                "market_profile": (
+                    _record("first", reference="market:second"),
+                    _record("second", reference="market:first"),
+                )
+            },
+        )
+        source_refusal(
+            "multiple_seed_policies",
+            {
+                "seed_policy": (
+                    _seed_policy_record(),
+                    _seed_policy_record(logical_name="alternate_seed_policy"),
+                )
+            },
+        )
+        source_refusal(
+            "wrong_seed_value_tag",
+            {
+                "seed_policy": (
+                    _seed_policy_record(
+                        extra_fields=(
+                            _field("root_seed", ScenarioValueKindV1.COUNT, 7),
+                        ),
+                    ),
+                )
+            },
+        )
+        source_refusal(
+            "unsupported_seed_policy_version",
+            {
+                "seed_policy": (
+                    _seed_policy_record(
+                        extra_fields=(
+                            _field(
+                                "policy_version",
+                                ScenarioValueKindV1.VERSION,
+                                2,
+                            ),
+                        ),
+                    ),
+                )
+            },
+        )
+        source_refusal(
+            "denied_cli_seed_override",
+            {},
+            cli_seed_override=9,
+        )
+        source_refusal(
+            "boolean_cli_seed_override",
+            {
+                "seed_policy": (
+                    _seed_policy_record(
+                        allow_override=True,
+                    ),
+                )
+            },
+            cli_seed_override=True,
+        )
+        from kirby2.audit.full_day import _sample_plan
+
+        source_refusal(
+            "wrong_native_payload_type",
+            {},
+            native_payload=_sample_plan(),
+        )
+        source_refusal(
+            "incomplete_target_registry",
+            {},
+            target_registry=ScenarioTargetRegistry(),
+        )
+
+        valid_root, valid_pack, valid_unused = _write_compiler_fixture(
+            fixture_root / "artifact_tampering"
+        )
+        artifact = compile_scenario(
+            valid_root,
+            "main.toml",
+            _balanced_native_scenario(),
+            activated_pack_namespaces={
+                "audit_pack": valid_pack,
+                "unused_pack": valid_unused,
+            },
+        )
+
+        def tampered_artifact(
+            label: str,
+            mutator: Callable[[dict[str, object]], None],
+        ) -> None:
+            nonlocal refusals
+            payload = artifact.as_dict()
+            mutator(payload)
+            failure = _expect_refusal(
+                lambda: CompiledScenarioArtifactV1(
+                    canonical_semantic_plan_bytes(payload)
+                ),
+                label,
+            )
+            if failure is None:
+                refusals += 1
+            else:
+                failures.append(failure)
+
+        tampered_artifact(
+            "forged execution eligibility",
+            lambda payload: payload.__setitem__("execution_eligible", True),
+        )
+        tampered_artifact(
+            "forged compiled artifact digest",
+            lambda payload: payload.__setitem__(
+                "compiled_artifact_digest",
+                "0" * 64,
+            ),
+        )
+        tampered_artifact(
+            "noncanonical native envelope",
+            lambda payload: payload.__setitem__(
+                "native_plan_envelope_json",
+                str(payload["native_plan_envelope_json"]) + " ",
+            ),
+        )
+        duplicate_key_raw = b'{"schema_version":1,' + artifact.canonical_bytes()[1:]
+        failure = _expect_refusal(
+            lambda: CompiledScenarioArtifactV1(duplicate_key_raw),
+            "duplicate artifact JSON key",
+        )
+        if failure is None:
+            refusals += 1
+        else:
+            failures.append(failure)
+
+    if refusals != WO32C_COMPILER_REFUSAL_COUNT:
+        failures.append("hostile compiler refusal inventory count changed")
+    return ScenarioLanguageAuditCase(
+        "scenario_compiler_hostile_refusals",
+        (
+            f"refused={refusals}/{WO32C_COMPILER_REFUSAL_COUNT} "
+            "expressions=false dynamic_python=false mutation=false early_run=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _write_compiler_fixture(
+    root: Path,
+    *,
+    allow_override: bool = False,
+    unrelated_id: str = "audit_unrelated_definition_v1",
+) -> tuple[Path, Path, Path]:
+    source_root = root / "source"
+    pack_root = root / "pack"
+    unused_pack = root / "unused_pack"
+    seed_records: tuple[ScenarioRecordV1, ...] = ()
+    if allow_override:
+        seed_records = (
+            _seed_policy_record(
+                allow_override=True,
+                extra_fields=(
+                    _field("root_seed", ScenarioValueKindV1.SEED, 17),
+                    _field(
+                        "substreams",
+                        ScenarioValueKindV1.IDENTIFIERS,
+                        (
+                            "scenario/market/analysis",
+                            "scenario/market/runtime",
+                        ),
+                    ),
+                ),
+            ),
+        )
+    _write_document(
+        source_root / "main.toml",
+        _source_document_bytes(
+            "audit_compiler_root_v1",
+            sections={
+                "market_profile": (
+                    _record(
+                        "derived_market",
+                        fields=(
+                            _field(
+                                "initial_mid",
+                                ScenarioValueKindV1.PRICE_TICKS,
+                                10_050,
+                            ),
+                        ),
+                        extends="market:base_market",
+                    ),
+                ),
+                "flow_model": (
+                    _record(
+                        "root_flow",
+                        fields=(
+                            _field(
+                                "message_rate",
+                                ScenarioValueKindV1.RATE_PER_SECOND,
+                                40,
+                            ),
+                        ),
+                        reference="market:derived_market",
+                    ),
+                ),
+                "seed_policy": seed_records,
+                "required_source_capabilities": (
+                    _record(
+                        "top_of_book_required",
+                        record_type="CAPABILITY_REQUIREMENT",
+                        fields=(
+                            _field(
+                                "capability",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "TOP_OF_BOOK_V1",
+                            ),
+                        ),
+                    ),
+                ),
+            },
+            imports=(ScenarioImportV1("base.toml", "audit_pack"),),
+        ),
+    )
+    _write_document(
+        pack_root / "base.toml",
+        _source_document_bytes(
+            "audit_compiler_base_v1",
+            sections={
+                "market_profile": (
+                    _record(
+                        "base_market",
+                        fields=(
+                            _field(
+                                "decision_interval",
+                                ScenarioValueKindV1.DURATION_MS,
+                                250,
+                            ),
+                            _field(
+                                "initial_mid",
+                                ScenarioValueKindV1.PRICE_TICKS,
+                                10_000,
+                            ),
+                        ),
+                    ),
+                )
+            },
+        ),
+    )
+    _write_document(
+        source_root / "unrelated.toml",
+        _source_document_bytes(
+            unrelated_id,
+            sections={
+                "market_profile": (_record("unrelated_market"),),
+            },
+        ),
+    )
+    unused_pack.mkdir(parents=True, exist_ok=True)
+    return source_root, pack_root, unused_pack
+
+
+def _seed_policy_record(
+    *,
+    logical_name: str = SCENARIO_SEED_POLICY_LOGICAL_NAME_V1,
+    allow_override: bool = False,
+    extra_fields: tuple[ScenarioFieldV1, ...] = (),
+) -> ScenarioRecordV1:
+    fields = (
+        _field(
+            "allow_cli_override",
+            ScenarioValueKindV1.FLAG,
+            allow_override,
+        ),
+        *extra_fields,
+    )
+    return _record(
+        logical_name,
+        record_type=SCENARIO_SEED_POLICY_RECORD_TYPE_V1,
+        fields=fields,
+    )
+
+
+def _balanced_native_scenario() -> object:
+    from kirby2.scenarios.market import load_scenario_definitions
+
+    return load_scenario_definitions()["balanced"]
+
+
+def _compiler_native_payloads() -> dict[ScenarioTargetKindV1, object]:
+    from kirby2.audit.full_day import _sample_plan
+    from kirby2.historical.lesson_catalog import load_historical_lessons
+    from kirby2.multivenue.replay import MultiVenueRecording
+    from kirby2.observability.replay import ObservabilityRecording
+
+    empty_digest = hashlib.sha256(b"{}").hexdigest()
+    return {
+        ScenarioTargetKindV1.FULL_DAY_PLAN_V1: _sample_plan(),
+        ScenarioTargetKindV1.MARKET_SCENARIO_V1: _balanced_native_scenario(),
+        ScenarioTargetKindV1.HIDDEN_LIQUIDITY_RECORDING_V1: ObservabilityRecording(
+            rules={},
+            commands=(),
+            completed_time_us=0,
+            expected_observable_feed={},
+            expected_ground_truth={},
+            expected_observable_sha256=empty_digest,
+            expected_truth_sha256=empty_digest,
+            expected_state_sha256="0" * 64,
+        ),
+        ScenarioTargetKindV1.MULTIVENUE_RECORDING_V1: MultiVenueRecording(
+            seed=1,
+            venue_configs=(),
+            depth_subscriptions=(),
+            commands=(),
+            completed_time_us=0,
+            route_ids=(),
+            expected_events=(),
+            expected_feed={},
+            expected_ground_truth={},
+            expected_scores={},
+            expected_state_sha256="0" * 64,
+        ),
+        ScenarioTargetKindV1.HISTORICAL_LESSON_V1: next(
+            iter(load_historical_lessons().values())
+        ),
+    }
+
+
+def _compiler_seed_policy_fixture():
+    from kirby2.scenario_lang.defaults import materialize_scenario_defaults
+    from kirby2.scenario_lang.seeds import build_compiled_seed_policy
+
+    return build_compiled_seed_policy(
+        materialize_scenario_defaults(_sample_source()).seed_policy_record
+    )
+
+
 def _write_valid_import_fixture(
     root: Path,
     *,
@@ -1536,13 +2309,14 @@ def _source_document_payload(
 def _record(
     logical_name: str,
     *,
+    record_type: str = "AUDIT_DEFINITION_V1",
     fields: tuple[ScenarioFieldV1, ...] = (),
     reference: str | None = None,
     extends: str | None = None,
 ) -> ScenarioRecordV1:
     return ScenarioRecordV1(
         logical_name=logical_name,
-        record_type="AUDIT_DEFINITION_V1",
+        record_type=record_type,
         version=1,
         fields=fields,
         reference=reference,
@@ -1617,7 +2391,9 @@ __all__ = [
     "WO32A_STRICT_REFUSAL_COUNT",
     "WO32B_DEFINITION_REFUSAL_COUNT",
     "WO32B_IMPORT_REFUSAL_COUNT",
+    "WO32C_COMPILER_REFUSAL_COUNT",
     "audit_scenario_language",
     "audit_wo32a_scenario_language",
     "audit_wo32b_scenario_language",
+    "audit_wo32c_scenario_language",
 ]

@@ -119,6 +119,7 @@ REGISTERABLE_GATE_IDS = (
     "WO31-I1",
     "WO32-A",
     "WO32-B",
+    "WO32-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -2233,6 +2234,66 @@ def _audit_wo32b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo32c() -> ExpansionGateReport:
+    """Run immutable compiler, target-registry, and seed-policy evidence."""
+
+    from kirby2.audit.scenario_language import (
+        WO32C_COMPILER_REFUSAL_COUNT,
+        audit_wo32c_scenario_language,
+    )
+    from kirby2.scenario_lang.models import (
+        SCENARIO_COMPILATION_PHASES_V1,
+        ScenarioTargetKindV1,
+    )
+
+    cases = audit_wo32c_scenario_language()
+    expected_names = (
+        "scenario_compiler_phase_and_artifact_inventory",
+        "scenario_compiler_determinism_and_ambient_independence",
+        "scenario_compiler_seed_override_and_substreams",
+        "scenario_target_registry_and_fail_closed_runtime",
+        "scenario_compiler_hostile_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO32-C cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO32-C compiler cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO32-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("compiler_phase_count", str(len(SCENARIO_COMPILATION_PHASES_V1))),
+            ("compiler_refusal_count", str(WO32C_COMPILER_REFUSAL_COUNT)),
+            ("execution_eligible", "false"),
+            ("target_kind_count", str(len(ScenarioTargetKindV1))),
+            ("validator_status", "NOT_IMPLEMENTED_UNTIL_WO32_D"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2431,6 +2492,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-I1", _audit_wo31i1),
     ("WO32-A", _audit_wo32a),
     ("WO32-B", _audit_wo32b),
+    ("WO32-C", _audit_wo32c),
 )
 
 
