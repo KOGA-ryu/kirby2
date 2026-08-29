@@ -114,6 +114,10 @@ class MinedCurriculumLineageV1:
 class CurriculumMode(str, Enum):
     LEARN = "LEARN"
     BLIND = "BLIND"
+    GUIDED = "GUIDED"
+    PRACTICE = "PRACTICE"
+    ASSESSMENT = "ASSESSMENT"
+    REMEDIATION = "REMEDIATION"
 
     @classmethod
     def parse(cls, value: str) -> CurriculumMode:
@@ -223,7 +227,7 @@ class CurriculumLesson:
         variation_seed: int,
     ) -> CurriculumDrill:
         if not isinstance(mode, CurriculumMode):
-            raise TypeError("curriculum mode must be LEARN or BLIND")
+            raise TypeError("curriculum mode is invalid")
         if type(variation_seed) is not int or variation_seed < 0:
             raise ValueError("variation seed must be a nonnegative integer")
         rng = SeededRng(variation_seed)
@@ -338,7 +342,7 @@ class CurriculumDrill:
         if len(self.lesson_id) != 2 or not self.lesson_id.isdigit():
             raise ValueError("curriculum drill lesson ID must contain two digits")
         if not isinstance(self.mode, CurriculumMode):
-            raise TypeError("curriculum drill mode must be LEARN or BLIND")
+            raise TypeError("curriculum drill mode is invalid")
         if any(
             not value
             for value in (
@@ -371,7 +375,12 @@ class CurriculumDrill:
 
     @property
     def live_scenario_label(self) -> str:
-        if self.mode is CurriculumMode.LEARN:
+        if self.mode in {
+            CurriculumMode.LEARN,
+            CurriculumMode.GUIDED,
+            CurriculumMode.PRACTICE,
+            CurriculumMode.REMEDIATION,
+        }:
             return f"lesson_{self.lesson_id}"
         return "blind_drill"
 
@@ -384,12 +393,71 @@ class CurriculumDrill:
         return "HIDDEN"
 
     def render_briefing(self) -> str:
+        # Keep the two legacy branches byte-for-byte compatible.  The adaptive
+        # modes are additive contracts and never reinterpret LEARN or BLIND.
         if self.mode is CurriculumMode.LEARN:
             drill = f"{self.lesson_id} {self.title}"
             learning = self.learning_objective
-        else:
+        elif self.mode is CurriculumMode.BLIND:
             drill = "BLIND DRILL"
             learning = "WITHHELD UNTIL COMPLETION"
+        elif self.mode is CurriculumMode.ASSESSMENT:
+            return "\n".join(
+                (
+                    "KIRBY2_CURRICULUM_BRIEFING",
+                    "MODE ASSESSMENT",
+                    "DRILL ASSESSMENT DRILL",
+                    "LEARNING_OBJECTIVE WITHHELD UNTIL ASSESSMENT CLOSURE",
+                    "PRIMARY_SKILL WITHHELD UNTIL ASSESSMENT CLOSURE",
+                    f"PLAYER_OBJECTIVE {self.player_objective.describe()}",
+                    f"VARIATION_ID {self.variation_id}",
+                    "ASSISTANCE RESTRICTED identity_hidden=true",
+                    "HIDDEN_CONFIGURATION concealed_until_completion=true",
+                )
+            )
+        elif self.mode is CurriculumMode.GUIDED:
+            return "\n".join(
+                (
+                    "KIRBY2_CURRICULUM_BRIEFING",
+                    "MODE GUIDED",
+                    f"DRILL {self.lesson_id} {self.title}",
+                    f"LEARNING_OBJECTIVE {self.learning_objective}",
+                    f"PRIMARY_SKILL {self.primary_skill_id}",
+                    f"PLAYER_OBJECTIVE {self.player_objective.describe()}",
+                    f"CONCEPT_EXPLANATION {self.post_session_explanation}",
+                    f"VARIATION_ID {self.variation_id}",
+                    "ASSISTANCE DECLARED concept_and_explanation_before_play=true",
+                    "HIDDEN_CONFIGURATION concealed_until_completion=true",
+                )
+            )
+        elif self.mode is CurriculumMode.PRACTICE:
+            return "\n".join(
+                (
+                    "KIRBY2_CURRICULUM_BRIEFING",
+                    "MODE PRACTICE",
+                    f"DRILL {self.lesson_id} {self.title}",
+                    f"LEARNING_OBJECTIVE {self.learning_objective}",
+                    f"PRIMARY_SKILL {self.primary_skill_id}",
+                    f"PLAYER_OBJECTIVE {self.player_objective.describe()}",
+                    f"VARIATION_ID {self.variation_id}",
+                    "ASSISTANCE FEEDBACK_AFTER_ATTEMPT",
+                    "HIDDEN_CONFIGURATION concealed_until_completion=true",
+                )
+            )
+        else:
+            return "\n".join(
+                (
+                    "KIRBY2_CURRICULUM_BRIEFING",
+                    "MODE REMEDIATION",
+                    f"DRILL {self.lesson_id} {self.title}",
+                    f"LEARNING_OBJECTIVE {self.learning_objective}",
+                    f"PRIMARY_SKILL {self.primary_skill_id}",
+                    f"PLAYER_OBJECTIVE {self.player_objective.describe()}",
+                    f"VARIATION_ID {self.variation_id}",
+                    "ASSISTANCE DIAGNOSED_ERROR_AND_PREREQUISITE_CONTEXT",
+                    "HIDDEN_CONFIGURATION concealed_until_completion=true",
+                )
+            )
         return "\n".join(
             (
                 "KIRBY2_CURRICULUM_BRIEFING",

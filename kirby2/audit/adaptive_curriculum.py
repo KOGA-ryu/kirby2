@@ -43,6 +43,19 @@ from kirby2.curriculum.evidence import (
 )
 from kirby2.curriculum.models import CurriculumDrill, CurriculumMode
 from kirby2.curriculum.learner import build_learner_projection_v1
+from kirby2.curriculum.adaptive_modes import (
+    ADAPTIVE_MODE_POLICIES_V1,
+    ASSESSMENT_BATCH_SIZE_V1,
+    AssessmentFreezeStatusV1,
+    freeze_assessment_v1,
+    reveal_closed_assessment_v1,
+    score_frozen_assessment_v1,
+)
+from kirby2.curriculum.plans import (
+    NOT_APPLICABLE_V1,
+    CurriculumPlanEntryV1,
+    CurriculumPlanV1,
+)
 from kirby2.curriculum.projections import (
     ASSESSMENT_BASE_WEIGHT_PPM_V1,
     GUIDED_BASE_WEIGHT_PPM_V1,
@@ -70,6 +83,21 @@ from kirby2.curriculum.skills import (
     SkillGraphV1,
     SkillPrerequisiteEdgeV1,
 )
+from kirby2.curriculum.selection import (
+    CURRICULUM_SELECTION_POLICY_SHA256_V1,
+    SELECTION_COMPONENT_WEIGHTS_PPM_V1,
+    SELECTION_COOLDOWN_WINDOWS_V1,
+    CandidateExclusionV1,
+    CurriculumCandidateCatalogV1,
+    CurriculumSelectionRequestV1,
+    CurriculumSelectionStatusV1,
+    ManualPlanStatusV1,
+    SelectionHistoryEntryV1,
+    SelectionSemanticValueV1,
+    build_legacy_candidate_catalog_v1,
+    projection_digest_v1,
+    select_curriculum_v1,
+)
 from kirby2.mining.models import canonical_json_bytes, sha256_json
 from kirby2.mining.skills import SKILL_REGISTRY_V1, STABLE_SKILL_IDS_V1
 
@@ -87,6 +115,10 @@ WO34B_SKILL_PROJECTION_COUNT = 23
 WO34B_AUDIT_CASE_COUNT = 5
 WO34B_PROJECTION_POLICY_SHA256 = (
     "8440d8cf51c69eb6cd287d9ec8c65715f4328e0854bfc3e3f3853c92f33f2550"
+)
+WO34C_AUDIT_CASE_COUNT = 6
+WO34C_SELECTION_POLICY_SHA256 = (
+    "47261cc202a532d8b01d9f1dbabddacd01fd7d0d60a26833ff7cb4e02cf0b8cf"
 )
 _DIGEST = "1" * 64
 
@@ -1466,6 +1498,743 @@ def audit_wo34b_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]
     )
 
 
+def _band_multiplier(band: ProjectionDiversityBandV1) -> int:
+    return {
+        ProjectionDiversityBandV1.LOW: 500_000,
+        ProjectionDiversityBandV1.NORMAL: 1_000_000,
+        ProjectionDiversityBandV1.HIGH: 2_000_000,
+    }[band]
+
+
+def _selection_history_sidecar(
+    assessment: AttemptAssessmentV1,
+    *,
+    candidate=None,
+) -> SelectionHistoryEntryV1:
+    ordinal = assessment.attempt_ordinal
+    return SelectionHistoryEntryV1(
+        assessment_id=assessment.assessment_id,
+        attempt_ordinal=ordinal,
+        lesson_digest=assessment.lesson_digest,
+        primary_skill_id=assessment.primary_skill_id,
+        parameter_digest=(
+            sha256_json({"selection_parameter": ordinal})
+            if candidate is None
+            else candidate.parameter_digest
+        ),
+        scenario_semantic_digest=(
+            assessment.observable_context.scenario_semantic_sha256
+        ),
+        scenario_seed=(
+            SelectionSemanticValueV1.concrete(str(34_000 + ordinal))
+            if candidate is None
+            else candidate.scenario_seed
+        ),
+        visible_queue_shape=(
+            SelectionSemanticValueV1.concrete(
+                sha256_json({"selection_queue_shape": ordinal})
+            )
+            if candidate is None
+            else candidate.visible_queue_shape
+        ),
+        symbol=(
+            SelectionSemanticValueV1.not_applicable()
+            if candidate is None
+            else candidate.symbol
+        ),
+        regime_parameter=(
+            SelectionSemanticValueV1.concrete(
+                sha256_json({"selection_regime": ordinal})
+            )
+            if candidate is None
+            else candidate.regime_parameter
+        ),
+        volume_band=projection_diversity_band_v1(
+            assessment.observable_context.volume_multiplier_ppm
+        ),
+        liquidity_band=projection_diversity_band_v1(
+            assessment.observable_context.liquidity_multiplier_ppm
+        ),
+        source_class=assessment.observable_context.source_class,
+    )
+
+
+def _selection_attempt_for_candidate(
+    candidate,
+    ordinal: int,
+    *,
+    learner_id: str,
+    score_ppm: int = 800_000,
+    error_types: tuple[LearnerErrorTypeV1, ...] = (),
+) -> AttemptAssessmentV1:
+    base = _projection_assessment(
+        ordinal,
+        learner_id=learner_id,
+        primary_skill_id=candidate.drill.primary_skill_id,
+        score_ppm=score_ppm,
+        mode=AttemptModeV1(candidate.drill.mode.value),
+        volume_multiplier_ppm=_band_multiplier(candidate.volume_band),
+        liquidity_multiplier_ppm=_band_multiplier(candidate.liquidity_band),
+        source_class=candidate.source_class,
+        error_types=error_types,
+    )
+    context = replace(
+        base.observable_context,
+        scenario_semantic_sha256=candidate.scenario_semantic_digest,
+    )
+    return replace(
+        base,
+        lesson_reference_id=candidate.candidate_id,
+        lesson_digest=candidate.lesson_digest,
+        observable_context=context,
+    )
+
+
+def _selection_modes_and_contract_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learn = prepare_lesson("01", CurriculumMode.LEARN, 42)
+    blind = prepare_lesson("01", CurriculumMode.BLIND, 42)
+    guided = prepare_lesson("01", CurriculumMode.GUIDED, 42)
+    practice = prepare_lesson("01", CurriculumMode.PRACTICE, 42)
+    assessment = prepare_lesson("01", CurriculumMode.ASSESSMENT, 42)
+    remediation = prepare_lesson("01", CurriculumMode.REMEDIATION, 42)
+    if (
+        CurriculumMode.parse("learn") is not CurriculumMode.LEARN
+        or CurriculumMode.parse("blind") is not CurriculumMode.BLIND
+        or CurriculumMode.parse("guided") is not CurriculumMode.GUIDED
+        or set(ADAPTIVE_MODE_POLICIES_V1)
+        != {
+            CurriculumMode.GUIDED,
+            CurriculumMode.PRACTICE,
+            CurriculumMode.ASSESSMENT,
+            CurriculumMode.REMEDIATION,
+        }
+    ):
+        failures.append("legacy or adaptive mode parsing differs")
+    learn_brief = learn.render_briefing()
+    blind_brief = blind.render_briefing()
+    if (
+        "MODE LEARN\nDRILL 01 Balanced book" not in learn_brief
+        or "PRIMARY_SKILL BOOK_READING" not in learn_brief
+        or "ASSISTANCE" in learn_brief
+        or "MODE BLIND\nDRILL BLIND DRILL" not in blind_brief
+        or "PRIMARY_SKILL WITHHELD UNTIL COMPLETION" not in blind_brief
+        or "Balanced book" in blind_brief
+        or "BOOK_READING" in blind_brief
+    ):
+        failures.append("legacy LEARN or BLIND briefing meaning changed")
+    if (
+        "CONCEPT_EXPLANATION" not in guided.render_briefing()
+        or "ASSISTANCE DECLARED" not in guided.render_briefing()
+        or "ASSISTANCE FEEDBACK_AFTER_ATTEMPT" not in practice.render_briefing()
+        or "CONCEPT_EXPLANATION" in practice.render_briefing()
+        or "Balanced book" in assessment.render_briefing()
+        or "BOOK_READING" in assessment.render_briefing()
+        or "ASSISTANCE RESTRICTED" not in assessment.render_briefing()
+        or "DIAGNOSED_ERROR_AND_PREREQUISITE_CONTEXT"
+        not in remediation.render_briefing()
+    ):
+        failures.append("adaptive modes are not behaviorally distinct or disclosure-safe")
+    if any(
+        CurriculumDrill.from_dict(item.as_dict()) != item
+        for item in (learn, blind, guided, practice, assessment, remediation)
+    ):
+        failures.append("curriculum mode roundtrip differs")
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.PRACTICE)
+    if (
+        CurriculumCandidateCatalogV1.from_json_bytes(catalog.canonical_bytes())
+        != catalog
+        or sum(SELECTION_COMPONENT_WEIGHTS_PPM_V1.values()) != POLICY_SCALE_V1
+        or dict(SELECTION_COOLDOWN_WINDOWS_V1)
+        != {
+            "lesson_digest": 5,
+            "parameter_digest": 4,
+            "scenario_seed": 4,
+            "visible_queue_shape": 3,
+            "symbol": 2,
+            "regime_parameter": 2,
+        }
+        or CURRICULUM_SELECTION_POLICY_SHA256_V1
+        != WO34C_SELECTION_POLICY_SHA256
+    ):
+        failures.append("selection policy, cooldowns, weights, or catalog bytes differ")
+    return AdaptiveCurriculumAuditCase(
+        "c_modes_policy_catalog_and_legacy_compatibility_are_fixed",
+        (
+            f"modes=6 adaptive_policies=4 candidates={len(catalog.candidates)} "
+            f"weights_ppm={sum(SELECTION_COMPONENT_WEIGHTS_PPM_V1.values())} "
+            f"policy_sha256={CURRICULUM_SELECTION_POLICY_SHA256_V1} "
+            "learn_blind_compatible=true assessment_identity_hidden=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _selection_cold_start_ranking_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    ledger = LearnerEvidenceLedgerV1("learner-selection-cold", ())
+    projection = build_learner_projection_v1(ledger, as_of_attempt_ordinal=0)
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.PRACTICE)
+    request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        1,
+        34_001,
+        CurriculumMode.PRACTICE,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        0,
+    )
+    first = select_curriculum_v1(request, projection, ledger, catalog)
+    second = select_curriculum_v1(request, projection, ledger, catalog)
+    expected_targets = tuple(
+        sorted(
+            {item.drill.primary_skill_id for item in catalog.candidates},
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    selected_eval = next(
+        item
+        for item in first.candidate_evaluations
+        if item.candidate_id == first.selected_candidate_id
+    )
+    if (
+        first.status is not CurriculumSelectionStatusV1.SELECTED
+        or not first.cold_start
+        or first.target_universe != expected_targets
+        or len(first.target_universe) != 10
+        or first.canonical_bytes() != second.canonical_bytes()
+        or type(first).from_json_bytes(first.canonical_bytes()) != first
+        or not _raises(
+            lambda: type(first).from_json_bytes(first.canonical_bytes() + b"\n")
+        )
+        or selected_eval.ranking is None
+        or selected_eval.ranking.weakness_ppm != 500_000
+        or selected_eval.ranking.uncertainty_ppm != POLICY_SCALE_V1
+        or selected_eval.ranking.recency_need_ppm != POLICY_SCALE_V1
+        or selected_eval.ranking.recent_variety_need_ppm != POLICY_SCALE_V1
+    ):
+        failures.append("cold-start universe, exact ranking, or replay differs")
+    absorption = tuple(
+        item
+        for item in first.candidate_evaluations
+        if item.primary_skill_id == "ABSORPTION_RECOGNITION"
+    )
+    if not absorption or any(item.eligible for item in absorption) or any(
+        CandidateExclusionV1.PREREQUISITE_NOT_READY not in item.exclusions
+        for item in absorption
+    ):
+        failures.append("cold start bypassed the TAPE_READING prerequisite")
+    changed_request = replace(request, root_seed=request.root_seed + 1)
+    changed = select_curriculum_v1(changed_request, projection, ledger, catalog)
+    common_id = first.ranking_order[0]
+    first_tie = next(
+        item.ranking.tie_digest
+        for item in first.candidate_evaluations
+        if item.candidate_id == common_id and item.ranking is not None
+    )
+    changed_tie = next(
+        item.ranking.tie_digest
+        for item in changed.candidate_evaluations
+        if item.candidate_id == common_id and item.ranking is not None
+    )
+    if first_tie == changed_tie or request.tie_context != (
+        f"WO34/PRACTICE/{request.projection_digest}/1"
+    ):
+        failures.append("selection root seed or exact tie context is inert")
+    guided_catalog = build_legacy_candidate_catalog_v1(CurriculumMode.GUIDED)
+    guided_request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        1,
+        34_001,
+        CurriculumMode.GUIDED,
+        guided_catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        0,
+    )
+    guided_record = select_curriculum_v1(
+        guided_request,
+        projection,
+        ledger,
+        guided_catalog,
+    )
+    if guided_record.selected_skill_id != "AGGRESSIVE_ENTRY" or any(
+        item.primary_skill_id != "AGGRESSIVE_ENTRY"
+        for item in guided_record.candidate_evaluations
+        if item.eligible
+    ):
+        failures.append("guided cold-start skill ordering differs")
+    return AdaptiveCurriculumAuditCase(
+        "c_cold_start_ranking_prerequisites_and_seeded_ties_are_exact",
+        (
+            f"targets={len(first.target_universe)}/10 "
+            f"eligible={len(first.eligible_candidate_ids)} "
+            f"selected_skill={first.selected_skill_id} "
+            f"guided_skill={guided_record.selected_skill_id} "
+            "weakness_ppm=500000 uncertainty_ppm=1000000 "
+            f"tie_context={request.tie_context}"
+        ),
+        tuple(failures),
+    )
+
+
+def _selection_prerequisite_and_cooldown_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learner_id = "learner-selection-prerequisite"
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.PRACTICE)
+    target = next(
+        item
+        for item in catalog.candidates
+        if item.drill.primary_skill_id == "ABSORPTION_RECOGNITION"
+        and item.drill.lesson_id == "07"
+    )
+    assessments: list[AttemptAssessmentV1] = []
+    for ordinal in range(1, 9):
+        source = (
+            EvidenceSourceClassV1.SYNTHETIC
+            if ordinal % 2
+            else EvidenceSourceClassV1.HISTORICAL_OR_RECONSTRUCTION
+        )
+        assessment = _projection_assessment(
+            ordinal,
+            learner_id=learner_id,
+            primary_skill_id="TAPE_READING",
+            score_ppm=900_000,
+            scenario_index=34_100 + ordinal,
+            volume_multiplier_ppm=(500_000, 1_000_000, 2_000_000)[
+                (ordinal - 1) % 3
+            ],
+            liquidity_multiplier_ppm=(500_000, 1_000_000, 2_000_000)[
+                (ordinal + 1) % 3
+            ],
+            source_class=source,
+        )
+        if ordinal == 8:
+            assessment = replace(
+                assessment,
+                lesson_reference_id=target.candidate_id,
+                lesson_digest=target.lesson_digest,
+                observable_context=replace(
+                    assessment.observable_context,
+                    scenario_semantic_sha256=target.scenario_semantic_digest,
+                    volume_multiplier_ppm=_band_multiplier(target.volume_band),
+                    liquidity_multiplier_ppm=_band_multiplier(target.liquidity_band),
+                    source_class=target.source_class,
+                ),
+            )
+        assessments.append(assessment)
+    ledger = LearnerEvidenceLedgerV1(learner_id, tuple(assessments))
+    projection = build_learner_projection_v1(ledger, as_of_attempt_ordinal=8)
+    history = tuple(
+        _selection_history_sidecar(
+            assessment,
+            candidate=(target if assessment.attempt_ordinal == 8 else None),
+        )
+        for assessment in assessments
+    )
+    request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        2,
+        34_002,
+        CurriculumMode.PRACTICE,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        8,
+    )
+    record = select_curriculum_v1(
+        request,
+        projection,
+        ledger,
+        catalog,
+        history,
+    )
+    tape = projection.skill("TAPE_READING")
+    target_eval = next(
+        item for item in record.candidate_evaluations if item.candidate_id == target.candidate_id
+    )
+    expected_cooldowns = {
+        "lesson_digest",
+        "parameter_digest",
+        "regime_parameter",
+        "scenario_seed",
+        "visible_queue_shape",
+    }
+    if (
+        tape.sufficiency is not ProjectionSufficiencyV1.SUFFICIENT
+        or tape.mastery_ppm < 650_000
+        or tape.confidence_ppm < 500_000
+        or not target_eval.prerequisite_checks
+        or not all(item.ready for item in target_eval.prerequisite_checks)
+        or set(target_eval.cooldown_matches) != expected_cooldowns
+        or CandidateExclusionV1.COOLDOWN_SYMBOL in target_eval.exclusions
+    ):
+        failures.append("prerequisite readiness, cooldown windows, or NA semantics differ")
+    if not any(
+        item.eligible and item.primary_skill_id == "ABSORPTION_RECOGNITION"
+        for item in record.candidate_evaluations
+    ):
+        failures.append("ready prerequisite did not admit another absorption drill")
+    single_catalog = CurriculumCandidateCatalogV1(CurriculumMode.PRACTICE, (target,))
+    single_request = replace(request, catalog_digest=single_catalog.catalog_digest)
+    exhausted = select_curriculum_v1(
+        single_request,
+        projection,
+        ledger,
+        single_catalog,
+        history,
+    )
+    if exhausted.status is not CurriculumSelectionStatusV1.NO_ELIGIBLE_DRILL:
+        failures.append("empty cooldown eligibility was relaxed")
+    missing = replace(
+        target,
+        visible_queue_shape=SelectionSemanticValueV1.missing(),
+    )
+    missing_catalog = CurriculumCandidateCatalogV1(CurriculumMode.PRACTICE, (missing,))
+    missing_request = replace(request, catalog_digest=missing_catalog.catalog_digest)
+    missing_record = select_curriculum_v1(
+        missing_request,
+        projection,
+        ledger,
+        missing_catalog,
+        history,
+    )
+    if CandidateExclusionV1.REQUIRED_METADATA_MISSING not in (
+        missing_record.candidate_evaluations[0].exclusions
+    ):
+        failures.append("missing required semantic metadata remained eligible")
+    return AdaptiveCurriculumAuditCase(
+        "c_prerequisite_readiness_cooldowns_and_missing_metadata_fail_closed",
+        (
+            f"tape_mastery_ppm={tape.mastery_ppm} "
+            f"tape_confidence_ppm={tape.confidence_ppm} "
+            f"cooldown_matches={','.join(target_eval.cooldown_matches)} "
+            "not_applicable_symbol_match=false no_relaxation=true "
+            "missing_metadata_eligible=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _selection_manual_plan_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learner_id = "learner-selection-plan"
+    ledger = LearnerEvidenceLedgerV1(learner_id, ())
+    projection = build_learner_projection_v1(ledger, as_of_attempt_ordinal=0)
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.PRACTICE)
+    chosen = next(item for item in catalog.candidates if item.drill.lesson_id == "14")
+    plan = CurriculumPlanV1(
+        "manual-plan-scope-a",
+        learner_id,
+        1,
+        1,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        (CurriculumPlanEntryV1(1, chosen.lesson_digest, CurriculumMode.PRACTICE),),
+    )
+    request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        1,
+        34_003,
+        CurriculumMode.PRACTICE,
+        catalog.catalog_digest,
+        plan.plan_digest,
+        0,
+    )
+    selected = select_curriculum_v1(
+        request,
+        projection,
+        ledger,
+        catalog,
+        plans=(plan,),
+    )
+    if (
+        selected.status is not CurriculumSelectionStatusV1.SELECTED
+        or selected.manual_plan.status is not ManualPlanStatusV1.APPLIED
+        or catalog.candidate(selected.selected_candidate_id).lesson_digest
+        != chosen.lesson_digest
+        or CurriculumPlanV1.from_json_bytes(plan.canonical_bytes()) != plan
+        or not _raises(lambda: setattr(plan, "learner_id", "mutated"))
+    ):
+        failures.append("valid immutable manual plan did not take exact precedence")
+    locked = next(
+        item
+        for item in catalog.candidates
+        if item.drill.primary_skill_id == "ABSORPTION_RECOGNITION"
+    )
+    invalid_plan = CurriculumPlanV1(
+        "manual-plan-scope-locked",
+        learner_id,
+        1,
+        1,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        (CurriculumPlanEntryV1(1, locked.lesson_digest, CurriculumMode.PRACTICE),),
+    )
+    invalid_request = replace(
+        request,
+        plan_assignment_digest=invalid_plan.plan_digest,
+    )
+    refused = select_curriculum_v1(
+        invalid_request,
+        projection,
+        ledger,
+        catalog,
+        plans=(invalid_plan,),
+    )
+    if (
+        refused.status is not CurriculumSelectionStatusV1.MANUAL_PLAN_REFUSED
+        or refused.reason != "PLANNED_LESSON_INELIGIBLE_OR_EXHAUSTED"
+        or refused.selected_candidate_id is not None
+    ):
+        failures.append("ineligible plan silently fell back to adaptive ranking")
+    second_plan = CurriculumPlanV1(
+        "manual-plan-scope-b",
+        learner_id,
+        1,
+        1,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        (
+            CurriculumPlanEntryV1(
+                1,
+                next(item for item in catalog.candidates if item.drill.lesson_id == "10").lesson_digest,
+                CurriculumMode.PRACTICE,
+            ),
+        ),
+    )
+    conflict = select_curriculum_v1(
+        request,
+        projection,
+        ledger,
+        catalog,
+        plans=(plan, second_plan),
+    )
+    if (
+        conflict.status is not CurriculumSelectionStatusV1.MANUAL_PLAN_REFUSED
+        or conflict.reason != "MULTIPLE_APPLICABLE_MANUAL_PLANS"
+        or len(conflict.manual_plan.plan_digests) != 2
+    ):
+        failures.append("multiple applicable plans did not refuse selection")
+    return AdaptiveCurriculumAuditCase(
+        "c_manual_plan_precedence_immutability_and_refusals_are_explicit",
+        (
+            f"plan_digest={plan.plan_digest} applied=true "
+            f"selected_lesson={catalog.candidate(selected.selected_candidate_id).drill.lesson_id} "
+            "ineligible_fallback=false conflict_refused=true canonical_roundtrip=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _selection_remediation_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learner_id = "learner-selection-remediation"
+    assessment = _projection_assessment(
+        1,
+        learner_id=learner_id,
+        primary_skill_id="BOOK_READING",
+        mode=AttemptModeV1.PRACTICE,
+        error_types=(
+            LearnerErrorTypeV1.WAITED_PAST_USEFUL_LIQUIDITY,
+            LearnerErrorTypeV1.OVERSIZED_RELATIVE_TO_LIQUIDITY,
+        ),
+    )
+    ledger = LearnerEvidenceLedgerV1(learner_id, (assessment,))
+    projection = build_learner_projection_v1(ledger, as_of_attempt_ordinal=1)
+    history = (_selection_history_sidecar(assessment),)
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.REMEDIATION)
+    request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        1,
+        34_004,
+        CurriculumMode.REMEDIATION,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        1,
+    )
+    record = select_curriculum_v1(
+        request,
+        projection,
+        ledger,
+        catalog,
+        history,
+    )
+    if (
+        record.status is not CurriculumSelectionStatusV1.SELECTED
+        or record.selected_skill_id != "POSITION_MANAGEMENT"
+        or any(
+            item.primary_skill_id != "POSITION_MANAGEMENT"
+            for item in record.candidate_evaluations
+            if item.eligible
+        )
+    ):
+        failures.append("remediation did not use newest-attempt fixed error priority")
+    empty_ledger = LearnerEvidenceLedgerV1("learner-remediation-empty", ())
+    empty_projection = build_learner_projection_v1(
+        empty_ledger,
+        as_of_attempt_ordinal=0,
+    )
+    empty_request = CurriculumSelectionRequestV1(
+        projection_digest_v1(empty_projection),
+        1,
+        34_004,
+        CurriculumMode.REMEDIATION,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        0,
+    )
+    empty = select_curriculum_v1(
+        empty_request,
+        empty_projection,
+        empty_ledger,
+        catalog,
+    )
+    if (
+        empty.status is not CurriculumSelectionStatusV1.NO_ELIGIBLE_DRILL
+        or empty.reason != "NO_REMEDIATION_ERROR_WITH_ELIGIBLE_DRILL"
+    ):
+        failures.append("remediation exhaustion did not return NO_ELIGIBLE_DRILL")
+    return AdaptiveCurriculumAuditCase(
+        "c_remediation_uses_latest_ten_fixed_error_priority_without_fallback",
+        (
+            "errors=OVERSIZED_RELATIVE_TO_LIQUIDITY,WAITED_PAST_USEFUL_LIQUIDITY "
+            f"selected_skill={record.selected_skill_id} latest_window=10 "
+            "unmapped_or_unavailable=SKIP exhaustion=NO_ELIGIBLE_DRILL"
+        ),
+        tuple(failures),
+    )
+
+
+def _selection_assessment_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learner_id = "learner-selection-assessment"
+    ledger = LearnerEvidenceLedgerV1(learner_id, ())
+    projection = build_learner_projection_v1(ledger, as_of_attempt_ordinal=0)
+    catalog = build_legacy_candidate_catalog_v1(CurriculumMode.ASSESSMENT)
+    request = CurriculumSelectionRequestV1(
+        projection_digest_v1(projection),
+        1,
+        34_005,
+        CurriculumMode.ASSESSMENT,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        0,
+    )
+    first = freeze_assessment_v1(request, projection, ledger, catalog)
+    second = freeze_assessment_v1(request, projection, ledger, catalog)
+    frozen = first.frozen_assessment
+    if (
+        first.status is not AssessmentFreezeStatusV1.FROZEN
+        or frozen is None
+        or second.frozen_assessment is None
+        or frozen.canonical_bytes() != second.frozen_assessment.canonical_bytes()
+        or type(frozen).from_json_bytes(frozen.canonical_bytes()) != frozen
+        or not _raises(
+            lambda: type(frozen).from_json_bytes(frozen.canonical_bytes() + b"\n")
+        )
+        or len(frozen.drills) != ASSESSMENT_BATCH_SIZE_V1
+        or len({item.primary_skill_id for item in frozen.drills[:4]}) != 4
+        or frozen.preassessment_ledger_digest != ledger.ledger_sha256
+    ):
+        failures.append("assessment bytes, seed, order, or first-four skill freeze differs")
+        return AdaptiveCurriculumAuditCase(
+            "c_assessment_freeze_scoring_anti_memorization_and_reveal_are_fixed",
+            "assessment_freeze_failed_before_scoring",
+            tuple(failures),
+        )
+    public_view = canonical_json_bytes(frozen.preclosure_view())
+    identities = {
+        item.primary_skill_id for item in frozen.drills
+    } | {
+        catalog.candidate(item.candidate_id).drill.title for item in frozen.drills
+    }
+    if any(identity.encode("ascii") in public_view for identity in identities):
+        failures.append("assessment preclosure view leaked lesson or detector identity")
+    attempts = tuple(
+        _selection_attempt_for_candidate(
+            catalog.candidate(item.candidate_id),
+            index,
+            learner_id=learner_id,
+            score_ppm=800_000,
+            error_types=(
+                (
+                    LearnerErrorTypeV1.FAILED_TO_COMPLETE_OBJECTIVE,
+                    LearnerErrorTypeV1.WRONG_HOTKEY,
+                )
+                if index == 1
+                else ()
+            ),
+        )
+        for index, item in enumerate(frozen.drills, start=1)
+    )
+    closure = score_frozen_assessment_v1(frozen, attempts)
+    reveal = reveal_closed_assessment_v1(frozen, closure, catalog)
+    if (
+        closure.score_ppm != 700_000
+        or closure.critical_error_record_count != 2
+        or closure.passed
+        or type(closure).from_json_bytes(closure.canonical_bytes()) != closure
+        or reveal["reveal_state"] != "REVEALED_AFTER_CLOSURE"
+        or len(reveal["drills"]) != 8
+    ):
+        failures.append("assessment post-cap average, critical-record count, or reveal differs")
+    repeated_lesson = catalog.candidate(frozen.drills[0].candidate_id).lesson_digest
+    plan_entries = tuple(
+        CurriculumPlanEntryV1(
+            ordinal,
+            repeated_lesson,
+            CurriculumMode.ASSESSMENT,
+        )
+        for ordinal in range(1, 9)
+    )
+    invalid_plan = CurriculumPlanV1(
+        "assessment-repeat-plan",
+        learner_id,
+        1,
+        8,
+        catalog.catalog_digest,
+        NOT_APPLICABLE_V1,
+        plan_entries,
+    )
+    planned_request = replace(
+        request,
+        plan_assignment_digest=invalid_plan.plan_digest,
+    )
+    planned = freeze_assessment_v1(
+        planned_request,
+        projection,
+        ledger,
+        catalog,
+        plans=(invalid_plan,),
+    )
+    if (
+        planned.status is not AssessmentFreezeStatusV1.REFUSED
+        or planned.reason != "MANUAL_PLAN_REFUSED_ASSESSMENT_LOCKS"
+    ):
+        failures.append("manual assessment plan bypassed anti-memorization locks")
+    return AdaptiveCurriculumAuditCase(
+        "c_assessment_freeze_scoring_anti_memorization_and_reveal_are_fixed",
+        (
+            f"batch={len(frozen.drills)}/8 distinct_first_four=4 "
+            f"freeze_sha256={frozen.assessment_digest} "
+            f"score_ppm={closure.score_ppm} critical_error_records=2 passed=false "
+            "identity_preclosure=HIDDEN reveal=AFTER_CLOSURE "
+            "manual_repeat_plan=REFUSED"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo34c_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]:
+    return (
+        _selection_modes_and_contract_case(),
+        _selection_cold_start_ranking_case(),
+        _selection_prerequisite_and_cooldown_case(),
+        _selection_manual_plan_case(),
+        _selection_remediation_case(),
+        _selection_assessment_case(),
+    )
+
+
 __all__ = [
     "WO34A_EDGE_COUNT",
     "WO34A_ERROR_COUNT",
@@ -1477,7 +2246,10 @@ __all__ = [
     "WO34B_AUDIT_CASE_COUNT",
     "WO34B_PROJECTION_POLICY_SHA256",
     "WO34B_SKILL_PROJECTION_COUNT",
+    "WO34C_AUDIT_CASE_COUNT",
+    "WO34C_SELECTION_POLICY_SHA256",
     "AdaptiveCurriculumAuditCase",
     "audit_wo34a_adaptive_curriculum",
     "audit_wo34b_adaptive_curriculum",
+    "audit_wo34c_adaptive_curriculum",
 ]

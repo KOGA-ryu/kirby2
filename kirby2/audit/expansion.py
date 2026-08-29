@@ -131,6 +131,7 @@ REGISTERABLE_GATE_IDS = (
     "WO33-E",
     "WO34-A",
     "WO34-B",
+    "WO34-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -2971,6 +2972,77 @@ def _audit_wo34b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo34c() -> ExpansionGateReport:
+    from kirby2.audit.adaptive_curriculum import (
+        WO34C_AUDIT_CASE_COUNT,
+        WO34C_SELECTION_POLICY_SHA256,
+        audit_wo34c_adaptive_curriculum,
+    )
+    from kirby2.curriculum.adaptive_modes import (
+        ASSESSMENT_BATCH_SIZE_V1,
+        ASSESSMENT_PASS_SCORE_PPM_V1,
+    )
+    from kirby2.curriculum.selection import (
+        CURRICULUM_SELECTION_MODEL_STATUS_V1,
+        CURRICULUM_SELECTION_POLICY_SHA256_V1,
+        SELECTION_COMPONENT_WEIGHTS_PPM_V1,
+        SELECTION_COOLDOWN_WINDOWS_V1,
+    )
+
+    cases = audit_wo34c_adaptive_curriculum()
+    expected_names = (
+        "c_modes_policy_catalog_and_legacy_compatibility_are_fixed",
+        "c_cold_start_ranking_prerequisites_and_seeded_ties_are_exact",
+        "c_prerequisite_readiness_cooldowns_and_missing_metadata_fail_closed",
+        "c_manual_plan_precedence_immutability_and_refusals_are_explicit",
+        "c_remediation_uses_latest_ten_fixed_error_priority_without_fallback",
+        "c_assessment_freeze_scoring_anti_memorization_and_reveal_are_fixed",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO34C_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO34-C cases differ from the fixed selection inventory")
+    if CURRICULUM_SELECTION_POLICY_SHA256_V1 != WO34C_SELECTION_POLICY_SHA256:
+        failures.append("WO34-C selection policy digest differs")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO34-C selection cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO34-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("assessment_batch_size", str(ASSESSMENT_BATCH_SIZE_V1)),
+            ("assessment_pass_score_ppm", str(ASSESSMENT_PASS_SCORE_PPM_V1)),
+            ("audit_case_count", str(WO34C_AUDIT_CASE_COUNT)),
+            ("cooldown_dimension_count", str(len(SELECTION_COOLDOWN_WINDOWS_V1))),
+            ("model_status", CURRICULUM_SELECTION_MODEL_STATUS_V1),
+            ("ranking_component_count", str(len(SELECTION_COMPONENT_WEIGHTS_PPM_V1))),
+            ("selection_policy_sha256", WO34C_SELECTION_POLICY_SHA256),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3181,6 +3253,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO33-E", _audit_wo33e),
     ("WO34-A", _audit_wo34a),
     ("WO34-B", _audit_wo34b),
+    ("WO34-C", _audit_wo34c),
 )
 
 
