@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .models import TABLE_SCHEMA_VERSION, RunManifest
+from .models import TABLE_SCHEMA_VERSION, ArtifactType, RunManifest
 from .toml_codec import encode_payload
 
 
@@ -225,6 +225,21 @@ RUN_ARTIFACT_REGISTRY_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+FULL_DAY_QUALIFICATION_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.FULL_DAY_PROFILE_QUALIFICATION,
+        ArtifactType.FULL_DAY_QUALIFICATION_RUN_PROOFS,
+        ArtifactType.FULL_DAY_REVIEW_SOURCE,
+        ArtifactType.FULL_DAY_REVIEW_SELECTION,
+        ArtifactType.FULL_DAY_REVIEW_PACKET,
+        ArtifactType.FULL_DAY_PERFORMANCE_EVIDENCE,
+        ArtifactType.FULL_DAY_QUALIFICATION_LEDGER,
+        ArtifactType.FULL_DAY_REVEAL_TOKEN,
+        ArtifactType.FULL_DAY_REVIEWER_SIDECAR,
+    }
+)
+
+
 def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
     """Project typed immutable artifacts into the rebuildable research catalog."""
 
@@ -246,6 +261,18 @@ def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, .
             manifest.artifacts,
             key=lambda item: (item.artifact_type.value, item.name),
         )
+    ]
+
+
+def qualification_artifact_registry_rows(
+    manifests: list[RunManifest],
+) -> list[tuple[object, ...]]:
+    """Project only explicitly typed qualification artifacts, never filenames."""
+
+    return [
+        row
+        for row in artifact_registry_rows(manifests)
+        if ArtifactType(str(row[1])) in FULL_DAY_QUALIFICATION_ARTIFACT_TYPES
     ]
 
 

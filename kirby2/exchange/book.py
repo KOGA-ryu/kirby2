@@ -243,11 +243,17 @@ class OrderBook:
     def best_ask(self) -> int | None:
         return self._ask_prices[0] if self._ask_prices else None
 
-    def process(self, order: Order) -> tuple[SimulationEvent, ...]:
+    def process(
+        self, order: Order, *, validate: bool = True
+    ) -> tuple[SimulationEvent, ...]:
+        if type(validate) is not bool:
+            raise TypeError("order-book validation mode must be boolean")
         owned_order = self._clone_pristine_order(order)
-        return self._process_owned(owned_order)
+        return self._process_owned(owned_order, validate=validate)
 
-    def _process_owned(self, order: Order) -> tuple[SimulationEvent, ...]:
+    def _process_owned(
+        self, order: Order, *, validate: bool = True
+    ) -> tuple[SimulationEvent, ...]:
         event_start = len(self.journal.events)
         self._register(order)
         self._emit_submitted(order)
@@ -266,17 +272,28 @@ class OrderBook:
                     unfilled_quantity=cancelled,
                 )
 
-        assert_order_book_invariants(self)
+        if validate:
+            assert_order_book_invariants(self)
         return self.journal.events[event_start:]
 
-    def cancel(self, target_order_id: str, command_id: str) -> tuple[SimulationEvent, ...]:
-        return self.process(Order.cancel(command_id, target_order_id))
+    def cancel(
+        self,
+        target_order_id: str,
+        command_id: str,
+        *,
+        validate: bool = True,
+    ) -> tuple[SimulationEvent, ...]:
+        return self.process(
+            Order.cancel(command_id, target_order_id), validate=validate
+        )
 
     def replace(
         self,
         target_order_id: str,
         replacement: Order,
         command_id: str,
+        *,
+        validate: bool = True,
     ) -> tuple[SimulationEvent, ...]:
         owned_replacement = self._clone_pristine_order(replacement)
         if owned_replacement.order_type is not OrderType.LIMIT:
@@ -285,15 +302,16 @@ class OrderBook:
             raise ValueError(f"duplicate order ID: {owned_replacement.order_id}")
         event_start = len(self.journal.events)
         target_was_active = target_order_id in self._active_orders
-        self.cancel(target_order_id, command_id)
+        self.cancel(target_order_id, command_id, validate=validate)
         if target_was_active:
-            self._process_owned(owned_replacement)
+            self._process_owned(owned_replacement, validate=validate)
             self.journal.emit(
                 EventType.ORDER_REPLACED,
                 new_order_id=owned_replacement.order_id,
                 old_order_id=target_order_id,
             )
-            assert_order_book_invariants(self)
+            if validate:
+                assert_order_book_invariants(self)
         return self.journal.events[event_start:]
 
     def reduce_order(
@@ -301,6 +319,8 @@ class OrderBook:
         target_order_id: str,
         new_total_quantity: int,
         command_id: str,
+        *,
+        validate: bool = True,
     ) -> tuple[SimulationEvent, ...]:
         """Reduce live quantity in place while preserving FIFO position.
 
@@ -337,7 +357,8 @@ class OrderBook:
             remaining_quantity=target.remaining_quantity,
             resting_sequence=target.resting_sequence,
         )
-        assert_order_book_invariants(self)
+        if validate:
+            assert_order_book_invariants(self)
         return self.journal.events[event_start:]
 
     def assert_invariants(self) -> None:

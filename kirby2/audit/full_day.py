@@ -17624,7 +17624,146 @@ def audit_wo31h_profiles() -> tuple[FullDayAuditCase, ...]:
     )
 
 
-def audit_full_day() -> tuple[FullDayAuditCase, ...]:
+def audit_wo31i_qualification() -> tuple[FullDayAuditCase, ...]:
+    """Exercise frozen qualification machinery with disjoint development evidence."""
+
+    from pathlib import Path
+
+    from kirby2.full_day.qualification import (
+        probe_frozen_profile_workload_development,
+        run_qualification_development_fixture,
+    )
+
+    fixture = Path(
+        str(
+            files("kirby2.full_day").joinpath(
+                "fixtures/qualification_development.toml"
+            )
+        )
+    )
+    report = run_qualification_development_fixture(fixture)
+    execution_probe = probe_frozen_profile_workload_development()
+    case_statuses = {
+        case_id: (engineering, behavioral, automated)
+        for case_id, engineering, behavioral, automated in report.case_results
+    }
+    formula_failures: list[str] = []
+    required_cases = {
+        "quiet_pass",
+        "trend_pass",
+        "event_pass",
+        "disorderly_pass",
+        "behavior_warning",
+        "universal_failure",
+        "abort_in_denominator",
+        "insufficient_component",
+        "performance_warning",
+    }
+    if set(case_statuses) != required_cases:
+        formula_failures.append("development qualification case inventory differs")
+    if report.protected_seed_access != "ABSENT":
+        formula_failures.append("development qualification accessed protected seeds")
+    if (
+        execution_probe.get("status") != "PASS"
+        or execution_probe.get("protected_seed_access") != "ABSENT"
+        or execution_probe.get("base_plan_sha256")
+        != "24ebad3b86eebdd0db1ff8dea33fbf9f4d57ee92478354944de9c0e48fefb860"
+        or execution_probe.get("protected_seed_refusals") != 12
+    ):
+        formula_failures.append("frozen profile execution adapter probe failed")
+    formula_failures.extend(report.failures)
+    review_failures: list[str] = []
+    if (
+        report.review_selected_count != 12
+        or report.review_shortfall_count != 10
+        or report.review_not_applicable_count != 1
+    ):
+        review_failures.append("review selection count differs from toy event fixture")
+    performance_failures: list[str] = []
+    if dict(report.performance_branches) != {
+        "PASS": "PASS",
+        "WARNING": "WARNING",
+        "FAIL": "FAIL",
+        "UNSUPPORTED": "UNSUPPORTED",
+    }:
+        performance_failures.append("performance branch classification differs")
+    persistence_failures: list[str] = []
+    if report.verification_status != "PASS":
+        persistence_failures.append("immutable qualification verification failed")
+    if report.refusal_count < 7:
+        persistence_failures.append("qualification hostile refusal inventory is incomplete")
+    return (
+        FullDayAuditCase(
+            "full_day_qualification_formula_and_disposition",
+            (
+                f"cases={len(report.case_results)} protected_seed_access="
+                f"{report.protected_seed_access} executable_actions="
+                f"{execution_probe['action_count']} ordinary_trades="
+                f"{execution_probe['trade_count_at_first_market']} protected_seed_refusals="
+                f"{execution_probe['protected_seed_refusals']} "
+                "engineering_behavioral_statistical_"
+                "performance_automated_human_separate=true"
+            ),
+            tuple(dict.fromkeys(formula_failures)),
+        ),
+        FullDayAuditCase(
+            "full_day_review_selection_and_blinding",
+            (
+                f"selected={report.review_selected_count} shortfalls="
+                f"{report.review_shortfall_count} review_rng_separate=true "
+                "blind_fields_enforced=true reviewer_sidecar_only=true"
+            ),
+            tuple(review_failures),
+        ),
+        FullDayAuditCase(
+            "full_day_performance_platform_and_abort",
+            (
+                "branches="
+                + ",".join(
+                    f"{name}:{status}" for name, status in report.performance_branches
+                )
+                + " raw_operational_measurements_separate=true"
+            ),
+            tuple(performance_failures),
+        ),
+        FullDayAuditCase(
+            "full_day_qualification_persistence_and_refusals",
+            (
+                f"run_id={report.persistence_run_id} verification="
+                f"{report.verification_status} refusals={report.refusal_count} "
+                "reentry=VERIFY_ONLY activation=FSYNC_THEN_ATOMIC_RENAME"
+            ),
+            tuple(persistence_failures),
+        ),
+    )
+
+
+def audit_wo31i1_evidence(evidence_root) -> tuple[FullDayAuditCase, ...]:
+    """Read generic immutable I1 evidence without ever regenerating it."""
+
+    from kirby2.full_day.qualification import verify_qualification_evidence_root
+
+    report = verify_qualification_evidence_root(evidence_root)
+    if report is None:
+        return (
+            FullDayAuditCase(
+                "full_day_profile_qualification_evidence",
+                "immutable WO31-I1 evidence is absent; validator did not regenerate it",
+                (),
+                status_override="NOT_EXERCISED",
+                reason_code="QUALIFICATION_EVIDENCE_ABSENT",
+            ),
+        )
+    return (
+        FullDayAuditCase(
+            "full_day_profile_qualification_evidence",
+            f"run_id={report.run_id} verification={report.as_dict()['status']}",
+            report.failures,
+        ),
+    )
+
+
+def audit_full_day(qualification_evidence=None) -> tuple[FullDayAuditCase, ...]:
     """Run every implemented WO31 full-day gate without persistent output."""
 
     return (
@@ -17641,6 +17780,12 @@ def audit_full_day() -> tuple[FullDayAuditCase, ...]:
         *audit_wo31f_composition(),
         *audit_wo31g_storage(),
         *audit_wo31h_profiles(),
+        *audit_wo31i_qualification(),
+        *(
+            ()
+            if qualification_evidence is None
+            else audit_wo31i1_evidence(qualification_evidence)
+        ),
     )
 
 
@@ -17666,4 +17811,6 @@ __all__ = [
     "audit_wo31f_composition",
     "audit_wo31g_storage",
     "audit_wo31h_profiles",
+    "audit_wo31i1_evidence",
+    "audit_wo31i_qualification",
 ]

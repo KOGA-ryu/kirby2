@@ -39,6 +39,7 @@ from .tables import (
     attach_run_id,
     evidence_digest,
     read_parquet_table,
+    qualification_artifact_registry_rows,
     write_parquet_tables,
 )
 from .toml_codec import canonical_digest, canonical_toml, file_sha256, load_toml
@@ -341,6 +342,25 @@ class RunStore:
                 result_digest_match=report.replay_valid,
                 evidence_digest_match=report.summary_valid,
                 schema_versions_supported=report.canonical_payloads_valid,
+                run_identity_match=manifest.run_id == run_id,
+                failures=report.failures,
+            )
+        if manifest.run_type is RunType.FULL_DAY_QUALIFICATION:
+            from kirby2.full_day.qualification import QualificationEvidenceStore
+
+            report = QualificationEvidenceStore(self.root.resolve()).verify(run_id)
+            return VerificationReport(
+                run_id=run_id,
+                manifest_loaded=report.manifest_valid,
+                references_exist=report.artifact_inventory_valid,
+                artifact_digests_match=report.artifact_digests_valid,
+                artifact_row_counts_match=report.canonical_payloads_valid,
+                event_sequence_complete=report.replay_verification_valid,
+                replay_configuration_available=report.reveal_token_valid,
+                replay_passed=report.replay_verification_valid,
+                result_digest_match=report.result_digest_valid,
+                evidence_digest_match=report.evidence_digest_valid,
+                schema_versions_supported=report.schema_inventory_valid,
                 run_identity_match=manifest.run_id == run_id,
                 failures=report.failures,
             )
@@ -649,6 +669,16 @@ class RunStore:
                 ]
             )
         )
+        expected_qualification_artifacts = tuple(
+            qualification_artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -673,6 +703,14 @@ class RunStore:
                         "ORDER BY run_id, artifact_type, artifact_name"
                     ).fetchall()
                 )
+                actual_qualification_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM full_day_qualification_artifacts "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
@@ -681,6 +719,8 @@ class RunStore:
             actual == expected
             and actual_datasets == expected_datasets
             and actual_artifacts == expected_artifacts
+            and actual_qualification_artifacts
+            == expected_qualification_artifacts
         )
 
     @contextmanager
@@ -709,6 +749,33 @@ class RunStore:
                     "SELECT * FROM run_summary WHERE scenario_id = ? "
                     "ORDER BY creation_timestamp_utc, run_id",
                     [scenario_id],
+                )
+            columns = tuple(item[0] for item in cursor.description)
+            return tuple(
+                dict(zip(columns, row, strict=True)) for row in cursor.fetchall()
+            )
+        finally:
+            connection.close()
+
+    def query_qualification_artifacts(
+        self, run_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return only typed full-day qualification artifacts from the catalog."""
+
+        self._ensure_catalog()
+        duckdb = _duckdb()
+        connection = duckdb.connect(str(self.catalog_path), read_only=True)
+        try:
+            if run_id is None:
+                cursor = connection.execute(
+                    "SELECT * FROM full_day_qualification_artifacts "
+                    "ORDER BY run_id, artifact_type, artifact_name"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM full_day_qualification_artifacts "
+                    "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
+                    [run_id],
                 )
             columns = tuple(item[0] for item in cursor.description)
             return tuple(
@@ -766,6 +833,7 @@ def _duckdb():
 
 
 _CATALOG_VIEWS = (
+    "full_day_qualification_artifacts",
     "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
@@ -809,6 +877,23 @@ def _create_fact_views(connection, runs_directory: Path) -> None:
 
 
 def _create_summary_views(connection) -> None:
+    connection.execute(
+        """
+        CREATE VIEW full_day_qualification_artifacts AS
+        SELECT * FROM run_artifact_registry
+        WHERE artifact_type IN (
+            'FULL_DAY_PROFILE_QUALIFICATION',
+            'FULL_DAY_QUALIFICATION_RUN_PROOFS',
+            'FULL_DAY_REVIEW_SOURCE',
+            'FULL_DAY_REVIEW_SELECTION',
+            'FULL_DAY_REVIEW_PACKET',
+            'FULL_DAY_PERFORMANCE_EVIDENCE',
+            'FULL_DAY_QUALIFICATION_LEDGER',
+            'FULL_DAY_REVEAL_TOKEN',
+            'FULL_DAY_REVIEWER_SIDECAR'
+        )
+        """
+    )
     connection.execute(
         """
         CREATE VIEW dataset_provenance AS

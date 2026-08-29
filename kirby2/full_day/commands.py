@@ -175,10 +175,55 @@ def _handle_demo(args: argparse.Namespace) -> int:
     return 0
 
 
-def _handle_audit(_args: argparse.Namespace) -> int:
+def _configure_qualification_dev(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--fixture", required=True, type=Path)
+
+
+def _handle_qualification_dev(args: argparse.Namespace) -> int:
+    from .qualification import run_qualification_development_fixture
+
+    report = run_qualification_development_fixture(args.fixture.resolve(strict=True))
+    _print(report.as_dict())
+    return 0 if report.passed else 1
+
+
+def _configure_qualify_profiles(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--evidence-root", required=True, type=Path)
+
+
+def _handle_qualify_profiles(args: argparse.Namespace) -> int:
+    from .qualification import qualify_day_profiles_once
+
+    repository = Path(__file__).resolve().parents[2]
+    run_id, report = qualify_day_profiles_once(
+        repository=repository,
+        manifest_path=args.manifest,
+        evidence_root=args.evidence_root,
+    )
+    _print(
+        {
+            "mode": "VERIFIED_IMMUTABLE_EVIDENCE" if report.passed else "FAILED",
+            "run_id": run_id,
+            "verification": report.as_dict(),
+        }
+    )
+    return 0 if report.passed else 1
+
+
+def _configure_audit(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--qualification-evidence", type=Path)
+
+
+def _handle_audit(args: argparse.Namespace) -> int:
     from kirby2.audit.full_day import audit_full_day
 
-    cases = audit_full_day()
+    evidence = (
+        None
+        if args.qualification_evidence is None
+        else args.qualification_evidence
+    )
+    cases = audit_full_day(evidence)
     failures = tuple(
         f"{case.name}: {failure}" for case in cases for failure in case.failures
     )
@@ -188,6 +233,16 @@ def _handle_audit(_args: argparse.Namespace) -> int:
         f"AUDIT_FULL_DAY {'FAIL' if failures else 'PASS'} "
         f"cases={len(cases)} failures={len(failures)}"
     )
+    if (
+        evidence is not None
+        and not failures
+        and any(
+            case.name == "full_day_profile_qualification_evidence"
+            and case.status == "NOT_EXERCISED"
+            for case in cases
+        )
+    ):
+        return 2
     return 1 if failures else 0
 
 
@@ -230,10 +285,25 @@ FULL_DAY_COMMAND_MODULE = CommandModule(
             configure=_configure_demo,
         ),
         CommandSpec(
+            command_id="FULL_DAY_QUALIFICATION_DEV_DEMO",
+            name="full-day-qualification-dev-demo",
+            help="exercise frozen qualification machinery with disjoint toy evidence",
+            handler=_handle_qualification_dev,
+            configure=_configure_qualification_dev,
+        ),
+        CommandSpec(
+            command_id="QUALIFY_DAY_PROFILES_DEMO",
+            name="qualify-day-profiles-demo",
+            help="execute or verify the exact one-time preregistered profile qualification",
+            handler=_handle_qualify_profiles,
+            configure=_configure_qualify_profiles,
+        ),
+        CommandSpec(
             command_id="AUDIT_FULL_DAY",
             name="audit-full-day",
             help="run the complete non-persisting full-day audit",
             handler=_handle_audit,
+            configure=_configure_audit,
         ),
     ),
 )

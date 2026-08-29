@@ -556,13 +556,23 @@ class AgentScheduler:
             "truth_events": [item.as_dict() for item in self._truth_events],
         }
 
-    def checkpoint_state(self) -> dict[str, object]:
+    def checkpoint_state(
+        self, *, _prevalidated_engine_state_sha256: str | None = None
+    ) -> dict[str, object]:
         """Return detached, strict state for dependency-ordered fresh restore."""
 
         from kirby2.full_day.models import validate_strict_json
 
         self._assert_owned_invariants()
-        engine_state_sha256 = _engine_checkpoint_sha256(self.engine)
+        engine_state_sha256 = _prevalidated_engine_state_sha256
+        if engine_state_sha256 is None:
+            engine_state_sha256 = _engine_checkpoint_sha256(self.engine)
+        elif (
+            type(engine_state_sha256) is not str
+            or len(engine_state_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in engine_state_sha256)
+        ):
+            raise ValueError("prevalidated engine checkpoint digest is malformed")
         payload = {
             "component_id": self.COMPONENT_ID,
             "definition": self.definition.identity_dict(),
@@ -593,6 +603,7 @@ class AgentScheduler:
         engine: MarketMechanicsEngine,
         clock: SimulationClock | None = None,
         order_id_allocator: Callable[[], str] | None = None,
+        _prevalidated_engine_state_sha256: str | None = None,
     ) -> AgentScheduler:
         from kirby2.full_day.models import canonical_json_bytes, validate_strict_json
 
@@ -625,7 +636,16 @@ class AgentScheduler:
             raise ValueError("agent scheduler definition is not canonical")
         if payload["definition_sha256"] != definition.sha256():
             raise ValueError("agent scheduler definition digest does not match")
-        if payload["engine_state_sha256"] != _engine_checkpoint_sha256(engine):
+        engine_state_sha256 = _prevalidated_engine_state_sha256
+        if engine_state_sha256 is None:
+            engine_state_sha256 = _engine_checkpoint_sha256(engine)
+        elif (
+            type(engine_state_sha256) is not str
+            or len(engine_state_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in engine_state_sha256)
+        ):
+            raise ValueError("prevalidated engine checkpoint digest is malformed")
+        if payload["engine_state_sha256"] != engine_state_sha256:
             raise ValueError("agent scheduler checkpoint targets a different engine state")
         seed = payload["seed"]
         if type(seed) is not int or seed < 0:
@@ -1511,6 +1531,7 @@ class AgentScheduler:
                 "external mechanics synchronization requires an injected scheduler"
             )
         self._capture_public_changes(before_book)
+        self._reconcile_agents()
         self._assert_owned_invariants()
 
     def _aggregated_book(self) -> dict[str, list[dict[str, int]]]:

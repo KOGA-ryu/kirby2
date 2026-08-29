@@ -115,6 +115,8 @@ REGISTERABLE_GATE_IDS = (
     "WO31-F",
     "WO31-G",
     "WO31-H",
+    "WO31-I",
+    "WO31-I1",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -1991,9 +1993,7 @@ def _audit_wo31h() -> ExpansionGateReport:
             )
         )
         failures.extend(f"{case.name}: {failure}" for failure in case.failures)
-        failures.extend(
-            f"{case.name}: {failure}" for failure in wrapper_failures
-        )
+        failures.extend(f"{case.name}: {failure}" for failure in wrapper_failures)
     bundle = load_full_day_profile_bundle()
     return ExpansionGateReport(
         card_id="WO31-H",
@@ -2009,6 +2009,108 @@ def _audit_wo31h() -> ExpansionGateReport:
             ("performance", "NOT_EXERCISED"),
             ("qualification", "NOT_EXERCISED"),
             ("review_selection", "NOT_EXERCISED"),
+        ),
+    )
+
+
+def _audit_wo31i() -> ExpansionGateReport:
+    """Exercise only disjoint development qualification evidence."""
+
+    from kirby2.audit.full_day import audit_wo31i_qualification
+
+    cases = audit_wo31i_qualification()
+    expected_names = (
+        "full_day_qualification_formula_and_disposition",
+        "full_day_review_selection_and_blinding",
+        "full_day_performance_platform_and_abort",
+        "full_day_qualification_persistence_and_refusals",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO31-I cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO31-I cases must all be required")
+        if case.status_override is not None:
+            wrapper_failures.append("WO31-I cases must report ordinary PASS/FAIL status")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(f"{case.name}: {failure}" for failure in wrapper_failures)
+    return ExpansionGateReport(
+        card_id="WO31-I",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("development_fixture", "DISJOINT_DEVELOPMENT_ONLY"),
+            ("human_acceptance", "PENDING"),
+            ("protected_seed_access", "ABSENT"),
+            ("real_execution_guard", "EXACT_CLEAN_COMMITTED_WO31_I_HEAD"),
+            ("reentry", "VERIFY_ONLY_NEVER_RERUN"),
+        ),
+    )
+
+
+def _audit_wo31i1() -> ExpansionGateReport:
+    """Read the governed evidence root; never invoke qualification generation."""
+
+    from kirby2.full_day.qualification import verify_qualification_evidence_root
+
+    repository = Path(__file__).resolve().parents[2]
+    evidence_root = repository / ".kirby2" / "full_day" / "qualification"
+    report = verify_qualification_evidence_root(evidence_root)
+    if report is None:
+        return ExpansionGateReport(
+            card_id="WO31-I1",
+            status=ExpansionGateStatus.NOT_EXERCISED,
+            checks=(
+                ExpansionGateCheck(
+                    code="full_day_profile_qualification_evidence",
+                    status=ExpansionGateStatus.NOT_EXERCISED,
+                    detail="immutable qualification evidence is absent; no workload was regenerated",
+                    required=True,
+                ),
+            ),
+            reason_code="QUALIFICATION_EVIDENCE_ABSENT",
+            metadata=(
+                ("evidence_root", ".kirby2/full_day/qualification"),
+                ("generation_authority", "ABSENT_FROM_VALIDATOR"),
+                ("human_acceptance", "PENDING"),
+            ),
+        )
+    failures = report.failures
+    return ExpansionGateReport(
+        card_id="WO31-I1",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=(
+            ExpansionGateCheck(
+                code="full_day_profile_qualification_evidence",
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failures
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=f"immutable evidence run_id={report.run_id} status={report.as_dict()['status']}",
+                required=True,
+            ),
+        ),
+        failures=failures,
+        metadata=(
+            ("evidence_root", ".kirby2/full_day/qualification"),
+            ("generation_authority", "ABSENT_FROM_VALIDATOR"),
+            ("human_acceptance", "PENDING"),
         ),
     )
 
@@ -2207,6 +2309,8 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO31-F", _audit_wo31f),
     ("WO31-G", _audit_wo31g),
     ("WO31-H", _audit_wo31h),
+    ("WO31-I", _audit_wo31i),
+    ("WO31-I1", _audit_wo31i1),
 )
 
 

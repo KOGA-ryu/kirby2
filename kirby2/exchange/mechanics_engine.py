@@ -398,7 +398,7 @@ class MarketMechanicsEngine:
                 self._schedule_index += 1
             self._expire_good_until(next_time)
         self.clock.advance_to(simulation_time_us)
-        self.assert_invariants()
+        self._assert_after_operation()
 
     def transition_session(self, state: SessionState, *, reason: str) -> None:
         if not isinstance(state, SessionState):
@@ -443,7 +443,7 @@ class MarketMechanicsEngine:
             SessionState.REOPENING_AUCTION,
         } and state is SessionState.CONTINUOUS:
             self._emit(MechanicsEventType.RESUME, reason=reason)
-        self.assert_invariants()
+        self._assert_after_operation()
 
     def submit(self, request: AdvancedOrderRequest) -> ManagedOrder | None:
         if request.order_id in self._orders or request.order_id in self.book.all_orders:
@@ -469,7 +469,7 @@ class MarketMechanicsEngine:
                 request=request.as_dict(),
             )
             self._emit_auction_indication("ORDER_ADDED")
-            self.assert_invariants()
+            self._assert_after_operation()
             return managed
         stp_rejection = self._apply_continuous_stp(managed)
         if stp_rejection is not None:
@@ -498,7 +498,7 @@ class MarketMechanicsEngine:
         if self._volatility_interruption(managed, makers):
             return managed
         self._process_continuous(managed)
-        self.assert_invariants()
+        self._assert_after_operation()
         return managed
 
     def cancel(self, order_id: str, *, reason: str = "USER_CANCEL") -> bool:
@@ -521,7 +521,11 @@ class MarketMechanicsEngine:
             self._emit_auction_indication("ORDER_CANCELLED")
         else:
             command_id = self._next_command_id("MECH-CANCEL")
-            self.book.cancel(order_id, command_id)
+            self.book.cancel(
+                order_id,
+                command_id,
+                validate=not self._validating_outer_replay,
+            )
             self._sync_continuous_orders()
             self._emit(
                 MechanicsEventType.ORDER_CANCELLED,
@@ -530,7 +534,7 @@ class MarketMechanicsEngine:
                 order_id=order_id,
                 reason=reason,
             )
-        self.assert_invariants()
+        self._assert_after_operation()
         return True
 
     def replace_order(
@@ -595,7 +599,12 @@ class MarketMechanicsEngine:
         if preserves:
             command_id = self._next_command_id("MECH-REDUCE")
             previous_sequence = core.resting_sequence
-            self.book.reduce_order(order_id, new_quantity, command_id)
+            self.book.reduce_order(
+                order_id,
+                new_quantity,
+                command_id,
+                validate=not self._validating_outer_replay,
+            )
             self._sync_continuous_orders()
             self._emit(
                 MechanicsEventType.PRIORITY_PRESERVED,
@@ -612,7 +621,7 @@ class MarketMechanicsEngine:
                 priority_preserved=True,
                 replacement_request_id=new_order_id,
             )
-            self.assert_invariants()
+            self._assert_after_operation()
             return managed
         if new_order_id in self._orders or new_order_id in self.book.all_orders:
             self._emit(
@@ -649,7 +658,7 @@ class MarketMechanicsEngine:
             replacement_leaves_quantity=replacement_leaves.quantity,
             replacement_accepted=(submitted is not None and submitted.status != "REJECTED"),
         )
-        self.assert_invariants()
+        self._assert_after_operation()
         return submitted
 
     def auction_indication(self):
@@ -698,8 +707,14 @@ class MarketMechanicsEngine:
             indication=result.indication.as_dict(),
             session_state=self.session_state.value,
         )
-        self.assert_invariants()
+        self._assert_after_operation()
         return result
+
+    def _assert_after_operation(self) -> None:
+        """Validate now unless an outer failure-atomic transaction owns the cut."""
+
+        if not self._validating_outer_replay:
+            self.assert_invariants()
 
     def assert_invariants(self) -> None:
         if (
@@ -942,7 +957,12 @@ class MarketMechanicsEngine:
         the strict book, journal, player-position, clock, and auction states.
         """
 
-        self.assert_invariants()
+        prior_replay_mode = self._validating_outer_replay
+        self._validating_outer_replay = True
+        try:
+            self.assert_invariants()
+        finally:
+            self._validating_outer_replay = prior_replay_mode
         _validate_outer_mechanics_lifecycle(self, strict_schedule=True)
         payload: dict[str, object] = {
             "allocators": {
@@ -1207,7 +1227,11 @@ class MarketMechanicsEngine:
         engine._schedule_index = schedule_index
         engine._last_trade_price_ticks = last_trade_price_ticks
         engine._auction_player_position = auction_player_position
-        engine.assert_invariants()
+        engine._validating_outer_replay = True
+        try:
+            engine.assert_invariants()
+        finally:
+            engine._validating_outer_replay = False
         if _canonical_json_bytes(engine.checkpoint_state()) != _canonical_json_bytes(
             payload
         ):
@@ -1355,7 +1379,7 @@ class MarketMechanicsEngine:
             order_id=managed.request.order_id,
             reason=reason,
         )
-        self.assert_invariants()
+        self._assert_after_operation()
 
     def _apply_continuous_stp(self, managed: ManagedOrder) -> str | None:
         request = managed.request
@@ -1379,7 +1403,11 @@ class MarketMechanicsEngine:
             return "SELF_TRADE_CANCEL_AGGRESSOR"
         for resting in self_matches:
             command_id = self._next_command_id("MECH-STP")
-            self.book.cancel(resting.order_id, command_id)
+            self.book.cancel(
+                resting.order_id,
+                command_id,
+                validate=not self._validating_outer_replay,
+            )
             self._sync_continuous_orders()
             self._emit(
                 MechanicsEventType.SELF_TRADE_PREVENTION,
@@ -1474,7 +1502,10 @@ class MarketMechanicsEngine:
             )
         )
         event_start = len(self.book.journal.events)
-        self.book.process(core)
+        self.book.process(
+            core,
+            validate=not self._validating_outer_replay,
+        )
         self._sync_continuous_orders()
         self._emit(
             MechanicsEventType.ORDER_ACCEPTED,
@@ -1577,7 +1608,11 @@ class MarketMechanicsEngine:
             return
         previous_cancelled = managed.cancelled_quantity
         command_id = self._next_command_id("MECH-EXPIRE")
-        self.book.cancel(managed.request.order_id, command_id)
+        self.book.cancel(
+            managed.request.order_id,
+            command_id,
+            validate=not self._validating_outer_replay,
+        )
         self._sync_continuous_orders()
         managed.expired_quantity += remaining
         managed.cancelled_quantity = previous_cancelled
@@ -2842,6 +2877,9 @@ def _validate_outer_command_replay(
             # operation is still intentionally in flight.
             return
 
+    # Replay operations deliberately defer their per-command audits.  Validate the
+    # complete reconstructed state once before comparing canonical projections.
+    shadow.assert_invariants()
     source_projection = {
         "allocators": {
             "arrival_sequence": engine._arrival_sequence,
@@ -2849,7 +2887,7 @@ def _validate_outer_command_replay(
         },
         "auction": engine.auction.checkpoint_state(),
         "auction_player_position": engine._auction_player_position,
-        "book": engine.book.checkpoint_state(),
+        "book": engine.book.runtime_state(),
         "clock": engine.clock.checkpoint_state(),
         "events": _outer_rows(engine.events),
         "last_trade_price_ticks": engine._last_trade_price_ticks,
@@ -2864,7 +2902,7 @@ def _validate_outer_command_replay(
         },
         "auction": shadow.auction.checkpoint_state(),
         "auction_player_position": shadow._auction_player_position,
-        "book": shadow.book.checkpoint_state(),
+        "book": shadow.book.runtime_state(),
         "clock": shadow.clock.checkpoint_state(),
         "events": _outer_rows(shadow.events),
         "last_trade_price_ticks": shadow._last_trade_price_ticks,

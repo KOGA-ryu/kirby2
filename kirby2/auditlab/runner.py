@@ -73,11 +73,13 @@ PROVENANCE_PACKAGE_ROOTS = (
     "strategy",
     "player",
     "research",
+    "full_day",
 )
 _PROVENANCE_TOP_LEVEL_FILES = (
     "kirby2/__init__.py",
     "kirby2/__main__.py",
     "kirby2/immutable.py",
+    "kirby2/runtime_state.py",
     "pyproject.toml",
 )
 _PROVENANCE_IGNORED_PARTS = frozenset({"__pycache__"})

@@ -16,7 +16,7 @@ kirby2 = "kirby2.__main__:main"
 include = ["kirby2*"]
 
 [tool.setuptools.package-data]
-"kirby2.full_day" = ["*.toml", "examples/*.json"]
+"kirby2.full_day" = ["*.toml", "examples/*.json", "fixtures/*.toml"]
 "kirby2.exchange" = ["MECHANICS.md"]
 "kirby2.algorithms" = ["README.md"]
 "kirby2.observability" = ["README.md"]

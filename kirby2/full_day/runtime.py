@@ -102,7 +102,7 @@ from .states import DurationExhaustionBehaviorV1
 
 
 FULL_DAY_RUNTIME_CHECKPOINT_SCHEMA_VERSION = 1
-FULL_DAY_RUNTIME_IMPLEMENTATION_VERSION = 2
+FULL_DAY_RUNTIME_IMPLEMENTATION_VERSION = 3
 FULL_DAY_RUNTIME_PROFILE_ID = INITIAL_PROFILE_ID
 FULL_DAY_RUNTIME_PROFILE_VERSION = 2
 MECHANICS_NATIVE_LEDGER_ID = "MARKET_MECHANICS_EVENTS_V1"
@@ -121,6 +121,7 @@ _WORK_PARTICIPANT_SCHEDULE = "PARTICIPANT_SCHEDULE"
 _WORK_AGENT_ARRIVAL = "AGENT_ARRIVAL"
 _WORK_AGENT_DECISION = "AGENT_DECISION"
 _WORK_CHECKPOINT_CAPTURE = "CHECKPOINT_CAPTURE"
+_WORK_MECHANICS_BATCH_SUBMIT = "MECHANICS_BATCH_SUBMIT"
 _WORK_MECHANICS_SUBMIT = "MECHANICS_SUBMIT"
 _WORK_MECHANICS_CANCEL = "MECHANICS_CANCEL"
 _WORK_MECHANICS_REPLACE = "MECHANICS_REPLACE"
@@ -147,6 +148,7 @@ _WORK_TYPES = frozenset(
         _WORK_HAWKES_FLOW_PROPOSAL,
         _WORK_QUEUE_REACTIVE_FLOW_PROPOSAL,
         _WORK_MECHANICS_CANCEL,
+        _WORK_MECHANICS_BATCH_SUBMIT,
         _WORK_MECHANICS_REPLACE,
         _WORK_MECHANICS_SUBMIT,
         _WORK_PARTICIPANT_SCHEDULE,
@@ -215,6 +217,11 @@ _WORK_CONTRACTS: Mapping[
             FULL_DAY_RUNTIME_COMPONENT,
             frozenset({WorkStageV1.PENDING_VENUE_ARRIVAL}),
             frozenset({"order_id", "reason"}),
+        ),
+        _WORK_MECHANICS_BATCH_SUBMIT: (
+            FULL_DAY_RUNTIME_COMPONENT,
+            frozenset({WorkStageV1.PENDING_VENUE_ARRIVAL}),
+            frozenset({"requests"}),
         ),
         _WORK_MECHANICS_REPLACE: (
             FULL_DAY_RUNTIME_COMPONENT,
@@ -1460,6 +1467,7 @@ class FullDayRuntime:
                     "_handle_queue_reactive_flow_proposal"
                 ),
                 _WORK_MECHANICS_CANCEL: "_handle_mechanics_cancel",
+                _WORK_MECHANICS_BATCH_SUBMIT: "_handle_mechanics_batch_submit",
                 _WORK_MECHANICS_REPLACE: "_handle_mechanics_replace",
                 _WORK_MECHANICS_SUBMIT: "_handle_mechanics_submit",
                 _WORK_PARTICIPANT_SCHEDULE: "_handle_participant_schedule",
@@ -2686,13 +2694,17 @@ class FullDayRuntime:
     def _capture_transaction_state(self) -> dict[str, object]:
         """Capture every mutable owner field for failure-atomic public advance."""
 
+        engine_state = self.engine.checkpoint_state()
+        engine_state_sha256 = canonical_sha256(engine_state)
         owner_bundle = {
             "agent_scheduler": (
                 None
                 if self.agent_scheduler is None
-                else self.agent_scheduler.checkpoint_state()
+                else self.agent_scheduler.checkpoint_state(
+                    _prevalidated_engine_state_sha256=engine_state_sha256
+                )
             ),
-            "engine": self.engine.checkpoint_state(),
+            "engine": engine_state,
             "delivery": (
                 None
                 if self.delivery is None
@@ -2847,6 +2859,9 @@ class FullDayRuntime:
                 engine=engine,
                 clock=clock,
                 order_id_allocator=order_allocator.allocate,
+                _prevalidated_engine_state_sha256=canonical_sha256(
+                    owner_bundle["engine"]
+                ),
             )
             if scheduler is None:
                 raise RuntimeError(
@@ -3083,6 +3098,13 @@ class FullDayRuntime:
             raise RuntimeError("full-day runtime advance is not reentrant")
         transaction = self._capture_transaction_state()
         start = len(self._events)
+        if self.engine._validating_outer_replay:
+            raise RuntimeError("full-day runtime inherited mechanics replay validation")
+        # ``advance_to`` is already failure-atomic and performs a complete runtime
+        # invariant check at every checkpoint and at the requested target.  Avoid
+        # replaying the entire mechanics command prefix after every child operation;
+        # the full outer replay is still mandatory at each transaction boundary.
+        self.engine._validating_outer_replay = True
         try:
             while self._heap and self._heap[0][0][0] <= target_time_us:
                 _ordering, work_id = heapq.heappop(self._heap)
@@ -3123,7 +3145,11 @@ class FullDayRuntime:
                     self._component_sequences[FULL_DAY_RUNTIME_COMPONENT] = (
                         self._state_runtime.component_local_sequence
                     )
-                    self.assert_invariants()
+                    self.engine._validating_outer_replay = False
+                    try:
+                        self.assert_invariants()
+                    finally:
+                        self.engine._validating_outer_replay = True
                     completed_delta = (
                         self._checkpoint_completed_count
                         - checkpoint_completed_before
@@ -3133,7 +3159,11 @@ class FullDayRuntime:
                             "checkpoint work completed an invalid number of cuts"
                         )
                     if completed_delta == 1:
-                        self.checkpoint_state()
+                        self.engine._validating_outer_replay = False
+                        try:
+                            self.checkpoint_state()
+                        finally:
+                            self.engine._validating_outer_replay = True
             self.clock.advance_to(target_time_us)
             state_emissions = self._state_runtime.advance_to(target_time_us)
             if state_emissions:
@@ -3143,9 +3173,11 @@ class FullDayRuntime:
             )
             self._schedule_next_state_batch()
             self._schedule_agent_work()
+            self.engine._validating_outer_replay = False
             self.assert_invariants()
             return tuple(self._events[start:])
         except BaseException:
+            self.engine._validating_outer_replay = False
             self._restore_transaction_state(transaction)
             raise
 
@@ -4841,6 +4873,41 @@ class FullDayRuntime:
             scheduler_book_before=scheduler_book_before
         )
 
+    def _handle_mechanics_batch_submit(self, item: RuntimeWorkItemV1) -> None:
+        """Apply one declared same-cut batch before publishing its market cut.
+
+        Every child remains an ordinary mechanics submission with its own canonical
+        order and mechanics events.  The runtime merely delays the passive public
+        projection until the entire same-time batch has completed, matching the
+        atomic work-item boundary used by every other handler.
+        """
+
+        scheduler_book_before = self._scheduler_market_snapshot()
+        raw_requests = _plain(item.payload.get("requests"))
+        if type(raw_requests) is not list or len(raw_requests) < 2:
+            raise ValueError("mechanics batch requires at least two requests")
+        requests: list[AdvancedOrderRequest] = []
+        for ordinal, raw_request in enumerate(raw_requests):
+            raw = _plain_object(
+                raw_request, f"mechanics batch request {ordinal}"
+            )
+            request = AdvancedOrderRequest.from_dict(raw)
+            if request.as_dict() != raw:
+                raise ValueError("mechanics batch request is not strict canonical state")
+            if _RUNTIME_ORDER_ID_RE.fullmatch(request.order_id) is not None:
+                raise ValueError(
+                    "external mechanics batch cannot claim a runtime-allocated order ID"
+                )
+            requests.append(request)
+        order_ids = tuple(request.order_id for request in requests)
+        if len(order_ids) != len(set(order_ids)):
+            raise ValueError("mechanics batch contains duplicate order IDs")
+        for request in requests:
+            self.engine.submit(request)
+        self._wrap_new_mechanics(
+            scheduler_book_before=scheduler_book_before
+        )
+
     def _handle_delivery_venue_receipt(self, item: RuntimeWorkItemV1) -> None:
         """Interpret one due passive route through the sole mechanics owner."""
 
@@ -5412,7 +5479,9 @@ class FullDayRuntime:
         self._quiescent_cuts.append(cut)
         self._checkpoint_completed_count += 1
 
-    def _scheduler_checkpoint_union(self) -> dict[str, object]:
+    def _scheduler_checkpoint_union(
+        self, *, engine_state_sha256: str | None = None
+    ) -> dict[str, object]:
         if self.agent_scheduler is None:
             return {
                 "absent_reason": ABSENT_REASON_COMPONENT_INACTIVE,
@@ -5421,7 +5490,9 @@ class FullDayRuntime:
         state_method = getattr(self.agent_scheduler, "checkpoint_state", None)
         if not callable(state_method):
             raise RuntimeError("active scheduler has no checkpoint state")
-        state = state_method()
+        state = state_method(
+            _prevalidated_engine_state_sha256=engine_state_sha256
+        )
         if not isinstance(state, Mapping):
             raise RuntimeError("active scheduler checkpoint is not an object")
         return {
@@ -5608,7 +5679,13 @@ class FullDayRuntime:
         records and are not claimed as fields owned by the runtime component.
         """
 
-        self.assert_invariants()
+        if self.engine._validating_outer_replay:
+            raise RuntimeError("runtime checkpoint inherited mechanics replay validation")
+        self.engine._validating_outer_replay = True
+        try:
+            self.assert_invariants()
+        finally:
+            self.engine._validating_outer_replay = False
         if self._executing is not None or self._state_emission_buffer:
             raise RuntimeError("runtime checkpoint requires a quiescent work boundary")
         cut = self.latest_quiescent_cut
@@ -5627,8 +5704,12 @@ class FullDayRuntime:
             current_time_us=self.clock.current_time_us,
             require_current_cut=True,
         )
+        engine_state = self.engine.checkpoint_state()
+        engine_state_sha256 = canonical_sha256(engine_state)
         state: dict[str, object] = {
-            "agent_scheduler": self._scheduler_checkpoint_union(),
+            "agent_scheduler": self._scheduler_checkpoint_union(
+                engine_state_sha256=engine_state_sha256
+            ),
             "agent_tokens": [
                 {"time_us": time_us, "work_type": work_type}
                 for work_type, time_us in sorted(self._agent_tokens)
@@ -5654,8 +5735,8 @@ class FullDayRuntime:
                 research_present=self.research is not None,
             ),
             "dequeued_count": self._dequeued_count,
-            "engine": self.engine.checkpoint_state(),
-            "engine_state_sha256": canonical_sha256(self.engine.checkpoint_state()),
+            "engine": engine_state,
+            "engine_state_sha256": engine_state_sha256,
             "events": [event.as_dict() for event in self._events],
             "executed_work": [
                 item.as_dict()
@@ -6521,6 +6602,9 @@ class FullDayRuntime:
                 engine=engine,
                 clock=engine.clock,
                 order_id_allocator=allocator.allocate,
+                _prevalidated_engine_state_sha256=str(
+                    payload["engine_state_sha256"]
+                ),
             )
         else:
             raise ValueError("agent scheduler checkpoint union status is unsupported")

@@ -3079,6 +3079,7 @@ def _provenance_and_gate_truth_case(
         "kirby2/__init__.py",
         "kirby2/__main__.py",
         "kirby2/immutable.py",
+        "kirby2/runtime_state.py",
         "pyproject.toml",
     }
     for root_name in audit_runner.PROVENANCE_PACKAGE_ROOTS:

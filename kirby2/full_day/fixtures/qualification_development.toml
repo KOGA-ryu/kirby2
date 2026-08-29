@@ -1,0 +1,144 @@
+schema_version = 1
+fixture_id = "WO31_I_DISJOINT_DEVELOPMENT_ONLY_V1"
+execution_kind = "DEVELOPMENT_ONLY"
+protected_seed_access = "ABSENT"
+profile_bundle_sha256 = "81835d8b8cbe9577da1bceef56a5ce1ac18bf43f068fb871a09d0ea5f769cc19"
+
+[toy_values]
+trade_count = 120
+continuous_quote_occupied_us = 96000000
+continuous_quote_eligible_us = 100000000
+maximum_nonhalt_empty_side_episode_us = 1000000
+maximum_continuous_spread_ticks = 12
+aggressive_buy_shares = 55
+aggressive_sell_shares = 45
+quiet_spread_ticks = 3
+quiet_displacement_ticks = 20
+trend_first_trade_ticks = 100
+trend_last_trade_ticks = 105
+trend_favored_shares = 70
+trend_other_shares = 30
+event_pre_aggressive_shares = 100
+event_shock_aggressive_shares = 200
+event_pre_range_ticks = 10
+event_shock_range_ticks = 15
+event_recovery_quote_occupied_us = 95
+event_recovery_quote_eligible_us = 100
+event_shock_spread_ticks = 6
+event_recovery_spread_ticks = 4
+disorderly_open_spread_ticks = 10
+disorderly_midday_spread_ticks = 6
+disorderly_final_spread_ticks = 5
+disorderly_open_cancel_count = 3
+disorderly_midday_cancel_count = 1
+disorderly_cancel_eligible_us = 100
+disorderly_final_quote_occupied_us = 96
+disorderly_final_quote_eligible_us = 100
+
+[[cases]]
+case_id = "quiet_pass"
+candidate_id = "DEV_ONLY_QUIET_PASS"
+profile_kind = "QUIET_RANGE_PRESSURE"
+root_seed_base = 9101000
+root_count = 4
+variant = "PASS"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "PASS"
+expected_automated = "READY"
+
+[[cases]]
+case_id = "trend_pass"
+candidate_id = "DEV_ONLY_TREND_PASS"
+profile_kind = "TREND_PRESSURE"
+root_seed_base = 9101010
+root_count = 4
+variant = "PASS"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "PASS"
+expected_automated = "READY"
+
+[[cases]]
+case_id = "event_pass"
+candidate_id = "DEV_ONLY_EVENT_PASS"
+profile_kind = "EVENT_SHOCK_PRESSURE"
+root_seed_base = 9101020
+root_count = 4
+variant = "PASS"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "PASS"
+expected_automated = "READY"
+
+[[cases]]
+case_id = "disorderly_pass"
+candidate_id = "DEV_ONLY_DISORDERLY_PASS"
+profile_kind = "DISORDERLY_OPEN_STABILIZATION_PRESSURE"
+root_seed_base = 9101030
+root_count = 4
+variant = "PASS"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "PASS"
+expected_automated = "READY"
+
+[[cases]]
+case_id = "behavior_warning"
+candidate_id = "DEV_ONLY_BEHAVIOR_WARNING"
+profile_kind = "QUIET_RANGE_PRESSURE"
+root_seed_base = 9101040
+root_count = 4
+variant = "BEHAVIOR_WARNING"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "WARNING"
+expected_automated = "NOT_READY"
+
+[[cases]]
+case_id = "universal_failure"
+candidate_id = "DEV_ONLY_UNIVERSAL_FAILURE"
+profile_kind = "QUIET_RANGE_PRESSURE"
+root_seed_base = 9101050
+root_count = 4
+variant = "UNIVERSAL_FAILURE"
+performance_status = "PASS"
+expected_engineering = "FAIL"
+expected_behavioral = "PASS"
+expected_automated = "NOT_READY"
+
+[[cases]]
+case_id = "abort_in_denominator"
+candidate_id = "DEV_ONLY_ABORT"
+profile_kind = "TREND_PRESSURE"
+root_seed_base = 9101060
+root_count = 4
+variant = "ABORT"
+performance_status = "PASS"
+expected_engineering = "FAIL"
+expected_behavioral = "PASS"
+expected_automated = "NOT_READY"
+
+[[cases]]
+case_id = "insufficient_component"
+candidate_id = "DEV_ONLY_INSUFFICIENT"
+profile_kind = "EVENT_SHOCK_PRESSURE"
+root_seed_base = 9101070
+root_count = 4
+variant = "INSUFFICIENT"
+performance_status = "PASS"
+expected_engineering = "PASS"
+expected_behavioral = "WARNING"
+expected_automated = "NOT_READY"
+
+[[cases]]
+case_id = "performance_warning"
+candidate_id = "DEV_ONLY_PERFORMANCE_WARNING"
+profile_kind = "DISORDERLY_OPEN_STABILIZATION_PRESSURE"
+root_seed_base = 9101080
+root_count = 4
+variant = "PASS"
+performance_status = "WARNING"
+expected_engineering = "PASS"
+expected_behavioral = "PASS"
+expected_automated = "NOT_READY"
