@@ -1,0 +1,203 @@
+"manifest_id" = "WO33_A1_MINING_PLAN_V1"
+"manifest_sha256" = "e1cc07dc1a8dffb5110a2987b6a1f2534d42ad6fc221517446ef327143f0cf7e"
+"manifest_version" = 1
+"policy_version" = "LESSON_MINING_V1"
+"qualification_sources_manifest_sha256" = "ff0cb292d1ed764b73f197462cd49c0c8a345fffcd547bab1c60b726b7d5eda5"
+"schema_version" = 1
+"semantic_sha256" = "a73b76b1df253e11e1e23d7e701c3d943a65847ed41fb7fea5ea1034b1dbbf0a"
+"threshold_manifest_sha256" = "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
+
+["arithmetic"]
+"clamp" = "clamp(x,0,1000000)"
+"division" = "ROUND_DIV_EVEN_V1"
+"fixed_point_scale" = 1000000
+"jaccard_empty_empty_ppm" = 1000000
+"jaccard_one_empty_ppm" = 0
+"missing_required" = "INSUFFICIENT_EVIDENCE"
+"not_applicable_weighting" = "OMIT_FROM_NUMERATOR_AND_DENOMINATOR"
+"ratio" = "UNBOUNDED_RATIO_PPM_V1"
+"share" = "UNSIGNED_SHARE_PPM_V1"
+
+["candidate_shortfall"]
+"duplicates_may_fill_quota" = false
+"event_five_gate" = "PASS_ONLY_IF_STEP_1_OBTAINS_FIVE"
+"quota_may_weaken_thresholds" = false
+"reserved_shortfall" = "RECORD_EXPLICITLY_THEN_RELEASE_TO_GLOBAL_FILL"
+"threshold_relaxation" = "FORBIDDEN"
+"under_target_result" = "EXPLICIT_POOL_EXHAUSTION_SHORTFALL"
+
+["deduplication"]
+"candidate_order" = ["difficulty_ppm", "active_start_us", "candidate_id_nfc_utf8"]
+"collapse" = "ONE_ORDERED_GREEDY_PASS_NOT_CONNECTED_COMPONENTS"
+"difficulty_insufficient" = "EXCLUDE_BEFORE_DEDUPLICATION"
+"duplicate_of" = "FIRST_RETAINED_DUPLICATE_IN_ORDER"
+"event_five_gram_jaccard_min_ppm" = 850000
+"feature_jaccard_min_ppm" = 900000
+"objective_jaccard_min_ppm" = 500000
+"regime_signature" = "EXACT_MATCH"
+"source_ancestry" = "EXACT_COMPLETE_DIGEST_MATCH"
+"time_interval" = "[active_start_us,post_end_us)"
+"time_iou_min_ppm" = 800000
+
+["deduplication_inputs"]
+"canonical_feature_value" = "NFC_STRING_OR_LOWERCASE_TRUE_FALSE_OR_BASE10_INTEGER_NO_LEADING_ZERO_EXCEPT_ZERO"
+"event_five_gram_order" = "UNIQUE_TUPLES_SORTED_BY_COMPACT_CANONICAL_JSON_BYTES"
+"event_five_grams" = "EVERY_CONSECUTIVE_FIVE_CANONICAL_EVENT_TOKENS_OR_ONE_COMPLETE_SHORTER_TUPLE"
+"event_price_relations" = ["BELOW_BID", "AT_BID", "INSIDE", "AT_ASK", "ABOVE_ASK", "NO_PRICE", "NO_REFERENCE_QUOTE"]
+"event_sides" = ["BUY", "SELL", "NONE"]
+"event_token" = "event_type|side|price_relation_to_pre_event_best_quotes"
+"feature_token" = "event_type|field_path|type_tag|canonical_value"
+"feature_token_exclusions" = ["GROUND_TRUTH", "IDS", "TIMESTAMPS"]
+"objective_set" = "PRIMARY_SKILL_PLUS_SORTED_SUPPORTING_SKILLS"
+"regime_fields" = ["phase", "regime_id", "volume_band", "liquidity_band", "spread_band"]
+"regime_missing_metadata" = "INDEPENDENT_NOT_APPLICABLE_NO_OUTCOME_INFERENCE"
+"source_ancestry_encoding" = "SHA256_COMPACT_SORTED_KEY_CANONICAL_JSON_EXPLICIT_NULLS"
+"source_ancestry_fields" = ["source_kind", "source_id", "source_sha256", "checkpoint_id", "checkpoint_sha256", "event_prefix_sha256", "parent_source_ancestry_sha256"]
+"time_iou" = "unsigned_share_ppm(max(0,min(a_end,b_end)-max(a_start,b_start)),(a_end-a_start)+(b_end-b_start)-intersection)"
+"volume_liquidity_bands_ppm" = "LOW_LT_750000;NORMAL_750000_TO_1250000;HIGH_GT_1250000"
+
+["deduplication_inputs"."spread_bands"]
+"EXTREME" = [9, 9223372036854775807]
+"MODERATE" = [3, 4]
+"ONE" = [1, 1]
+"TWO" = [2, 2]
+"WIDE" = [5, 8]
+
+["detector_families"]
+"ABSORPTION" = ["ASK_ABSORPTION", "APPARENT_LIQUIDITY_MIRAGE", "BID_ABSORPTION", "HIDDEN_RESERVE_REFRESH"]
+"EXECUTION" = ["CANCEL_FILL_RACE", "LATENCY_SENSITIVE_OPPORTUNITY"]
+"FLOW" = ["AGGRESSIVE_FLOW_BURST", "CANCELLATION_BURST", "DISTRESSED_LIQUIDATION", "MEAN_REVERSION_TRANSITION", "MOMENTUM_EXHAUSTION"]
+"FRAGMENTATION" = ["MULTI_VENUE_FRAGMENTATION", "ROUTING_DILEMMA"]
+"PRICE_LIQUIDITY" = ["FAILED_BREAKOUT", "LIQUIDITY_VACUUM", "SPREAD_EXPANSION", "SPREAD_RECOVERY"]
+"QUEUE" = ["QUEUE_DEPLETION", "QUEUE_REPLENISHMENT", "STRONG_QUEUE_IMBALANCE"]
+"SESSION" = ["AUCTION_IMBALANCE_CHANGE", "HALT_REOPENING"]
+
+["difficulty"]
+"component_order" = ["inverse_signal_duration_ppm", "conflict_ppm", "reaction_hardness_ppm", "spread_hardness_ppm", "latency_hardness_ppm", "inverse_liquidity_ppm", "venue_hardness_ppm", "hidden_uncertainty_ppm", "objective_depth_hardness_ppm", "feature_hardness_ppm", "inverse_quality_ppm"]
+"policy_id" = "LESSON_DIFFICULTY_V1"
+"positive_infinity_legibility_ppm" = 1000000
+
+["difficulty"."evidence_quality_ppm"]
+"H" = 850000
+"R" = 500000
+"S" = 1000000
+
+["difficulty"."formulas"]
+"conflict_ppm" = "unsigned_share_ppm(opposite_direction_aggressive_shares,same_direction_aggressive_shares+opposite_direction_aggressive_shares)"
+"difficulty_ppm" = "round_div_even(sum(applicable_weight*component),sum(applicable_weight))"
+"duration_legibility_ppm" = "clamp(round_div_even(observed_contiguous_duration*S,2*required_duration),0,S)"
+"feature_hardness_ppm" = "clamp(round_div_even((feature_count-1)*S,9),0,S)"
+"inverse_liquidity_ppm" = "S-clamp(round_div_even(three_level_depth*S,5000),0,S)"
+"inverse_quality_ppm" = "S-evidence_quality_ppm"
+"inverse_signal_duration_ppm" = "S-round_div_even(sum(applicable_signal_and_duration),count(applicable_signal_and_duration))"
+"latency_hardness_ppm" = "clamp(round_div_even(latency_us*S,10000),0,S)"
+"lower_bound_legibility_ppm" = "clamp(round_div_even(x*S,2*L),0,S)"
+"objective_depth_hardness_ppm" = "clamp(round_div_even(objective_shares*S,max(1,executable_depth)),0,S)"
+"reaction_hardness_ppm" = "clamp(round_div_even((2000000-reaction_us)*S,2000000),0,S)"
+"spread_hardness_ppm" = "clamp(round_div_even((spread_ticks-1)*S,9),0,S)"
+"upper_bound_legibility_ppm" = "clamp(round_div_even((2*U-x)*S,max(1,2*U)),0,S)"
+"venue_hardness_ppm" = "clamp(round_div_even((venue_count-1)*S,3),0,S)"
+
+["difficulty"."hidden_uncertainty_ppm"]
+"H" = 250000
+"R" = 750000
+"S" = 0
+
+["difficulty"."input_rules"]
+"activation_evidence" = "COMPLETE_INCLUDING_FINAL_ACTIVATING_EVENT"
+"and_legibility" = "MIN_CLAUSE_LEGIBILITY"
+"boolean_legibility" = "REQUIRED_TRUE_EQUALS_S"
+"conflict_interval" = "[active_start_us,activation_us+1)"
+"feature_count" = "DISTINCT_OBSERVABLE_FIELD_PATHS_IN_SATISFIED_ACTIVATION_CLAUSES"
+"hidden_uncertainty" = "NOT_APPLICABLE_OUTSIDE_HIDDEN_LIQUIDITY_CAPABILITY"
+"latency" = "max(0,client_visible_time_us-source_event_time_us)_FOR_FINAL_ACTIVATING_EVENT"
+"missing_component" = "MISSING_QUOTE_DEPTH_DELIVERY_MAKES_ONLY_COMPONENT_NOT_APPLICABLE"
+"objective_size_depth" = "NOT_APPLICABLE_FOR_OBSERVE_CLASSIFY_V1"
+"or_legibility" = "MAX_LEGIBILITY_OF_FULLY_SATISFIED_BRANCH"
+"reaction_us" = "post_end_us-activation_us"
+"signal_duration_legibility" = "ROUND_DIV_EVEN_MEAN_OF_APPLICABLE_SIGNAL_AND_DURATION"
+"signed_clause_orientation" = "X_LE_NEGATIVE_L_TO_NEGATIVE_X_GE_L;ABS_X_GE_L_TO_ABS_X;DIRECTIONAL_X_TO_BUY_X_OR_SELL_NEGATIVE_X"
+"spread_depth_venues" = "LAST_COMPLETE_OBSERVABLE_PROJECTION_STRICTLY_BEFORE_ACTIVATION"
+"venue_count" = "AUTHORITATIVE_POSITIVE_EXECUTABLE_DEPTH_OR_COMPLETE_TWO_SIDED_QUOTES"
+
+["difficulty"."weights_ppm"]
+"conflict_ppm" = 100000
+"feature_hardness_ppm" = 80000
+"hidden_uncertainty_ppm" = 60000
+"inverse_liquidity_ppm" = 100000
+"inverse_quality_ppm" = 60000
+"inverse_signal_duration_ppm" = 160000
+"latency_hardness_ppm" = 70000
+"objective_depth_hardness_ppm" = 80000
+"reaction_hardness_ppm" = 110000
+"spread_hardness_ppm" = 100000
+"venue_hardness_ppm" = 80000
+
+["diversity"]
+"difficulty_bands_ppm" = [{ "lower_ppm" = 0, "upper_inclusive" = false, "upper_ppm" = 250000 }, { "lower_ppm" = 250000, "upper_inclusive" = false, "upper_ppm" = 500000 }, { "lower_ppm" = 500000, "upper_inclusive" = false, "upper_ppm" = 750000 }, { "lower_ppm" = 750000, "upper_inclusive" = true, "upper_ppm" = 1000000 }]
+"dimensions" = ["primary_skill", "detector_family", "source", "phase", "source_window_outcome", "difficulty_band"]
+"marginal_score" = "round_div_even(sum(dimension_weight*novelty),S)"
+"novelty" = "round_div_even(S,1+selected_count_for_exact_value)"
+"selection" = "GREEDY_HIGHEST_SCORE_THEN_GLOBAL_TIE_BREAK"
+
+["diversity"."dimension_values"]
+"detector_family" = "REGISTRY_FAMILY"
+"difficulty_band" = "ONE_CONTAINING_INTERVAL"
+"global_tie_break" = "COMMON_POLICY_TIE_DIGEST_LESSON_MINING_V1_ROOT_3399001_THEN_NFC_UTF8_CANDIDATE_ID"
+"phase" = "RECORDED_SESSION_PHASE_AT_ACTIVATION"
+"primary_skill" = "PRIMARY_SKILL_ONLY"
+"source" = "QUALIFICATION_SOURCE_ROW"
+"source_window_outcome" = "MINED_SOURCE_PATH_LABEL"
+"source_window_outcome_rule" = "ORIENTED_MID_X2_GE_2_CONTINUATION;LE_NEGATIVE_2_REVERSAL;ELSE_STASIS;NONDIRECTIONAL_NOT_APPLICABLE;MISSING_QUOTES_NOT_OBSERVABLE"
+
+["diversity"."weights_ppm"]
+"detector_family" = 200000
+"difficulty_band" = 150000
+"phase" = 100000
+"primary_skill" = 250000
+"source" = 200000
+"source_window_outcome" = 100000
+
+["execution_scope"]
+"candidate_mining" = "NOT_EXERCISED"
+"candidate_outcomes" = "NOT_INSPECTED"
+"detector_invocation" = "NOT_EXERCISED"
+"human_review" = "PENDING"
+"policy_action" = "VALIDATE_AND_DIGEST_ONLY"
+"selection" = "NOT_EXERCISED"
+"threshold_relaxation" = "FORBIDDEN"
+
+["review_sampling"]
+"event_material_distinctness" = "(family_differs_OR_primary_skill_differs)_AND_(phase_differs_OR_source_window_outcome_differs_OR_difficulty_band_differs)"
+"global_fill" = "EVERY_REMAINING_VALID_CANDIDATE_SAME_GREEDY_DIVERSITY"
+"selection_root" = 3399001
+"source_order" = ["event", "quiet", "hidden", "fragmented", "historical"]
+"step_order" = ["EVENT_FIVE_MATERIALLY_DISTINCT", "THREE_EACH_OTHER_SOURCE", "GLOBAL_FILL_TO_TWENTY"]
+"target_count" = 20
+"tie_context" = "WO33_REVIEW_V1"
+
+["review_sampling"."reserved_counts"]
+"event" = 5
+"fragmented" = 3
+"hidden" = 3
+"historical" = 3
+"quiet" = 3
+
+["sampling"]
+"candidate_rarity" = "OWN_DETECTOR_SOURCE_ROW_VALUE"
+"denominator_exclusions" = ["BOUNDARY_CLIPPED", "FIELD_INCOMPLETE", "MISSING_CAPABILITY", "ORDINARY_EXCLUSION"]
+"denominator_zero" = "NOT_EXERCISED"
+"eligible_default_unit" = "ONE_DETECTOR_SOURCE_OBSERVABLE_BIN_100000_US"
+"frequency_ppm" = "unsigned_share_ppm(qualifying_units,eligible_units)"
+"multiple_qualifying_keys_per_unit" = "COUNT_ONCE"
+"overall_detector_frequency" = "POOL_ROW_NUMERATORS_AND_DENOMINATORS_ONCE_RETAIN_PER_ROW"
+"population" = "ALL_ELIGIBLE_UNITS_FIVE_PREREGISTERED_ROWS_BEFORE_DEDUP_AND_REVIEW"
+"rarity_ppm" = "S-sample_frequency_ppm"
+
+["sampling"."alternate_units"]
+"AGGRESSIVE_FLOW_BURST" = "COMPLETE_ALIGNED_ONE_SECOND_GROUP"
+"AUCTION_IMBALANCE_CHANGE" = "CONSECUTIVE_PUBLICATION_PAIR"
+"CANCELLATION_BURST" = "COMPLETE_ALIGNED_ONE_SECOND_GROUP"
+"CANCEL_FILL_RACE" = "BOUND_REPLAY_PAIR"
+"HALT_REOPENING" = "COMPLETE_HALT_REOPEN_EPISODE"
+"LATENCY_SENSITIVE_OPPORTUNITY" = "BOUND_REPLAY_PAIR"

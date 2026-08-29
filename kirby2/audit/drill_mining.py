@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from kirby2.audit.historical_lessons import audit_historical_lessons
 from kirby2.mining import (
@@ -23,6 +24,7 @@ from kirby2.mining import (
     CapabilityRecordRowV1,
     CheckpointReferenceV1,
     DetectorProjectionV1,
+    DetectorThresholdsManifestV1,
     DetectorSupportStatusV1,
     DifficultyProjectionV1,
     EvidenceClassV1,
@@ -30,6 +32,8 @@ from kirby2.mining import (
     HumanReviewDecisionV1,
     HumanReviewSidecarV1,
     LessonCandidateV1,
+    MiningPlanManifestV1,
+    MiningPolicyBundleV1,
     ObservableFeatureSummaryV1,
     ObserveClassifyObjectiveV1,
     RarityProjectionV1,
@@ -40,8 +44,11 @@ from kirby2.mining import (
     SourceIdentityV1,
     SourceKindV1,
     SourceWindowOutcomeV1,
+    QualificationSourcesManifestV1,
     canonical_json_bytes,
+    load_mining_policy_bundle,
     round_div_even,
+    sha256_json,
 )
 
 
@@ -49,6 +56,21 @@ WO33A_DETECTOR_COUNT = 22
 WO33A_SKILL_COUNT = 23
 WO33A_IDENTITY_KEY_COUNT = 21
 WO33A_REVIEW_DECISION_COUNT = 4
+WO33A1_SOURCE_COUNT = 5
+WO33A1_REVIEW_TARGET_COUNT = 20
+
+WO33A1_THRESHOLD_MANIFEST_SHA256 = (
+    "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
+)
+WO33A1_SOURCE_MANIFEST_SHA256 = (
+    "ff0cb292d1ed764b73f197462cd49c0c8a345fffcd547bab1c60b726b7d5eda5"
+)
+WO33A1_MINING_PLAN_MANIFEST_SHA256 = (
+    "e1cc07dc1a8dffb5110a2987b6a1f2534d42ad6fc221517446ef327143f0cf7e"
+)
+WO33A1_POLICY_BUNDLE_SHA256 = (
+    "e5986bca08593cf2ac933a924e4895886d55b48e258690d8f3ef3d31cb5383ec"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +104,20 @@ def audit_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
         _versioned_skill_and_objective_case(),
         _detector_capability_admission_case(),
         _assessment_reveal_and_historical_regression_case(),
+    )
+
+
+def audit_wo33a1_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
+    """Validate preregistration and source identity without mining candidates."""
+
+    bundle = load_mining_policy_bundle()
+    return (
+        _a1_detector_threshold_manifest_case(bundle),
+        _a1_difficulty_sampling_and_shortfall_case(bundle),
+        _a1_dedup_diversity_and_review_case(bundle),
+        _a1_qualification_source_matrix_case(bundle),
+        _a1_source_replay_identity_case(bundle),
+        _a1_unexercised_and_hostile_refusal_case(bundle),
     )
 
 
@@ -674,6 +710,561 @@ def _assessment_reveal_and_historical_regression_case() -> DrillMiningAuditCase:
     )
 
 
+def _a1_detector_threshold_manifest_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    threshold_manifest = bundle.thresholds
+    payload = threshold_manifest.as_dict()
+    if (
+        threshold_manifest.manifest_sha256 != WO33A1_THRESHOLD_MANIFEST_SHA256
+        or bundle.plan.manifest_sha256 != WO33A1_MINING_PLAN_MANIFEST_SHA256
+        or bundle.sources.manifest_sha256 != WO33A1_SOURCE_MANIFEST_SHA256
+        or bundle.bundle_sha256 != WO33A1_POLICY_BUNDLE_SHA256
+    ):
+        failures.append("WO33-A1 policy bundle differs from its preregistered digest")
+    if threshold_manifest.detector_ids != DETECTOR_IDS_V1:
+        failures.append("threshold manifest detector inventory/order differs from registry")
+    bundles = payload["capability_bundles"]
+    detectors = payload["detectors"]
+    if not isinstance(bundles, dict) or not isinstance(detectors, dict):
+        failures.append("threshold capability/detector tables are malformed")
+    else:
+        for detector_id in DETECTOR_IDS_V1:
+            declaration = DETECTOR_REGISTRY_V1.require(detector_id, 1)
+            row = detectors[detector_id]
+            if not isinstance(row, dict):
+                failures.append(f"{detector_id} threshold row is malformed")
+                continue
+            bundle_id = row["capability_bundle"]
+            if bundles.get(bundle_id) != list(declaration.required_capabilities):
+                failures.append(f"{detector_id} capability bundle differs from registry")
+            if row["evidence_classes"] != [
+                item.value for item in declaration.supported_evidence_classes
+            ]:
+                failures.append(f"{detector_id} evidence scope differs from registry")
+            if not row["rule_expression"] or not row["thresholds"]:
+                failures.append(f"{detector_id} lacks an operational activation rule")
+            if len(threshold_manifest.detector_threshold_sha256(detector_id)) != 64:
+                failures.append(f"{detector_id} threshold row is not content addressed")
+    distinctive_thresholds = {
+        "AGGRESSIVE_FLOW_BURST": ("absolute_aggressive_flow_imbalance_ppm", 700_000),
+        "APPARENT_LIQUIDITY_MIRAGE": ("cohort_cancelled_share_ppm", 800_000),
+        "ASK_ABSORPTION": ("aggressive_buy_quantity", 1_000),
+        "AUCTION_IMBALANCE_CHANGE": ("relative_change_ppm", 250_000),
+        "BID_ABSORPTION": ("aggressive_sell_quantity", 1_000),
+        "CANCELLATION_BURST": ("cancel_to_add_ratio_ppm", 3_000_000),
+        "CANCEL_FILL_RACE": ("latency_intervention_delta", 1_000),
+        "DISTRESSED_LIQUIDATION": ("distressed_sell_quantity", 5_000),
+        "FAILED_BREAKOUT": ("return_deadline", 3_000_000),
+        "HALT_REOPENING": ("spread_ratio_ppm", 2_000_000),
+        "HIDDEN_RESERVE_REFRESH": ("reserve_refresh_count", 3),
+        "LATENCY_SENSITIVE_OPPORTUNITY": ("slow_latency", 2_500),
+        "LIQUIDITY_VACUUM": ("depletion_share_ppm", 750_000),
+        "MEAN_REVERSION_TRANSITION": ("trailing_p50_window", 30_000_000),
+        "MOMENTUM_EXHAUSTION": ("initial_mid_x2_movement", 10),
+        "MULTI_VENUE_FRAGMENTATION": ("best_price_difference", 2),
+        "QUEUE_DEPLETION": ("depletion_share_ppm", 700_000),
+        "QUEUE_REPLENISHMENT": ("cycle_count", 3),
+        "ROUTING_DILEMMA": ("absolute_quantity_difference", 250),
+        "SPREAD_EXPANSION": ("expanded_spread", 4),
+        "SPREAD_RECOVERY": ("recovery_deadline", 5_000_000),
+        "STRONG_QUEUE_IMBALANCE": ("absolute_queue_imbalance_ppm", 600_000),
+    }
+    for detector_id, (name, expected) in distinctive_thresholds.items():
+        row = threshold_manifest.detector(detector_id)
+        observed = {
+            item["name"]: item["value"] for item in row["thresholds"]
+        }.get(name)
+        if observed != expected:
+            failures.append(f"{detector_id} distinctive threshold differs")
+    auction = threshold_manifest.detector("AUCTION_IMBALANCE_CHANGE")
+    halt = threshold_manifest.detector("HALT_REOPENING")
+    if (
+        "AUCTION" in auction["exclusion_rules"]
+        or "SESSION_BOUNDARY" in auction["exclusion_rules"]
+        or "HALT" in halt["exclusion_rules"]
+        or payload["binning"]["observable_bin_us"] != 100_000
+    ):
+        failures.append("ordinary exclusions or the two explicit exceptions differ")
+    return DrillMiningAuditCase(
+        "mining_detector_thresholds_are_complete_operational_and_digest_bound",
+        (
+            f"detectors={len(threshold_manifest.detector_ids)}/22 "
+            f"threshold_manifest_sha256={threshold_manifest.manifest_sha256} "
+            "bin_us=100000 evidence=S,H,R exceptions=auction,halt"
+        ),
+        tuple(failures),
+    )
+
+
+def _a1_difficulty_sampling_and_shortfall_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    plan = bundle.plan.as_dict()
+    difficulty = plan["difficulty"]
+    weights = difficulty["weights_ppm"]
+    expected_weights = {
+        "conflict_ppm": 100_000,
+        "feature_hardness_ppm": 80_000,
+        "hidden_uncertainty_ppm": 60_000,
+        "inverse_liquidity_ppm": 100_000,
+        "inverse_quality_ppm": 60_000,
+        "inverse_signal_duration_ppm": 160_000,
+        "latency_hardness_ppm": 70_000,
+        "objective_depth_hardness_ppm": 80_000,
+        "reaction_hardness_ppm": 110_000,
+        "spread_hardness_ppm": 100_000,
+        "venue_hardness_ppm": 80_000,
+    }
+    if weights != expected_weights or sum(weights.values()) != 1_000_000:
+        failures.append("the eleven nominal difficulty weights differ")
+    if difficulty["evidence_quality_ppm"] != {
+        "H": 850_000,
+        "R": 500_000,
+        "S": 1_000_000,
+    } or difficulty["hidden_uncertainty_ppm"] != {
+        "H": 250_000,
+        "R": 750_000,
+        "S": 0,
+    }:
+        failures.append("evidence quality or hidden uncertainty differs")
+    formulas = difficulty["formulas"]
+    input_rules = difficulty["input_rules"]
+    if (
+        formulas["difficulty_ppm"]
+        != "round_div_even(sum(applicable_weight*component),sum(applicable_weight))"
+        or formulas["reaction_hardness_ppm"]
+        != "clamp(round_div_even((2000000-reaction_us)*S,2000000),0,S)"
+        or input_rules["objective_size_depth"]
+        != "NOT_APPLICABLE_FOR_OBSERVE_CLASSIFY_V1"
+        or input_rules["and_legibility"] != "MIN_CLAUSE_LEGIBILITY"
+        or input_rules["boolean_legibility"] != "REQUIRED_TRUE_EQUALS_S"
+        or input_rules["or_legibility"]
+        != "MAX_LEGIBILITY_OF_FULLY_SATISFIED_BRANCH"
+        or input_rules["signal_duration_legibility"]
+        != "ROUND_DIV_EVEN_MEAN_OF_APPLICABLE_SIGNAL_AND_DURATION"
+        or input_rules["signed_clause_orientation"]
+        != (
+            "X_LE_NEGATIVE_L_TO_NEGATIVE_X_GE_L;ABS_X_GE_L_TO_ABS_X;"
+            "DIRECTIONAL_X_TO_BUY_X_OR_SELL_NEGATIVE_X"
+        )
+    ):
+        failures.append("difficulty formula, clause orientation, or input rule differs")
+    sampling = plan["sampling"]
+    if (
+        sampling["eligible_default_unit"]
+        != "ONE_DETECTOR_SOURCE_OBSERVABLE_BIN_100000_US"
+        or sampling["denominator_zero"] != "NOT_EXERCISED"
+        or sampling["multiple_qualifying_keys_per_unit"] != "COUNT_ONCE"
+        or len(sampling["alternate_units"]) != 6
+    ):
+        failures.append("sample-frequency denominator or alternate units differ")
+    shortfall = plan["candidate_shortfall"]
+    if (
+        shortfall["quota_may_weaken_thresholds"] is not False
+        or shortfall["duplicates_may_fill_quota"] is not False
+        or shortfall["event_five_gate"]
+        != "PASS_ONLY_IF_STEP_1_OBTAINS_FIVE"
+    ):
+        failures.append("candidate shortfall can conceal or weaken a fixed gate")
+    return DrillMiningAuditCase(
+        "mining_difficulty_sampling_and_shortfall_are_preregistered",
+        (
+            f"difficulty_components={len(weights)} weight_sum={sum(weights.values())} "
+            "default_unit=detector/source/100000us alternate_units=6 "
+            "zero_eligible=NOT_EXERCISED thresholds_never_weaken=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _a1_dedup_diversity_and_review_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    plan = bundle.plan.as_dict()
+    dedup = plan["deduplication"]
+    if {
+        "time_iou_min_ppm": dedup["time_iou_min_ppm"],
+        "feature_jaccard_min_ppm": dedup["feature_jaccard_min_ppm"],
+        "event_five_gram_jaccard_min_ppm": dedup[
+            "event_five_gram_jaccard_min_ppm"
+        ],
+        "objective_jaccard_min_ppm": dedup["objective_jaccard_min_ppm"],
+    } != {
+        "time_iou_min_ppm": 800_000,
+        "feature_jaccard_min_ppm": 900_000,
+        "event_five_gram_jaccard_min_ppm": 850_000,
+        "objective_jaccard_min_ppm": 500_000,
+    }:
+        failures.append("deduplication similarity thresholds differ")
+    if (
+        dedup["source_ancestry"] != "EXACT_COMPLETE_DIGEST_MATCH"
+        or dedup["regime_signature"] != "EXACT_MATCH"
+        or dedup["collapse"] != "ONE_ORDERED_GREEDY_PASS_NOT_CONNECTED_COMPONENTS"
+        or dedup["candidate_order"]
+        != ["difficulty_ppm", "active_start_us", "candidate_id_nfc_utf8"]
+    ):
+        failures.append("deduplication identity or greedy ordering differs")
+    dedup_inputs = plan["deduplication_inputs"]
+    if (
+        dedup_inputs["time_iou"]
+        != (
+            "unsigned_share_ppm(max(0,min(a_end,b_end)-max(a_start,b_start)),"
+            "(a_end-a_start)+(b_end-b_start)-intersection)"
+        )
+        or dedup_inputs["event_five_gram_order"]
+        != "UNIQUE_TUPLES_SORTED_BY_COMPACT_CANONICAL_JSON_BYTES"
+        or dedup_inputs["source_ancestry_encoding"]
+        != "SHA256_COMPACT_SORTED_KEY_CANONICAL_JSON_EXPLICIT_NULLS"
+    ):
+        failures.append("deduplication canonical encodings or IoU formula differ")
+    diversity = plan["diversity"]
+    if diversity["weights_ppm"] != {
+        "detector_family": 200_000,
+        "difficulty_band": 150_000,
+        "phase": 100_000,
+        "primary_skill": 250_000,
+        "source": 200_000,
+        "source_window_outcome": 100_000,
+    } or sum(diversity["weights_ppm"].values()) != 1_000_000:
+        failures.append("diversity dimensions or weights differ")
+    if diversity["difficulty_bands_ppm"] != [
+        {"lower_ppm": 0, "upper_inclusive": False, "upper_ppm": 250_000},
+        {
+            "lower_ppm": 250_000,
+            "upper_inclusive": False,
+            "upper_ppm": 500_000,
+        },
+        {
+            "lower_ppm": 500_000,
+            "upper_inclusive": False,
+            "upper_ppm": 750_000,
+        },
+        {
+            "lower_ppm": 750_000,
+            "upper_inclusive": True,
+            "upper_ppm": 1_000_000,
+        },
+    ] or diversity["dimension_values"]["source_window_outcome_rule"] != (
+        "ORIENTED_MID_X2_GE_2_CONTINUATION;LE_NEGATIVE_2_REVERSAL;"
+        "ELSE_STASIS;NONDIRECTIONAL_NOT_APPLICABLE;"
+        "MISSING_QUOTES_NOT_OBSERVABLE"
+    ):
+        failures.append("difficulty bands or source-window outcome rule differ")
+    review = plan["review_sampling"]
+    if (
+        review["target_count"] != WO33A1_REVIEW_TARGET_COUNT
+        or review["selection_root"] != 3_399_001
+        or review["tie_context"] != "WO33_REVIEW_V1"
+        or review["source_order"]
+        != ["event", "quiet", "hidden", "fragmented", "historical"]
+        or review["reserved_counts"]
+        != {"event": 5, "fragmented": 3, "hidden": 3, "historical": 3, "quiet": 3}
+    ):
+        failures.append("stratified twenty-candidate review sampling differs")
+    if len(plan["detector_families"]) != 7 or sum(
+        len(values) for values in plan["detector_families"].values()
+    ) != 22:
+        failures.append("detector family partition does not cover twenty-two detectors")
+    return DrillMiningAuditCase(
+        "mining_dedup_diversity_and_review_sampling_are_preregistered",
+        (
+            "dedup=ancestry+iou800000+features900000+regime+fivegram850000+"
+            "objective500000 diversity_dimensions=6 review_target=20 "
+            "reserved=event5+other3x4 global_fill=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _a1_repository_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _a1_qualification_source_matrix_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    from kirby2.scenario_lang.commands import inspect_scenario_source
+
+    failures: list[str] = []
+    repository = _a1_repository_root()
+    expected_profiles = {
+        "event": ("EVENT_SHOCK_PRESSURE", 3_102_000, "S", 0, 6_000_000_000),
+        "fragmented": ("MULTIVENUE_RECORDING_V1", 3_302_002, "S", 0, 1_300),
+        "hidden": ("HIDDEN_LIQUIDITY_RECORDING_V1", 3_302_001, "S", 0, 300),
+        "historical": (
+            "HISTORICAL_LESSON_V1",
+            "NOT_APPLICABLE",
+            "R",
+            0,
+            30_000_000,
+        ),
+        "quiet": ("QUIET_RANGE_PRESSURE", 3_102_000, "S", 0, 6_000_000_000),
+    }
+    for row in bundle.sources.rows:
+        path = repository / str(row.source["example_path"])
+        if not path.is_file():
+            failures.append(f"{row.row_id} example source is absent")
+            continue
+        raw = path.read_bytes()
+        if (
+            len(raw) != row.source["raw_bytes_length"]
+            or hashlib.sha256(raw).hexdigest() != row.source["raw_sha256"]
+        ):
+            failures.append(f"{row.row_id} example source bytes differ")
+            continue
+        report = inspect_scenario_source(path)
+        artifact = report.artifact
+        if not report.passed or artifact is None:
+            failures.append(f"{row.row_id} exact WO32 example no longer compiles")
+            continue
+        if (
+            artifact.compiled_artifact_digest
+            != row.source["compiled_artifact_sha256"]
+            or artifact.semantic_plan_digest != row.source["semantic_plan_sha256"]
+            or artifact.source_bundle_digest != row.source["source_bundle_sha256"]
+            or artifact.adapter_id != row.source["example_adapter_id"]
+            or artifact.adapter_version != row.source["example_adapter_version"]
+            or artifact.target_kind.value != row.source["example_target_kind"]
+            or artifact.seed_policy.selected_root_seed
+            != row.source["example_selected_root_seed"]
+        ):
+            failures.append(f"{row.row_id} compiled WO32 source identity differs")
+        expected = expected_profiles[row.row_id]
+        observed = (
+            row.identity["qualification_profile_id"],
+            row.identity["qualification_root_seed"],
+            row.identity["evidence_class"],
+            row.bounds["source_start_us"],
+            row.bounds["source_end_us"],
+        )
+        if observed != expected:
+            failures.append(f"{row.row_id} qualification identity/bounds differ")
+        native_path = row.configuration["native_payload_path"]
+        if native_path not in {
+            "WO31_I1_IMMUTABLE_PLAN_ARTIFACT",
+            "NOT_APPLICABLE",
+        }:
+            native = repository / str(native_path)
+            if (
+                not native.is_file()
+                or native.stat().st_size
+                != row.configuration["native_payload_raw_bytes_length"]
+                or hashlib.sha256(native.read_bytes()).hexdigest()
+                != row.configuration["native_payload_raw_sha256"]
+            ):
+                failures.append(f"{row.row_id} native payload bytes differ")
+    if len(bundle.sources.rows) != WO33A1_SOURCE_COUNT:
+        failures.append("qualification source matrix count differs")
+    return DrillMiningAuditCase(
+        "mining_five_source_matrix_resolves_exact_bytes_bounds_and_capabilities",
+        (
+            f"sources={len(bundle.sources.rows)}/5 roots=3102000,3102000,"
+            "3302001,3302002,NOT_APPLICABLE evidence=S,S,S,S,R "
+            "source_and_config_bytes=digest_bound"
+        ),
+        tuple(failures),
+    )
+
+
+def _a1_source_replay_identity_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    from kirby2.historical.lesson_runner import run_historical_lesson
+    from kirby2.multivenue.replay import replay_multivenue_recording
+    from kirby2.observability.replay import replay_observability_recording
+    from kirby2.scenario_lang.commands import inspect_scenario_source
+
+    failures: list[str] = []
+    repository = _a1_repository_root()
+    protected_rows = {"quiet", "event"}
+    for row in bundle.sources.rows:
+        if row.row_id in protected_rows:
+            parent = repository / str(row.provenance["parent_artifact_path"])
+            if not parent.is_file():
+                failures.append(f"{row.row_id} immutable WO31-I1 proof is absent")
+                continue
+            raw = parent.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != row.provenance["parent_artifact_sha256"]:
+                failures.append(f"{row.row_id} WO31-I1 proof parent digest differs")
+                continue
+            try:
+                proof_payload = json.loads(raw)
+            except json.JSONDecodeError:
+                failures.append(f"{row.row_id} WO31-I1 proof parent is invalid JSON")
+                continue
+            matches = [
+                item
+                for item in proof_payload.get("run_proofs", [])
+                if item.get("candidate_id")
+                == row.identity["qualification_profile_id"]
+                and item.get("partition") == "QUALIFICATION"
+                and item.get("root_seed") == 3_102_000
+            ]
+            embedded = json.loads(str(row.configuration["bytes_json"]))
+            if len(matches) != 1 or matches[0] != embedded:
+                failures.append(f"{row.row_id} did not resolve one exact WO31-I1 proof")
+                continue
+            proof = matches[0]
+            if (
+                proof["run_digest"] != row.identity["expected_native_run_digest"]
+                or proof["run_digest"] != row.identity["expected_replay_digest"]
+                or proof["full_day_run_id"] != row.provenance["full_day_run_id"]
+                or proof["replay_verification_status"] != "PASS"
+            ):
+                failures.append(f"{row.row_id} WO31-I1 replay identity differs")
+            review_path = parent.with_name("review-source.json")
+            if not review_path.is_file():
+                failures.append(f"{row.row_id} WO31-I1 review source is absent")
+                continue
+            review_raw = review_path.read_bytes()
+            review_sha = hashlib.sha256(review_raw).hexdigest()
+            try:
+                review = json.loads(review_raw)
+            except json.JSONDecodeError:
+                failures.append(f"{row.row_id} WO31-I1 review source is invalid JSON")
+                continue
+            review_matches = [
+                item
+                for item in review.get("runs", [])
+                if item.get("candidate_id")
+                == row.identity["qualification_profile_id"]
+                and item.get("root_seed") == 3_102_000
+            ]
+            if (
+                len(review_matches) != 1
+                or review_matches[0]["session_start_us"]
+                != row.bounds["source_start_us"]
+                or review_matches[0]["session_end_us"]
+                != row.bounds["source_end_us"]
+                or f"review_source_sha256={review_sha}"
+                not in str(row.provenance["parent_selector"])
+            ):
+                failures.append(f"{row.row_id} WO31-I1 session bounds differ")
+            continue
+
+        source_path = repository / str(row.source["example_path"])
+        report = inspect_scenario_source(source_path)
+        if not report.passed or report.artifact is None:
+            failures.append(f"{row.row_id} source cannot resolve for replay")
+            continue
+        artifact = report.artifact
+        native = artifact.plan_envelope.payload
+        if artifact.run_identity_digest != row.identity["expected_native_run_digest"]:
+            failures.append(f"{row.row_id} native run identity differs")
+        if row.row_id == "hidden":
+            replay = replay_observability_recording(native)
+            replay_digest = native.sha256()
+            state_digest = replay.venue.state_sha256()
+        elif row.row_id == "fragmented":
+            replay = replay_multivenue_recording(native)
+            replay_digest = native.sha256()
+            state_digest = replay.coordinator.state_sha256()
+        else:
+            session = run_historical_lesson(native)
+            replay = None
+            replay_digest = session.run.replay_sha256()
+            state_digest = "NOT_APPLICABLE"
+        if replay is not None and not replay.passed:
+            failures.append(f"{row.row_id} deterministic recording replay failed")
+        if (
+            replay_digest != row.identity["expected_replay_digest"]
+            or state_digest != row.identity["expected_final_state_sha256"]
+        ):
+            failures.append(f"{row.row_id} replay or final-state digest differs")
+        if row.execution["candidate_outcomes_inspected"] != "FORBIDDEN":
+            failures.append(f"{row.row_id} permits candidate outcome inspection")
+    return DrillMiningAuditCase(
+        "mining_source_replay_identities_verify_without_protected_regeneration",
+        (
+            "wo31_i1_rows=2 read_only=true protected_seed_execution=absent "
+            "fixed_recording_replays=2 historical_sources=1 replay_identity=exact"
+        ),
+        tuple(failures),
+    )
+
+
+def _a1_unexercised_and_hostile_refusal_case(
+    bundle: MiningPolicyBundleV1,
+) -> DrillMiningAuditCase:
+    from kirby2.research.toml_codec import canonical_toml
+
+    failures: list[str] = []
+    scopes = (
+        bundle.thresholds.as_dict()["execution_scope"],
+        bundle.plan.as_dict()["execution_scope"],
+        bundle.sources.as_dict()["execution_scope"],
+    )
+    if any(scope["candidate_mining"] != "NOT_EXERCISED" for scope in scopes):
+        failures.append("a preregistration manifest overstates candidate mining")
+    if (
+        scopes[0]["detector_invocation"] != "NOT_EXERCISED"
+        or scopes[1]["detector_invocation"] != "NOT_EXERCISED"
+        or scopes[2]["detector_invocation"] != "NOT_EXERCISED"
+        or scopes[1]["selection"] != "NOT_EXERCISED"
+        or scopes[2]["selection"] != "NOT_EXERCISED"
+    ):
+        failures.append("detector or selection execution was claimed prematurely")
+
+    refusals = 0
+    probes: list[Callable[[], object]] = [
+        lambda: DetectorThresholdsManifestV1.from_toml_bytes(
+            b" " + bundle.thresholds.canonical_bytes()
+        ),
+        lambda: QualificationSourcesManifestV1.from_toml_bytes(
+            bundle.sources.canonical_bytes().replace(
+                b"3302001", b"3102000", 1
+            )
+        ),
+    ]
+    changed_thresholds = bundle.thresholds.as_dict()
+    changed_thresholds["unexpected_policy"] = True
+    _rehash_a1_manifest(changed_thresholds)
+    probes.append(
+        lambda: DetectorThresholdsManifestV1.from_toml_bytes(
+            canonical_toml(changed_thresholds).encode("utf-8")
+        )
+    )
+    changed_plan = bundle.plan.as_dict()
+    changed_plan["threshold_manifest_sha256"] = "0" * 64
+    _rehash_a1_manifest(changed_plan)
+
+    def wrong_cross_binding() -> object:
+        changed = MiningPlanManifestV1.from_toml_bytes(
+            canonical_toml(changed_plan).encode("utf-8")
+        )
+        return MiningPolicyBundleV1(bundle.thresholds, changed, bundle.sources)
+
+    probes.append(wrong_cross_binding)
+    for operation in probes:
+        if _raises(operation):
+            refusals += 1
+        else:
+            failures.append("a hostile manifest mutation was accepted")
+    return DrillMiningAuditCase(
+        "mining_preregistration_is_unexercised_and_hostile_mutations_fail_closed",
+        (
+            f"refusals={refusals}/4 detector_invocation=NOT_EXERCISED "
+            "candidate_mining=NOT_EXERCISED selection=NOT_EXERCISED "
+            "human_review=PENDING"
+        ),
+        tuple(failures),
+    )
+
+
+def _rehash_a1_manifest(payload: dict[str, object]) -> None:
+    payload.pop("manifest_sha256", None)
+    payload.pop("semantic_sha256", None)
+    semantic = {
+        key: value for key, value in payload.items() if key != "manifest_version"
+    }
+    payload["semantic_sha256"] = sha256_json(semantic)
+    payload["manifest_sha256"] = sha256_json(payload)
+
+
 def _sample_candidate(
     *,
     bounds: CandidateBoundsV1 | None = None,
@@ -881,5 +1472,12 @@ __all__ = [
     "WO33A_IDENTITY_KEY_COUNT",
     "WO33A_REVIEW_DECISION_COUNT",
     "WO33A_SKILL_COUNT",
+    "WO33A1_MINING_PLAN_MANIFEST_SHA256",
+    "WO33A1_POLICY_BUNDLE_SHA256",
+    "WO33A1_REVIEW_TARGET_COUNT",
+    "WO33A1_SOURCE_COUNT",
+    "WO33A1_SOURCE_MANIFEST_SHA256",
+    "WO33A1_THRESHOLD_MANIFEST_SHA256",
     "audit_drill_mining",
+    "audit_wo33a1_drill_mining",
 ]

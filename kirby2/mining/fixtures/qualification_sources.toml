@@ -1,0 +1,373 @@
+"manifest_id" = "WO33_A1_QUALIFICATION_SOURCES_V1"
+"manifest_sha256" = "ff0cb292d1ed764b73f197462cd49c0c8a345fffcd547bab1c60b726b7d5eda5"
+"manifest_version" = 1
+"policy_version" = "LESSON_MINING_V1"
+"row_order" = ["quiet", "event", "hidden", "fragmented", "historical"]
+"schema_version" = 1
+"semantic_sha256" = "21b514b5445f7fa67b35d985468e4d7d5637ab7711e7593e8d55dc53d544c909"
+
+["execution_scope"]
+"candidate_mining" = "NOT_EXERCISED"
+"candidate_outcome_inspection" = "FORBIDDEN"
+"detector_invocation" = "NOT_EXERCISED"
+"hidden_fragmented_allowed_roots" = [3302001, 3302002]
+"protected_wo31_seed_execution" = "FORBIDDEN"
+"selection" = "NOT_EXERCISED"
+"source_identity_validation" = "READ_ONLY_EXCEPT_FIXED_RECORDING_REPLAY"
+
+["rows"]
+
+["rows"."event"]
+"row_id" = "event"
+"stratum" = "EVENT_DRIVEN_FULL_DAY"
+
+["rows"."event"."adapter"]
+"checkpoint_adapter_id" = "FULL_DAY_RUNTIME_V1"
+"generator_adapter_id" = "KIRBY2_FULL_DAY_PLAN_ADAPTER_V1"
+"generator_adapter_version" = 1
+"generator_target_kind" = "FULL_DAY_PLAN_V1"
+
+["rows"."event"."bounds"]
+"source_end_us" = 6000000000
+"source_start_us" = 0
+
+["rows"."event"."capabilities"]
+"adapter_contract_sha256" = "1d3189f49168a2ba27ff937ef3011c702185d9b34ff02662715f0467712fe1c3"
+"provided" = ["AUCTION_STATE", "COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "HALT_STATE", "MICROSECOND_TIMESTAMP_PRECISION", "PORTABLE_CHECKPOINT", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"required" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+
+["rows"."event"."configuration"]
+"bytes_format" = "CANONICAL_JSON_V1"
+"bytes_json" = "{\"abort_code\":null,\"candidate_id\":\"EVENT_SHOCK_PRESSURE\",\"event_prefix_sha256\":\"81d8d4d101082434eabbbdb9d3a7d8b86207297e3014cd81358c333f1009125b\",\"final_checkpoint_sha256\":\"6af0e90e7d1be67315f0a2938d27b5f571ff28917de518303664e36cc3ef7ba7\",\"full_day_evidence_digest\":\"afc0f6d73e55a2b3dadebf83445b23b2024a63022d9d22edbfeb4ac847bb8f65\",\"full_day_run_id\":\"run-45f71c1f8860646e3bedc1e3\",\"outer_event_count\":706,\"partition\":\"QUALIFICATION\",\"plan_sha256\":\"6c6e48c2560fa7e56573d73bb9e108c820c2daff0abc35e9f2d066cc42fa32d2\",\"replay_verification_status\":\"PASS\",\"root_seed\":3102000,\"run_digest\":\"37b235512ca489e7136770a1d7d78d4c9870033d648e522ed9156a56ceab47c9\",\"workload_sha256\":\"473c0537d01b1b2512059a30c787526961c36e44d368da61eb8c1885a885bdc1\"}"
+"bytes_length" = 736
+"bytes_sha256" = "827c3986528d7558b00c6e012592f9714e86e2446dc71233eee7bf7ad674ba6d"
+"native_payload_canonical_sha256" = "6c6e48c2560fa7e56573d73bb9e108c820c2daff0abc35e9f2d066cc42fa32d2"
+"native_payload_path" = "WO31_I1_IMMUTABLE_PLAN_ARTIFACT"
+"native_payload_raw_bytes_length" = 0
+"native_payload_raw_sha256" = "NOT_APPLICABLE"
+
+["rows"."event"."execution"]
+"candidate_outcomes_inspected" = "FORBIDDEN"
+"protected_seed_access" = "READ_ONLY_EXISTING_WO31_I1_EVIDENCE"
+"qualification_root_application" = "EXACT_WO31_I1_PROFILE_ROOT"
+"replay_verification" = "PASS_IMMUTABLE_WO31_I1_PROOF"
+"source_generation" = "FORBIDDEN_USE_IMMUTABLE_WO31_I1_ARTIFACT"
+
+["rows"."event"."identity"]
+"evidence_class" = "S"
+"expected_final_state_sha256" = "NOT_APPLICABLE"
+"expected_native_run_digest" = "37b235512ca489e7136770a1d7d78d4c9870033d648e522ed9156a56ceab47c9"
+"expected_replay_digest" = "37b235512ca489e7136770a1d7d78d4c9870033d648e522ed9156a56ceab47c9"
+"qualification_profile_id" = "EVENT_SHOCK_PRESSURE"
+"qualification_root_seed" = 3102000
+"source_id" = "run-45f71c1f8860646e3bedc1e3"
+"source_kind" = "RUN"
+"source_selected_root_seed" = 3102000
+"source_sha256" = "37b235512ca489e7136770a1d7d78d4c9870033d648e522ed9156a56ceab47c9"
+
+["rows"."event"."provenance"]
+"checkpoint_sha256" = "6af0e90e7d1be67315f0a2938d27b5f571ff28917de518303664e36cc3ef7ba7"
+"event_prefix_sha256" = "81d8d4d101082434eabbbdb9d3a7d8b86207297e3014cd81358c333f1009125b"
+"evidence_run_id" = "run-bf21e61c4b0d50862f901be1"
+"full_day_run_id" = "run-45f71c1f8860646e3bedc1e3"
+"parent_artifact_path" = ".kirby2/full_day/qualification/runs/run-bf21e61c4b0d50862f901be1/run-proofs.json"
+"parent_artifact_sha256" = "ed719f31782307beaea4a45db7d570f8f853d5e42387009bfe49261cf999c551"
+"parent_selector" = "candidate_id=EVENT_SHOCK_PRESSURE;partition=QUALIFICATION;root_seed=3102000;review_source_sha256=4b7fbbde7181182f41e99e483c4f57655e80f5461343a0879d189bf4dd408004"
+"plan_sha256" = "6c6e48c2560fa7e56573d73bb9e108c820c2daff0abc35e9f2d066cc42fa32d2"
+"workload_sha256" = "473c0537d01b1b2512059a30c787526961c36e44d368da61eb8c1885a885bdc1"
+
+["rows"."event"."source"]
+"compiled_artifact_sha256" = "a44cbdb2e42053e956c48789c334075195a455eb1056c6f938e66de63cd77b1c"
+"example_adapter_id" = "KIRBY2_MARKET_SCENARIO_ADAPTER_V1"
+"example_adapter_version" = 1
+"example_path" = "kirby2/scenario_lang/examples/opening_momentum.toml"
+"example_selected_root_seed" = 73
+"example_target_kind" = "MARKET_SCENARIO_V1"
+"raw_bytes_length" = 2552
+"raw_sha256" = "520148fd928acc3f84b65d3c6f41e1127c4278516fc50a7b2d6fe90118f7f7f3"
+"semantic_plan_sha256" = "345093ce066c6e1cdbfdb50a2f1ea68ef2d849ca7d83508a4722fe16f29ca76b"
+"source_bundle_sha256" = "ad2dda5ed9e42d6fce1eb140c366ca39e9528fdc3aa41ca5036cb7de2c3dbb40"
+
+["rows"."fragmented"]
+"row_id" = "fragmented"
+"stratum" = "FRAGMENTED_MARKET_DAY"
+
+["rows"."fragmented"."adapter"]
+"checkpoint_adapter_id" = "MULTIVENUE_RECORDING_V1"
+"generator_adapter_id" = "KIRBY2_MULTIVENUE_RECORDING_ADAPTER_V1"
+"generator_adapter_version" = 1
+"generator_target_kind" = "MULTIVENUE_RECORDING_V1"
+
+["rows"."fragmented"."bounds"]
+"source_end_us" = 1300
+"source_start_us" = 0
+
+["rows"."fragmented"."capabilities"]
+"adapter_contract_sha256" = "5f6bb1573d6d32af1dd7b3c70db8d204e1b1700243f638929d2829195c78dbcd"
+"provided" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "EXECUTABLE_DEPTH", "FEE_SCHEDULE", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "PER_VENUE_QUOTES", "QUOTES", "RECEIPT_LATENCY_MODEL", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"required" = ["COMPLETE_EVENT_SEQUENCE", "EXECUTABLE_DEPTH", "FEE_SCHEDULE", "PER_VENUE_QUOTES", "RECEIPT_LATENCY_MODEL"]
+
+["rows"."fragmented"."configuration"]
+"bytes_format" = "CANONICAL_JSON_V1"
+"bytes_json" = "{\"adapter_id\":\"KIRBY2_MULTIVENUE_RECORDING_ADAPTER_V1\",\"adapter_version\":1,\"qualification_root_seed\":3302002,\"recording_sha256\":\"a9bdaf0a0bdbaac35046d934f1b348d70d1ec6bae8f87ad26580fc0d1fae9db3\",\"replay_mode\":\"FIXED_RECORDING_NO_RNG\",\"source_selected_root_seed\":42,\"target_kind\":\"MULTIVENUE_RECORDING_V1\"}"
+"bytes_length" = 305
+"bytes_sha256" = "74e9e5b3c9b2e564d10f62de0a03f1ee00620b9a347cddad21bc4f029b842fad"
+"native_payload_canonical_sha256" = "a9bdaf0a0bdbaac35046d934f1b348d70d1ec6bae8f87ad26580fc0d1fae9db3"
+"native_payload_path" = "kirby2/scenario_lang/examples/native/fragmented_venue_recording.json"
+"native_payload_raw_bytes_length" = 23315
+"native_payload_raw_sha256" = "8be6be74b32da6db0be5dc414ffb980840048978a6cc12413fa01bab813ee93a"
+
+["rows"."fragmented"."execution"]
+"candidate_outcomes_inspected" = "FORBIDDEN"
+"protected_seed_access" = "ABSENT"
+"qualification_root_application" = "ANCESTRY_DOMAIN_FIXED_RECORDING_REPLAY_CONSUMES_NO_RNG"
+"replay_verification" = "PASS_REQUIRED"
+"source_generation" = "DETERMINISTIC_FIXED_RECORDING_REPLAY_AT_NONPROTECTED_ROOT"
+
+["rows"."fragmented"."identity"]
+"evidence_class" = "S"
+"expected_final_state_sha256" = "d39c43584609c583ba3cb75896178fe3b433e0f8450a84f6bc90a274515a8979"
+"expected_native_run_digest" = "16f411f74704e11a67b37780daf252043717d81e1a40c00b8fca2f25392b9c0f"
+"expected_replay_digest" = "a9bdaf0a0bdbaac35046d934f1b348d70d1ec6bae8f87ad26580fc0d1fae9db3"
+"qualification_profile_id" = "MULTIVENUE_RECORDING_V1"
+"qualification_root_seed" = 3302002
+"source_id" = "fragmented-venue-recording-3302002"
+"source_kind" = "RUN"
+"source_selected_root_seed" = 42
+"source_sha256" = "a9bdaf0a0bdbaac35046d934f1b348d70d1ec6bae8f87ad26580fc0d1fae9db3"
+
+["rows"."fragmented"."provenance"]
+"checkpoint_sha256" = "NOT_APPLICABLE"
+"event_prefix_sha256" = "NOT_APPLICABLE"
+"evidence_run_id" = "NOT_APPLICABLE"
+"full_day_run_id" = "NOT_APPLICABLE"
+"parent_artifact_path" = "kirby2/scenario_lang/examples/native/fragmented_venue_recording.json"
+"parent_artifact_sha256" = "8be6be74b32da6db0be5dc414ffb980840048978a6cc12413fa01bab813ee93a"
+"parent_selector" = "COMPLETE_CANONICAL_RECORDING"
+"plan_sha256" = "NOT_APPLICABLE"
+"workload_sha256" = "NOT_APPLICABLE"
+
+["rows"."fragmented"."source"]
+"compiled_artifact_sha256" = "c892bdf9ed458581a0c954d212c6dd63caa0358b2295002f7f15510f5bdb95e8"
+"example_adapter_id" = "KIRBY2_MULTIVENUE_RECORDING_ADAPTER_V1"
+"example_adapter_version" = 1
+"example_path" = "kirby2/scenario_lang/examples/fragmented_venue.toml"
+"example_selected_root_seed" = 42
+"example_target_kind" = "MULTIVENUE_RECORDING_V1"
+"raw_bytes_length" = 3561
+"raw_sha256" = "8197a21efde1be8b008917c043a940150319951dcc88e44df4b89089ed016639"
+"semantic_plan_sha256" = "3c7a18d4a8e75133320c2bfb88913575f56165245d219eac4541e05f88c46715"
+"source_bundle_sha256" = "0d753648f5e5a0f62f189421ce80313f3d889e8b5a622f8f67b4eedc437b77a6"
+
+["rows"."hidden"]
+"row_id" = "hidden"
+"stratum" = "HIDDEN_LIQUIDITY_DAY"
+
+["rows"."hidden"."adapter"]
+"checkpoint_adapter_id" = "HIDDEN_LIQUIDITY_RECORDING_V1"
+"generator_adapter_id" = "KIRBY2_HIDDEN_LIQUIDITY_RECORDING_ADAPTER_V1"
+"generator_adapter_version" = 1
+"generator_target_kind" = "HIDDEN_LIQUIDITY_RECORDING_V1"
+
+["rows"."hidden"."bounds"]
+"source_end_us" = 300
+"source_start_us" = 0
+
+["rows"."hidden"."capabilities"]
+"adapter_contract_sha256" = "1c936913c084cde45557ec2f89d1b9633ee0b8bf09e8cca11089c201e1c6cb68"
+"provided" = ["AUTHORITATIVE_RESERVE_REFRESH_LABELS", "COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"required" = ["AUTHORITATIVE_RESERVE_REFRESH_LABELS", "COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+
+["rows"."hidden"."configuration"]
+"bytes_format" = "CANONICAL_JSON_V1"
+"bytes_json" = "{\"adapter_id\":\"KIRBY2_HIDDEN_LIQUIDITY_RECORDING_ADAPTER_V1\",\"adapter_version\":1,\"qualification_root_seed\":3302001,\"recording_sha256\":\"7ab8dee81a23d6599837da5f85d4ea1e71dbfd3402c0f6dbdb1b80eb43aacdc7\",\"replay_mode\":\"FIXED_RECORDING_NO_RNG\",\"source_selected_root_seed\":11,\"target_kind\":\"HIDDEN_LIQUIDITY_RECORDING_V1\"}"
+"bytes_length" = 317
+"bytes_sha256" = "c542c0528f193e272614901c8db24dafecc78da3ce0dac87d228da5dbb714f6d"
+"native_payload_canonical_sha256" = "7ab8dee81a23d6599837da5f85d4ea1e71dbfd3402c0f6dbdb1b80eb43aacdc7"
+"native_payload_path" = "kirby2/scenario_lang/examples/native/hidden_liquidity_recording.json"
+"native_payload_raw_bytes_length" = 13614
+"native_payload_raw_sha256" = "9f63b44af6bf11ca7353decb159d9fb2751a9685b7c908754d05ef0a416b877a"
+
+["rows"."hidden"."execution"]
+"candidate_outcomes_inspected" = "FORBIDDEN"
+"protected_seed_access" = "ABSENT"
+"qualification_root_application" = "ANCESTRY_DOMAIN_FIXED_RECORDING_REPLAY_CONSUMES_NO_RNG"
+"replay_verification" = "PASS_REQUIRED"
+"source_generation" = "DETERMINISTIC_FIXED_RECORDING_REPLAY_AT_NONPROTECTED_ROOT"
+
+["rows"."hidden"."identity"]
+"evidence_class" = "S"
+"expected_final_state_sha256" = "60f60cd7425a9238e164698259a6c04587c1126806cdefd54916732da78f8a97"
+"expected_native_run_digest" = "a436e1cc9388da388b445711b289dd71fdb5c19dffae0865d5b849a4b26b91eb"
+"expected_replay_digest" = "7ab8dee81a23d6599837da5f85d4ea1e71dbfd3402c0f6dbdb1b80eb43aacdc7"
+"qualification_profile_id" = "HIDDEN_LIQUIDITY_RECORDING_V1"
+"qualification_root_seed" = 3302001
+"source_id" = "hidden-liquidity-recording-3302001"
+"source_kind" = "RUN"
+"source_selected_root_seed" = 11
+"source_sha256" = "7ab8dee81a23d6599837da5f85d4ea1e71dbfd3402c0f6dbdb1b80eb43aacdc7"
+
+["rows"."hidden"."provenance"]
+"checkpoint_sha256" = "NOT_APPLICABLE"
+"event_prefix_sha256" = "NOT_APPLICABLE"
+"evidence_run_id" = "NOT_APPLICABLE"
+"full_day_run_id" = "NOT_APPLICABLE"
+"parent_artifact_path" = "kirby2/scenario_lang/examples/native/hidden_liquidity_recording.json"
+"parent_artifact_sha256" = "9f63b44af6bf11ca7353decb159d9fb2751a9685b7c908754d05ef0a416b877a"
+"parent_selector" = "COMPLETE_CANONICAL_RECORDING"
+"plan_sha256" = "NOT_APPLICABLE"
+"workload_sha256" = "NOT_APPLICABLE"
+
+["rows"."hidden"."source"]
+"compiled_artifact_sha256" = "bf346c43d477f58c9de44639c09344c8b88a25a03b255dde1a65e5a0f689395a"
+"example_adapter_id" = "KIRBY2_HIDDEN_LIQUIDITY_RECORDING_ADAPTER_V1"
+"example_adapter_version" = 1
+"example_path" = "kirby2/scenario_lang/examples/hidden_liquidity.toml"
+"example_selected_root_seed" = 11
+"example_target_kind" = "HIDDEN_LIQUIDITY_RECORDING_V1"
+"raw_bytes_length" = 2739
+"raw_sha256" = "a0fee30eb2eccc2de042d4004a1639f1f7a6108386e841d934e28296b71a90ee"
+"semantic_plan_sha256" = "e294d8b80ff36deb3f8cc03d191f20e9927f2093742021f6f887dfeb9ed6df9a"
+"source_bundle_sha256" = "48c937a86ed677f0f5ec4d3b024892c49adf040df4ffebb69ddd2ecc4528de33"
+
+["rows"."historical"]
+"row_id" = "historical"
+"stratum" = "HISTORICAL_RECONSTRUCTION"
+
+["rows"."historical"."adapter"]
+"checkpoint_adapter_id" = "HISTORICAL_LESSON_SESSION_V1"
+"generator_adapter_id" = "KIRBY2_HISTORICAL_LESSON_ADAPTER_V1"
+"generator_adapter_version" = 1
+"generator_target_kind" = "HISTORICAL_LESSON_V1"
+
+["rows"."historical"."bounds"]
+"source_end_us" = 30000000
+"source_start_us" = 0
+
+["rows"."historical"."capabilities"]
+"adapter_contract_sha256" = "9dbdc695edcdc83d81d072df2665a11a4cea6fe44652df8bcea5ccdbae8fe1f2"
+"provided" = ["COMPLETE_EVENT_SEQUENCE", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"required" = ["COMPLETE_EVENT_SEQUENCE", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+
+["rows"."historical"."configuration"]
+"bytes_format" = "CANONICAL_JSON_V1"
+"bytes_json" = "{\"adapter_id\":\"KIRBY2_HISTORICAL_LESSON_ADAPTER_V1\",\"adapter_version\":1,\"lesson_id\":\"reconstruction_liquidity_decision\",\"native_plan_digest\":\"02ecd7e4e4d32950d314b8c437630e694b077ac1d0872e9c1789f66491b5a077\",\"qualification_root_seed\":\"NOT_APPLICABLE\",\"source_replay_sha256\":\"27f2287c973b7f7106362a4184d46b536718a354b1b06463b31054809b45efc5\",\"target_kind\":\"HISTORICAL_LESSON_V1\"}"
+"bytes_length" = 378
+"bytes_sha256" = "725c5d25655be22447e7fac279010060bc93b6715ad13cd5949f4973e30fb3d7"
+"native_payload_canonical_sha256" = "02ecd7e4e4d32950d314b8c437630e694b077ac1d0872e9c1789f66491b5a077"
+"native_payload_path" = "kirby2/historical/lessons/reconstruction_liquidity_decision.json"
+"native_payload_raw_bytes_length" = 3140
+"native_payload_raw_sha256" = "53ea3da0ac93b9d93f079740ce179a189db95f29dd1b119fdc47526432eaff9a"
+
+["rows"."historical"."execution"]
+"candidate_outcomes_inspected" = "FORBIDDEN"
+"protected_seed_access" = "ABSENT"
+"qualification_root_application" = "NOT_APPLICABLE"
+"replay_verification" = "PASS_EXISTING_IMMUTABLE_SOURCE"
+"source_generation" = "RESOLVE_EXISTING_IMMUTABLE_RECONSTRUCTION"
+
+["rows"."historical"."identity"]
+"evidence_class" = "R"
+"expected_final_state_sha256" = "NOT_APPLICABLE"
+"expected_native_run_digest" = "79d772e597ba2692ef9e510c0d47a01bb417bd0ba58db43c43cfcbb65c13da1c"
+"expected_replay_digest" = "27f2287c973b7f7106362a4184d46b536718a354b1b06463b31054809b45efc5"
+"qualification_profile_id" = "HISTORICAL_LESSON_V1"
+"qualification_root_seed" = "NOT_APPLICABLE"
+"source_id" = "reconstruction_liquidity_decision"
+"source_kind" = "RECONSTRUCTION"
+"source_selected_root_seed" = 19
+"source_sha256" = "27f2287c973b7f7106362a4184d46b536718a354b1b06463b31054809b45efc5"
+
+["rows"."historical"."provenance"]
+"checkpoint_sha256" = "NOT_APPLICABLE"
+"event_prefix_sha256" = "NOT_APPLICABLE"
+"evidence_run_id" = "NOT_APPLICABLE"
+"full_day_run_id" = "NOT_APPLICABLE"
+"parent_artifact_path" = "kirby2/historical/lessons/reconstruction_liquidity_decision.json"
+"parent_artifact_sha256" = "53ea3da0ac93b9d93f079740ce179a189db95f29dd1b119fdc47526432eaff9a"
+"parent_selector" = "lesson_id=reconstruction_liquidity_decision;fixture_id=reconstruction_demo"
+"plan_sha256" = "NOT_APPLICABLE"
+"workload_sha256" = "NOT_APPLICABLE"
+
+["rows"."historical"."source"]
+"compiled_artifact_sha256" = "b42f416534b0cb6a296c1e4240fa61bf0f951f9dcd0cbbc2f17e56d8fd10daf3"
+"example_adapter_id" = "KIRBY2_HISTORICAL_LESSON_ADAPTER_V1"
+"example_adapter_version" = 1
+"example_path" = "kirby2/scenario_lang/examples/historical_reconstruction.toml"
+"example_selected_root_seed" = 19
+"example_target_kind" = "HISTORICAL_LESSON_V1"
+"raw_bytes_length" = 2557
+"raw_sha256" = "61c1c81e301b8caf6c2c8b736bc2fdca8b992595911bffd1bd8c0df0ad02ef6f"
+"semantic_plan_sha256" = "26f1f882b4e728647e337dadf54d00822ec8acc0d995588febefb30050123b33"
+"source_bundle_sha256" = "c650d1e067e26e9f5fbd981dfc54423ea703f1402eac33c2f71b84765f041241"
+
+["rows"."quiet"]
+"row_id" = "quiet"
+"stratum" = "QUIET_FULL_DAY"
+
+["rows"."quiet"."adapter"]
+"checkpoint_adapter_id" = "FULL_DAY_RUNTIME_V1"
+"generator_adapter_id" = "KIRBY2_FULL_DAY_PLAN_ADAPTER_V1"
+"generator_adapter_version" = 1
+"generator_target_kind" = "FULL_DAY_PLAN_V1"
+
+["rows"."quiet"."bounds"]
+"source_end_us" = 6000000000
+"source_start_us" = 0
+
+["rows"."quiet"."capabilities"]
+"adapter_contract_sha256" = "1d3189f49168a2ba27ff937ef3011c702185d9b34ff02662715f0467712fe1c3"
+"provided" = ["AUCTION_STATE", "COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "HALT_STATE", "MICROSECOND_TIMESTAMP_PRECISION", "PORTABLE_CHECKPOINT", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"required" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+
+["rows"."quiet"."configuration"]
+"bytes_format" = "CANONICAL_JSON_V1"
+"bytes_json" = "{\"abort_code\":null,\"candidate_id\":\"QUIET_RANGE_PRESSURE\",\"event_prefix_sha256\":\"ccce682776e66e454f22de7bc98a99bebae237dac93bd99b75b4a180c874bcb9\",\"final_checkpoint_sha256\":\"c2eb70f23d73ba0b0adfff0d74a4be9a86fff7907ec5e47a5bcc34e34f8c99ef\",\"full_day_evidence_digest\":\"455935bd656aeadd417e38f57fbf00de52c16e32b96fd7565f0c5f1914c79306\",\"full_day_run_id\":\"run-79a4cc30043ec8d04f86ee38\",\"outer_event_count\":592,\"partition\":\"QUALIFICATION\",\"plan_sha256\":\"b355329fdc74b3f246d50395cdf97e7a5b0cba91450dab175eee4883f724b8b0\",\"replay_verification_status\":\"PASS\",\"root_seed\":3102000,\"run_digest\":\"ec49f16cc555e53d2afda505b42e9746c7a49026cea1e08e81aef9854d01ed3b\",\"workload_sha256\":\"0a05157776678ddbab8b91a770ff88da6cd832080c23856f77c4df6f30cf820d\"}"
+"bytes_length" = 736
+"bytes_sha256" = "94a04a66b4c0ac79bbf318ddea6a64cfeaaa0634dea87625fa49a0580e3906cc"
+"native_payload_canonical_sha256" = "b355329fdc74b3f246d50395cdf97e7a5b0cba91450dab175eee4883f724b8b0"
+"native_payload_path" = "WO31_I1_IMMUTABLE_PLAN_ARTIFACT"
+"native_payload_raw_bytes_length" = 0
+"native_payload_raw_sha256" = "NOT_APPLICABLE"
+
+["rows"."quiet"."execution"]
+"candidate_outcomes_inspected" = "FORBIDDEN"
+"protected_seed_access" = "READ_ONLY_EXISTING_WO31_I1_EVIDENCE"
+"qualification_root_application" = "EXACT_WO31_I1_PROFILE_ROOT"
+"replay_verification" = "PASS_IMMUTABLE_WO31_I1_PROOF"
+"source_generation" = "FORBIDDEN_USE_IMMUTABLE_WO31_I1_ARTIFACT"
+
+["rows"."quiet"."identity"]
+"evidence_class" = "S"
+"expected_final_state_sha256" = "NOT_APPLICABLE"
+"expected_native_run_digest" = "ec49f16cc555e53d2afda505b42e9746c7a49026cea1e08e81aef9854d01ed3b"
+"expected_replay_digest" = "ec49f16cc555e53d2afda505b42e9746c7a49026cea1e08e81aef9854d01ed3b"
+"qualification_profile_id" = "QUIET_RANGE_PRESSURE"
+"qualification_root_seed" = 3102000
+"source_id" = "run-79a4cc30043ec8d04f86ee38"
+"source_kind" = "RUN"
+"source_selected_root_seed" = 3102000
+"source_sha256" = "ec49f16cc555e53d2afda505b42e9746c7a49026cea1e08e81aef9854d01ed3b"
+
+["rows"."quiet"."provenance"]
+"checkpoint_sha256" = "c2eb70f23d73ba0b0adfff0d74a4be9a86fff7907ec5e47a5bcc34e34f8c99ef"
+"event_prefix_sha256" = "ccce682776e66e454f22de7bc98a99bebae237dac93bd99b75b4a180c874bcb9"
+"evidence_run_id" = "run-bf21e61c4b0d50862f901be1"
+"full_day_run_id" = "run-79a4cc30043ec8d04f86ee38"
+"parent_artifact_path" = ".kirby2/full_day/qualification/runs/run-bf21e61c4b0d50862f901be1/run-proofs.json"
+"parent_artifact_sha256" = "ed719f31782307beaea4a45db7d570f8f853d5e42387009bfe49261cf999c551"
+"parent_selector" = "candidate_id=QUIET_RANGE_PRESSURE;partition=QUALIFICATION;root_seed=3102000;review_source_sha256=4b7fbbde7181182f41e99e483c4f57655e80f5461343a0879d189bf4dd408004"
+"plan_sha256" = "b355329fdc74b3f246d50395cdf97e7a5b0cba91450dab175eee4883f724b8b0"
+"workload_sha256" = "0a05157776678ddbab8b91a770ff88da6cd832080c23856f77c4df6f30cf820d"
+
+["rows"."quiet"."source"]
+"compiled_artifact_sha256" = "ebd4b004941b51642aea947d30bf92216deeda86957be6549c794bbe109e54c0"
+"example_adapter_id" = "KIRBY2_FULL_DAY_PLAN_ADAPTER_V1"
+"example_adapter_version" = 1
+"example_path" = "kirby2/scenario_lang/examples/full_day.toml"
+"example_selected_root_seed" = 42
+"example_target_kind" = "FULL_DAY_PLAN_V1"
+"raw_bytes_length" = 2429
+"raw_sha256" = "d00d3421a03bf1020f36549c5f702dd251e3456b98447bce95780cb7fe98b48c"
+"semantic_plan_sha256" = "60994dc0f239771b493d16e6fc4e46298948ce7ab0f6fdd9b6b0a16897f9619b"
+"source_bundle_sha256" = "a1644739536db5742844df2667293023557ffafa265f5c305a45a01a5b7bf3cf"

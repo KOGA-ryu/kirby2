@@ -10,10 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import tomllib
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from importlib.resources import files
 from types import MappingProxyType
+
+from kirby2.research.toml_codec import canonical_toml
 
 
 MINING_SCHEMA_VERSION_V1 = 1
@@ -24,6 +29,10 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]{0,95}\Z")
 _NOT_APPLICABLE = "NOT_APPLICABLE"
 _CONSOLIDATED = "CONSOLIDATED"
+
+DETECTOR_THRESHOLDS_MANIFEST_ID_V1 = "WO33_A1_DETECTOR_THRESHOLDS_V1"
+MINING_PLAN_MANIFEST_ID_V1 = "WO33_A1_MINING_PLAN_V1"
+QUALIFICATION_SOURCES_MANIFEST_ID_V1 = "WO33_A1_QUALIFICATION_SOURCES_V1"
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -1402,10 +1411,864 @@ def _validate_candidate_types(candidate: LessonCandidateV1) -> None:
             raise TypeError(f"candidate {label} is invalid")
 
 
+def _strict_manifest_payload(
+    raw: bytes,
+    *,
+    filename: str,
+    manifest_id: str,
+    expected_keys: set[str],
+) -> tuple[dict[str, object], bytes]:
+    """Parse one canonical, self-digesting WO33-A1 TOML policy document."""
+
+    if type(raw) is not bytes:
+        raise TypeError(f"{filename} input must be exact bytes")
+    try:
+        payload = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"{filename} is not strict UTF-8 TOML") from error
+    if type(payload) is not dict or set(payload) != expected_keys:
+        raise ValueError(f"{filename} root fields differ from its closed schema")
+    _validate_manifest_value(payload, filename)
+    canonical = canonical_toml(payload).encode("utf-8")
+    if canonical != raw:
+        raise ValueError(f"{filename} is not canonical TOML")
+    if (
+        payload["schema_version"] != MINING_SCHEMA_VERSION_V1
+        or payload["manifest_version"] != 1
+        or payload["manifest_id"] != manifest_id
+        or payload["policy_version"] != "LESSON_MINING_V1"
+    ):
+        raise ValueError(f"{filename} identity is not WO33-A1 V1")
+    semantic_sha256 = payload["semantic_sha256"]
+    manifest_sha256 = payload["manifest_sha256"]
+    _require_digest(str(semantic_sha256), f"{filename} semantic digest")
+    _require_digest(str(manifest_sha256), f"{filename} manifest digest")
+    manifest_identity = {
+        key: value for key, value in payload.items() if key != "manifest_sha256"
+    }
+    if sha256_json(manifest_identity) != manifest_sha256:
+        raise ValueError(f"{filename} manifest digest is not reproducible")
+    semantic_identity = {
+        key: value
+        for key, value in manifest_identity.items()
+        if key not in {"manifest_version", "semantic_sha256"}
+    }
+    if sha256_json(semantic_identity) != semantic_sha256:
+        raise ValueError(f"{filename} semantic digest is not reproducible")
+    return payload, canonical
+
+
+def _validate_manifest_value(value: object, label: str) -> None:
+    if value is None or type(value) in {str, int, bool}:
+        if type(value) is str and unicodedata.normalize("NFC", value) != value:
+            raise ValueError(f"{label} contains non-NFC text")
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_manifest_value(item, label)
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str or not key:
+                raise ValueError(f"{label} contains an invalid table key")
+            _validate_manifest_value(key, label)
+            _validate_manifest_value(item, label)
+        return
+    raise TypeError(f"{label} contains a noncanonical value type")
+
+
+def _require_manifest_table(
+    payload: object,
+    expected_keys: set[str],
+    label: str,
+) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError(f"{label} fields differ from its closed schema")
+    return payload
+
+
+def _require_digest_or_not_applicable(value: object, label: str) -> None:
+    if value == _NOT_APPLICABLE:
+        return
+    if type(value) is not str:
+        raise TypeError(f"{label} must be a digest or NOT_APPLICABLE")
+    _require_digest(value, label)
+
+
+def _require_relative_manifest_path(value: object, label: str) -> str:
+    if type(value) is not str or not value or "\x00" in value:
+        raise ValueError(f"{label} must be a nonempty relative path")
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if normalized.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{label} must be confined and normalized")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorThresholdsManifestV1:
+    semantic_sha256: str
+    manifest_sha256: str
+    file_sha256: str
+    detector_ids: tuple[str, ...]
+    _payload: dict[str, object] = field(repr=False)
+    _canonical_bytes: bytes = field(repr=False)
+
+    def as_dict(self) -> dict[str, object]:
+        return json.loads(canonical_json_bytes(self._payload).decode("ascii"))
+
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    def detector(self, detector_id: str) -> dict[str, object]:
+        detectors = self._payload["detectors"]
+        if not isinstance(detectors, Mapping) or detector_id not in detectors:
+            raise KeyError(detector_id)
+        row = detectors[detector_id]
+        if not isinstance(row, Mapping):
+            raise TypeError("detector threshold row is not a table")
+        return json.loads(canonical_json_bytes(row).decode("ascii"))
+
+    def detector_threshold_sha256(self, detector_id: str) -> str:
+        return sha256_json(self.detector(detector_id))
+
+    @classmethod
+    def from_toml_bytes(cls, raw: bytes) -> DetectorThresholdsManifestV1:
+        payload, canonical = _strict_manifest_payload(
+            raw,
+            filename="detector_thresholds.toml",
+            manifest_id=DETECTOR_THRESHOLDS_MANIFEST_ID_V1,
+            expected_keys={
+                "arithmetic",
+                "binning",
+                "candidate_enumeration",
+                "capability_bundles",
+                "detector_order",
+                "detectors",
+                "evidence_scope",
+                "execution_scope",
+                "exclusions",
+                "manifest_id",
+                "manifest_sha256",
+                "manifest_version",
+                "policy_version",
+                "schema_version",
+                "semantic_sha256",
+            },
+        )
+        order = payload["detector_order"]
+        detectors = payload["detectors"]
+        from .detectors import DETECTOR_IDS_V1
+
+        if (
+            type(order) is not list
+            or any(type(item) is not str for item in order)
+            or tuple(order) != DETECTOR_IDS_V1
+            or not isinstance(detectors, Mapping)
+            or set(detectors) != set(order)
+        ):
+            raise ValueError("detector threshold inventory is not exact")
+        capability_bundles = payload["capability_bundles"]
+        if not isinstance(capability_bundles, Mapping) or not capability_bundles:
+            raise ValueError("detector capability bundles are absent")
+        for bundle_id, inventory in capability_bundles.items():
+            _require_identifier(str(bundle_id), "capability bundle ID")
+            if (
+                type(inventory) is not list
+                or not inventory
+                or any(type(item) is not str for item in inventory)
+                or inventory
+                != sorted(set(inventory), key=lambda item: item.encode("utf-8"))
+            ):
+                raise ValueError(f"{bundle_id} capability bundle is not canonical")
+        exact_row_keys = {
+            "ambiguity_rules",
+            "capability_bundle",
+            "detector_id",
+            "evidence_classes",
+            "exclusion_rules",
+            "family",
+            "horizons",
+            "key_axes",
+            "rule_expression",
+            "rule_id",
+            "sampling_unit",
+            "special_rules",
+            "thresholds",
+            "version",
+            "witness_kind",
+        }
+        for detector_id in order:
+            row = detectors[detector_id]
+            if not isinstance(row, Mapping) or set(row) != exact_row_keys:
+                raise ValueError(f"{detector_id} threshold fields differ")
+            if row["detector_id"] != detector_id or row["version"] != 1:
+                raise ValueError(f"{detector_id} threshold identity differs")
+            if row["capability_bundle"] not in capability_bundles:
+                raise ValueError(f"{detector_id} names an unknown capability bundle")
+            for name, allow_empty in (
+                ("ambiguity_rules", False),
+                ("evidence_classes", False),
+                ("exclusion_rules", True),
+                ("special_rules", True),
+            ):
+                values = row[name]
+                if (
+                    type(values) is not list
+                    or (not allow_empty and not values)
+                    or any(type(item) is not str or not item for item in values)
+                    or len(set(values)) != len(values)
+                ):
+                    raise ValueError(f"{detector_id} {name} inventory differs")
+            if (
+                type(row["key_axes"]) is not list
+                or len(row["key_axes"]) != 4
+                or any(type(item) is not str or not item for item in row["key_axes"])
+            ):
+                raise ValueError(f"{detector_id} key axes differ")
+            if any(item not in {"S", "H", "R"} for item in row["evidence_classes"]):
+                raise ValueError(f"{detector_id} evidence class is unknown")
+            horizons = _require_manifest_table(
+                row["horizons"],
+                {
+                    "maximum_post_activation_horizon_us",
+                    "maximum_pre_activation_lookback_us",
+                    "required_persistence_us",
+                },
+                f"{detector_id} horizons",
+            )
+            if any(type(value) is not int or value < 0 for value in horizons.values()):
+                raise ValueError(f"{detector_id} horizons must be nonnegative integers")
+            for name in (
+                "family",
+                "rule_expression",
+                "rule_id",
+                "sampling_unit",
+                "witness_kind",
+            ):
+                if type(row[name]) is not str or not row[name]:
+                    raise ValueError(f"{detector_id} {name} must be nonempty text")
+            thresholds = row["thresholds"]
+            if type(thresholds) is not list or not thresholds:
+                raise ValueError(f"{detector_id} has no operational thresholds")
+            for threshold in thresholds:
+                if not isinstance(threshold, Mapping) or set(threshold) != {
+                    "name",
+                    "operator",
+                    "unit",
+                    "value",
+                }:
+                    raise ValueError(f"{detector_id} threshold clause differs")
+                if any(
+                    type(threshold[name]) is not str or not threshold[name]
+                    for name in ("name", "operator", "unit")
+                ) or type(threshold["value"]) not in {int, str}:
+                    raise TypeError(f"{detector_id} threshold values are not exact")
+        return cls(
+            semantic_sha256=str(payload["semantic_sha256"]),
+            manifest_sha256=str(payload["manifest_sha256"]),
+            file_sha256=hashlib.sha256(raw).hexdigest(),
+            detector_ids=tuple(str(item) for item in order),
+            _payload=payload,
+            _canonical_bytes=canonical,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MiningPlanManifestV1:
+    semantic_sha256: str
+    manifest_sha256: str
+    file_sha256: str
+    _payload: dict[str, object] = field(repr=False)
+    _canonical_bytes: bytes = field(repr=False)
+
+    def as_dict(self) -> dict[str, object]:
+        return json.loads(canonical_json_bytes(self._payload).decode("ascii"))
+
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    @classmethod
+    def from_toml_bytes(cls, raw: bytes) -> MiningPlanManifestV1:
+        payload, canonical = _strict_manifest_payload(
+            raw,
+            filename="mining_plan.toml",
+            manifest_id=MINING_PLAN_MANIFEST_ID_V1,
+            expected_keys={
+                "arithmetic",
+                "candidate_shortfall",
+                "deduplication",
+                "deduplication_inputs",
+                "detector_families",
+                "difficulty",
+                "diversity",
+                "execution_scope",
+                "manifest_id",
+                "manifest_sha256",
+                "manifest_version",
+                "policy_version",
+                "qualification_sources_manifest_sha256",
+                "review_sampling",
+                "sampling",
+                "schema_version",
+                "semantic_sha256",
+                "threshold_manifest_sha256",
+            },
+        )
+        for name in (
+            "qualification_sources_manifest_sha256",
+            "threshold_manifest_sha256",
+        ):
+            _require_digest(str(payload[name]), f"mining plan {name}")
+        table_keys = {
+            "arithmetic": {
+                "clamp",
+                "division",
+                "fixed_point_scale",
+                "jaccard_empty_empty_ppm",
+                "jaccard_one_empty_ppm",
+                "missing_required",
+                "not_applicable_weighting",
+                "ratio",
+                "share",
+            },
+            "candidate_shortfall": {
+                "duplicates_may_fill_quota",
+                "event_five_gate",
+                "quota_may_weaken_thresholds",
+                "reserved_shortfall",
+                "threshold_relaxation",
+                "under_target_result",
+            },
+            "deduplication": {
+                "candidate_order",
+                "collapse",
+                "difficulty_insufficient",
+                "duplicate_of",
+                "event_five_gram_jaccard_min_ppm",
+                "feature_jaccard_min_ppm",
+                "objective_jaccard_min_ppm",
+                "regime_signature",
+                "source_ancestry",
+                "time_interval",
+                "time_iou_min_ppm",
+            },
+            "deduplication_inputs": {
+                "canonical_feature_value",
+                "event_five_grams",
+                "event_five_gram_order",
+                "event_price_relations",
+                "event_sides",
+                "event_token",
+                "feature_token",
+                "feature_token_exclusions",
+                "objective_set",
+                "regime_fields",
+                "regime_missing_metadata",
+                "source_ancestry_encoding",
+                "source_ancestry_fields",
+                "spread_bands",
+                "time_iou",
+                "volume_liquidity_bands_ppm",
+            },
+            "difficulty": {
+                "component_order",
+                "evidence_quality_ppm",
+                "formulas",
+                "hidden_uncertainty_ppm",
+                "input_rules",
+                "policy_id",
+                "positive_infinity_legibility_ppm",
+                "weights_ppm",
+            },
+            "diversity": {
+                "difficulty_bands_ppm",
+                "dimension_values",
+                "dimensions",
+                "marginal_score",
+                "novelty",
+                "selection",
+                "weights_ppm",
+            },
+            "execution_scope": {
+                "candidate_mining",
+                "candidate_outcomes",
+                "detector_invocation",
+                "human_review",
+                "policy_action",
+                "selection",
+                "threshold_relaxation",
+            },
+            "review_sampling": {
+                "event_material_distinctness",
+                "global_fill",
+                "reserved_counts",
+                "selection_root",
+                "source_order",
+                "step_order",
+                "target_count",
+                "tie_context",
+            },
+            "sampling": {
+                "alternate_units",
+                "candidate_rarity",
+                "denominator_exclusions",
+                "denominator_zero",
+                "eligible_default_unit",
+                "frequency_ppm",
+                "multiple_qualifying_keys_per_unit",
+                "overall_detector_frequency",
+                "population",
+                "rarity_ppm",
+            },
+        }
+        for name, keys in table_keys.items():
+            _require_manifest_table(payload[name], keys, f"mining plan {name}")
+        difficulty_bands = payload["diversity"]["difficulty_bands_ppm"]
+        if type(difficulty_bands) is not list or len(difficulty_bands) != 4:
+            raise ValueError("mining difficulty bands must contain four rows")
+        for band in difficulty_bands:
+            row = _require_manifest_table(
+                band,
+                {"lower_ppm", "upper_inclusive", "upper_ppm"},
+                "mining difficulty band",
+            )
+            if (
+                type(row["lower_ppm"]) is not int
+                or type(row["upper_ppm"]) is not int
+                or type(row["upper_inclusive"]) is not bool
+                or not 0 <= row["lower_ppm"] < row["upper_ppm"] <= POLICY_SCALE_V1
+            ):
+                raise ValueError("mining difficulty band bounds are invalid")
+        from .detectors import DETECTOR_IDS_V1
+
+        families = payload["detector_families"]
+        if not isinstance(families, Mapping) or set(families) != {
+            "ABSORPTION",
+            "EXECUTION",
+            "FLOW",
+            "FRAGMENTATION",
+            "PRICE_LIQUIDITY",
+            "QUEUE",
+            "SESSION",
+        }:
+            raise ValueError("mining detector families differ from the closed V1 set")
+        family_members = [item for members in families.values() for item in members]
+        if (
+            any(type(members) is not list or not members for members in families.values())
+            or len(family_members) != len(set(family_members))
+            or set(family_members) != set(DETECTOR_IDS_V1)
+        ):
+            raise ValueError("mining detector families do not partition the registry")
+        return cls(
+            semantic_sha256=str(payload["semantic_sha256"]),
+            manifest_sha256=str(payload["manifest_sha256"]),
+            file_sha256=hashlib.sha256(raw).hexdigest(),
+            _payload=payload,
+            _canonical_bytes=canonical,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationSourceRowV1:
+    row_id: str
+    stratum: str
+    source: dict[str, object]
+    adapter: dict[str, object]
+    configuration: dict[str, object]
+    identity: dict[str, object]
+    bounds: dict[str, object]
+    capabilities: dict[str, object]
+    provenance: dict[str, object]
+    execution: dict[str, object]
+
+    @classmethod
+    def from_dict(
+        cls,
+        row_id: str,
+        payload: Mapping[str, object],
+    ) -> QualificationSourceRowV1:
+        if set(payload) != {
+            "adapter",
+            "bounds",
+            "capabilities",
+            "configuration",
+            "execution",
+            "identity",
+            "provenance",
+            "row_id",
+            "source",
+            "stratum",
+        }:
+            raise ValueError(f"qualification source {row_id} fields differ")
+        table_keys = {
+            "source": {
+                "compiled_artifact_sha256",
+                "example_adapter_id",
+                "example_adapter_version",
+                "example_path",
+                "example_selected_root_seed",
+                "example_target_kind",
+                "raw_bytes_length",
+                "raw_sha256",
+                "semantic_plan_sha256",
+                "source_bundle_sha256",
+            },
+            "adapter": {
+                "checkpoint_adapter_id",
+                "generator_adapter_id",
+                "generator_adapter_version",
+                "generator_target_kind",
+            },
+            "configuration": {
+                "bytes_format",
+                "bytes_json",
+                "bytes_length",
+                "bytes_sha256",
+                "native_payload_canonical_sha256",
+                "native_payload_path",
+                "native_payload_raw_bytes_length",
+                "native_payload_raw_sha256",
+            },
+            "identity": {
+                "evidence_class",
+                "expected_final_state_sha256",
+                "expected_native_run_digest",
+                "expected_replay_digest",
+                "qualification_profile_id",
+                "qualification_root_seed",
+                "source_id",
+                "source_kind",
+                "source_selected_root_seed",
+                "source_sha256",
+            },
+            "bounds": {"source_end_us", "source_start_us"},
+            "capabilities": {
+                "adapter_contract_sha256",
+                "provided",
+                "required",
+            },
+            "provenance": {
+                "checkpoint_sha256",
+                "event_prefix_sha256",
+                "evidence_run_id",
+                "full_day_run_id",
+                "parent_artifact_path",
+                "parent_artifact_sha256",
+                "parent_selector",
+                "plan_sha256",
+                "workload_sha256",
+            },
+            "execution": {
+                "candidate_outcomes_inspected",
+                "protected_seed_access",
+                "qualification_root_application",
+                "replay_verification",
+                "source_generation",
+            },
+        }
+        values: dict[str, dict[str, object]] = {}
+        for name, keys in table_keys.items():
+            table = payload[name]
+            if not isinstance(table, Mapping) or set(table) != keys:
+                raise ValueError(f"qualification source {row_id} {name} fields differ")
+            values[name] = dict(table)
+        if payload["row_id"] != row_id:
+            raise ValueError(f"qualification source {row_id} identity differs")
+        _require_nfc(str(payload["stratum"]), f"qualification source {row_id} stratum")
+        source = values["source"]
+        _require_relative_manifest_path(
+            source["example_path"],
+            f"qualification source {row_id} example path",
+        )
+        for name in (
+            "compiled_artifact_sha256",
+            "raw_sha256",
+            "semantic_plan_sha256",
+            "source_bundle_sha256",
+        ):
+            if type(source[name]) is not str:
+                raise TypeError(f"qualification source {row_id} {name} is not text")
+            _require_digest(source[name], f"qualification source {row_id} {name}")
+        for name in (
+            "example_adapter_version",
+            "example_selected_root_seed",
+            "raw_bytes_length",
+        ):
+            if type(source[name]) is not int or source[name] < 0:
+                raise ValueError(f"qualification source {row_id} {name} is invalid")
+        if source["example_adapter_version"] != 1 or source["raw_bytes_length"] == 0:
+            raise ValueError(f"qualification source {row_id} example identity differs")
+        for name in ("example_adapter_id", "example_target_kind"):
+            _require_identifier(str(source[name]), f"qualification source {row_id} {name}")
+        adapter = values["adapter"]
+        for name in (
+            "checkpoint_adapter_id",
+            "generator_adapter_id",
+            "generator_target_kind",
+        ):
+            _require_identifier(str(adapter[name]), f"qualification source {row_id} {name}")
+        if adapter["generator_adapter_version"] != 1:
+            raise ValueError(f"qualification source {row_id} adapter version differs")
+        config = values["configuration"]
+        config_text = config["bytes_json"]
+        if type(config_text) is not str:
+            raise TypeError(f"qualification source {row_id} config bytes are not text")
+        config_raw = config_text.encode("utf-8")
+        try:
+            config_payload = json.loads(config_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"qualification source {row_id} config is not JSON") from error
+        if not isinstance(config_payload, Mapping):
+            raise TypeError(f"qualification source {row_id} config is not an object")
+        if canonical_json_bytes(config_payload) != config_raw:
+            raise ValueError(f"qualification source {row_id} config is not canonical JSON")
+        if (
+            config["bytes_format"] != "CANONICAL_JSON_V1"
+            or config["bytes_length"] != len(config_raw)
+            or config["bytes_sha256"] != hashlib.sha256(config_raw).hexdigest()
+        ):
+            raise ValueError(f"qualification source {row_id} config digest differs")
+        _require_digest(
+            str(config["native_payload_canonical_sha256"]),
+            f"qualification source {row_id} native payload digest",
+        )
+        _require_relative_manifest_path(
+            config["native_payload_path"],
+            f"qualification source {row_id} native payload path",
+        )
+        if (
+            type(config["native_payload_raw_bytes_length"]) is not int
+            or config["native_payload_raw_bytes_length"] < 0
+        ):
+            raise ValueError(f"qualification source {row_id} native length is invalid")
+        _require_digest_or_not_applicable(
+            config["native_payload_raw_sha256"],
+            f"qualification source {row_id} native raw digest",
+        )
+        if (
+            config["native_payload_raw_bytes_length"] == 0
+        ) != (config["native_payload_raw_sha256"] == _NOT_APPLICABLE):
+            raise ValueError(f"qualification source {row_id} native raw identity differs")
+        identity = values["identity"]
+        if identity["evidence_class"] not in {"S", "H", "R"}:
+            raise ValueError(f"qualification source {row_id} evidence class is unknown")
+        if identity["source_kind"] not in {"RUN", "DATASET", "RECONSTRUCTION"}:
+            raise ValueError(f"qualification source {row_id} source kind is unknown")
+        for name in (
+            "expected_final_state_sha256",
+            "expected_native_run_digest",
+            "expected_replay_digest",
+        ):
+            _require_digest_or_not_applicable(
+                identity[name],
+                f"qualification source {row_id} {name}",
+            )
+        _require_digest(
+            str(identity["source_sha256"]),
+            f"qualification source {row_id} source digest",
+        )
+        for name in ("qualification_profile_id", "source_id"):
+            _require_nfc(str(identity[name]), f"qualification source {row_id} {name}")
+        root_seed = identity["qualification_root_seed"]
+        if not (
+            (type(root_seed) is int and root_seed >= 0)
+            or root_seed == _NOT_APPLICABLE
+        ):
+            raise ValueError(f"qualification source {row_id} root seed is invalid")
+        if (
+            type(identity["source_selected_root_seed"]) is not int
+            or identity["source_selected_root_seed"] < 0
+        ):
+            raise ValueError(f"qualification source {row_id} source seed is invalid")
+        bounds = values["bounds"]
+        if (
+            type(bounds["source_start_us"]) is not int
+            or type(bounds["source_end_us"]) is not int
+            or bounds["source_start_us"] < 0
+            or bounds["source_end_us"] <= bounds["source_start_us"]
+        ):
+            raise ValueError(f"qualification source {row_id} bounds are invalid")
+        capabilities = values["capabilities"]
+        _require_digest(
+            str(capabilities["adapter_contract_sha256"]),
+            f"qualification source {row_id} adapter contract digest",
+        )
+        for name in ("required", "provided"):
+            inventory = capabilities[name]
+            if (
+                type(inventory) is not list
+                or any(type(item) is not str for item in inventory)
+                or inventory != sorted(set(inventory), key=lambda item: item.encode("utf-8"))
+            ):
+                raise ValueError(f"qualification source {row_id} capabilities differ")
+        if not set(capabilities["required"]).issubset(capabilities["provided"]):
+            raise ValueError(f"qualification source {row_id} lacks a required capability")
+        provenance = values["provenance"]
+        _require_relative_manifest_path(
+            provenance["parent_artifact_path"],
+            f"qualification source {row_id} parent artifact path",
+        )
+        _require_digest(
+            str(provenance["parent_artifact_sha256"]),
+            f"qualification source {row_id} parent artifact digest",
+        )
+        for name in (
+            "checkpoint_sha256",
+            "event_prefix_sha256",
+            "plan_sha256",
+            "workload_sha256",
+        ):
+            _require_digest_or_not_applicable(
+                provenance[name],
+                f"qualification source {row_id} {name}",
+            )
+        for name in (
+            "evidence_run_id",
+            "full_day_run_id",
+            "parent_selector",
+        ):
+            _require_nfc(str(provenance[name]), f"qualification source {row_id} {name}")
+        execution = values["execution"]
+        for name, value in execution.items():
+            _require_nfc(str(value), f"qualification source {row_id} execution {name}")
+        return cls(
+            row_id=row_id,
+            stratum=str(payload["stratum"]),
+            source=values["source"],
+            adapter=values["adapter"],
+            configuration=config,
+            identity=values["identity"],
+            bounds=bounds,
+            capabilities=capabilities,
+            provenance=provenance,
+            execution=execution,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationSourcesManifestV1:
+    semantic_sha256: str
+    manifest_sha256: str
+    file_sha256: str
+    rows: tuple[QualificationSourceRowV1, ...]
+    _payload: dict[str, object] = field(repr=False)
+    _canonical_bytes: bytes = field(repr=False)
+
+    def as_dict(self) -> dict[str, object]:
+        return json.loads(canonical_json_bytes(self._payload).decode("ascii"))
+
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    def row(self, row_id: str) -> QualificationSourceRowV1:
+        for row in self.rows:
+            if row.row_id == row_id:
+                return row
+        raise KeyError(row_id)
+
+    @classmethod
+    def from_toml_bytes(cls, raw: bytes) -> QualificationSourcesManifestV1:
+        payload, canonical = _strict_manifest_payload(
+            raw,
+            filename="qualification_sources.toml",
+            manifest_id=QUALIFICATION_SOURCES_MANIFEST_ID_V1,
+            expected_keys={
+                "execution_scope",
+                "manifest_id",
+                "manifest_sha256",
+                "manifest_version",
+                "policy_version",
+                "row_order",
+                "rows",
+                "schema_version",
+                "semantic_sha256",
+            },
+        )
+        order = payload["row_order"]
+        rows = payload["rows"]
+        if (
+            order != ["quiet", "event", "hidden", "fragmented", "historical"]
+            or not isinstance(rows, Mapping)
+            or set(rows) != set(order)
+        ):
+            raise ValueError("qualification source matrix is not the fixed five rows")
+        typed_rows = tuple(
+            QualificationSourceRowV1.from_dict(row_id, rows[row_id])
+            for row_id in order
+            if isinstance(rows[row_id], Mapping)
+        )
+        if len(typed_rows) != 5:
+            raise ValueError("qualification source matrix did not parse five rows")
+        return cls(
+            semantic_sha256=str(payload["semantic_sha256"]),
+            manifest_sha256=str(payload["manifest_sha256"]),
+            file_sha256=hashlib.sha256(raw).hexdigest(),
+            rows=typed_rows,
+            _payload=payload,
+            _canonical_bytes=canonical,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MiningPolicyBundleV1:
+    thresholds: DetectorThresholdsManifestV1
+    plan: MiningPlanManifestV1
+    sources: QualificationSourcesManifestV1
+
+    def __post_init__(self) -> None:
+        plan = self.plan.as_dict()
+        if (
+            plan["threshold_manifest_sha256"]
+            != self.thresholds.manifest_sha256
+            or plan["qualification_sources_manifest_sha256"]
+            != self.sources.manifest_sha256
+        ):
+            raise ValueError("mining plan does not bind both preregistered manifests")
+
+    @property
+    def bundle_sha256(self) -> str:
+        return sha256_json(
+            {
+                "mining_plan_manifest_sha256": self.plan.manifest_sha256,
+                "qualification_sources_manifest_sha256": self.sources.manifest_sha256,
+                "threshold_manifest_sha256": self.thresholds.manifest_sha256,
+            }
+        )
+
+
+def load_detector_thresholds() -> DetectorThresholdsManifestV1:
+    raw = files("kirby2.mining").joinpath("detector_thresholds.toml").read_bytes()
+    return DetectorThresholdsManifestV1.from_toml_bytes(raw)
+
+
+def load_mining_plan() -> MiningPlanManifestV1:
+    raw = files("kirby2.mining").joinpath("mining_plan.toml").read_bytes()
+    return MiningPlanManifestV1.from_toml_bytes(raw)
+
+
+def load_qualification_sources() -> QualificationSourcesManifestV1:
+    raw = files("kirby2.mining").joinpath(
+        "fixtures/qualification_sources.toml"
+    ).read_bytes()
+    return QualificationSourcesManifestV1.from_toml_bytes(raw)
+
+
+def load_mining_policy_bundle() -> MiningPolicyBundleV1:
+    return MiningPolicyBundleV1(
+        thresholds=load_detector_thresholds(),
+        plan=load_mining_plan(),
+        sources=load_qualification_sources(),
+    )
+
+
 __all__ = [
+    "DETECTOR_THRESHOLDS_MANIFEST_ID_V1",
     "LESSON_CANDIDATE_ID_PREFIX_V1",
+    "MINING_PLAN_MANIFEST_ID_V1",
     "MINING_SCHEMA_VERSION_V1",
     "POLICY_SCALE_V1",
+    "QUALIFICATION_SOURCES_MANIFEST_ID_V1",
     "CandidateBoundsV1",
     "CandidateDirectionV1",
     "CandidateKeyV1",
@@ -1419,6 +2282,7 @@ __all__ = [
     "CapabilityRecordV1",
     "CheckpointReferenceV1",
     "DetectorProjectionV1",
+    "DetectorThresholdsManifestV1",
     "DifficultyProjectionV1",
     "EvidenceClassV1",
     "GroundTruthAccessGrantV1",
@@ -1426,6 +2290,8 @@ __all__ = [
     "HumanReviewDecisionV1",
     "HumanReviewSidecarV1",
     "LessonCandidateV1",
+    "MiningPlanManifestV1",
+    "MiningPolicyBundleV1",
     "ObservableFeatureSummaryV1",
     "ObserveClassifyObjectiveV1",
     "RarityProjectionV1",
@@ -1435,7 +2301,13 @@ __all__ = [
     "SourceIdentityV1",
     "SourceKindV1",
     "SourceWindowOutcomeV1",
+    "QualificationSourceRowV1",
+    "QualificationSourcesManifestV1",
     "canonical_json_bytes",
+    "load_detector_thresholds",
+    "load_mining_plan",
+    "load_mining_policy_bundle",
+    "load_qualification_sources",
     "ratio_ppm",
     "round_div_even",
     "sha256_json",

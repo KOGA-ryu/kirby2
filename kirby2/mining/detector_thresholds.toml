@@ -1,0 +1,536 @@
+"detector_order" = ["AGGRESSIVE_FLOW_BURST", "APPARENT_LIQUIDITY_MIRAGE", "ASK_ABSORPTION", "AUCTION_IMBALANCE_CHANGE", "BID_ABSORPTION", "CANCELLATION_BURST", "CANCEL_FILL_RACE", "DISTRESSED_LIQUIDATION", "FAILED_BREAKOUT", "HALT_REOPENING", "HIDDEN_RESERVE_REFRESH", "LATENCY_SENSITIVE_OPPORTUNITY", "LIQUIDITY_VACUUM", "MEAN_REVERSION_TRANSITION", "MOMENTUM_EXHAUSTION", "MULTI_VENUE_FRAGMENTATION", "QUEUE_DEPLETION", "QUEUE_REPLENISHMENT", "ROUTING_DILEMMA", "SPREAD_EXPANSION", "SPREAD_RECOVERY", "STRONG_QUEUE_IMBALANCE"]
+"manifest_id" = "WO33_A1_DETECTOR_THRESHOLDS_V1"
+"manifest_sha256" = "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
+"manifest_version" = 1
+"policy_version" = "LESSON_MINING_V1"
+"schema_version" = 1
+"semantic_sha256" = "a9d9158b7fc58e14ba9639067af6c5d80c1ce47574495ca4698f2b942f26cb3f"
+
+["arithmetic"]
+"fixed_point_scale" = 1000000
+"jaccard_empty_empty_ppm" = 1000000
+"missing_required" = "INSUFFICIENT_EVIDENCE"
+"not_applicable" = "NOT_APPLICABLE"
+"percentile" = "NEAREST_RANK_V1"
+"reduction_order" = "ASCENDING_SEMANTIC_ID_THEN_ROOT_SEED_THEN_EVENT_OR_ATTEMPT_ORDINAL"
+"rounding" = "ROUND_DIV_EVEN_V1"
+"time_weighted_percentile" = "TIME_WEIGHTED_NEAREST_RANK_V1"
+"zero_denominator" = "INSUFFICIENT_EVIDENCE_UNLESS_EXPLICIT_POSITIVE_INFINITY"
+
+["binning"]
+"active_bin_event_rule" = "RIGHT_BOUNDARY_EVENT_BELONGS_TO_NEXT_BIN"
+"aggressive_and_cancel_group_alignment" = "SOURCE_LOWER_BOUND_TEN_CONSECUTIVE_OBSERVABLE_BINS"
+"aggressive_and_cancel_group_us" = 1000000
+"left_limit_projection" = "AFTER_EVENTS_STRICTLY_BEFORE_LEFT_EDGE_BEFORE_EVENTS_AT_LEFT_EDGE"
+"observable_bin_us" = 100000
+"state_clause_sampling" = "ORDERED_LEFT_LIMIT_PROJECTIONS_ONLY"
+"trailing_windows" = "EXCLUDE_ACTIVE_BIN_OR_GROUP"
+
+["candidate_enumeration"]
+"axis_order" = ["detector_id", "direction", "side", "venue", "price", "witness_key", "anchor_start_us", "evidence_discriminator"]
+"bounds" = "HALF_OPEN_SOURCE_CLIPPED_V1"
+"direction_order" = ["BUY", "SELL", "NOT_APPLICABLE"]
+"evidence_discriminator" = "SHA256_COMPACT_CANONICAL_JSON_CONTRIBUTING_EVENT_ID_ARRAY"
+"price_order" = "POSITIVE_INTEGER_ASCENDING_THEN_NOT_APPLICABLE"
+"scan" = "STATELESS_EXHAUSTIVE"
+"side_order" = ["BUY", "SELL", "NOT_APPLICABLE"]
+"tie_context" = "LESSON_MINING_V1"
+"tie_root" = 3399001
+"venue_order" = "NFC_BYTE_REAL_VENUES_THEN_CONSOLIDATED_THEN_NOT_APPLICABLE"
+"witness_scan" = "CANONICAL_JSON_BYTES"
+
+["capability_bundles"]
+"AUC" = ["AUCTION_STATE", "COMPLETE_EVENT_SEQUENCE", "INDICATIVE_PRICE", "PUBLISHED_IMBALANCE"]
+"HALT" = ["COMPLETE_EVENT_SEQUENCE", "HALT_STATE", "QUOTES", "TRADES"]
+"HID" = ["AUTHORITATIVE_RESERVE_REFRESH_LABELS", "COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "QUOTES", "SESSION_EVENTS"]
+"LAT" = ["COMPLETE_EVENT_SEQUENCE", "DETERMINISTIC_LATENCY_INTERVENTION", "MICROSECOND_TIMESTAMP_PRECISION", "PORTABLE_CHECKPOINT", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"LAT_MBO" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "DETERMINISTIC_LATENCY_INTERVENTION", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "PORTABLE_CHECKPOINT", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"MBO" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "QUOTES", "SESSION_EVENTS"]
+"MBO_TQ" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "ORDER_IDENTITY", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"PART" = ["AUTHORITATIVE_PARTICIPANT_IDENTITY", "COMPLETE_EVENT_SEQUENCE", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"Q2" = ["COMPLETE_EVENT_SEQUENCE", "DEPTH_DELTAS", "DEPTH_SNAPSHOTS", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS"]
+"TQ" = ["COMPLETE_EVENT_SEQUENCE", "MICROSECOND_TIMESTAMP_PRECISION", "QUOTES", "SESSION_EVENTS", "TRADES", "TRADE_AGGRESSOR_SIDE"]
+"VEN" = ["COMPLETE_EVENT_SEQUENCE", "EXECUTABLE_DEPTH", "FEE_SCHEDULE", "PER_VENUE_QUOTES", "RECEIPT_LATENCY_MODEL"]
+
+["detectors"]
+
+["detectors"."AGGRESSIVE_FLOW_BURST"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "AGGRESSIVE_FLOW_BURST"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FLOW"
+"key_axes" = ["SIGN", "SIGN", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "one-second aggressive volume>=max(2000,4*P50(previous twenty complete aligned groups)) AND abs(aggressive_flow_imbalance)>=700000"
+"rule_id" = "AGGRESSIVE_FLOW_BURST_RULE_V1"
+"sampling_unit" = "ALIGNED_ONE_SECOND_GROUP"
+"special_rules" = ["TEN_CONSECUTIVE_SOURCE_ALIGNED_BINS", "TRAILING_WINDOW_EXCLUDES_ACTIVE_GROUP"]
+"thresholds" = [{ "name" = "active_aggressive_volume_floor", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 2000 }, { "name" = "trailing_group_count", "operator" = "EXACT", "unit" = "COUNT", "value" = 20 }, { "name" = "trailing_p50_multiplier", "operator" = "GREATER_OR_EQUAL", "unit" = "INTEGER", "value" = 4 }, { "name" = "absolute_aggressive_flow_imbalance_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 700000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."AGGRESSIVE_FLOW_BURST"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 20000000
+"required_persistence_us" = 0
+
+["detectors"."APPARENT_LIQUIDITY_MIRAGE"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO"
+"detector_id" = "APPARENT_LIQUIDITY_MIRAGE"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "ABSORPTION"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "SOURCE_VENUE", "RELEVANT_PRICE"]
+"rule_expression" = "freeze first cohort reaching displayed sum>=2000; within 500000 us cohort_cancelled/cohort_peak>=800000 and cohort_executed/cohort_peak<=200000"
+"rule_id" = "APPARENT_LIQUIDITY_MIRAGE_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["COHORT_FROZEN_AT_FIRST_QUALIFYING_BOUNDARY"]
+"thresholds" = [{ "name" = "cohort_displayed_sum", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 2000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 500000 }, { "name" = "cohort_cancelled_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 800000 }, { "name" = "cohort_executed_share_ppm", "operator" = "LESS_OR_EQUAL", "unit" = "PPM", "value" = 200000 }]
+"version" = 1
+"witness_kind" = "ORDER_COHORT"
+
+["detectors"."APPARENT_LIQUIDITY_MIRAGE"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 500000
+"required_persistence_us" = 0
+
+["detectors"."ASK_ABSORPTION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO_TQ"
+"detector_id" = "ASK_ABSORPTION"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "ABSORPTION"
+"key_axes" = ["SELL", "SELL", "CONSOLIDATED", "OPENING_BEST_ASK"]
+"rule_expression" = "aggressive buys>=1000 shares in 2000000 us AND best ask tick never increases AND ask adds plus reserve refreshes at opening best ask>=300 shares"
+"rule_id" = "ASK_ABSORPTION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "aggressive_buy_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 1000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 2000000 }, { "name" = "best_ask_increase", "operator" = "EXACT", "unit" = "TICKS", "value" = 0 }, { "name" = "ask_add_and_refresh", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 300 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."ASK_ABSORPTION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 2000000
+"required_persistence_us" = 0
+
+["detectors"."AUCTION_IMBALANCE_CHANGE"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "AUC"
+"detector_id" = "AUCTION_IMBALANCE_CHANGE"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["HALT", "MISSING_CAPABILITY"]
+"family" = "SESSION"
+"key_axes" = ["SIGN", "SIGN", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "consecutive publications within 30000000 us have absolute change>=10000 and relative change>=250000, or signs differ and both magnitudes>=5000"
+"rule_id" = "AUCTION_IMBALANCE_CHANGE_RULE_V1"
+"sampling_unit" = "CONSECUTIVE_PUBLICATION_PAIR"
+"special_rules" = ["AUCTION_INTERVAL_EXCEPTION", "SIGN_CHANGE_IS_ALTERNATE_BRANCH"]
+"thresholds" = [{ "name" = "publication_interval", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 30000000 }, { "name" = "absolute_share_change", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 10000 }, { "name" = "relative_change_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 250000 }, { "name" = "sign_change_minimum_magnitude", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 5000 }]
+"version" = 1
+"witness_kind" = "AUCTION_PUBLICATION_PAIR"
+
+["detectors"."AUCTION_IMBALANCE_CHANGE"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 30000000
+"required_persistence_us" = 0
+
+["detectors"."BID_ABSORPTION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO_TQ"
+"detector_id" = "BID_ABSORPTION"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "ABSORPTION"
+"key_axes" = ["BUY", "BUY", "CONSOLIDATED", "OPENING_BEST_BID"]
+"rule_expression" = "aggressive sells>=1000 shares in 2000000 us AND best bid tick never decreases AND bid adds plus reserve refreshes at opening best bid>=300 shares"
+"rule_id" = "BID_ABSORPTION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "aggressive_sell_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 1000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 2000000 }, { "name" = "best_bid_decrease", "operator" = "EXACT", "unit" = "TICKS", "value" = 0 }, { "name" = "bid_add_and_refresh", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 300 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."BID_ABSORPTION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 2000000
+"required_persistence_us" = 0
+
+["detectors"."CANCELLATION_BURST"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO"
+"detector_id" = "CANCELLATION_BURST"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FLOW"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "one-second cancellations>=max(2000,4*P50(previous twenty complete aligned groups)) AND ratio_ppm(cancelled,added)>=3000000"
+"rule_id" = "CANCELLATION_BURST_RULE_V1"
+"sampling_unit" = "ALIGNED_ONE_SECOND_GROUP"
+"special_rules" = ["ZERO_ADDS_POSITIVE_CANCELLATIONS_IS_POSITIVE_INFINITY", "TEN_CONSECUTIVE_SOURCE_ALIGNED_BINS"]
+"thresholds" = [{ "name" = "active_cancelled_quantity_floor", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 2000 }, { "name" = "trailing_group_count", "operator" = "EXACT", "unit" = "COUNT", "value" = 20 }, { "name" = "trailing_p50_multiplier", "operator" = "GREATER_OR_EQUAL", "unit" = "INTEGER", "value" = 4 }, { "name" = "cancel_to_add_ratio_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "UNBOUNDED_PPM", "value" = 3000000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."CANCELLATION_BURST"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 20000000
+"required_persistence_us" = 0
+
+["detectors"."CANCEL_FILL_RACE"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "LAT_MBO"
+"detector_id" = "CANCEL_FILL_RACE"
+"evidence_classes" = ["S", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "EXECUTION"
+"key_axes" = ["NOT_APPLICABLE", "ORDER_SIDE", "VENUE_OR_CONSOLIDATED", "RELEVANT_PRICE"]
+"rule_expression" = "baseline cancel and opposing fill arrivals differ<=2000 us; replay cancel latency max(0,baseline-1000) and baseline+1000; terminal FULL_FILL versus CANCEL winner differs"
+"rule_id" = "CANCEL_FILL_RACE_RULE_V1"
+"sampling_unit" = "BOUND_REPLAY_PAIR"
+"special_rules" = ["FULL_FILL_ONLY_WHEN_ORIGINAL_QUANTITY_FULLY_FILLED", "PARTIAL_REMAINDER_CANCELLED_IS_CANCEL"]
+"thresholds" = [{ "name" = "baseline_arrival_difference", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 2000 }, { "name" = "latency_intervention_delta", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 1000 }]
+"version" = 1
+"witness_kind" = "CANCEL_FILL_TUPLE"
+
+["detectors"."CANCEL_FILL_RACE"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 2000
+"required_persistence_us" = 0
+
+["detectors"."DISTRESSED_LIQUIDATION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "PART"
+"detector_id" = "DISTRESSED_LIQUIDATION"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FLOW"
+"key_axes" = ["SELL", "SELL", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "authoritative distressed sells>=5000 in 5000000 us, sell/buy ratio>=4000000, and first-to-last mid_x2 movement<=-2"
+"rule_id" = "DISTRESSED_LIQUIDATION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["AUTHORITATIVE_PARTICIPANT_IDENTITY_REQUIRED", "ZERO_BUYS_POSITIVE_SELLS_IS_POSITIVE_INFINITY"]
+"thresholds" = [{ "name" = "distressed_sell_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 5000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "sell_to_buy_ratio_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "UNBOUNDED_PPM", "value" = 4000000 }, { "name" = "signed_mid_x2_movement", "operator" = "LESS_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = -2 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."DISTRESSED_LIQUIDATION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 5000000
+"required_persistence_us" = 0
+
+["detectors"."FAILED_BREAKOUT"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "FAILED_BREAKOUT"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "PRICE_LIQUIDITY"
+"key_axes" = ["SIGN", "NOT_APPLICABLE", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "upward mid_x2>=prior_five_second_max+2 then last beyond max occurs <2000000 us after first and mid_x2<=prior_max-2 within 3000000 us; downward symmetric"
+"rule_id" = "FAILED_BREAKOUT_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["UPWARD_DOWNWARD_EXACT_SYMMETRY"]
+"thresholds" = [{ "name" = "prior_extreme_lookback", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "breakout_mid_x2_distance", "operator" = "GREATER_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = 2 }, { "name" = "beyond_extreme_span", "operator" = "LESS_THAN", "unit" = "MICROSECONDS", "value" = 2000000 }, { "name" = "return_mid_x2_distance", "operator" = "GREATER_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = 2 }, { "name" = "return_deadline", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 3000000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."FAILED_BREAKOUT"."horizons"]
+"maximum_post_activation_horizon_us" = 3000000
+"maximum_pre_activation_lookback_us" = 5000000
+"required_persistence_us" = 0
+
+["detectors"."HALT_REOPENING"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "HALT"
+"detector_id" = "HALT_REOPENING"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "MISSING_CAPABILITY"]
+"family" = "SESSION"
+"key_axes" = ["GAP_SIGN", "NOT_APPLICABLE", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "halt then reopen; first post trade versus last pre trade gap>=3 ticks or time-weighted P50 post/pre five-second spread ratio>=2000000"
+"rule_id" = "HALT_REOPENING_RULE_V1"
+"sampling_unit" = "COMPLETE_HALT_REOPEN_EPISODE"
+"special_rules" = ["HALT_INTERVAL_EXCEPTION", "FULL_COVERAGE_AND_POSITIVE_DURATION_TWO_SIDED_SEGMENTS_REQUIRED"]
+"thresholds" = [{ "name" = "pre_spread_window", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "post_spread_window", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "price_gap", "operator" = "GREATER_OR_EQUAL", "unit" = "TICKS", "value" = 3 }, { "name" = "spread_ratio_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "UNBOUNDED_PPM", "value" = 2000000 }]
+"version" = 1
+"witness_kind" = "HALT_REOPEN_PAIR"
+
+["detectors"."HALT_REOPENING"."horizons"]
+"maximum_post_activation_horizon_us" = 5000000
+"maximum_pre_activation_lookback_us" = 5000000
+"required_persistence_us" = 0
+
+["detectors"."HIDDEN_RESERVE_REFRESH"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "HID"
+"detector_id" = "HIDDEN_RESERVE_REFRESH"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "ABSORPTION"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "SOURCE_VENUE", "RELEVANT_PRICE"]
+"rule_expression" = "at one price executed quantity>=1500 in 5000000 us, maximum displayed<=500, and at least three authoritative reserve refreshes after executions"
+"rule_id" = "HIDDEN_RESERVE_REFRESH_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["AUTHORITATIVE_RESERVE_REFRESH_LABEL_REQUIRED"]
+"thresholds" = [{ "name" = "executed_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 1500 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "maximum_displayed_quantity", "operator" = "LESS_OR_EQUAL", "unit" = "SHARES", "value" = 500 }, { "name" = "reserve_refresh_count", "operator" = "GREATER_OR_EQUAL", "unit" = "COUNT", "value" = 3 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."HIDDEN_RESERVE_REFRESH"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 5000000
+"required_persistence_us" = 0
+
+["detectors"."LATENCY_SENSITIVE_OPPORTUNITY"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "LAT"
+"detector_id" = "LATENCY_SENSITIVE_OPPORTUNITY"
+"evidence_classes" = ["S", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "EXECUTION"
+"key_axes" = ["OBJECTIVE", "OBJECTIVE", "VENUE_OR_CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "replay identical checkpoint information/action at 250 us and 2500 us; fill difference share>=250000 or fee-adjusted average-cost difference>=1000 milliticks/share"
+"rule_id" = "LATENCY_SENSITIVE_OPPORTUNITY_RULE_V1"
+"sampling_unit" = "BOUND_REPLAY_PAIR"
+"special_rules" = ["OR_BRANCH_USES_FULLY_SATISFIED_MAX", "IDENTICAL_INFORMATION_ACTION_CHECKPOINT"]
+"thresholds" = [{ "name" = "fast_latency", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 250 }, { "name" = "slow_latency", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 2500 }, { "name" = "fill_difference_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 250000 }, { "name" = "average_cost_difference", "operator" = "GREATER_OR_EQUAL", "unit" = "MILLITICKS_PER_SHARE", "value" = 1000 }]
+"version" = 1
+"witness_kind" = "LATENCY_ACTION"
+
+["detectors"."LATENCY_SENSITIVE_OPPORTUNITY"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 0
+"required_persistence_us" = 0
+
+["detectors"."LIQUIDITY_VACUUM"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO_TQ"
+"detector_id" = "LIQUIDITY_VACUUM"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "PRICE_LIQUIDITY"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "CONSOLIDATED", "RELEVANT_PRICE"]
+"rule_expression" = "positive three-level depth depletes>=750000 within 1000000 us with cancel_share>=600000 and spread expansion>=2 ticks or side empty"
+"rule_id" = "LIQUIDITY_VACUUM_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["SIDE_EMPTY_SATISFIES_FINAL_BRANCH"]
+"thresholds" = [{ "name" = "starting_three_level_depth", "operator" = "GREATER_THAN", "unit" = "SHARES", "value" = 0 }, { "name" = "depletion_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 750000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 1000000 }, { "name" = "cancel_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 600000 }, { "name" = "spread_expansion", "operator" = "GREATER_OR_EQUAL", "unit" = "TICKS", "value" = 2 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."LIQUIDITY_VACUUM"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 1000000
+"required_persistence_us" = 0
+
+["detectors"."MEAN_REVERSION_TRANSITION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "MEAN_REVERSION_TRANSITION"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FLOW"
+"key_axes" = ["SIGN", "NOT_APPLICABLE", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "absolute displacement from frozen trailing-thirty-second P50>=8 mid_x2 units; within 15000000 us return share>=500000 and imbalance changes sign with each magnitude>=300000"
+"rule_id" = "MEAN_REVERSION_TRANSITION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["TRAILING_P50_FROZEN_AT_ACTIVATION", "IMBALANCE_SIGN_CHANGE_REQUIRED"]
+"thresholds" = [{ "name" = "trailing_p50_window", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 30000000 }, { "name" = "initial_displacement", "operator" = "GREATER_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = 8 }, { "name" = "return_window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 15000000 }, { "name" = "return_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 500000 }, { "name" = "imbalance_signed_magnitude", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 300000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."MEAN_REVERSION_TRANSITION"."horizons"]
+"maximum_post_activation_horizon_us" = 15000000
+"maximum_pre_activation_lookback_us" = 30000000
+"required_persistence_us" = 0
+
+["detectors"."MOMENTUM_EXHAUSTION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "MOMENTUM_EXHAUSTION"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FLOW"
+"key_axes" = ["SIGN", "SIGN", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "mid_x2 moves>=10 units in 10000000 us with same-direction imbalance>=700000; next 5000000 us adds<=2 units and absolute imbalance<=200000"
+"rule_id" = "MOMENTUM_EXHAUSTION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "initial_mid_x2_movement", "operator" = "GREATER_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = 10 }, { "name" = "initial_window", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 10000000 }, { "name" = "same_direction_imbalance_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 700000 }, { "name" = "forward_window", "operator" = "EXACT", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "additional_same_direction_movement", "operator" = "LESS_OR_EQUAL", "unit" = "MID_X2_UNITS", "value" = 2 }, { "name" = "forward_absolute_imbalance_ppm", "operator" = "LESS_OR_EQUAL", "unit" = "PPM", "value" = 200000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."MOMENTUM_EXHAUSTION"."horizons"]
+"maximum_post_activation_horizon_us" = 5000000
+"maximum_pre_activation_lookback_us" = 10000000
+"required_persistence_us" = 0
+
+["detectors"."MULTI_VENUE_FRAGMENTATION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "VEN"
+"detector_id" = "MULTI_VENUE_FRAGMENTATION"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FRAGMENTATION"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "NOT_APPLICABLE", "NOT_APPLICABLE"]
+"rule_expression" = "venues each executable>=100 shares and bid or ask difference>=2 ticks continuously for >=5000 us"
+"rule_id" = "MULTI_VENUE_FRAGMENTATION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "per_venue_executable_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 100 }, { "name" = "best_price_difference", "operator" = "GREATER_OR_EQUAL", "unit" = "TICKS", "value" = 2 }, { "name" = "persistence", "operator" = "GREATER_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 5000 }]
+"version" = 1
+"witness_kind" = "VENUE_PAIR"
+
+["detectors"."MULTI_VENUE_FRAGMENTATION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 5000
+"required_persistence_us" = 5000
+
+["detectors"."QUEUE_DEPLETION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "Q2"
+"detector_id" = "QUEUE_DEPLETION"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "QUEUE"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "CONSOLIDATED", "RELEVANT_PRICE"]
+"rule_expression" = "side starts >=500 shares AND depletion_share>=700000 within 1000000 us"
+"rule_id" = "QUEUE_DEPLETION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "starting_displayed_quantity", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 500 }, { "name" = "depletion_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 700000 }, { "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 1000000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."QUEUE_DEPLETION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 1000000
+"required_persistence_us" = 0
+
+["detectors"."QUEUE_REPLENISHMENT"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "MBO"
+"detector_id" = "QUEUE_REPLENISHMENT"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "QUEUE"
+"key_axes" = ["NOT_APPLICABLE", "AFFECTED", "CONSOLIDATED", "RELEVANT_PRICE"]
+"rule_expression" = "within 5000000 us at least three greedy nonoverlapping >=500000 depletion cycles return to round_div_even(cycle_start,2) within 500000 us and cumulative ordinary-add plus reserve-refresh quantity>=1000 shares"
+"rule_id" = "QUEUE_REPLENISHMENT_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["GREEDY_NONOVERLAPPING_CYCLES_V1", "CYCLE_START_FIRST_UNUSED_POSITIVE_SAMPLE"]
+"thresholds" = [{ "name" = "window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "cycle_count", "operator" = "GREATER_OR_EQUAL", "unit" = "COUNT", "value" = 3 }, { "name" = "cycle_depletion_share_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 500000 }, { "name" = "return_deadline", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 500000 }, { "name" = "return_quantity_divisor", "operator" = "EXACT", "unit" = "INTEGER", "value" = 2 }, { "name" = "cumulative_add_and_refresh", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 1000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."QUEUE_REPLENISHMENT"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 5000000
+"required_persistence_us" = 0
+
+["detectors"."ROUTING_DILEMMA"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "VEN"
+"detector_id" = "ROUTING_DILEMMA"
+"evidence_classes" = ["S", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "FRAGMENTATION"
+"key_axes" = ["OBJECTIVE", "OBJECTIVE", "NOT_APPLICABLE", "NOT_APPLICABLE"]
+"rule_expression" = "two Pareto-incomparable routes each strictly better on one and worse on another of cost quantity receipt time; one material difference threshold must hold"
+"rule_id" = "ROUTING_DILEMMA_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["MATERIAL_DIFFERENCE_IS_OR", "PARETO_INCOMPARABILITY_REQUIRED"]
+"thresholds" = [{ "name" = "absolute_cost_difference", "operator" = "GREATER_OR_EQUAL", "unit" = "MILLITICKS_PER_SHARE", "value" = 1000 }, { "name" = "absolute_quantity_difference", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 250 }, { "name" = "absolute_receipt_time_difference", "operator" = "GREATER_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 1000 }]
+"version" = 1
+"witness_kind" = "ROUTE_PAIR"
+
+["detectors"."ROUTING_DILEMMA"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 0
+"required_persistence_us" = 0
+
+["detectors"."SPREAD_EXPANSION"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "SPREAD_EXPANSION"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "PRICE_LIQUIDITY"
+"key_axes" = ["NOT_APPLICABLE", "NOT_APPLICABLE", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "spread changes from <=2 to >=4 ticks within 500000 us and remains >=4 continuously for >=500000 us"
+"rule_id" = "SPREAD_EXPANSION_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "starting_spread", "operator" = "LESS_OR_EQUAL", "unit" = "TICKS", "value" = 2 }, { "name" = "expanded_spread", "operator" = "GREATER_OR_EQUAL", "unit" = "TICKS", "value" = 4 }, { "name" = "transition_window", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 500000 }, { "name" = "persistence", "operator" = "GREATER_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 500000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."SPREAD_EXPANSION"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 500000
+"required_persistence_us" = 500000
+
+["detectors"."SPREAD_RECOVERY"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "TQ"
+"detector_id" = "SPREAD_RECOVERY"
+"evidence_classes" = ["S", "H", "R"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "PRICE_LIQUIDITY"
+"key_axes" = ["NOT_APPLICABLE", "NOT_APPLICABLE", "CONSOLIDATED", "NOT_APPLICABLE"]
+"rule_expression" = "following a spread-expansion candidate spread reaches <=2 within 5000000 us and remains <=2 continuously for >=1000000 us"
+"rule_id" = "SPREAD_RECOVERY_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = ["PARENT_CANDIDATE_ID_REQUIRED"]
+"thresholds" = [{ "name" = "recovered_spread", "operator" = "LESS_OR_EQUAL", "unit" = "TICKS", "value" = 2 }, { "name" = "recovery_deadline", "operator" = "LESS_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 5000000 }, { "name" = "persistence", "operator" = "GREATER_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 1000000 }]
+"version" = 1
+"witness_kind" = "SPREAD_EXPANSION_PARENT"
+
+["detectors"."SPREAD_RECOVERY"."horizons"]
+"maximum_post_activation_horizon_us" = 6000000
+"maximum_pre_activation_lookback_us" = 0
+"required_persistence_us" = 1000000
+
+["detectors"."STRONG_QUEUE_IMBALANCE"]
+"ambiguity_rules" = ["NONEMPTY_KNOWN_AMBIGUITY_OVERRIDES_OBJECTIVE"]
+"capability_bundle" = "Q2"
+"detector_id" = "STRONG_QUEUE_IMBALANCE"
+"evidence_classes" = ["S", "H"]
+"exclusion_rules" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+"family" = "QUEUE"
+"key_axes" = ["SIGN", "SIGN", "CONSOLIDATED", "RELEVANT_PRICE"]
+"rule_expression" = "abs(I)>=600000 AND bid_top+ask_top>=500 shares continuously for >=2000000 us"
+"rule_id" = "STRONG_QUEUE_IMBALANCE_RULE_V1"
+"sampling_unit" = "OBSERVABLE_BIN_100000_US"
+"special_rules" = []
+"thresholds" = [{ "name" = "absolute_queue_imbalance_ppm", "operator" = "GREATER_OR_EQUAL", "unit" = "PPM", "value" = 600000 }, { "name" = "top_total", "operator" = "GREATER_OR_EQUAL", "unit" = "SHARES", "value" = 500 }, { "name" = "continuous_duration", "operator" = "GREATER_OR_EQUAL", "unit" = "MICROSECONDS", "value" = 2000000 }]
+"version" = 1
+"witness_kind" = "NOT_APPLICABLE"
+
+["detectors"."STRONG_QUEUE_IMBALANCE"."horizons"]
+"maximum_post_activation_horizon_us" = 1
+"maximum_pre_activation_lookback_us" = 2000000
+"required_persistence_us" = 2000000
+
+["evidence_scope"]
+"H" = "OBSERVED_HISTORICAL_MARKET_BY_ORDER_PLUS_NAMED_BUNDLE"
+"R" = "EXPLICIT_RECONSTRUCTION_OR_COUNTERFACTUAL_PLUS_NAMED_OBSERVABLE_BUNDLE"
+"S" = "AUTHORITATIVE_SYNTHETIC_GROUND_TRUTH"
+"unlisted" = "NOT_EXERCISED"
+
+["exclusions"]
+"exceptions" = ["AUCTION_IMBALANCE_CHANGE", "HALT_REOPENING"]
+"missing_capability_result" = "NOT_EXERCISED"
+"missing_denominator_result" = "INSUFFICIENT_EVIDENCE"
+"ordinary" = ["AUCTION", "HALT", "MISSING_CAPABILITY", "SESSION_BOUNDARY"]
+
+["execution_scope"]
+"candidate_mining" = "NOT_EXERCISED"
+"detector_invocation" = "NOT_EXERCISED"
+"human_review" = "PENDING"
+"selection" = "NOT_EXERCISED"
+"source_outcome_inspection" = "NOT_EXERCISED"
