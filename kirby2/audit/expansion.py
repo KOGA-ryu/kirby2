@@ -130,6 +130,7 @@ REGISTERABLE_GATE_IDS = (
     "WO33-D",
     "WO33-E",
     "WO34-A",
+    "WO34-B",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -2899,11 +2900,73 @@ def _audit_wo34a() -> ExpansionGateReport:
             ("edge_count", str(WO34A_EDGE_COUNT)),
             ("error_count", str(WO34A_ERROR_COUNT)),
             ("evidence_family_count", str(WO34A_EVIDENCE_FAMILY_COUNT)),
-            ("learner_projection", "NOT_IMPLEMENTED_UNTIL_WO34_B"),
+            ("learner_projection", "IMPLEMENTED_BY_WO34_B"),
             ("legacy_lesson_count", str(WO34A_LEGACY_LESSON_COUNT)),
             ("root_count", str(WO34A_ROOT_COUNT)),
             ("skill_count", str(WO34A_SKILL_COUNT)),
             ("skill_graph_sha256", WO34A_SKILL_GRAPH_SHA256),
+        ),
+    )
+
+
+def _audit_wo34b() -> ExpansionGateReport:
+    from kirby2.audit.adaptive_curriculum import (
+        WO34B_AUDIT_CASE_COUNT,
+        WO34B_PROJECTION_POLICY_SHA256,
+        WO34B_SKILL_PROJECTION_COUNT,
+        audit_wo34b_adaptive_curriculum,
+    )
+    from kirby2.curriculum.projections import (
+        LEARNER_PROJECTION_MODEL_ID_V1,
+        LEARNER_PROJECTION_STATUS_V1,
+        RECENT_HISTORY_LIMIT_V1,
+    )
+
+    cases = audit_wo34b_adaptive_curriculum()
+    expected_names = (
+        "b_policy_equations_and_empty_prior_are_exact",
+        "b_error_caps_modes_and_recency_are_exact",
+        "b_confidence_diversity_sufficiency_and_history_are_exact",
+        "b_rebuild_is_prefix_order_clock_and_version_deterministic",
+        "b_zero_weight_and_pnl_cannot_update_projection",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if len(cases) != WO34B_AUDIT_CASE_COUNT or tuple(
+        case.name for case in cases
+    ) != expected_names:
+        failures.append("WO34-B cases differ from the fixed projection inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO34-B projection cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO34-B",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("audit_case_count", str(WO34B_AUDIT_CASE_COUNT)),
+            ("learner_projection_model_id", LEARNER_PROJECTION_MODEL_ID_V1),
+            ("model_status", LEARNER_PROJECTION_STATUS_V1),
+            ("projection_policy_sha256", WO34B_PROJECTION_POLICY_SHA256),
+            ("recent_history_limit", str(RECENT_HISTORY_LIMIT_V1)),
+            ("skill_projection_count", str(WO34B_SKILL_PROJECTION_COUNT)),
         ),
     )
 
@@ -3117,6 +3180,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO33-D", _audit_wo33d),
     ("WO33-E", _audit_wo33e),
     ("WO34-A", _audit_wo34a),
+    ("WO34-B", _audit_wo34b),
 )
 
 

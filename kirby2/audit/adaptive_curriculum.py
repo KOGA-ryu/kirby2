@@ -36,11 +36,31 @@ from kirby2.curriculum.evidence import (
     LearnerEvidenceLedgerV1,
     ObservableAttemptContextV1,
     OpportunityStateV1,
+    POLICY_SCALE_V1,
     SkillEvidenceV1,
     SupportingEvidenceReferenceV1,
     require_scoring_policy_v1,
 )
 from kirby2.curriculum.models import CurriculumDrill, CurriculumMode
+from kirby2.curriculum.learner import build_learner_projection_v1
+from kirby2.curriculum.projections import (
+    ASSESSMENT_BASE_WEIGHT_PPM_V1,
+    GUIDED_BASE_WEIGHT_PPM_V1,
+    LEARNER_PROJECTION_MODEL_ID_V1,
+    LEARNER_PROJECTION_POLICY_V1,
+    LEARNER_PROJECTION_STATUS_V1,
+    PRACTICE_BASE_WEIGHT_PPM_V1,
+    RECENT_HISTORY_LIMIT_V1,
+    REMEDIATION_BASE_WEIGHT_PPM_V1,
+    LearnerProjectionV1,
+    ProjectedSkillLabelV1,
+    ProjectionDiversityBandV1,
+    ProjectionSufficiencyV1,
+    mul_ppm_v1,
+    projection_diversity_band_v1,
+    recency_factor_ppm_v1,
+    round_div_even_v1,
+)
 from kirby2.curriculum.skills import (
     PREREQUISITE_CONFIDENCE_MIN_PPM_V1,
     PREREQUISITE_MASTERY_MIN_PPM_V1,
@@ -62,6 +82,11 @@ WO34A_EVIDENCE_FAMILY_COUNT = 10
 WO34A_LEGACY_LESSON_COUNT = 14
 WO34A_SKILL_GRAPH_SHA256 = (
     "ec08caff691eb62915a9b9dd0ceb6481981e8e5e4a2452a7c01cfcf6b05b5141"
+)
+WO34B_SKILL_PROJECTION_COUNT = 23
+WO34B_AUDIT_CASE_COUNT = 5
+WO34B_PROJECTION_POLICY_SHA256 = (
+    "8440d8cf51c69eb6cd287d9ec8c65715f4328e0854bfc3e3f3853c92f33f2550"
 )
 _DIGEST = "1" * 64
 
@@ -279,6 +304,205 @@ def _ambiguous_assessment() -> AttemptAssessmentV1:
         auxiliary_outcomes=(),
         study_timestamp_utc="2026-08-29T00:00:02Z",
     )
+
+
+def _projection_assessment(
+    ordinal: int,
+    *,
+    learner_id: str = "learner-projection-audit-001",
+    primary_skill_id: str = "BOOK_READING",
+    score_ppm: int = 900_000,
+    mode: AttemptModeV1 = AttemptModeV1.ASSESSMENT,
+    scenario_index: int | None = None,
+    volume_multiplier_ppm: int = 1_000_000,
+    liquidity_multiplier_ppm: int = 1_000_000,
+    source_class: EvidenceSourceClassV1 = EvidenceSourceClassV1.SYNTHETIC,
+    error_types: tuple[LearnerErrorTypeV1, ...] = (),
+    pnl_value: int | None = None,
+    study_second: int | None = None,
+    simulation_time_us: int | None = None,
+) -> AttemptAssessmentV1:
+    policy = SCORING_POLICY_REGISTRY_V1["LEGACY_OBJECTIVE_SCORING_V1"]
+    if scenario_index is None:
+        scenario_index = ordinal
+    mapped_skills = {
+        mapped
+        for error_type in error_types
+        if (
+            mapped := mapped_skill_for_error_v1(error_type, primary_skill_id)
+        )
+        is not None
+    }
+    supporting_skills = tuple(sorted(mapped_skills.difference({primary_skill_id})))
+    sorted_errors = tuple(sorted(error_types, key=lambda item: item.value))
+    no_action = LearnerErrorTypeV1.FAILED_TO_ACT_DURING_GREEN in error_types
+    reference_state = (
+        OpportunityStateV1.RED
+        if LearnerErrorTypeV1.ACTED_DURING_RED in error_types
+        else (
+            OpportunityStateV1.WAIT
+            if LearnerErrorTypeV1.CHASED_AFTER_INVALIDATION in error_types
+            else OpportunityStateV1.GREEN
+        )
+    )
+    activation_us = ordinal * 1_000
+    action = AttemptActionV1(
+        action_id=f"projection-action-{ordinal}",
+        action_kind=(
+            AttemptActionKindV1.NO_ACTION
+            if no_action
+            else AttemptActionKindV1.CLASSIFICATION
+        ),
+        occurred_us=None if no_action else activation_us + 100,
+        action_sha256=(
+            None
+            if no_action
+            else sha256_json({"projection_action": ordinal})
+        ),
+        supporting_evidence_references=(
+            _ref(
+                EvidenceReferenceKindV1.ACTION,
+                f"projection-action-proof-{ordinal}",
+            ),
+        ),
+    )
+    context = ObservableAttemptContextV1(
+        context_id=f"projection-context-{ordinal}",
+        scenario_semantic_sha256=sha256_json(
+            {"projection_scenario": scenario_index}
+        ),
+        volume_multiplier_ppm=volume_multiplier_ppm,
+        liquidity_multiplier_ppm=liquidity_multiplier_ppm,
+        source_class=source_class,
+        simulation_time_us=(
+            ordinal * 10_000
+            if simulation_time_us is None
+            else simulation_time_us
+        ),
+        supporting_evidence_references=(
+            _ref(
+                EvidenceReferenceKindV1.OBSERVABLE_CONTEXT,
+                f"projection-context-proof-{ordinal}",
+            ),
+        ),
+    )
+    skills = tuple(sorted({primary_skill_id, *supporting_skills}))
+    skill_evidence = tuple(
+        SkillEvidenceV1(
+            skill_id=skill_id,
+            opportunity_present=True,
+            observable=True,
+            score_ppm=score_ppm,
+            scoring_policy_id=policy.policy_id,
+            scoring_policy_digest=policy.policy_digest,
+            supporting_evidence_references=(
+                _ref(
+                    EvidenceReferenceKindV1.SCORING_INPUT,
+                    f"projection-score-{ordinal}-{skill_id.lower()}",
+                    family=(
+                        EvidenceFamilyV1.HOTKEY_ERROR
+                        if skill_id == "HOTKEY_ACCURACY"
+                        else EvidenceFamilyV1.CORRECT_CLASSIFICATION
+                    ),
+                ),
+            ),
+        )
+        for skill_id in skills
+    )
+    errors = tuple(
+        AttemptErrorRecordV1(
+            error_type,
+            mapped_skill_for_error_v1(error_type, primary_skill_id),
+            (
+                _ref(
+                    EvidenceReferenceKindV1.SCORING_INPUT,
+                    f"projection-error-{ordinal}-{error_type.value.lower()}",
+                    family=EvidenceFamilyV1.DISCIPLINE_COMPLIANCE,
+                ),
+            ),
+        )
+        for error_type in sorted_errors
+    )
+    auxiliary = (
+        ()
+        if pnl_value is None
+        else (
+            AuxiliaryOutcomeV1(
+                "PNL",
+                pnl_value,
+                "MILLITICKS",
+                (
+                    _ref(
+                        EvidenceReferenceKindV1.SOURCE_RECORD,
+                        f"projection-pnl-{ordinal}",
+                    ),
+                ),
+            ),
+        )
+    )
+    second = ordinal if study_second is None else study_second
+    return AttemptAssessmentV1(
+        learner_id=learner_id,
+        attempt_ordinal=ordinal,
+        lesson_reference_id=f"projection-lesson-{ordinal}",
+        lesson_digest=sha256_json({"projection_lesson": ordinal}),
+        primary_skill_id=primary_skill_id,
+        supporting_skill_ids=supporting_skills,
+        mode=mode,
+        opportunity=AttemptOpportunityV1(
+            opportunity_id=f"projection-opportunity-{ordinal}",
+            opportunity_present=True,
+            observable=True,
+            reaction_time_sufficient=True,
+            reference_state=reference_state,
+            activation_us=activation_us,
+            reaction_deadline_us=activation_us + 500,
+            supporting_evidence_references=(
+                _ref(
+                    EvidenceReferenceKindV1.OPPORTUNITY,
+                    f"projection-opportunity-proof-{ordinal}",
+                ),
+            ),
+        ),
+        action=action,
+        observable_context=context,
+        scoring_policy_id=policy.policy_id,
+        scoring_policy_digest=policy.policy_digest,
+        skill_evidence=skill_evidence,
+        errors=errors,
+        ambiguity=AttemptAmbiguityV1.NONE,
+        evidence_sufficiency=AttemptEvidenceSufficiencyV1.SUFFICIENT,
+        auxiliary_outcomes=auxiliary,
+        study_timestamp_utc=f"2026-08-29T00:00:{second:02d}Z",
+    )
+
+
+def _projection_ledger(
+    count: int,
+    *,
+    score_ppm: int = 900_000,
+    distinct_scenarios: bool = True,
+) -> LearnerEvidenceLedgerV1:
+    volumes = (500_000, 1_000_000, 1_500_000)
+    liquidities = (1_500_000, 500_000, 1_000_000)
+    assessments = tuple(
+        _projection_assessment(
+            ordinal,
+            score_ppm=score_ppm,
+            scenario_index=ordinal if distinct_scenarios else 1,
+            volume_multiplier_ppm=volumes[(ordinal - 1) % len(volumes)],
+            liquidity_multiplier_ppm=liquidities[
+                (ordinal - 1) % len(liquidities)
+            ],
+            source_class=(
+                EvidenceSourceClassV1.SYNTHETIC
+                if ordinal % 2
+                else EvidenceSourceClassV1.HISTORICAL_OR_RECONSTRUCTION
+            ),
+        )
+        for ordinal in range(1, count + 1)
+    )
+    return LearnerEvidenceLedgerV1("learner-projection-audit-001", assessments)
 
 
 def _skill_graph_case() -> AdaptiveCurriculumAuditCase:
@@ -714,6 +938,534 @@ def audit_wo34a_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]
     )
 
 
+def _projection_policy_and_prior_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    empty_ledger = LearnerEvidenceLedgerV1("learner-projection-empty", ())
+    projection = build_learner_projection_v1(
+        empty_ledger,
+        as_of_attempt_ordinal=0,
+    )
+    if (
+        projection.model_id != LEARNER_PROJECTION_MODEL_ID_V1
+        or projection.model_status != LEARNER_PROJECTION_STATUS_V1
+        or projection.model_policy_digest != WO34B_PROJECTION_POLICY_SHA256
+        or LEARNER_PROJECTION_POLICY_V1.policy_digest
+        != WO34B_PROJECTION_POLICY_SHA256
+        or projection.input_assessment_count != 0
+        or projection.input_skill_evidence_count != 0
+        or projection.input_evidence_sha256 != sha256_json([])
+        or len(projection.skill_projections) != WO34B_SKILL_PROJECTION_COUNT
+    ):
+        failures.append("empty projection identity, input binding, or skill count differs")
+    if any(
+        row.mastery_ppm != 500_000
+        or row.confidence_ppm != 0
+        or row.uncertainty_ppm != POLICY_SCALE_V1
+        or row.attempt_count != 0
+        or row.effective_weight_ppm != 0
+        or row.weighted_score_sum != 0
+        or row.model_evidence_score_ppm is not None
+        or row.sufficiency is not ProjectionSufficiencyV1.INSUFFICIENT
+        or row.label is not ProjectedSkillLabelV1.INSUFFICIENT
+        or row.recommendation_eligible
+        or row.recent_attempt_history
+        for row in projection.skill_projections
+    ):
+        failures.append("empty projection differs from the four-observation prior")
+    if (
+        GUIDED_BASE_WEIGHT_PPM_V1 != 250_000
+        or PRACTICE_BASE_WEIGHT_PPM_V1 != 600_000
+        or ASSESSMENT_BASE_WEIGHT_PPM_V1 != POLICY_SCALE_V1
+        or REMEDIATION_BASE_WEIGHT_PPM_V1 != 700_000
+        or recency_factor_ppm_v1(0) != POLICY_SCALE_V1
+        or recency_factor_ppm_v1(20) != 500_000
+        or round_div_even_v1(1, 2) != 0
+        or round_div_even_v1(3, 2) != 2
+        or round_div_even_v1(-1, 2) != 0
+        or round_div_even_v1(-3, 2) != -2
+        or projection_diversity_band_v1(749_999)
+        is not ProjectionDiversityBandV1.LOW
+        or projection_diversity_band_v1(750_000)
+        is not ProjectionDiversityBandV1.NORMAL
+        or projection_diversity_band_v1(1_250_000)
+        is not ProjectionDiversityBandV1.NORMAL
+        or projection_diversity_band_v1(1_250_001)
+        is not ProjectionDiversityBandV1.HIGH
+    ):
+        failures.append("base weights, decay, bands, or round-to-even equations differ")
+    if LearnerProjectionV1.from_json_bytes(
+        projection.canonical_bytes()
+    ).canonical_bytes() != projection.canonical_bytes():
+        failures.append("empty projection canonical roundtrip differs")
+    hostile_operations = (
+        lambda: build_learner_projection_v1(
+            empty_ledger,
+            as_of_attempt_ordinal=0,
+            model_id="LEARNER_PROJECTION_V2",
+        ),
+        lambda: build_learner_projection_v1(
+            empty_ledger,
+            as_of_attempt_ordinal=True,
+        ),
+        lambda: build_learner_projection_v1(
+            empty_ledger,
+            as_of_attempt_ordinal=-1,
+        ),
+        lambda: replace(projection, model_policy_digest=_DIGEST),
+        lambda: replace(
+            projection,
+            skill_projections=projection.skill_projections[:-1],
+        ),
+        lambda: LearnerProjectionV1.from_json_bytes(
+            projection.canonical_bytes() + b"\n"
+        ),
+    )
+    refusal_count = sum(_raises(operation) for operation in hostile_operations)
+    if refusal_count != len(hostile_operations):
+        failures.append("projection version, type, policy, shape, or canonical refusal differs")
+    return AdaptiveCurriculumAuditCase(
+        "b_policy_equations_and_empty_prior_are_exact",
+        (
+            f"model={projection.model_id} status={projection.model_status} "
+            f"policy_sha256={projection.model_policy_digest} skills=23 "
+            "prior_mastery_ppm=500000 prior_confidence_ppm=0 "
+            f"hostile_refusals={refusal_count}/{len(hostile_operations)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _projection_caps_modes_and_recency_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    learner_id = "learner-projection-audit-001"
+    assessments = (
+        _successful_assessment(ordinal=1, learner_id=learner_id),
+        _projection_assessment(2, mode=AttemptModeV1.PRACTICE),
+        _projection_assessment(3, mode=AttemptModeV1.ASSESSMENT),
+        _projection_assessment(4, mode=AttemptModeV1.REMEDIATION),
+        _projection_assessment(
+            5,
+            error_types=(LearnerErrorTypeV1.FAILED_TO_COMPLETE_OBJECTIVE,),
+        ),
+        _projection_assessment(
+            6,
+            primary_skill_id="SPREAD_DECISION",
+            error_types=(LearnerErrorTypeV1.CROSSED_UNNECESSARILY,),
+        ),
+        _projection_assessment(
+            7,
+            primary_skill_id="SPREAD_DECISION",
+            error_types=(
+                LearnerErrorTypeV1.CROSSED_UNNECESSARILY,
+                LearnerErrorTypeV1.FAILED_TO_COMPLETE_OBJECTIVE,
+            ),
+        ),
+        _projection_assessment(
+            8,
+            primary_skill_id="EXIT_EXECUTION",
+            error_types=(LearnerErrorTypeV1.ACTED_DURING_RED,),
+        ),
+        _projection_assessment(
+            9,
+            primary_skill_id="EXIT_EXECUTION",
+            error_types=(LearnerErrorTypeV1.WRONG_HOTKEY,),
+        ),
+    )
+    projection = build_learner_projection_v1(
+        LearnerEvidenceLedgerV1(learner_id, assessments),
+        as_of_attempt_ordinal=9,
+    )
+    book = projection.skill("BOOK_READING")
+    script = projection.skill("SCRIPT_DISCIPLINE")
+    spread = projection.skill("SPREAD_DECISION")
+    hotkey = projection.skill("HOTKEY_ACCURACY")
+    exit_execution = projection.skill("EXIT_EXECUTION")
+    book_history = book.recent_attempt_history
+    if (
+        tuple(item.base_weight_ppm for item in book_history)
+        != (
+            GUIDED_BASE_WEIGHT_PPM_V1,
+            PRACTICE_BASE_WEIGHT_PPM_V1,
+            ASSESSMENT_BASE_WEIGHT_PPM_V1,
+            REMEDIATION_BASE_WEIGHT_PPM_V1,
+            ASSESSMENT_BASE_WEIGHT_PPM_V1,
+        )
+        or tuple(item.post_cap_score_ppm for item in book_history)
+        != (800_000, 900_000, 900_000, 900_000, 0)
+    ):
+        failures.append("mode weights or primary-skill critical cap differ")
+    if any(
+        item.age_attempts != 9 - item.attempt_ordinal
+        or item.recency_factor_ppm
+        != recency_factor_ppm_v1(9 - item.attempt_ordinal)
+        or item.effective_weight_ppm
+        != mul_ppm_v1(item.base_weight_ppm, item.recency_factor_ppm)
+        for row in (book, script, spread, hotkey, exit_execution)
+        for item in row.recent_attempt_history
+    ):
+        failures.append("ordinal age, recency, or effective weight differs")
+    if (
+        tuple(item.post_cap_score_ppm for item in script.recent_attempt_history)
+        != (DEFAULT_SCORED_ERROR_CAP_PPM_V1, 0)
+        or script.known_error_types
+        != (
+            LearnerErrorTypeV1.ACTED_DURING_RED,
+            LearnerErrorTypeV1.FAILED_TO_ACT_DURING_GREEN,
+        )
+        or LearnerErrorTypeV1.FAILED_TO_ACT_DURING_GREEN in book.known_error_types
+        or tuple(item.post_cap_score_ppm for item in hotkey.recent_attempt_history)
+        != (0,)
+        or hotkey.known_error_types != (LearnerErrorTypeV1.WRONG_HOTKEY,)
+        or tuple(
+            item.post_cap_score_ppm
+            for item in exit_execution.recent_attempt_history
+        )
+        != (900_000, 900_000)
+    ):
+        failures.append("default or critical cap leaked beyond its mapped skill")
+    if (
+        tuple(item.post_cap_score_ppm for item in spread.recent_attempt_history)
+        != (DEFAULT_SCORED_ERROR_CAP_PPM_V1, 0)
+        or spread.known_error_types
+        != (
+            LearnerErrorTypeV1.CROSSED_UNNECESSARILY,
+            LearnerErrorTypeV1.FAILED_TO_COMPLETE_OBJECTIVE,
+        )
+        or spread.last_demonstrated_failure is None
+        or spread.last_demonstrated_failure.reference.attempt_ordinal != 7
+    ):
+        failures.append("default, multiple-minimum, or latest-failure cap differs")
+    if (
+        book.last_demonstrated_failure is None
+        or book.last_demonstrated_failure.reference.attempt_ordinal != 5
+        or script.last_demonstrated_failure is None
+        or script.last_demonstrated_failure.reference.attempt_ordinal != 8
+        or hotkey.last_demonstrated_failure is None
+        or hotkey.last_demonstrated_failure.reference.attempt_ordinal != 9
+    ):
+        failures.append("demonstrated failure references differ")
+    return AdaptiveCurriculumAuditCase(
+        "b_error_caps_modes_and_recency_are_exact",
+        (
+            "mode_weights_ppm=250000,600000,1000000,700000 "
+            "mapped_caps_ppm=250000,0 multiple_caps=MINIMUM "
+            f"book_weight_ppm={book.effective_weight_ppm} "
+            f"script_errors={len(script.known_error_types)} "
+            f"spread_errors={len(spread.known_error_types)} hotkey_errors=1"
+        ),
+        tuple(failures),
+    )
+
+
+def _projection_confidence_and_history_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    projection_8 = build_learner_projection_v1(
+        _projection_ledger(8),
+        as_of_attempt_ordinal=8,
+    )
+    book = projection_8.skill("BOOK_READING")
+    expected_weight = sum(
+        mul_ppm_v1(ASSESSMENT_BASE_WEIGHT_PPM_V1, recency_factor_ppm_v1(age))
+        for age in range(7, -1, -1)
+    )
+    expected_weighted_score = expected_weight * 900_000
+    expected_mastery = round_div_even_v1(
+        2 * POLICY_SCALE_V1 * POLICY_SCALE_V1 + expected_weighted_score,
+        4 * POLICY_SCALE_V1 + expected_weight,
+    )
+    expected_evidence_confidence = min(
+        POLICY_SCALE_V1,
+        round_div_even_v1(expected_weight, 8),
+    )
+    if (
+        book.effective_weight_ppm != expected_weight
+        or book.weighted_score_sum != expected_weighted_score
+        or book.mastery_ppm != expected_mastery
+        or book.evidence_confidence_ppm != expected_evidence_confidence
+        or book.diversity_confidence_ppm != POLICY_SCALE_V1
+        or book.confidence_ppm != expected_evidence_confidence
+        or book.uncertainty_ppm
+        != POLICY_SCALE_V1 - expected_evidence_confidence
+    ):
+        failures.append("mastery, evidence confidence, or diversity equation differs")
+    if (
+        book.attempt_count != 8
+        or book.scenario_diversity_count != 8
+        or set(book.volume_band_diversity) != set(ProjectionDiversityBandV1)
+        or set(book.liquidity_band_diversity) != set(ProjectionDiversityBandV1)
+        or len(book.source_class_diversity) != 2
+        or book.sufficiency is not ProjectionSufficiencyV1.SUFFICIENT
+        or book.label is not ProjectedSkillLabelV1.STRONG
+        or not book.recommendation_eligible
+        or book.last_demonstrated_success is None
+        or book.last_demonstrated_success.reference.attempt_ordinal != 8
+        or book.last_demonstrated_failure is not None
+    ):
+        failures.append("diversity, sufficiency, label, or outcome boundary differs")
+    label_boundaries = tuple(
+        (
+            expected_mastery,
+            expected_label,
+            build_learner_projection_v1(
+                _projection_ledger(8, score_ppm=score_ppm),
+                as_of_attempt_ordinal=8,
+            ).skill("BOOK_READING"),
+        )
+        for score_ppm, expected_mastery, expected_label in (
+            (499_999, 499_999, ProjectedSkillLabelV1.NEEDS_WORK),
+            (500_000, 500_000, ProjectedSkillLabelV1.DEVELOPING),
+            (816_373, 699_999, ProjectedSkillLabelV1.DEVELOPING),
+            (816_374, 700_000, ProjectedSkillLabelV1.STRONG),
+        )
+    )
+    if any(
+        row.mastery_ppm != expected_mastery
+        or row.label is not expected_label
+        or row.sufficiency is not ProjectionSufficiencyV1.SUFFICIENT
+        for expected_mastery, expected_label, row in label_boundaries
+    ):
+        failures.append("needs-work, developing, or strong label boundary differs")
+    threshold_ledger = LearnerEvidenceLedgerV1(
+        "learner-projection-audit-001",
+        (
+            _projection_assessment(1, score_ppm=300_000),
+            _projection_assessment(2, score_ppm=700_000),
+        ),
+    )
+    threshold_book = build_learner_projection_v1(
+        threshold_ledger,
+        as_of_attempt_ordinal=2,
+    ).skill("BOOK_READING")
+    if (
+        threshold_book.last_demonstrated_failure is None
+        or threshold_book.last_demonstrated_failure.reference.attempt_ordinal != 1
+        or threshold_book.last_demonstrated_success is None
+        or threshold_book.last_demonstrated_success.reference.attempt_ordinal != 2
+    ):
+        failures.append("inclusive success or failure score threshold differs")
+    projection_7 = build_learner_projection_v1(
+        _projection_ledger(7),
+        as_of_attempt_ordinal=7,
+    )
+    same_scenario = build_learner_projection_v1(
+        _projection_ledger(8, distinct_scenarios=False),
+        as_of_attempt_ordinal=8,
+    )
+    if (
+        projection_7.skill("BOOK_READING").sufficiency
+        is not ProjectionSufficiencyV1.INSUFFICIENT
+        or same_scenario.skill("BOOK_READING").scenario_diversity_count != 1
+        or same_scenario.skill("BOOK_READING").sufficiency
+        is not ProjectionSufficiencyV1.INSUFFICIENT
+    ):
+        failures.append("opportunity-count or scenario-diversity gate differs")
+    projection_25 = build_learner_projection_v1(
+        _projection_ledger(25),
+        as_of_attempt_ordinal=25,
+    )
+    history_25 = projection_25.skill("BOOK_READING").recent_attempt_history
+    if (
+        len(history_25) != RECENT_HISTORY_LIMIT_V1
+        or tuple(item.attempt_ordinal for item in history_25)
+        != tuple(range(6, 26))
+        or projection_25.skill("BOOK_READING").attempt_count != 25
+    ):
+        failures.append("recent positive-history cap or total count differs")
+    return AdaptiveCurriculumAuditCase(
+        "b_confidence_diversity_sufficiency_and_history_are_exact",
+        (
+            f"attempts={book.attempt_count}/8 weight_ppm={expected_weight} "
+            f"mastery_ppm={book.mastery_ppm} confidence_ppm={book.confidence_ppm} "
+            "diversity=scenario8,volume3,liquidity3,source2 "
+            "labels=499999/500000/699999/700000 "
+            f"history={len(history_25)}/{RECENT_HISTORY_LIMIT_V1}"
+        ),
+        tuple(failures),
+    )
+
+
+def _projection_rebuild_and_version_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    ledger = _projection_ledger(8)
+    ledger_bytes = ledger.canonical_bytes()
+    first = build_learner_projection_v1(ledger, as_of_attempt_ordinal=8)
+    second = build_learner_projection_v1(ledger, as_of_attempt_ordinal=8)
+    if first.canonical_bytes() != second.canonical_bytes():
+        failures.append("identical rebuilds produced different projection bytes")
+    future_ledger = ledger.append(_projection_assessment(9))
+    prefix = build_learner_projection_v1(
+        future_ledger,
+        as_of_attempt_ordinal=8,
+    )
+    if prefix.canonical_bytes() != first.canonical_bytes():
+        failures.append("future immutable evidence changed the earlier projection prefix")
+    changed_first = replace(
+        ledger.assessments[0],
+        study_timestamp_utc="2039-12-31T23:59:59Z",
+        observable_context=replace(
+            ledger.assessments[0].observable_context,
+            simulation_time_us=987_654_321,
+        ),
+    )
+    changed_ledger = LearnerEvidenceLedgerV1(
+        ledger.learner_id,
+        (changed_first, *ledger.assessments[1:]),
+    )
+    changed = build_learner_projection_v1(
+        changed_ledger,
+        as_of_attempt_ordinal=8,
+    )
+    if (
+        changed.model_values_sha256 != first.model_values_sha256
+        or changed.input_evidence_sha256 == first.input_evidence_sha256
+        or changed.projection_id == first.projection_id
+        or changed.canonical_bytes() == first.canonical_bytes()
+    ):
+        failures.append("clock provenance was not separated from deterministic model values")
+    history = first.skill("BOOK_READING").recent_attempt_history
+    if (
+        tuple(item.attempt_ordinal for item in history) != tuple(range(1, 9))
+        or first.input_assessment_count != 8
+        or first.input_skill_evidence_count != 8
+        or LearnerProjectionV1.from_json_bytes(first.canonical_bytes()) != first
+        or ledger.canonical_bytes() != ledger_bytes
+    ):
+        failures.append("input ordering, roundtrip, counts, or ledger immutability differs")
+    tampered = first.as_dict()
+    tampered["model_values_sha256"] = _DIGEST
+    hostile_operations = (
+        lambda: LearnerEvidenceLedgerV1(
+            ledger.learner_id,
+            tuple(reversed(ledger.assessments)),
+        ),
+        lambda: build_learner_projection_v1(
+            ledger,
+            as_of_attempt_ordinal=8,
+            model_id="LEARNER_PROJECTION_V2",
+        ),
+        lambda: build_learner_projection_v1(
+            ledger,
+            as_of_attempt_ordinal=True,
+        ),
+        lambda: build_learner_projection_v1(
+            ledger,
+            as_of_attempt_ordinal=-1,
+        ),
+        lambda: replace(first, as_of_attempt_ordinal=9),
+        lambda: replace(history[0], study_timestamp_utc="NOT_EXPLICIT_UTC"),
+        lambda: LearnerProjectionV1.from_json_bytes(canonical_json_bytes(tampered)),
+        lambda: LearnerProjectionV1.from_json_bytes(first.canonical_bytes() + b" "),
+    )
+    refusal_count = sum(_raises(operation) for operation in hostile_operations)
+    if refusal_count != len(hostile_operations):
+        failures.append("ordering, version, ordinal, digest, or canonical refusal differs")
+    return AdaptiveCurriculumAuditCase(
+        "b_rebuild_is_prefix_order_clock_and_version_deterministic",
+        (
+            f"input_assessments={first.input_assessment_count} "
+            f"input_skill_rows={first.input_skill_evidence_count} "
+            f"model_values_sha256={first.model_values_sha256} "
+            "future_prefix_unchanged=true clock_values_excluded=true "
+            f"hostile_refusals={refusal_count}/{len(hostile_operations)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _projection_zero_weight_and_pnl_case() -> AdaptiveCurriculumAuditCase:
+    failures: list[str] = []
+    ambiguous = _ambiguous_assessment()
+    pnl_reference = (
+        _ref(EvidenceReferenceKindV1.SOURCE_RECORD, "projection-pnl-hostile-2"),
+    )
+    ambiguous_low = replace(
+        ambiguous,
+        auxiliary_outcomes=(AuxiliaryOutcomeV1("PNL", 125, "MILLITICKS", pnl_reference),),
+    )
+    ambiguous_high = replace(
+        ambiguous,
+        auxiliary_outcomes=(
+            AuxiliaryOutcomeV1("PNL", 987_654_321, "MILLITICKS", pnl_reference),
+        ),
+    )
+    low = build_learner_projection_v1(
+        LearnerEvidenceLedgerV1(ambiguous.learner_id, (ambiguous_low,)),
+        as_of_attempt_ordinal=2,
+    )
+    high = build_learner_projection_v1(
+        LearnerEvidenceLedgerV1(ambiguous.learner_id, (ambiguous_high,)),
+        as_of_attempt_ordinal=2,
+    )
+    book = low.skill("BOOK_READING")
+    if (
+        low.model_values_sha256 != high.model_values_sha256
+        or low.input_evidence_sha256 == high.input_evidence_sha256
+        or low.projection_id == high.projection_id
+        or book.mastery_ppm != 500_000
+        or book.confidence_ppm != 0
+        or book.attempt_count != 0
+        or book.model_evidence_score_ppm is not None
+        or book.observed_counts.total_rows != 1
+        or book.observed_counts.ambiguous_rows != 1
+        or book.observed_counts.positive_weight_rows != 0
+        or book.observed_counts.zero_weight_rows != 1
+    ):
+        failures.append("ambiguous evidence or PNL changed the learner estimate")
+    positive_low_assessment = _projection_assessment(1, pnl_value=1)
+    positive_high_assessment = _projection_assessment(1, pnl_value=987_654_321)
+    positive_low = build_learner_projection_v1(
+        LearnerEvidenceLedgerV1(
+            positive_low_assessment.learner_id,
+            (positive_low_assessment,),
+        ),
+        as_of_attempt_ordinal=1,
+    )
+    positive_high = build_learner_projection_v1(
+        LearnerEvidenceLedgerV1(
+            positive_high_assessment.learner_id,
+            (positive_high_assessment,),
+        ),
+        as_of_attempt_ordinal=1,
+    )
+    if (
+        positive_low.model_values_sha256 != positive_high.model_values_sha256
+        or positive_low.input_evidence_sha256
+        == positive_high.input_evidence_sha256
+        or positive_low.skill("BOOK_READING").mastery_ppm
+        != positive_high.skill("BOOK_READING").mastery_ppm
+        or positive_low.skill("BOOK_READING").model_evidence_score_ppm
+        != positive_high.skill("BOOK_READING").model_evidence_score_ppm
+        or b"987654321" in positive_high.canonical_bytes()
+        or any(
+            "pnl" in key.lower()
+            for key in positive_high
+            .skill("BOOK_READING")
+            .recent_attempt_history[0]
+            .as_dict()
+        )
+    ):
+        failures.append("auxiliary PNL leaked into positive model values")
+    return AdaptiveCurriculumAuditCase(
+        "b_zero_weight_and_pnl_cannot_update_projection",
+        (
+            "ambiguous_rows=1 positive_weight_rows=0 mastery_ppm=500000 "
+            "pnl_weight_ppm=0 provenance_digest_changes=true "
+            f"model_values_sha256={positive_low.model_values_sha256}"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo34b_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]:
+    return (
+        _projection_policy_and_prior_case(),
+        _projection_caps_modes_and_recency_case(),
+        _projection_confidence_and_history_case(),
+        _projection_rebuild_and_version_case(),
+        _projection_zero_weight_and_pnl_case(),
+    )
+
+
 __all__ = [
     "WO34A_EDGE_COUNT",
     "WO34A_ERROR_COUNT",
@@ -722,6 +1474,10 @@ __all__ = [
     "WO34A_ROOT_COUNT",
     "WO34A_SKILL_COUNT",
     "WO34A_SKILL_GRAPH_SHA256",
+    "WO34B_AUDIT_CASE_COUNT",
+    "WO34B_PROJECTION_POLICY_SHA256",
+    "WO34B_SKILL_PROJECTION_COUNT",
     "AdaptiveCurriculumAuditCase",
     "audit_wo34a_adaptive_curriculum",
+    "audit_wo34b_adaptive_curriculum",
 ]
