@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["MULTIVENUE_RECORDING_V1"], "name" = "required_adapters" }], "logical_name" = "recording_checkpoint", "record_type" = "CHECKPOINT_POLICY_V1", "version" = 1 }]
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "text" = "native/fragmented_venue_recording.json", "name" = "payload_path" }, { "identifier" = "8be6be74b32da6db0be5dc414ffb980840048978a6cc12413fa01bab813ee93a", "name" = "payload_sha256" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = []
+
+["historical_constraints"]
+"records" = []
+
+["instrument"]
+"records" = [{ "fields" = [{ "identifiers" = ["LIMIT", "MARKET"], "name" = "supported_order_instructions" }, { "identifier" = "K2X", "name" = "symbol" }], "logical_name" = "K2X", "record_type" = "INSTRUMENT_V1", "version" = 1 }]
+
+["latency"]
+"records" = [{ "fields" = [{ "identifier" = "SYNTHETIC", "name" = "mode" }, { "latency_us" = 0, "name" = "routing_latency" }], "logical_name" = "routing_latency", "record_type" = "SYNTHETIC_LATENCY_V1", "version" = 1 }]
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_MULTIVENUE_RECORDING_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "43964564f4710939e962d4eb19ad0866ff68771e6b1ec74e011e8910178feebc"
+"description" = "An exact passive-routing replay across two separately declared compatible venues."
+"scenario_id" = "fragmented_venue_execution_task_v1"
+"scenario_version" = 1
+"target_kind" = "MULTIVENUE_RECORDING_V1"
+"target_version" = 1
+"title" = "Fragmented-venue execution task"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["FUTURE_EVENTS", "GROUND_TRUTH", "TRUE_QUEUE_POSITION"], "name" = "hidden_features" }, { "identifiers" = ["BEST_ASK", "BEST_BID", "CONSOLIDATED_BEST_ASK", "CONSOLIDATED_BEST_BID", "VENUE_DISPLAYED_DEPTH"], "name" = "observable_features" }], "logical_name" = "information_boundary", "record_type" = "REVEAL_POLICY_V1", "version" = 1 }]
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = [{ "fields" = [{ "flag" = false, "name" = "allow_cli_override" }, { "name" = "root_seed", "seed" = 42 }], "logical_name" = "scenario_seed_policy", "record_type" = "SCENARIO_SEED_POLICY_V1", "version" = 1 }]
+
+["session_schedule"]
+"records" = []
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = [{ "fields" = [{ "identifiers" = ["K2X"], "name" = "instruments" }, { "name" = "starting_best_ask_ticks", "price_ticks" = 101 }, { "name" = "starting_best_bid_ticks", "price_ticks" = 99 }, { "identifiers" = ["LIMIT", "MARKET"], "name" = "supported_order_instructions" }, { "identifier" = "ALPHA", "name" = "venue_id" }], "logical_name" = "ALPHA", "record_type" = "VENUE_V1", "version" = 1 }, { "fields" = [{ "identifiers" = ["K2X"], "name" = "instruments" }, { "name" = "starting_best_ask_ticks", "price_ticks" = 101 }, { "name" = "starting_best_bid_ticks", "price_ticks" = 99 }, { "identifiers" = ["LIMIT", "MARKET"], "name" = "supported_order_instructions" }, { "identifier" = "BETA", "name" = "venue_id" }], "logical_name" = "BETA", "record_type" = "VENUE_V1", "version" = 1 }]
+
+["volume"]
+"records" = []

@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = []
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "identifier" = "HIDDEN_LIQUIDITY_LESSON_V1", "name" = "fixture_id" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = []
+
+["historical_constraints"]
+"records" = []
+
+["instrument"]
+"records" = []
+
+["latency"]
+"records" = []
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_MARKET_SCENARIO_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "3b3e0e876d2dc52e8260e3fffe5cc97a2955faaa05da1d7c05fc11dbae0f8e1d"
+"description" = "Hostile scenario authoring diagnostic fixture."
+"scenario_id" = "invalid_wrong_target_tag_v1"
+"scenario_version" = 1
+"target_kind" = "MARKET_SCENARIO_V1"
+"target_version" = 1
+"title" = "Invalid invalid_wrong_target_tag_v1"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = []
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = []
+
+["session_schedule"]
+"records" = []
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = []
+
+["volume"]
+"records" = []

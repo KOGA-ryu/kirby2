@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import os
 from dataclasses import dataclass, replace
+from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Callable
@@ -25,6 +29,15 @@ from kirby2.scenario_lang.compiler import (
     compile_validated_scenario,
     replay_compiled_scenario,
     run_compiled_scenario,
+)
+from kirby2.scenario_lang.commands import (
+    SCENARIO_EXPLAIN_SECTION_NAMES_V1,
+    SCENARIO_SOURCE_COMMAND_MODULE,
+    VALID_SCENARIO_EXAMPLE_FILENAMES_V1,
+    diff_scenario_sources,
+    explain_scenario_source,
+    inspect_scenario_source,
+    persist_compiled_artifact,
 )
 from kirby2.scenario_lang.defaults import (
     SCENARIO_SEED_POLICY_LOGICAL_NAME_V1,
@@ -96,6 +109,10 @@ WO32B_DEFINITION_REFUSAL_COUNT = 9
 WO32C_COMPILER_REFUSAL_COUNT = 15
 WO32D_VALIDATION_FAMILY_COUNT = 12
 WO32D_FINALIZATION_REFUSAL_COUNT = 8
+WO32E_VALID_EXAMPLE_COUNT = 6
+WO32E_EXPLAIN_SECTION_COUNT = 14
+WO32E_VALIDATION_INVALID_COUNT = 12
+WO32E_SOURCE_INVALID_ROOT_COUNT = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +168,7 @@ def audit_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
         *audit_wo32b_scenario_language(),
         *audit_wo32c_scenario_language(),
         *audit_wo32d_scenario_language(),
+        *audit_wo32e_scenario_language(),
     )
 
 
@@ -187,6 +205,18 @@ def audit_wo32d_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
         _validation_family_diagnostics_case(),
         _validation_target_capability_matrix_case(),
         _validation_required_unknown_and_refusal_case(),
+    )
+
+
+def audit_wo32e_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
+    """Exercise authoring commands, examples, diagnostics, diff, and run."""
+
+    return (
+        _authoring_wo32abcd_regression_case(),
+        _authoring_command_registration_case(),
+        _authoring_six_example_runtime_matrix_case(),
+        _authoring_explain_and_semantic_diff_case(),
+        _authoring_hostile_diagnostics_case(),
     )
 
 
@@ -2419,6 +2449,394 @@ def _validation_required_unknown_and_refusal_case() -> ScenarioLanguageAuditCase
     )
 
 
+def _authoring_wo32abcd_regression_case() -> ScenarioLanguageAuditCase:
+    cases = (
+        *audit_wo32a_scenario_language(),
+        *audit_wo32b_scenario_language(),
+        *audit_wo32c_scenario_language(),
+        *audit_wo32d_scenario_language(),
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ScenarioLanguageAuditCase(
+        "scenario_authoring_wo32abcd_regression",
+        (
+            f"prior_cases={len(cases)} passing="
+            f"{sum(not case.failures for case in cases)}"
+        ),
+        failures,
+    )
+
+
+def _authoring_command_registration_case() -> ScenarioLanguageAuditCase:
+    from kirby2.__main__ import _parser
+    from kirby2.cli.expansion import declared_expansion_command_names
+
+    failures: list[str] = []
+    declared_names = declared_expansion_command_names()
+    module_names = tuple(command.name for command in SCENARIO_SOURCE_COMMAND_MODULE.commands)
+    if module_names != ("scenario-source", "scenario-language-demo"):
+        failures.append("scenario authoring module top-level command inventory changed")
+    if any(declared_names.count(name) != 1 for name in module_names):
+        failures.append("scenario authoring commands are absent or duplicated")
+    parser = _parser()
+    legacy = parser.parse_args(("scenario", "balanced"))
+    if (
+        legacy.command != "scenario"
+        or legacy.name != "balanced"
+        or "_kirby2_expansion_handler" in vars(legacy)
+    ):
+        failures.append("scenario-source registration reinterpreted legacy scenario NAME")
+    examples = _scenario_examples_root()
+    for action in ("lint", "compile", "explain", "diff", "run"):
+        arguments: tuple[str, ...]
+        if action == "compile":
+            arguments = (
+                "scenario-source",
+                action,
+                str(examples / "full_day.toml"),
+                "--output",
+                str(examples / "unused-artifact.json"),
+            )
+        elif action == "diff":
+            arguments = (
+                "scenario-source",
+                action,
+                str(examples / "full_day.toml"),
+                str(examples / "full_day.toml"),
+            )
+        elif action == "run":
+            arguments = (
+                "scenario-source",
+                action,
+                str(examples / "full_day.toml"),
+                "--artifact",
+                str(examples / "unused-run.json"),
+            )
+        else:
+            arguments = (
+                "scenario-source",
+                action,
+                str(examples / "full_day.toml"),
+            )
+        parsed = parser.parse_args(arguments)
+        if (
+            parsed.command != "scenario-source"
+            or parsed.scenario_source_action != action
+            or not callable(vars(parsed).get("_kirby2_expansion_handler"))
+        ):
+            failures.append(f"scenario-source {action} was not modularly registered")
+    demo = parser.parse_args(
+        (
+            "scenario-language-demo",
+            "--source",
+            str(examples / "full_day.toml"),
+        )
+    )
+    if not callable(vars(demo).get("_kirby2_expansion_handler")):
+        failures.append("scenario-language-demo was not modularly registered")
+    return ScenarioLanguageAuditCase(
+        "scenario_authoring_command_registration",
+        "actions=lint,compile,explain,diff,run legacy_scenario=unchanged modular=true",
+        tuple(failures),
+    )
+
+
+def _authoring_six_example_runtime_matrix_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    examples = _scenario_examples_root()
+    expected_kinds = (
+        ScenarioTargetKindV1.FULL_DAY_PLAN_V1,
+        ScenarioTargetKindV1.MARKET_SCENARIO_V1,
+        ScenarioTargetKindV1.HIDDEN_LIQUIDITY_RECORDING_V1,
+        ScenarioTargetKindV1.MULTIVENUE_RECORDING_V1,
+        ScenarioTargetKindV1.HISTORICAL_LESSON_V1,
+        ScenarioTargetKindV1.FULL_DAY_PLAN_V1,
+    )
+    compiled_digests: list[str] = []
+    observed_kinds: list[ScenarioTargetKindV1] = []
+    runtime_count = 0
+    with TemporaryDirectory(prefix="kirby2-wo32e-valid-examples-") as temp:
+        root = Path(temp)
+        for ordinal, (filename, expected_kind) in enumerate(
+            zip(VALID_SCENARIO_EXAMPLE_FILENAMES_V1, expected_kinds, strict=True),
+            start=1,
+        ):
+            source_path = examples / filename
+            first = inspect_scenario_source(source_path)
+            second = inspect_scenario_source(source_path)
+            if not first.passed or first.artifact is None:
+                failures.append(
+                    f"{filename} did not lint/compile: "
+                    f"{[item.code for item in first.diagnostics]}"
+                )
+                continue
+            artifact = first.artifact
+            if (
+                second.artifact is None
+                or second.artifact.canonical_bytes() != artifact.canonical_bytes()
+            ):
+                failures.append(f"{filename} did not recompile byte-identically")
+            if artifact.target_kind is not expected_kind:
+                failures.append(f"{filename} reached the wrong tagged adapter")
+                continue
+            sections = explain_scenario_source(first)
+            if tuple(name for name, _ in sections) != SCENARIO_EXPLAIN_SECTION_NAMES_V1:
+                failures.append(f"{filename} omitted an explain section")
+            output = root / f"artifact-{ordinal:02d}.json"
+            persisted = persist_compiled_artifact(artifact, output)
+            restored = replay_compiled_scenario(persisted.read_bytes())
+            if restored.canonical_bytes() != artifact.canonical_bytes():
+                failures.append(f"{filename} persisted artifact did not replay exactly")
+                continue
+            before_run = _filesystem_snapshot(root)
+            try:
+                runtime = run_compiled_scenario(restored)
+            except (TypeError, ValueError, RuntimeError) as error:
+                failures.append(f"{filename} runtime refused: {error}")
+                continue
+            if _filesystem_snapshot(root) != before_run:
+                failures.append(f"{filename} target runtime wrote beside its artifact")
+            if expected_kind in {
+                ScenarioTargetKindV1.HIDDEN_LIQUIDITY_RECORDING_V1,
+                ScenarioTargetKindV1.MULTIVENUE_RECORDING_V1,
+            } and not getattr(runtime, "passed", False):
+                failures.append(f"{filename} exact replay did not pass")
+            if (
+                expected_kind is ScenarioTargetKindV1.MARKET_SCENARIO_V1
+                and getattr(runtime, "seed", None)
+                != artifact.seed_policy.selected_root_seed
+            ):
+                failures.append(f"{filename} ignored the artifact-selected seed")
+            if (
+                expected_kind is ScenarioTargetKindV1.FULL_DAY_PLAN_V1
+                and getattr(getattr(runtime, "engine", None), "session_state", None).value
+                != "CLOSED"
+            ):
+                failures.append(f"{filename} did not terminate in CLOSED")
+            if (
+                expected_kind is ScenarioTargetKindV1.HISTORICAL_LESSON_V1
+                and getattr(getattr(runtime, "lesson", None), "lesson_id", None)
+                != "reconstruction_liquidity_decision"
+            ):
+                failures.append(f"{filename} ran the wrong historical lesson")
+            compiled_digests.append(artifact.compiled_artifact_digest)
+            observed_kinds.append(artifact.target_kind)
+            runtime_count += 1
+    if len(VALID_SCENARIO_EXAMPLE_FILENAMES_V1) != WO32E_VALID_EXAMPLE_COUNT:
+        failures.append("valid scenario example count changed")
+    if len(set(compiled_digests)) != WO32E_VALID_EXAMPLE_COUNT:
+        failures.append("the six named examples do not have distinct artifacts")
+    if set(observed_kinds) != set(ScenarioTargetKindV1):
+        failures.append("the six examples do not cover all five target adapters")
+    return ScenarioLanguageAuditCase(
+        "scenario_authoring_six_example_runtime_matrix",
+        (
+            f"examples={len(compiled_digests)}/{WO32E_VALID_EXAMPLE_COUNT} "
+            f"runtimes={runtime_count} targets={len(set(observed_kinds))}/5 "
+            "persist_replay=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _authoring_explain_and_semantic_diff_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    raw = (_scenario_examples_root() / "full_day.toml").read_bytes()
+    semantic_marker = b'"flag" = true, "name" = "restore_required"'
+    if raw.count(semantic_marker) != 1:
+        return ScenarioLanguageAuditCase(
+            "scenario_authoring_explain_and_semantic_diff",
+            "fixture_marker=ABSENT",
+            ("full_day semantic edit marker changed",),
+        )
+    with TemporaryDirectory(prefix="kirby2-wo32e-diff-") as temp:
+        root = Path(temp)
+        plain_path = root / "plain" / "main.toml"
+        formatted_path = root / "formatted" / "main.toml"
+        semantic_path = root / "semantic" / "main.toml"
+        _write_document(plain_path, raw)
+        _write_document(formatted_path, b"# presentation-only comment\n\n" + raw)
+        _write_document(
+            semantic_path,
+            raw.replace(
+                semantic_marker,
+                b'"flag" = false, "name" = "restore_required"',
+                1,
+            ),
+        )
+        before = _filesystem_snapshot(root)
+        plain = inspect_scenario_source(plain_path)
+        formatted = inspect_scenario_source(formatted_path)
+        semantic = inspect_scenario_source(semantic_path)
+        if not all(item.passed for item in (plain, formatted, semantic)):
+            failures.append("diff fixtures did not all pass compilation and validation")
+        else:
+            format_diff = diff_scenario_sources(plain, formatted)
+            semantic_diff = diff_scenario_sources(plain, semantic)
+            if (
+                format_diff["semantic_changes"]
+                or format_diff["semantic_identity_changed"]
+                or len(format_diff["source_only_changes"]) != 1
+            ):
+                failures.append("format-only diff was reported as a semantic edit")
+            if not format_diff["compiled_identity_changed"]:
+                failures.append("format-only provenance did not enter compiled identity")
+            if (
+                not semantic_diff["semantic_changes"]
+                or not semantic_diff["semantic_identity_changed"]
+                or not semantic_diff["compiled_identity_changed"]
+                or semantic_diff["source_only_changes"]
+            ):
+                failures.append("one-field semantic edit was not separated correctly")
+            sections = explain_scenario_source(plain)
+            names = tuple(name for name, _ in sections)
+            if (
+                names != SCENARIO_EXPLAIN_SECTION_NAMES_V1
+                or len(names) != WO32E_EXPLAIN_SECTION_COUNT
+                or not all(payload is not None for _, payload in sections)
+            ):
+                failures.append("explain did not answer the fixed named section inventory")
+            invalidation = dict(sections)["INVALIDATION_CONDITIONS"]
+            if not isinstance(invalidation, list) or len(invalidation) < 5:
+                failures.append("explain omitted known invalidation/refusal conditions")
+        if _filesystem_snapshot(root) != before:
+            failures.append("lint/explain/diff wrote into the source fixture tree")
+    return ScenarioLanguageAuditCase(
+        "scenario_authoring_explain_and_semantic_diff",
+        (
+            f"explain_sections={WO32E_EXPLAIN_SECTION_COUNT} "
+            "format_semantic_changes=0 source_only=1 semantic_edit=true writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _authoring_hostile_diagnostics_case() -> ScenarioLanguageAuditCase:
+    from kirby2.scenario_lang import commands as command_module
+
+    failures: list[str] = []
+    examples = _scenario_examples_root()
+    invalid_root = examples / "invalid"
+    validation_root = invalid_root / "validation"
+    source_root = invalid_root / "source"
+    before = _filesystem_snapshot(invalid_root)
+    validation_manifest = json.loads(
+        (validation_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    observed_families: set[str] = set()
+    for entry in validation_manifest:
+        path = validation_root / str(entry["file"])
+        first = inspect_scenario_source(path)
+        second = inspect_scenario_source(path)
+        expected_code = str(entry["code"])
+        matching = tuple(item for item in first.diagnostics if item.code == expected_code)
+        if first.passed or first.artifact is None or first.artifact.execution_eligible:
+            failures.append(f"{path.name} did not fail before finalization")
+        if tuple(item.as_dict() for item in first.diagnostics) != tuple(
+            item.as_dict() for item in second.diagnostics
+        ):
+            failures.append(f"{path.name} diagnostics were not byte-stable")
+        if len(matching) != 1:
+            failures.append(f"{path.name} omitted stable code {expected_code}")
+            continue
+        diagnostic = matching[0]
+        if (
+            not diagnostic.blocks_execution
+            or diagnostic.correction is None
+            or not diagnostic.semantic_path
+            or diagnostic.span.start_line <= 0
+            or diagnostic.span.start_column <= 0
+        ):
+            failures.append(f"{path.name} diagnostic is not useful and located")
+        observed_families.add(str(entry["family"]))
+    source_manifest = json.loads(
+        (source_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    source_names = tuple(source_manifest["runnable_invalid_roots"])
+    if len(source_names) != WO32E_SOURCE_INVALID_ROOT_COUNT:
+        failures.append("hostile source invalid-root inventory changed")
+    if len(source_manifest["hostile_import_classes"]) != WO32B_IMPORT_REFUSAL_COUNT:
+        failures.append("hostile import class manifest is incomplete")
+    if len(source_manifest["hostile_expression_classes"]) != 14:
+        failures.append("hostile evaluator/field class manifest is incomplete")
+    source_results: dict[str, object] = {}
+    for filename in source_names:
+        path = source_root / str(filename)
+        first = inspect_scenario_source(path)
+        second = inspect_scenario_source(path)
+        source_results[str(filename)] = first
+        if first.passed or first.artifact is not None:
+            failures.append(f"{filename} passed or created a compiled artifact")
+        if tuple(item.as_dict() for item in first.diagnostics) != tuple(
+            item.as_dict() for item in second.diagnostics
+        ):
+            failures.append(f"{filename} source diagnostic was not stable")
+        if not first.diagnostics or any(
+            item.correction is None
+            or not item.semantic_path
+            or item.span.start_line <= 0
+            or item.span.start_column <= 0
+            for item in first.diagnostics
+        ):
+            failures.append(f"{filename} lacks a useful located correction")
+    wrong_tag = source_results.get("wrong_target_tag.toml")
+    if wrong_tag is None or [item.code for item in wrong_tag.diagnostics] != [
+        "TARGET_FIXTURE_TAG_MISMATCH"
+    ]:
+        failures.append("wrong-tag fixture was coerced or diagnosed ambiguously")
+
+    executed = False
+    original_run = command_module.run_compiled_scenario
+
+    def forbidden_run(*args: object, **kwargs: object) -> object:
+        nonlocal executed
+        executed = True
+        raise AssertionError("invalid scenario reached runtime dispatch")
+
+    with TemporaryDirectory(prefix="kirby2-wo32e-invalid-run-") as temp:
+        artifact_path = Path(temp) / "must-not-exist.json"
+        command_module.run_compiled_scenario = forbidden_run
+        try:
+            namespace = argparse.Namespace(
+                scenario_source_action="run",
+                source=validation_root / str(validation_manifest[0]["file"]),
+                pack=[],
+                seed=None,
+                artifact=artifact_path,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = command_module._handle_scenario_source(namespace)
+        finally:
+            command_module.run_compiled_scenario = original_run
+        if exit_code != 1 or artifact_path.exists() or executed:
+            failures.append("invalid scenario wrote an artifact or reached execution")
+    if observed_families != set(SCENARIO_VALIDATION_FAMILIES_V1):
+        failures.append("invalid corpus does not cover every WO32-D validation family")
+    if len(validation_manifest) != WO32E_VALIDATION_INVALID_COUNT:
+        failures.append("validation invalid corpus count changed")
+    if _filesystem_snapshot(invalid_root) != before:
+        failures.append("hostile diagnostic inspection changed the invalid corpus")
+    return ScenarioLanguageAuditCase(
+        "scenario_authoring_hostile_diagnostics",
+        (
+            f"validation_families={len(observed_families)}/12 "
+            f"invalid_roots={len(source_names)} import_classes="
+            f"{len(source_manifest['hostile_import_classes'])} "
+            f"expression_classes={len(source_manifest['hostile_expression_classes'])} "
+            "execution=false writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _scenario_examples_root() -> Path:
+    return Path(str(files("kirby2.scenario_lang").joinpath("examples"))).resolve()
+
+
 def _validation_family_fixtures() -> tuple[
     tuple[
         str,
@@ -3266,9 +3684,14 @@ __all__ = [
     "WO32C_COMPILER_REFUSAL_COUNT",
     "WO32D_FINALIZATION_REFUSAL_COUNT",
     "WO32D_VALIDATION_FAMILY_COUNT",
+    "WO32E_EXPLAIN_SECTION_COUNT",
+    "WO32E_SOURCE_INVALID_ROOT_COUNT",
+    "WO32E_VALIDATION_INVALID_COUNT",
+    "WO32E_VALID_EXAMPLE_COUNT",
     "audit_scenario_language",
     "audit_wo32a_scenario_language",
     "audit_wo32b_scenario_language",
     "audit_wo32c_scenario_language",
     "audit_wo32d_scenario_language",
+    "audit_wo32e_scenario_language",
 ]

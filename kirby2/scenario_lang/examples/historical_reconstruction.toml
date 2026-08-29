@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["HISTORICAL_LESSON_SESSION_V1"], "name" = "required_adapters" }], "logical_name" = "lesson_checkpoint", "record_type" = "CHECKPOINT_POLICY_V1", "version" = 1 }]
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "identifier" = "HISTORICAL_RECONSTRUCTION_V1", "name" = "fixture_id" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = []
+
+["historical_constraints"]
+"records" = [{ "fields" = [{ "flag" = false, "name" = "exact_replay" }, { "identifier" = "RECONSTRUCTION", "name" = "replay_mode" }, { "flag" = false, "name" = "requires_market_by_order" }, { "identifier" = "TRADES_AND_QUOTES", "name" = "source_capability" }], "logical_name" = "reconstruction_source", "record_type" = "HISTORICAL_SOURCE_V1", "version" = 1 }]
+
+["instrument"]
+"records" = []
+
+["latency"]
+"records" = []
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_HISTORICAL_LESSON_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "fa27142a87ab0a8274e3ad1a818aeeaaa6c5e1ff717c5504048af461cd27f4d9"
+"description" = "A provenance-labeled reconstruction that preserves weaker-data and missing-Level-2 limits."
+"scenario_id" = "historical_reconstruction_lesson_v1"
+"scenario_version" = 1
+"target_kind" = "HISTORICAL_LESSON_V1"
+"target_version" = 1
+"title" = "Historical reconstruction lesson"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["FUTURE_EVENTS", "FUTURE_TRADES"], "name" = "hidden_features" }, { "identifiers" = ["BEST_ASK", "BEST_BID", "HISTORICAL_CONTEXT_AVAILABLE_AT_CUTOFF", "TRADE_PRINTS"], "name" = "observable_features" }], "logical_name" = "information_boundary", "record_type" = "REVEAL_POLICY_V1", "version" = 1 }]
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = [{ "fields" = [{ "flag" = false, "name" = "allow_cli_override" }, { "name" = "root_seed", "seed" = 19 }], "logical_name" = "scenario_seed_policy", "record_type" = "SCENARIO_SEED_POLICY_V1", "version" = 1 }]
+
+["session_schedule"]
+"records" = []
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = []
+
+["volume"]
+"records" = []

@@ -19,6 +19,14 @@ include = ["kirby2*"]
 "kirby2.full_day" = ["*.toml", "examples/*.json", "fixtures/*.toml"]
 "kirby2.exchange" = ["MECHANICS.md"]
 "kirby2.algorithms" = ["README.md"]
+"kirby2.scenario_lang" = [
+  "examples/*.toml",
+  "examples/native/*.json",
+  "examples/invalid/source/*.json",
+  "examples/invalid/source/*.toml",
+  "examples/invalid/validation/*.json",
+  "examples/invalid/validation/*.toml",
+]
 "kirby2.observability" = ["README.md"]
 "kirby2.scenarios" = ["accepted_scenarios.json"]
 "kirby2.historical" = ["FEATURES.md", "LESSONS.md", "fixtures/*.json", "lessons/*.json"]

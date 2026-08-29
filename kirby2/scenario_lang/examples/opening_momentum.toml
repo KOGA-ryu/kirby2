@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = []
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "identifier" = "OPENING_MOMENTUM_V1", "name" = "fixture_id" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = [{ "fields" = [{ "name" = "message_rate", "rate_per_second" = 40 }, { "identifier" = "SIMPLE", "name" = "model" }], "logical_name" = "opening_flow", "record_type" = "SIMPLE_FLOW_V1", "version" = 1 }]
+
+["historical_constraints"]
+"records" = []
+
+["instrument"]
+"records" = []
+
+["latency"]
+"records" = []
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_MARKET_SCENARIO_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "3b3e0e876d2dc52e8260e3fffe5cc97a2955faaa05da1d7c05fc11dbae0f8e1d"
+"description" = "A one-second seeded upward-momentum market drill with an explicit opening activity window."
+"scenario_id" = "opening_momentum_drill_v1"
+"scenario_version" = 1
+"target_kind" = "MARKET_SCENARIO_V1"
+"target_version" = 1
+"title" = "Opening momentum drill"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["FUTURE_EVENTS"], "name" = "hidden_features" }, { "identifiers" = ["BEST_ASK", "BEST_BID", "DISPLAYED_DEPTH", "SPREAD", "TRADE_PRINTS"], "name" = "observable_features" }], "logical_name" = "information_boundary", "record_type" = "REVEAL_POLICY_V1", "version" = 1 }]
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = [{ "fields" = [{ "flag" = false, "name" = "allow_cli_override" }, { "name" = "root_seed", "seed" = 73 }], "logical_name" = "scenario_seed_policy", "record_type" = "SCENARIO_SEED_POLICY_V1", "version" = 1 }]
+
+["session_schedule"]
+"records" = [{ "fields" = [{ "latency_us" = 1000000, "name" = "end_time_us" }, { "latency_us" = 0, "name" = "start_time_us" }], "logical_name" = "opening_window", "record_type" = "SESSION_WINDOW_V1", "version" = 1 }]
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = []
+
+["volume"]
+"records" = [{ "fields" = [{ "name" = "relative_volume", "volume_multiplier" = { "denominator" = 2, "numerator" = 3 } }], "logical_name" = "opening_volume", "record_type" = "VOLUME_PROFILE_V1", "version" = 1 }]

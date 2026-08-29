@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["ENGINE_MARKET_MECHANICS_V1", "FULL_DAY_RUNTIME_V1"], "name" = "required_adapters" }, { "flag" = true, "name" = "restore_required" }], "logical_name" = "full_day_checkpoints", "record_type" = "CHECKPOINT_POLICY_V1", "version" = 1 }]
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "identifier" = "QUIET_FULL_DAY_V1", "name" = "fixture_id" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = []
+
+["historical_constraints"]
+"records" = []
+
+["instrument"]
+"records" = []
+
+["latency"]
+"records" = []
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_FULL_DAY_PLAN_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "e746086d8f3ae4f56f86ee78537345f2306de853bc64cf70d3f9c7b9c84f06c2"
+"description" = "A mechanics-only synthetic day with auctions, continuous trading, checkpoints, and no injected shocks."
+"scenario_id" = "quiet_full_day_v1"
+"scenario_version" = 1
+"target_kind" = "FULL_DAY_PLAN_V1"
+"target_version" = 1
+"title" = "Quiet full day"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = [{ "fields" = [{ "identifiers" = ["FUTURE_EVENTS", "GROUND_TRUTH"], "name" = "hidden_features" }, { "identifiers" = ["BEST_ASK", "BEST_BID", "DISPLAYED_DEPTH", "SPREAD", "TRADE_PRINTS"], "name" = "observable_features" }], "logical_name" = "information_boundary", "record_type" = "REVEAL_POLICY_V1", "version" = 1 }]
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = [{ "fields" = [{ "flag" = false, "name" = "allow_cli_override" }, { "name" = "root_seed", "seed" = 42 }], "logical_name" = "scenario_seed_policy", "record_type" = "SCENARIO_SEED_POLICY_V1", "version" = 1 }]
+
+["session_schedule"]
+"records" = [{ "fields" = [{ "latency_us" = 6000000000, "name" = "end_time_us" }, { "latency_us" = 0, "name" = "start_time_us" }], "logical_name" = "trading_day", "record_type" = "SESSION_WINDOW_V1", "version" = 1 }]
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = []
+
+["volume"]
+"records" = []

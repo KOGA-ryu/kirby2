@@ -1,0 +1,62 @@
+[
+  {
+    "family": "SESSION_AUCTION_HALT",
+    "code": "INVALID_TIME_RANGE",
+    "file": "01_session_auction_halt.toml"
+  },
+  {
+    "family": "STATE_GRAPH_REACHABILITY",
+    "code": "UNREACHABLE_STRATEGY_STATE",
+    "file": "02_state_graph_reachability.toml"
+  },
+  {
+    "family": "TRANSITION_NUMERICS",
+    "code": "INVALID_TRANSITION_WEIGHT",
+    "file": "03_transition_numerics.toml"
+  },
+  {
+    "family": "HAWKES_STABILITY",
+    "code": "HAWKES_PROFILE_UNKNOWN",
+    "file": "04_hawkes_stability.toml"
+  },
+  {
+    "family": "VENUE_INSTRUMENT_COMPATIBILITY",
+    "code": "UNSUPPORTED_ORDER_INSTRUCTION",
+    "file": "05_venue_instrument_compatibility.toml"
+  },
+  {
+    "family": "LATENCY_REPLAY_COMPATIBILITY",
+    "code": "EXACT_REPLAY_REQUIRES_STRONGER_DATA",
+    "file": "06_latency_replay_compatibility.toml"
+  },
+  {
+    "family": "FEATURE_OBSERVABILITY",
+    "code": "HIDDEN_TRUTH_EXPOSED",
+    "file": "07_feature_observability.toml"
+  },
+  {
+    "family": "STRATEGY_NO_LOOKAHEAD",
+    "code": "FUTURE_INFORMATION_EXPOSED",
+    "file": "08_strategy_no_lookahead.toml"
+  },
+  {
+    "family": "RESOURCE_LIMITS",
+    "code": "AGENT_BUDGET_UNBOUNDED",
+    "file": "09_resource_limits.toml"
+  },
+  {
+    "family": "CHECKPOINT_ADAPTERS",
+    "code": "CHECKPOINT_ADAPTER_UNSUPPORTED",
+    "file": "10_checkpoint_adapters.toml"
+  },
+  {
+    "family": "HISTORICAL_CAPABILITY",
+    "code": "HISTORICAL_MBO_REQUIRES_MARKET_BY_ORDER",
+    "file": "11_historical_capability.toml"
+  },
+  {
+    "family": "TARGET_CAPABILITY_CONTRACT",
+    "code": "CAPABILITY_DIGEST_MISMATCH",
+    "file": "12_target_capability_contract.toml"
+  }
+]

@@ -1,0 +1,81 @@
+"schema_version" = 1
+
+["accepted_behavioral_envelopes"]
+"records" = []
+
+["agent_populations"]
+"records" = []
+
+["checkpoint_policy"]
+"records" = []
+
+["curriculum_metadata"]
+"records" = [{ "fields" = [{ "identifier" = "OPENING_MOMENTUM_V1", "name" = "fixture_id" }], "logical_name" = "target_binding", "record_type" = "SCENARIO_TARGET_BINDING_V1", "version" = 1 }]
+
+["day_local_states"]
+"records" = []
+
+["flow_model"]
+"records" = [{ "fields" = [], "logical_name" = "eval", "record_type" = "EVAL_V1", "version" = 1 }, { "fields" = [], "logical_name" = "evaluator", "record_type" = "EVALUATOR_V1", "version" = 1 }, { "fields" = [], "logical_name" = "expression", "record_type" = "EXPRESSION_V1", "version" = 1 }, { "fields" = [], "logical_name" = "python", "record_type" = "PYTHON_V1", "version" = 1 }, { "fields" = [], "logical_name" = "reflect", "record_type" = "REFLECT_V1", "version" = 1 }, { "fields" = [], "logical_name" = "reflection", "record_type" = "REFLECTION_V1", "version" = 1 }, { "fields" = [], "logical_name" = "shell", "record_type" = "SHELL_V1", "version" = 1 }, { "fields" = [{ "name" = "callable", "text" = "forbidden" }, { "name" = "evaluator", "text" = "forbidden" }, { "name" = "expression", "text" = "forbidden" }, { "name" = "module_import", "text" = "forbidden" }, { "name" = "python_symbol", "text" = "forbidden" }, { "name" = "reflection", "text" = "forbidden" }, { "name" = "shell_command", "text" = "forbidden" }], "logical_name" = "unsafe_fields", "record_type" = "DECLARATION_V1", "version" = 1 }]
+
+["historical_constraints"]
+"records" = []
+
+["instrument"]
+"records" = []
+
+["latency"]
+"records" = []
+
+["liquidity"]
+"records" = []
+
+["market_profile"]
+"records" = []
+
+["metadata"]
+"adapter_id" = "KIRBY2_MARKET_SCENARIO_ADAPTER_V1"
+"adapter_version" = 1
+"capability_digest" = "3b3e0e876d2dc52e8260e3fffe5cc97a2955faaa05da1d7c05fc11dbae0f8e1d"
+"description" = "Hostile scenario authoring diagnostic fixture."
+"scenario_id" = "invalid_unsafe_evaluator_classes_v1"
+"scenario_version" = 1
+"target_kind" = "MARKET_SCENARIO_V1"
+"target_version" = 1
+"title" = "Invalid invalid_unsafe_evaluator_classes_v1"
+
+["player_objective"]
+"records" = []
+
+["regimes"]
+"records" = []
+
+["required_source_capabilities"]
+"records" = []
+
+["reveal_policy"]
+"records" = []
+
+["scheduled_events"]
+"records" = []
+
+["seed_policy"]
+"records" = []
+
+["session_schedule"]
+"records" = []
+
+["strategy"]
+"records" = []
+
+["transition_rules"]
+"records" = []
+
+["unscheduled_events"]
+"records" = []
+
+["venues"]
+"records" = []
+
+["volume"]
+"records" = []

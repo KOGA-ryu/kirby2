@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from kirby2.full_day.commands import FULL_DAY_COMMAND_MODULE
+from kirby2.scenario_lang.commands import SCENARIO_SOURCE_COMMAND_MODULE
 
 from .registry import (
     CommandModule,
@@ -43,6 +44,7 @@ EXPANSION_COMMAND_MODULES = (
         ),
     ),
     FULL_DAY_COMMAND_MODULE,
+    SCENARIO_SOURCE_COMMAND_MODULE,
 )
 
 
