@@ -1,9 +1,9 @@
 """Deterministic runtime contracts for operational lesson detectors.
 
-WO33-B1 evaluates canonical detector opportunities.  Source-specific adapters are
+WO33-B1/B2 evaluate canonical detector opportunities.  Source-specific adapters are
 responsible for producing those opportunities from immutable event streams; this
 runtime owns capability admission, threshold binding, canonical ordering, explicit
-denominators, exclusions, and immutable raw findings.
+denominators, exclusions, timing-safe assessment projection, and immutable findings.
 """
 
 from __future__ import annotations
@@ -64,6 +64,28 @@ B1_DETECTOR_IDS_V1 = tuple(
         key=lambda item: item.encode("utf-8"),
     )
 )
+B2_DETECTOR_IDS_V1 = tuple(
+    sorted(
+        {
+            "AUCTION_IMBALANCE_CHANGE",
+            "CANCEL_FILL_RACE",
+            "DISTRESSED_LIQUIDATION",
+            "HALT_REOPENING",
+            "LATENCY_SENSITIVE_OPPORTUNITY",
+            "MULTI_VENUE_FRAGMENTATION",
+            "ROUTING_DILEMMA",
+        },
+        key=lambda item: item.encode("utf-8"),
+    )
+)
+OPERATIONAL_DETECTOR_IDS_V1 = tuple(
+    sorted(
+        {*B1_DETECTOR_IDS_V1, *B2_DETECTOR_IDS_V1},
+        key=lambda item: item.encode("utf-8"),
+    )
+)
+RETROSPECTIVE_METRIC_NAMES_V1 = ("adverse_selection_x2_tick_shares",)
+ASSESSMENT_DATA_POLICY_ID_V1 = "ORIGINAL_DECISION_INFORMATION_ONLY_V1"
 
 _IDENTIFIER = re.compile(r"[A-Z][A-Z0-9_]{0,95}\Z")
 _MEASUREMENT_NAME = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
@@ -258,6 +280,7 @@ class DetectorOpportunityV1:
         ):
             raise ValueError("contributing event lies outside the active evidence")
         object.__setattr__(self, "contributing_events", events)
+        _validate_witness_event_links(self.witness_kind, self.witness_ids, events)
 
         if type(self.exclusions) is not tuple or any(
             not isinstance(item, MiningExclusionV1) for item in self.exclusions
@@ -273,19 +296,10 @@ class DetectorOpportunityV1:
             _require_nfc(item, "detector witness ID")
         if len(set(self.witness_ids)) != len(self.witness_ids):
             raise ValueError("detector witness IDs must be unique")
-        if self.witness_kind == _NOT_APPLICABLE:
-            if self.witness_ids:
-                raise ValueError("NOT_APPLICABLE witness may not have IDs")
-            return ()
-        if self.witness_kind == "ORDER_COHORT":
-            if not self.witness_ids:
-                raise ValueError("order-cohort witness must contain order IDs")
-            return tuple(sorted(self.witness_ids, key=lambda item: item.encode("utf-8")))
-        if self.witness_kind == "SPREAD_EXPANSION_PARENT":
-            if len(self.witness_ids) != 1:
-                raise ValueError("spread-expansion parent witness requires one ID")
-            return self.witness_ids
-        raise ValueError("detector opportunity witness kind is not implemented by B1")
+        canonicalizer = _WITNESS_CANONICALIZERS_V1.get(self.witness_kind)
+        if canonicalizer is None:
+            raise ValueError("detector opportunity witness kind is not operational")
+        return canonicalizer(self, self.witness_ids)
 
     @property
     def measurement_map(self) -> Mapping[str, MeasurementValueV1]:
@@ -386,6 +400,138 @@ class DetectorOpportunityV1:
         return sha256_json(self.as_dict())
 
 
+def _witness_none(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    if witness_ids:
+        raise ValueError("NOT_APPLICABLE witness may not have IDs")
+    return ()
+
+
+def _witness_order_cohort(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    if not witness_ids:
+        raise ValueError("order-cohort witness must contain order IDs")
+    return tuple(sorted(witness_ids, key=lambda item: item.encode("utf-8")))
+
+
+def _witness_exact(
+    witness_ids: tuple[str, ...],
+    count: int,
+    label: str,
+) -> tuple[str, ...]:
+    if len(witness_ids) != count:
+        raise ValueError(f"{label} witness requires exactly {count} IDs")
+    return witness_ids
+
+
+def _witness_parent(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    return _witness_exact(witness_ids, 1, "spread-expansion parent")
+
+
+def _witness_latency_action(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    ordered = _witness_exact(witness_ids, 4, "latency action")
+    checkpoint_sha256, _action_id, venue, direction = ordered
+    if re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256) is None:
+        raise ValueError("latency-action checkpoint digest is invalid")
+    if (
+        venue != opportunity.venue
+        or venue == _NOT_APPLICABLE
+        or direction != opportunity.direction.value
+        or opportunity.direction is CandidateDirectionV1.NOT_APPLICABLE
+    ):
+        raise ValueError("latency-action witness differs from its candidate key")
+    return ordered
+
+
+def _witness_cancel_fill(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    return _witness_exact(witness_ids, 3, "cancel/fill")
+
+
+def _witness_unordered_pair(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    pair = _witness_exact(witness_ids, 2, "unordered pair")
+    return tuple(sorted(pair, key=lambda item: item.encode("utf-8")))
+
+
+def _witness_causal_pair(
+    opportunity: DetectorOpportunityV1,
+    witness_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    del opportunity
+    return _witness_exact(witness_ids, 2, "causal pair")
+
+
+_WITNESS_CANONICALIZERS_V1: Mapping[
+    str,
+    Callable[[DetectorOpportunityV1, tuple[str, ...]], tuple[str, ...]],
+] = MappingProxyType(
+    {
+        _NOT_APPLICABLE: _witness_none,
+        "AUCTION_PUBLICATION_PAIR": _witness_causal_pair,
+        "CANCEL_FILL_TUPLE": _witness_cancel_fill,
+        "HALT_REOPEN_PAIR": _witness_causal_pair,
+        "LATENCY_ACTION": _witness_latency_action,
+        "ORDER_COHORT": _witness_order_cohort,
+        "ROUTE_PAIR": _witness_unordered_pair,
+        "SPREAD_EXPANSION_PARENT": _witness_parent,
+        "VENUE_PAIR": _witness_unordered_pair,
+    }
+)
+
+_WITNESS_EVENT_LINK_POSITIONS_V1: Mapping[str, tuple[int, ...]] = MappingProxyType(
+    {
+        "AUCTION_PUBLICATION_PAIR": (0, 1),
+        "HALT_REOPEN_PAIR": (0, 1),
+    }
+)
+_CAUSALLY_ORDERED_WITNESS_KINDS_V1 = frozenset(
+    {
+        "AUCTION_PUBLICATION_PAIR",
+        "HALT_REOPEN_PAIR",
+    }
+)
+
+
+def _validate_witness_event_links(
+    witness_kind: str,
+    witness_ids: tuple[str, ...],
+    events: tuple[MiningEventReferenceV1, ...],
+) -> None:
+    linked_positions = _WITNESS_EVENT_LINK_POSITIONS_V1.get(witness_kind)
+    if linked_positions is None:
+        return
+    positions = {event.event_id: index for index, event in enumerate(events)}
+    linked_ids = tuple(witness_ids[index] for index in linked_positions)
+    if any(witness_id not in positions for witness_id in linked_ids):
+        raise ValueError("witness does not name its contributing source events")
+    observed_positions = tuple(positions[witness_id] for witness_id in linked_ids)
+    if (
+        witness_kind in _CAUSALLY_ORDERED_WITNESS_KINDS_V1
+        and observed_positions != tuple(sorted(observed_positions))
+    ):
+        raise ValueError("causal witness IDs do not retain source-event order")
+
+
 @dataclass(frozen=True, slots=True)
 class RuleEvaluationV1:
     qualifies: bool
@@ -474,6 +620,32 @@ class DetectorFindingV1:
             "interpretation_scope": "DETECTOR_INTERPRETATION_NOT_HISTORICAL_FACT",
             "opportunity_sha256": self.opportunity_sha256,
             "record_kind": "RAW_DETECTOR_FINDING_V1",
+            "schema_version": MINING_SCHEMA_VERSION_V1,
+            "source_ancestry_sha256": self.source_ancestry_sha256,
+        }
+
+    def assessment_projection(self) -> dict[str, object]:
+        """Return only information admissible at the original decision cutoff.
+
+        Raw detector findings may be created by replay and may later acquire outcome
+        metrics.  The assessment surface deliberately omits the detector identity,
+        post horizon, replay outcomes, and all derived measurements.
+        """
+
+        return {
+            "active_start_us": self.bounds.active_start_us,
+            "assessment_data_policy_id": ASSESSMENT_DATA_POLICY_ID_V1,
+            "detector_identity": "WITHHELD_DURING_ASSESSMENT",
+            "evidence_available_through_us": self.bounds.activation_us,
+            "outcome_data": "WITHHELD_DURING_ASSESSMENT",
+            "record_kind": "DETECTOR_ASSESSMENT_PROJECTION_V1",
+            "retrospective_metrics": [
+                {
+                    "name": name,
+                    "status": "WITHHELD_DURING_ASSESSMENT",
+                }
+                for name in RETROSPECTIVE_METRIC_NAMES_V1
+            ],
             "schema_version": MINING_SCHEMA_VERSION_V1,
             "source_ancestry_sha256": self.source_ancestry_sha256,
         }
@@ -669,12 +841,14 @@ class MiningDetectorRuntimeV1:
             raise ValueError("WO33-A1 threshold manifest changed before detector mining")
         object.__setattr__(self, "threshold_manifest", canonical_manifest)
         handlers = dict(
-            _default_b1_handlers() if self.handlers is None else self.handlers
+            _default_operational_handlers() if self.handlers is None else self.handlers
         )
-        if set(handlers) != set(B1_DETECTOR_IDS_V1):
-            raise ValueError("B1 detector handler inventory is incomplete or expanded")
+        if set(handlers) != set(OPERATIONAL_DETECTOR_IDS_V1):
+            raise ValueError(
+                "operational detector handler inventory is incomplete or expanded"
+            )
         if any(not callable(handler) for handler in handlers.values()):
-            raise TypeError("B1 detector handler is not callable")
+            raise TypeError("operational detector handler is not callable")
         object.__setattr__(
             self,
             "_handler_map",
@@ -696,7 +870,7 @@ class MiningDetectorRuntimeV1:
         opportunities: Sequence[DetectorOpportunityV1],
     ) -> DetectorRunReportV1:
         if detector_id not in self._handler_map:
-            raise ValueError(f"B1 detector is not operational: {detector_id}")
+            raise ValueError(f"detector is not operational: {detector_id}")
         if not isinstance(source, SourceCapabilityInventoryV1):
             raise TypeError("detector source capability inventory is invalid")
         if not isinstance(source_ancestry, SourceAncestryV1):
@@ -815,11 +989,17 @@ class MiningDetectorRuntimeV1:
             if not isinstance(evaluation, RuleEvaluationV1):
                 raise TypeError("detector handler returned a noncanonical evaluation")
             if not evaluation.qualifies:
+                if evaluation.reason_codes == ("INSUFFICIENT_EVIDENCE",):
+                    eligible_units -= 1
+                    excluded_units += 1
+                    disposition = OpportunityDispositionV1.EXCLUDED
+                else:
+                    disposition = OpportunityDispositionV1.BELOW_THRESHOLD
                 considerations.append(
                     DetectorConsiderationV1(
                         opportunity.opportunity_id,
                         opportunity.sha256,
-                        OpportunityDispositionV1.BELOW_THRESHOLD,
+                        disposition,
                         evaluation.reason_codes,
                     )
                 )
@@ -883,7 +1063,13 @@ def _validate_key_axes(
         raise ValueError("detector manifest key axes are invalid")
     direction_values = {
         "BUY": {CandidateDirectionV1.BUY},
+        "GAP_SIGN": {
+            CandidateDirectionV1.BUY,
+            CandidateDirectionV1.SELL,
+            CandidateDirectionV1.NOT_APPLICABLE,
+        },
         "NOT_APPLICABLE": {CandidateDirectionV1.NOT_APPLICABLE},
+        "OBJECTIVE": {CandidateDirectionV1.BUY, CandidateDirectionV1.SELL},
         "SELL": {CandidateDirectionV1.SELL},
         "SIGN": {CandidateDirectionV1.BUY, CandidateDirectionV1.SELL},
     }
@@ -891,6 +1077,8 @@ def _validate_key_axes(
         "AFFECTED": {CandidateSideV1.BUY, CandidateSideV1.SELL},
         "BUY": {CandidateSideV1.BUY},
         "NOT_APPLICABLE": {CandidateSideV1.NOT_APPLICABLE},
+        "OBJECTIVE": {CandidateSideV1.BUY, CandidateSideV1.SELL},
+        "ORDER_SIDE": {CandidateSideV1.BUY, CandidateSideV1.SELL},
         "SELL": {CandidateSideV1.SELL},
         "SIGN": {CandidateSideV1.BUY, CandidateSideV1.SELL},
     }
@@ -904,8 +1092,10 @@ def _validate_key_axes(
         raise ValueError("detector opportunity side differs from its key axis")
     venue_validators: Mapping[str, Callable[[str], bool]] = {
         "CONSOLIDATED": lambda value: value == _CONSOLIDATED,
+        "NOT_APPLICABLE": lambda value: value == _NOT_APPLICABLE,
         "SOURCE_VENUE": lambda value: value
         not in {_CONSOLIDATED, _NOT_APPLICABLE},
+        "VENUE_OR_CONSOLIDATED": lambda value: value != _NOT_APPLICABLE,
     }
     venue_validator = venue_validators.get(str(venue_axis))
     if venue_validator is None or not venue_validator(opportunity.venue):
@@ -924,11 +1114,16 @@ def _validate_key_axes(
 def _validate_sampling_alignment(opportunity: DetectorOpportunityV1) -> None:
     alignment_by_unit = {
         "ALIGNED_ONE_SECOND_GROUP": 1_000_000,
+        "BOUND_REPLAY_PAIR": None,
+        "COMPLETE_HALT_REOPEN_EPISODE": None,
+        "CONSECUTIVE_PUBLICATION_PAIR": None,
         "OBSERVABLE_BIN_100000_US": 100_000,
     }
-    alignment = alignment_by_unit.get(opportunity.sampling_unit)
+    if opportunity.sampling_unit not in alignment_by_unit:
+        raise ValueError("detector sampling unit has no canonical alignment rule")
+    alignment = alignment_by_unit[opportunity.sampling_unit]
     if alignment is None:
-        raise ValueError("B1 detector sampling unit has no canonical alignment")
+        return
     if (opportunity.active_start_us - opportunity.source_start_us) % alignment != 0:
         raise ValueError("detector opportunity is not aligned to the source lower bound")
 
@@ -999,6 +1194,34 @@ def nearest_rank_p50(values: tuple[int, ...]) -> int:
     return ordered[rank - 1]
 
 
+def time_weighted_nearest_rank_p50(
+    values: tuple[int, ...],
+    durations_us: tuple[int, ...],
+) -> int:
+    if (
+        not values
+        or len(values) != len(durations_us)
+        or any(type(value) is not int or value < 0 for value in values)
+        or any(type(duration) is not int or duration <= 0 for duration in durations_us)
+    ):
+        raise ValueError(
+            "time-weighted detector P50 requires nonempty nonnegative values "
+            "and positive durations"
+        )
+    ordered = sorted(
+        zip(values, durations_us, range(len(values)), strict=True),
+        key=lambda item: (item[0], item[2]),
+    )
+    total_duration = sum(durations_us)
+    target = max(1, (500_000 * total_duration + 1_000_000 - 1) // 1_000_000)
+    cumulative = 0
+    for value, duration, _canonical_segment_order in ordered:
+        cumulative += duration
+        if cumulative >= target:
+            return value
+    raise RuntimeError("time-weighted detector P50 failed to reach its target")
+
+
 def _evidence_label(evidence_class: EvidenceClassV1) -> FindingEvidenceLabelV1:
     return {
         EvidenceClassV1.SYNTHETIC_GROUND_TRUTH: (
@@ -1013,21 +1236,33 @@ def _evidence_label(evidence_class: EvidenceClassV1) -> FindingEvidenceLabelV1:
     }[evidence_class]
 
 
-def _default_b1_handlers() -> Mapping[str, DetectorHandlerV1]:
+def _default_operational_handlers() -> Mapping[str, DetectorHandlerV1]:
     from .flow_detectors import FLOW_DETECTOR_HANDLERS_V1
+    from .latency_detectors import LATENCY_DETECTOR_HANDLERS_V1
+    from .mechanics_detectors import MECHANICS_DETECTOR_HANDLERS_V1
     from .queue_detectors import QUEUE_DETECTOR_HANDLERS_V1
+    from .venue_detectors import VENUE_DETECTOR_HANDLERS_V1
 
-    combined = {**QUEUE_DETECTOR_HANDLERS_V1, **FLOW_DETECTOR_HANDLERS_V1}
-    if len(combined) != len(QUEUE_DETECTOR_HANDLERS_V1) + len(
-        FLOW_DETECTOR_HANDLERS_V1
-    ):
-        raise ValueError("B1 detector handler modules overlap")
+    modules = (
+        QUEUE_DETECTOR_HANDLERS_V1,
+        FLOW_DETECTOR_HANDLERS_V1,
+        LATENCY_DETECTOR_HANDLERS_V1,
+        MECHANICS_DETECTOR_HANDLERS_V1,
+        VENUE_DETECTOR_HANDLERS_V1,
+    )
+    combined = {key: value for module in modules for key, value in module.items()}
+    if len(combined) != sum(len(module) for module in modules):
+        raise ValueError("operational detector handler modules overlap")
     return combined
 
 
 __all__ = [
+    "ASSESSMENT_DATA_POLICY_ID_V1",
     "B1_DETECTOR_IDS_V1",
+    "B2_DETECTOR_IDS_V1",
     "DETECTOR_RUNTIME_ID_V1",
+    "OPERATIONAL_DETECTOR_IDS_V1",
+    "RETROSPECTIVE_METRIC_NAMES_V1",
     "WO33A1_THRESHOLD_MANIFEST_SHA256_V1",
     "DetectorConsiderationV1",
     "DetectorFindingV1",
@@ -1048,5 +1283,6 @@ __all__ = [
     "measurement_int",
     "measurement_int_tuple",
     "nearest_rank_p50",
+    "time_weighted_nearest_rank_p50",
     "threshold_int",
 ]

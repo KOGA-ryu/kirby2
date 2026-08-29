@@ -62,6 +62,10 @@ WO33B1_DETECTOR_COUNT = 15
 WO33B1_SYNTHETIC_REPORT_SHA256 = (
     "66a3de3f170a9c21d401489685514edc505f1de4ffbd14607caee32c247c8516"
 )
+WO33B2_DETECTOR_COUNT = 7
+WO33B2_SYNTHETIC_REPORT_SHA256 = (
+    "832b09a7b459a3d2404b3a39e3100d6405d8d392628e9c77d25e89536c3fcac2"
+)
 
 WO33A1_THRESHOLD_MANIFEST_SHA256 = (
     "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
@@ -153,6 +157,28 @@ def audit_wo33b1_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
             source,
             ancestry,
         ),
+    )
+
+
+def audit_wo33b2_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
+    """Exercise B2 execution-mechanics rules and timing-safe projections."""
+
+    runtime, opportunities, reports, ancestry = _b2_synthetic_reports()
+    return (
+        _b2_runtime_and_manifest_binding_case(runtime, reports),
+        _b2_synthetic_activation_and_branch_case(
+            runtime,
+            opportunities,
+            reports,
+            ancestry,
+        ),
+        _b2_capability_refusal_case(runtime, opportunities),
+        _b2_canonical_ancestry_label_and_timing_case(
+            runtime,
+            opportunities,
+            ancestry,
+        ),
+        _b2_hostile_contract_refusal_case(runtime, opportunities, ancestry),
     )
 
 
@@ -1314,9 +1340,14 @@ def _b1_runtime_and_manifest_binding_case(
 
     failures: list[str] = []
     handlers = {**QUEUE_DETECTOR_HANDLERS_V1, **FLOW_DETECTOR_HANDLERS_V1}
+    operational_b1_ids = tuple(
+        detector_id
+        for detector_id in runtime.handler_ids
+        if detector_id in set(B1_DETECTOR_IDS_V1)
+    )
     if (
-        runtime.handler_ids != B1_DETECTOR_IDS_V1
-        or len(runtime.handler_ids) != WO33B1_DETECTOR_COUNT
+        operational_b1_ids != B1_DETECTOR_IDS_V1
+        or len(operational_b1_ids) != WO33B1_DETECTOR_COUNT
         or len({id(handler) for handler in handlers.values()})
         != WO33B1_DETECTOR_COUNT
     ):
@@ -1326,7 +1357,7 @@ def _b1_runtime_and_manifest_binding_case(
         != WO33A1_THRESHOLD_MANIFEST_SHA256_V1
     ):
         failures.append("B1 runtime did not pin the committed A1 threshold manifest")
-    for detector_id in runtime.handler_ids:
+    for detector_id in B1_DETECTOR_IDS_V1:
         row = runtime.threshold_manifest.detector(detector_id)
         report = reports[detector_id]
         if (
@@ -1342,14 +1373,14 @@ def _b1_runtime_and_manifest_binding_case(
         ):
             failures.append(f"{detector_id} did not consume its exact A1 rule row")
     aggregate_sha256 = sha256_json(
-        [reports[detector_id].as_dict() for detector_id in runtime.handler_ids]
+        [reports[detector_id].as_dict() for detector_id in B1_DETECTOR_IDS_V1]
     )
     if aggregate_sha256 != WO33B1_SYNTHETIC_REPORT_SHA256:
         failures.append("B1 synthetic runtime evidence digest changed")
     return DrillMiningAuditCase(
         "b1_fifteen_distinct_handlers_consume_the_committed_a1_manifest",
         (
-            f"handlers={len(runtime.handler_ids)}/15 versions=1 "
+            f"handlers={len(operational_b1_ids)}/15 versions=1 "
             f"threshold_manifest_sha256={runtime.threshold_manifest.manifest_sha256} "
             f"synthetic_report_sha256={aggregate_sha256}"
         ),
@@ -1831,7 +1862,7 @@ def _b1_hostile_runtime_refusal_case(
 
 
 def _b1_synthetic_reports():
-    from kirby2.mining.runtime import MiningDetectorRuntimeV1
+    from kirby2.mining.runtime import B1_DETECTOR_IDS_V1, MiningDetectorRuntimeV1
 
     runtime = MiningDetectorRuntimeV1()
     source_identity = SourceIdentityV1(
@@ -1846,10 +1877,10 @@ def _b1_synthetic_reports():
     )
     opportunities = {
         detector_id: _b1_qualifying_opportunity(runtime, detector_id)
-        for detector_id in runtime.handler_ids
+        for detector_id in B1_DETECTOR_IDS_V1
     }
     reports: dict[str, object] = {}
-    for detector_id in runtime.handler_ids:
+    for detector_id in B1_DETECTOR_IDS_V1:
         detector_opportunities = (opportunities[detector_id],)
         if detector_id == "STRONG_QUEUE_IMBALANCE":
             detector_opportunities = (
@@ -2195,6 +2226,1045 @@ def _b1_weak_strong_opportunity(qualifying):
     )
 
 
+def _b2_runtime_and_manifest_binding_case(
+    runtime,
+    reports: dict[str, object],
+) -> DrillMiningAuditCase:
+    from kirby2.mining.latency_detectors import LATENCY_DETECTOR_HANDLERS_V1
+    from kirby2.mining.mechanics_detectors import MECHANICS_DETECTOR_HANDLERS_V1
+    from kirby2.mining.runtime import (
+        B2_DETECTOR_IDS_V1,
+        DETECTOR_RUNTIME_ID_V1,
+        OPERATIONAL_DETECTOR_IDS_V1,
+        WO33A1_THRESHOLD_MANIFEST_SHA256_V1,
+    )
+    from kirby2.mining.venue_detectors import VENUE_DETECTOR_HANDLERS_V1
+
+    failures: list[str] = []
+    modules = (
+        LATENCY_DETECTOR_HANDLERS_V1,
+        MECHANICS_DETECTOR_HANDLERS_V1,
+        VENUE_DETECTOR_HANDLERS_V1,
+    )
+    handlers = {key: value for module in modules for key, value in module.items()}
+    operational_b2_ids = tuple(
+        detector_id
+        for detector_id in runtime.handler_ids
+        if detector_id in set(B2_DETECTOR_IDS_V1)
+    )
+    if (
+        runtime.handler_ids != OPERATIONAL_DETECTOR_IDS_V1
+        or operational_b2_ids != B2_DETECTOR_IDS_V1
+        or len(handlers) != WO33B2_DETECTOR_COUNT
+        or len({id(handler) for handler in handlers.values()})
+        != WO33B2_DETECTOR_COUNT
+    ):
+        failures.append("B2 does not expose seven distinct handlers in the closed runtime")
+    if (
+        runtime.threshold_manifest.manifest_sha256
+        != WO33A1_THRESHOLD_MANIFEST_SHA256_V1
+    ):
+        failures.append("B2 runtime did not pin the committed A1 threshold manifest")
+    for detector_id in B2_DETECTOR_IDS_V1:
+        row = runtime.threshold_manifest.detector(detector_id)
+        report = reports[detector_id]
+        if (
+            row["detector_id"] != detector_id
+            or row["version"] != 1
+            or not row["thresholds"]
+            or report.detector.threshold_sha256
+            != runtime.threshold_manifest.detector_threshold_sha256(detector_id)
+            or report.threshold_manifest_sha256
+            != WO33A1_THRESHOLD_MANIFEST_SHA256_V1
+            or report.as_dict()["runtime_id"] != DETECTOR_RUNTIME_ID_V1
+            or report.as_dict()["schema_version"] != 1
+        ):
+            failures.append(f"{detector_id} did not consume its exact A1 rule row")
+    aggregate_sha256 = sha256_json(
+        [reports[detector_id].as_dict() for detector_id in B2_DETECTOR_IDS_V1]
+    )
+    if aggregate_sha256 != WO33B2_SYNTHETIC_REPORT_SHA256:
+        failures.append("B2 synthetic runtime evidence digest changed")
+    return DrillMiningAuditCase(
+        "b2_seven_distinct_handlers_extend_the_closed_runtime_and_bind_a1",
+        (
+            f"handlers={len(operational_b2_ids)}/7 runtime_handlers="
+            f"{len(runtime.handler_ids)}/22 versions=1 "
+            f"threshold_manifest_sha256={runtime.threshold_manifest.manifest_sha256} "
+            f"synthetic_report_sha256={aggregate_sha256}"
+        ),
+        tuple(failures),
+    )
+
+
+def _b2_synthetic_activation_and_branch_case(
+    runtime,
+    opportunities: dict[str, object],
+    reports: dict[str, object],
+    ancestry: SourceAncestryV1,
+) -> DrillMiningAuditCase:
+    from kirby2.mining.runtime import (
+        B2_DETECTOR_IDS_V1,
+        DetectorRunStatusV1,
+        FindingEvidenceLabelV1,
+        time_weighted_nearest_rank_p50,
+    )
+
+    failures: list[str] = []
+    emitted_ids = {
+        detector_id
+        for detector_id, report in reports.items()
+        if report.status is DetectorRunStatusV1.EXERCISED
+        and report.eligible_units == 1
+        and report.qualifying_units == 1
+        and len(report.findings) == 1
+    }
+    if emitted_ids != set(B2_DETECTOR_IDS_V1):
+        failures.append("a B2 synthetic boundary fixture did not emit exactly once")
+    if any(
+        report.sample_frequency_ppm != 1_000_000
+        for report in reports.values()
+    ):
+        failures.append("B2 sample frequency is not derived from its denominator")
+    findings = [finding for report in reports.values() for finding in report.findings]
+    if (
+        len({finding.finding_sha256 for finding in findings})
+        != WO33B2_DETECTOR_COUNT
+        or any(
+            finding.source_ancestry_sha256 != ancestry.sha256
+            or finding.evidence_label
+            is not FindingEvidenceLabelV1.AUTHORITATIVE_SYNTHETIC_GROUND_TRUTH
+            or finding.as_dict()["record_kind"] != "RAW_DETECTOR_FINDING_V1"
+            for finding in findings
+        )
+    ):
+        failures.append("B2 findings lost identity, ancestry, or evidence scope")
+
+    source_identity = ancestry.source_identity
+    latency_cost_only = _replace_b2_measurements(
+        opportunities["LATENCY_SENSITIVE_OPPORTUNITY"],
+        opportunity_id="b2-latency-cost-only-branch",
+        fast_filled_quantity=100,
+        slow_filled_quantity=100,
+        fast_fee_adjusted_average_cost_milliticks_per_share=100_000,
+        slow_fee_adjusted_average_cost_milliticks_per_share=101_000,
+    )
+    auction_absolute_only = _replace_b2_measurements(
+        opportunities["AUCTION_IMBALANCE_CHANGE"],
+        opportunity_id="b2-auction-absolute-relative-only-branch",
+        old_imbalance_shares=40_000,
+        new_imbalance_shares=50_000,
+    )
+    halt_spread_only = _replace_b2_measurements(
+        opportunities["HALT_REOPENING"],
+        opportunity_id="b2-halt-spread-only-branch",
+        direction=CandidateDirectionV1.NOT_APPLICABLE,
+        first_post_reopen_trade_ticks=101,
+    )
+    distressed_finite = _replace_b2_measurements(
+        opportunities["DISTRESSED_LIQUIDATION"],
+        opportunity_id="b2-distressed-finite-ratio-branch",
+        distressed_buy_quantity=1_250,
+    )
+    branch_opportunities = (
+        ("LATENCY_SENSITIVE_OPPORTUNITY", latency_cost_only),
+        ("AUCTION_IMBALANCE_CHANGE", auction_absolute_only),
+        ("HALT_REOPENING", halt_spread_only),
+        ("DISTRESSED_LIQUIDATION", distressed_finite),
+    )
+    branch_reports = {
+        detector_id: runtime.run(
+            detector_id,
+            _inventory_for(
+                detector_id,
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (opportunity,),
+        )
+        for detector_id, opportunity in branch_opportunities
+    }
+    branch_measurements = {
+        detector_id: _derived_measurement_map(report)
+        for detector_id, report in branch_reports.items()
+    }
+    cancel_measurements = _derived_measurement_map(reports["CANCEL_FILL_RACE"])
+    latency_base = opportunities["LATENCY_SENSITIVE_OPPORTUNITY"]
+    latency_sell = replace(
+        latency_base,
+        opportunity_id="b2-latency-sell-symmetry",
+        direction=CandidateDirectionV1.SELL,
+        side=CandidateSideV1.SELL,
+        witness_ids=(
+            latency_base.witness_ids[0],
+            latency_base.witness_ids[1],
+            latency_base.witness_ids[2],
+            "SELL",
+        ),
+    )
+    symmetric_opportunities = (
+        ("LATENCY_SENSITIVE_OPPORTUNITY", latency_sell),
+        (
+            "CANCEL_FILL_RACE",
+            _replace_b2_measurements(
+                opportunities["CANCEL_FILL_RACE"],
+                opportunity_id="b2-cancel-fill-sell-symmetry",
+                side=CandidateSideV1.SELL,
+            ),
+        ),
+        (
+            "MULTI_VENUE_FRAGMENTATION",
+            _replace_b2_measurements(
+                opportunities["MULTI_VENUE_FRAGMENTATION"],
+                opportunity_id="b2-fragmentation-sell-symmetry",
+                side=CandidateSideV1.SELL,
+            ),
+        ),
+        (
+            "ROUTING_DILEMMA",
+            _replace_b2_measurements(
+                opportunities["ROUTING_DILEMMA"],
+                opportunity_id="b2-routing-sell-symmetry",
+                direction=CandidateDirectionV1.SELL,
+                side=CandidateSideV1.SELL,
+            ),
+        ),
+        (
+            "AUCTION_IMBALANCE_CHANGE",
+            _replace_b2_measurements(
+                opportunities["AUCTION_IMBALANCE_CHANGE"],
+                opportunity_id="b2-auction-sell-symmetry",
+                direction=CandidateDirectionV1.SELL,
+                side=CandidateSideV1.SELL,
+                old_imbalance_shares=5_000,
+                new_imbalance_shares=-5_000,
+            ),
+        ),
+        (
+            "HALT_REOPENING",
+            _replace_b2_measurements(
+                opportunities["HALT_REOPENING"],
+                opportunity_id="b2-halt-sell-symmetry",
+                direction=CandidateDirectionV1.SELL,
+                first_post_reopen_trade_ticks=97,
+            ),
+        ),
+    )
+    symmetric_reports = tuple(
+        runtime.run(
+            detector_id,
+            _inventory_for(
+                detector_id,
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (opportunity,),
+        )
+        for detector_id, opportunity in symmetric_opportunities
+    )
+    if (
+        any(report.qualifying_units != 1 for report in branch_reports.values())
+        or any(report.qualifying_units != 1 for report in symmetric_reports)
+        or branch_measurements["LATENCY_SENSITIVE_OPPORTUNITY"].get(
+            "cost_difference_branch_satisfied"
+        )
+        is not True
+        or branch_measurements["LATENCY_SENSITIVE_OPPORTUNITY"].get(
+            "fill_difference_branch_satisfied"
+        )
+        is not False
+        or branch_measurements["AUCTION_IMBALANCE_CHANGE"].get(
+            "absolute_relative_branch_satisfied"
+        )
+        is not True
+        or branch_measurements["AUCTION_IMBALANCE_CHANGE"].get(
+            "sign_change_branch_satisfied"
+        )
+        is not False
+        or branch_measurements["HALT_REOPENING"].get(
+            "price_gap_branch_satisfied"
+        )
+        is not False
+        or branch_measurements["HALT_REOPENING"].get(
+            "spread_branch_satisfied"
+        )
+        is not True
+        or branch_measurements["DISTRESSED_LIQUIDATION"].get(
+            "sell_to_buy_ratio_ppm"
+        )
+        != 4_000_000
+        or branch_measurements["DISTRESSED_LIQUIDATION"].get(
+            "sell_to_buy_positive_infinity"
+        )
+        is not False
+        or cancel_measurements.get("fast_terminal_outcome") != "CANCEL"
+        or cancel_measurements.get("slow_terminal_outcome") != "FULL_FILL"
+        or time_weighted_nearest_rank_p50(
+            (1, 2, 10),
+            (1_000_000, 1_000_000, 3_000_000),
+        )
+        != 10
+    ):
+        failures.append("a B2 alternate OR branch or terminal race semantic differs")
+    return DrillMiningAuditCase(
+        "b2_exact_synthetic_boundaries_activate_all_detectors_and_or_branches",
+        (
+            f"detectors={len(emitted_ids)}/7 considered=7 eligible=7 emitted=7 "
+            "alternate_or_branches=4/4 cancel_race=CANCEL_vs_FULL_FILL "
+            "positive_infinity_and_finite_ratio=qualified sell_symmetry=6/6 "
+            "weighted_p50=10"
+        ),
+        tuple(failures),
+    )
+
+
+def _b2_capability_refusal_case(
+    runtime,
+    opportunities: dict[str, object],
+) -> DrillMiningAuditCase:
+    from kirby2.mining.runtime import (
+        DetectorRunStatusV1,
+        OpportunityDispositionV1,
+    )
+
+    failures: list[str] = []
+    source_identity = SourceIdentityV1(
+        SourceKindV1.RUN,
+        "b2-capability-refusal-source",
+        _digest("b2-capability-refusal-source"),
+    )
+    ancestry = SourceAncestryV1(
+        source_identity.kind,
+        source_identity.source_id,
+        source_identity.source_sha256,
+    )
+    removed_capabilities = {
+        "AUCTION_IMBALANCE_CHANGE": "PUBLISHED_IMBALANCE",
+        "CANCEL_FILL_RACE": "ORDER_IDENTITY",
+        "DISTRESSED_LIQUIDATION": "AUTHORITATIVE_PARTICIPANT_IDENTITY",
+        "HALT_REOPENING": "HALT_STATE",
+        "LATENCY_SENSITIVE_OPPORTUNITY": "PORTABLE_CHECKPOINT",
+        "MULTI_VENUE_FRAGMENTATION": "PER_VENUE_QUOTES",
+        "ROUTING_DILEMMA": "RECEIPT_LATENCY_MODEL",
+    }
+    refused = 0
+    for detector_id, missing_capability in removed_capabilities.items():
+        inventory = _inventory_for(
+            detector_id,
+            EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+            source_identity,
+        )
+        weak_inventory = replace(
+            inventory,
+            available_records=tuple(
+                record
+                for record in inventory.available_records
+                if record.capability != missing_capability
+            ),
+        )
+        report = runtime.run(
+            detector_id,
+            weak_inventory,
+            ancestry,
+            (opportunities[detector_id],),
+        )
+        if (
+            report.status is DetectorRunStatusV1.NOT_EXERCISED
+            and report.reason_code == "INSUFFICIENT_SOURCE_CAPABILITY"
+            and report.missing_capabilities == (missing_capability,)
+            and report.eligible_units == 0
+            and not report.findings
+            and report.considered[0].disposition
+            is OpportunityDispositionV1.NOT_EXERCISED
+        ):
+            refused += 1
+        else:
+            failures.append(
+                f"{detector_id} did not refuse missing {missing_capability}"
+            )
+
+    historical_identity = SourceIdentityV1(
+        SourceKindV1.DATASET,
+        "b2-weak-historical-source",
+        _digest("b2-weak-historical-source"),
+    )
+    historical_ancestry = SourceAncestryV1(
+        historical_identity.kind,
+        historical_identity.source_id,
+        historical_identity.source_sha256,
+    )
+    market_by_order_foundation = _inventory_for(
+        "STRONG_QUEUE_IMBALANCE",
+        EvidenceClassV1.HISTORICAL_MARKET_BY_ORDER,
+        historical_identity,
+    )
+    unsupported_historical = tuple(
+        runtime.run(
+            detector_id,
+            market_by_order_foundation,
+            historical_ancestry,
+            (opportunities[detector_id],),
+        )
+        for detector_id in (
+            "LATENCY_SENSITIVE_OPPORTUNITY",
+            "CANCEL_FILL_RACE",
+            "ROUTING_DILEMMA",
+        )
+    )
+    fragmented_inventory = _inventory_for(
+        "MULTI_VENUE_FRAGMENTATION",
+        EvidenceClassV1.HISTORICAL_MARKET_BY_ORDER,
+        historical_identity,
+    )
+    weak_fragmented = replace(
+        fragmented_inventory,
+        available_records=tuple(
+            record
+            for record in fragmented_inventory.available_records
+            if record.capability != "PER_VENUE_QUOTES"
+        ),
+    )
+    historical_fragmentation = runtime.run(
+        "MULTI_VENUE_FRAGMENTATION",
+        weak_fragmented,
+        historical_ancestry,
+        (opportunities["MULTI_VENUE_FRAGMENTATION"],),
+    )
+    if any(
+        report.status is not DetectorRunStatusV1.NOT_EXERCISED
+        or report.reason_code != "UNSUPPORTED_EVIDENCE_CLASS"
+        or report.eligible_units != 0
+        or report.findings
+        for report in unsupported_historical
+    ) or (
+        historical_fragmentation.status
+        is not DetectorRunStatusV1.NOT_EXERCISED
+        or historical_fragmentation.reason_code
+        != "INSUFFICIENT_SOURCE_CAPABILITY"
+        or historical_fragmentation.missing_capabilities != ("PER_VENUE_QUOTES",)
+    ):
+        failures.append("historical execution evidence absence was silently reconstructed")
+    return DrillMiningAuditCase(
+        "b2_every_missing_capability_and_weak_historical_source_is_not_exercised",
+        (
+            f"missing_capability_refusals={refused}/7 denominator=0 "
+            "historical_latency_cancel_route=UNSUPPORTED_EVIDENCE_CLASS "
+            "historical_fragmentation_without_routes=INSUFFICIENT_SOURCE_CAPABILITY"
+        ),
+        tuple(failures),
+    )
+
+
+def _b2_canonical_ancestry_label_and_timing_case(
+    runtime,
+    opportunities: dict[str, object],
+    ancestry: SourceAncestryV1,
+) -> DrillMiningAuditCase:
+    from kirby2.mining.runtime import (
+        ASSESSMENT_DATA_POLICY_ID_V1,
+        RETROSPECTIVE_METRIC_NAMES_V1,
+        FindingEvidenceLabelV1,
+    )
+
+    failures: list[str] = []
+    if RETROSPECTIVE_METRIC_NAMES_V1 != ("adverse_selection_x2_tick_shares",):
+        failures.append("the declared retrospective metric inventory changed")
+    fragmented = opportunities["MULTI_VENUE_FRAGMENTATION"]
+    later_events = tuple(
+        replace(
+            event,
+            event_id=f"{event.event_id}-later",
+            timestamp_us=event.timestamp_us + 100_000,
+            source_sequence=event.source_sequence + 100,
+        )
+        for event in fragmented.contributing_events
+    )
+    later = replace(
+        fragmented,
+        opportunity_id="b2-multi-venue-fragmentation-later",
+        active_start_us=fragmented.active_start_us + 100_000,
+        activation_us=fragmented.activation_us + 100_000,
+        witness_ids=tuple(reversed(fragmented.witness_ids)),
+        measurements=tuple(reversed(fragmented.measurements)),
+        contributing_events=tuple(reversed(later_events)),
+    )
+    canonical_source = _inventory_for(
+        "MULTI_VENUE_FRAGMENTATION",
+        EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+        ancestry.source_identity,
+    )
+    canonical = runtime.run(
+        "MULTI_VENUE_FRAGMENTATION",
+        canonical_source,
+        ancestry,
+        (fragmented, later),
+    )
+    reordered_fragmented = replace(
+        fragmented,
+        witness_ids=tuple(reversed(fragmented.witness_ids)),
+        measurements=tuple(reversed(fragmented.measurements)),
+        contributing_events=tuple(reversed(fragmented.contributing_events)),
+    )
+    reordered_later = replace(
+        later,
+        witness_ids=tuple(reversed(later.witness_ids)),
+        measurements=tuple(reversed(later.measurements)),
+        contributing_events=tuple(reversed(later.contributing_events)),
+    )
+    reordered = runtime.run(
+        "MULTI_VENUE_FRAGMENTATION",
+        canonical_source,
+        ancestry,
+        (reordered_later, reordered_fragmented),
+    )
+    if (
+        canonical.report_sha256 != reordered.report_sha256
+        or any(
+            finding.source_ancestry_sha256 != ancestry.sha256
+            for finding in canonical.findings
+        )
+    ):
+        failures.append("B2 canonical ordering changed evidence or source ancestry")
+
+    historical_identity = SourceIdentityV1(
+        SourceKindV1.DATASET,
+        "b2-historical-fragmented-source",
+        _digest("b2-historical-fragmented-source"),
+    )
+    historical_ancestry = SourceAncestryV1(
+        historical_identity.kind,
+        historical_identity.source_id,
+        historical_identity.source_sha256,
+    )
+    historical = runtime.run(
+        "MULTI_VENUE_FRAGMENTATION",
+        _inventory_for(
+            "MULTI_VENUE_FRAGMENTATION",
+            EvidenceClassV1.HISTORICAL_MARKET_BY_ORDER,
+            historical_identity,
+        ),
+        historical_ancestry,
+        (fragmented,),
+    )
+    reconstruction_identity = SourceIdentityV1(
+        SourceKindV1.RECONSTRUCTION,
+        "b2-route-reconstruction-source",
+        _digest("b2-route-reconstruction-source"),
+    )
+    reconstruction_ancestry = SourceAncestryV1(
+        reconstruction_identity.kind,
+        reconstruction_identity.source_id,
+        reconstruction_identity.source_sha256,
+    )
+    reconstruction = runtime.run(
+        "ROUTING_DILEMMA",
+        _inventory_for(
+            "ROUTING_DILEMMA",
+            EvidenceClassV1.RECONSTRUCTION_COUNTERFACTUAL,
+            reconstruction_identity,
+        ),
+        reconstruction_ancestry,
+        (opportunities["ROUTING_DILEMMA"],),
+    )
+    if (
+        historical.qualifying_units != 1
+        or historical.findings[0].evidence_label
+        is not FindingEvidenceLabelV1.HISTORICAL_DETECTOR_INTERPRETATION
+        or reconstruction.qualifying_units != 1
+        or reconstruction.findings[0].evidence_label
+        is not FindingEvidenceLabelV1.SYNTHETIC_RECONSTRUCTION
+    ):
+        failures.append("B2 historical or reconstruction labels claimed fact status")
+
+    assessment_keys = {
+        "active_start_us",
+        "assessment_data_policy_id",
+        "detector_identity",
+        "evidence_available_through_us",
+        "outcome_data",
+        "record_kind",
+        "retrospective_metrics",
+        "schema_version",
+        "source_ancestry_sha256",
+    }
+    timing_safe = 0
+    for detector_id in ("LATENCY_SENSITIVE_OPPORTUNITY", "HALT_REOPENING"):
+        report = runtime.run(
+            detector_id,
+            _inventory_for(
+                detector_id,
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                ancestry.source_identity,
+            ),
+            ancestry,
+            (opportunities[detector_id],),
+        )
+        finding = report.findings[0]
+        projection = finding.assessment_projection()
+        projection_bytes = canonical_json_bytes(projection)
+        retrospective = projection.get("retrospective_metrics")
+        safe = (
+            set(projection) == assessment_keys
+            and projection["assessment_data_policy_id"]
+            == ASSESSMENT_DATA_POLICY_ID_V1
+            and projection["evidence_available_through_us"]
+            == finding.bounds.activation_us
+            and projection["active_start_us"] == finding.bounds.active_start_us
+            and projection["outcome_data"] == "WITHHELD_DURING_ASSESSMENT"
+            and projection["detector_identity"]
+            == "WITHHELD_DURING_ASSESSMENT"
+            and isinstance(retrospective, list)
+            and tuple(row["name"] for row in retrospective)
+            == RETROSPECTIVE_METRIC_NAMES_V1
+            and all(
+                row["status"] == "WITHHELD_DURING_ASSESSMENT"
+                for row in retrospective
+            )
+            and detector_id.encode("utf-8") not in projection_bytes
+            and b"post_end_us" not in projection_bytes
+            and b"derived_measurements" not in projection_bytes
+            and b"opportunity_sha256" not in projection_bytes
+        )
+        if safe:
+            timing_safe += 1
+        else:
+            failures.append(f"{detector_id} assessment projection leaked replay outcome")
+    return DrillMiningAuditCase(
+        "b2_order_ancestry_labels_and_original_decision_timing_are_preserved",
+        (
+            f"canonical_report_sha256={canonical.report_sha256} "
+            "reordered_equal=true ancestry_preserved=true "
+            "historical_label=INTERPRETATION reconstruction_label=SYNTHETIC "
+            f"timing_safe_assessments={timing_safe}/2 adverse_selection=WITHHELD"
+        ),
+        tuple(failures),
+    )
+
+
+def _b2_hostile_contract_refusal_case(
+    runtime,
+    opportunities: dict[str, object],
+    ancestry: SourceAncestryV1,
+) -> DrillMiningAuditCase:
+    from kirby2.mining.runtime import (
+        DetectorMeasurementV1,
+        DetectorRunStatusV1,
+        MiningDetectorRuntimeV1,
+        OpportunityDispositionV1,
+    )
+
+    failures: list[str] = []
+    source_identity = ancestry.source_identity
+    latency = opportunities["LATENCY_SENSITIVE_OPPORTUNITY"]
+    cancel = opportunities["CANCEL_FILL_RACE"]
+    venue = opportunities["MULTI_VENUE_FRAGMENTATION"]
+    auction = opportunities["AUCTION_IMBALANCE_CHANGE"]
+    incomplete_handlers = dict(runtime.handlers)
+    incomplete_handlers.pop("ROUTING_DILEMMA")
+    probes: tuple[Callable[[], object], ...] = (
+        lambda: MiningDetectorRuntimeV1(handlers=incomplete_handlers),
+        lambda: replace(
+            latency,
+            witness_ids=(
+                "not-a-checkpoint-digest",
+                latency.witness_ids[1],
+                latency.witness_ids[2],
+                latency.witness_ids[3],
+            ),
+        ),
+        lambda: replace(latency, witness_ids=latency.witness_ids[:3]),
+        lambda: replace(venue, witness_ids=(venue.witness_ids[0],)),
+        lambda: replace(auction, witness_ids=tuple(reversed(auction.witness_ids))),
+        lambda: runtime.run(
+            "CANCEL_FILL_RACE",
+            _inventory_for(
+                "CANCEL_FILL_RACE",
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (replace(cancel, sampling_unit="OBSERVABLE_BIN_100000_US"),),
+        ),
+        lambda: runtime.run(
+            "CANCEL_FILL_RACE",
+            _inventory_for(
+                "CANCEL_FILL_RACE",
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (
+                replace(
+                    cancel,
+                    witness_kind="ROUTE_PAIR",
+                    witness_ids=("ROUTE-A", "ROUTE-B"),
+                ),
+            ),
+        ),
+        lambda: runtime.run(
+            "LATENCY_SENSITIVE_OPPORTUNITY",
+            _inventory_for(
+                "LATENCY_SENSITIVE_OPPORTUNITY",
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (
+                replace(
+                    latency,
+                    measurements=(
+                        *latency.measurements,
+                        DetectorMeasurementV1(
+                            "adverse_selection_x2_tick_shares",
+                            999_999,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    refusals = sum(_raises(probe) for probe in probes)
+    if refusals != len(probes):
+        failures.append("a hostile B2 witness, schema, or handler mutation was accepted")
+
+    route = opportunities["ROUTING_DILEMMA"]
+    mismatched_route = replace(route, side=CandidateSideV1.SELL)
+    route_report = runtime.run(
+        "ROUTING_DILEMMA",
+        _inventory_for(
+            "ROUTING_DILEMMA",
+            EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+            source_identity,
+        ),
+        ancestry,
+        (mismatched_route,),
+    )
+    incomplete_halt = _replace_b2_measurements(
+        opportunities["HALT_REOPENING"],
+        opportunity_id="b2-halt-incomplete-spread-coverage",
+        pre_window_coverage_us=4_999_999,
+    )
+    halt_report = runtime.run(
+        "HALT_REOPENING",
+        _inventory_for(
+            "HALT_REOPENING",
+            EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+            source_identity,
+        ),
+        ancestry,
+        (incomplete_halt,),
+    )
+    if (
+        route_report.status is not DetectorRunStatusV1.EXERCISED
+        or route_report.qualifying_units != 0
+        or route_report.considered[0].disposition
+        is not OpportunityDispositionV1.BELOW_THRESHOLD
+        or route_report.considered[0].reason_codes
+        != ("ROUTING_DILEMMA_KEY_MISMATCH",)
+        or halt_report.status is not DetectorRunStatusV1.NOT_EXERCISED
+        or halt_report.reason_code != "ZERO_ELIGIBLE_DENOMINATOR"
+        or halt_report.eligible_units != 0
+        or halt_report.excluded_units != 1
+        or halt_report.qualifying_units != 0
+        or halt_report.considered[0].disposition
+        is not OpportunityDispositionV1.EXCLUDED
+        or halt_report.considered[0].reason_codes != ("INSUFFICIENT_EVIDENCE",)
+    ):
+        failures.append("B2 key mismatch or incomplete halt evidence did not fail closed")
+    return DrillMiningAuditCase(
+        "b2_witness_schema_timing_key_and_incomplete_evidence_mutations_fail_closed",
+        (
+            f"hard_refusals={refusals}/{len(probes)} handler_inventory=closed "
+            "witness_arity_and_causality=closed sampling=closed fields=exact "
+            "route_key=below_threshold halt_coverage=INSUFFICIENT_EVIDENCE_EXCLUDED"
+        ),
+        tuple(failures),
+    )
+
+
+def _b2_synthetic_reports():
+    from kirby2.mining.runtime import B2_DETECTOR_IDS_V1, MiningDetectorRuntimeV1
+
+    runtime = MiningDetectorRuntimeV1()
+    source_identity = SourceIdentityV1(
+        SourceKindV1.RUN,
+        "b2-synthetic-source",
+        _digest("b2-synthetic-source"),
+    )
+    ancestry = SourceAncestryV1(
+        source_identity.kind,
+        source_identity.source_id,
+        source_identity.source_sha256,
+    )
+    opportunities = {
+        detector_id: _b2_qualifying_opportunity(runtime, detector_id)
+        for detector_id in B2_DETECTOR_IDS_V1
+    }
+    reports = {
+        detector_id: runtime.run(
+            detector_id,
+            _inventory_for(
+                detector_id,
+                EvidenceClassV1.SYNTHETIC_GROUND_TRUTH,
+                source_identity,
+            ),
+            ancestry,
+            (opportunities[detector_id],),
+        )
+        for detector_id in B2_DETECTOR_IDS_V1
+    }
+    return runtime, opportunities, reports, ancestry
+
+
+def _b2_qualifying_opportunity(runtime, detector_id: str):
+    from kirby2.mining.runtime import (
+        DetectorMeasurementV1,
+        DetectorOpportunityV1,
+        MiningEventReferenceV1,
+    )
+
+    checkpoint_sha256 = _digest("b2-latency-checkpoint")
+    specifications: dict[str, dict[str, object]] = {
+        "AUCTION_IMBALANCE_CHANGE": {
+            "direction": CandidateDirectionV1.BUY,
+            "side": CandidateSideV1.BUY,
+            "venue": "CONSOLIDATED",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "AUCTION_PUBLICATION_PAIR",
+            "witness_ids": ("AUCTION-PUBLICATION-1", "AUCTION-PUBLICATION-2"),
+            "active_start_us": 30_000_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "new_imbalance_shares": 5_000,
+                "old_imbalance_shares": -5_000,
+                "publication_interval_us": 30_000_000,
+            },
+            "events": (
+                ("AUCTION-PUBLICATION-1", 30_000_000, 1),
+                ("AUCTION-PUBLICATION-2", 60_000_000, 2),
+            ),
+        },
+        "CANCEL_FILL_RACE": {
+            "direction": CandidateDirectionV1.NOT_APPLICABLE,
+            "side": CandidateSideV1.BUY,
+            "venue": "XNAS",
+            "price": 100,
+            "witness_kind": "CANCEL_FILL_TUPLE",
+            "witness_ids": (
+                "ORDER-0001",
+                "CANCEL-COMMAND-0001",
+                "CONTRA-ARRIVAL-0001",
+            ),
+            "active_start_us": 59_999_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "baseline_cancel_arrival_us": 10_500,
+                "baseline_cancel_latency_us": 1_500,
+                "baseline_opposing_fill_arrival_us": 10_000,
+                "checkpoint_information_identical": True,
+                "fast_cancel_latency_us": 500,
+                "fast_cancelled_quantity": 60,
+                "fast_effective_cancel_source_sequence": 2,
+                "fast_effective_cancel_us": 9_500,
+                "fast_filled_quantity": 40,
+                "fast_opposing_fill_arrival_source_sequence": 1,
+                "fast_opposing_fill_arrival_us": 10_000,
+                "original_quantity": 100,
+                "slow_cancel_latency_us": 2_500,
+                "slow_cancelled_quantity": 0,
+                "slow_effective_cancel_source_sequence": 2,
+                "slow_effective_cancel_us": 11_500,
+                "slow_filled_quantity": 100,
+                "slow_opposing_fill_arrival_source_sequence": 1,
+                "slow_opposing_fill_arrival_us": 10_000,
+            },
+            "events": (
+                ("ORDER-0001", 59_999_000, 1),
+                ("CANCEL-COMMAND-0001", 59_999_500, 2),
+                ("CONTRA-ARRIVAL-0001", 60_000_000, 3),
+            ),
+        },
+        "DISTRESSED_LIQUIDATION": {
+            "direction": CandidateDirectionV1.SELL,
+            "side": CandidateSideV1.SELL,
+            "venue": "CONSOLIDATED",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "NOT_APPLICABLE",
+            "witness_ids": (),
+            "active_start_us": 55_000_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "authoritative_participant_identity": True,
+                "distressed_buy_quantity": 0,
+                "distressed_sell_quantity": 5_000,
+                "elapsed_us": 5_000_000,
+                "first_mid_x2": 200,
+                "last_mid_x2": 198,
+            },
+            "events": (
+                ("DISTRESSED-FLOW-START", 55_000_000, 1),
+                ("DISTRESSED-FLOW-END", 60_000_000, 2),
+            ),
+        },
+        "HALT_REOPENING": {
+            "direction": CandidateDirectionV1.BUY,
+            "side": CandidateSideV1.NOT_APPLICABLE,
+            "venue": "CONSOLIDATED",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "HALT_REOPEN_PAIR",
+            "witness_ids": ("HALT-EVENT", "REOPEN-EVENT"),
+            "active_start_us": 50_000_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "first_post_reopen_trade_ticks": 103,
+                "halt_time_us": 50_000_000,
+                "last_pre_halt_trade_ticks": 100,
+                "post_spread_durations_us": (2_500_000, 2_500_000),
+                "post_spread_ticks": (2, 4),
+                "post_window_coverage_us": 5_000_000,
+                "pre_spread_durations_us": (2_500_000, 2_500_000),
+                "pre_spread_ticks": (1, 2),
+                "pre_window_coverage_us": 5_000_000,
+                "reopen_time_us": 55_000_000,
+            },
+            "events": (
+                ("HALT-EVENT", 50_000_000, 1),
+                ("REOPEN-EVENT", 55_000_000, 2),
+            ),
+        },
+        "LATENCY_SENSITIVE_OPPORTUNITY": {
+            "direction": CandidateDirectionV1.BUY,
+            "side": CandidateSideV1.BUY,
+            "venue": "XNAS",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "LATENCY_ACTION",
+            "witness_ids": (checkpoint_sha256, "ACTION-0001", "XNAS", "BUY"),
+            "active_start_us": 60_000_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "action_identical": True,
+                "checkpoint_information_identical": True,
+                "fast_fee_adjusted_average_cost_milliticks_per_share": 100_000,
+                "fast_filled_quantity": 100,
+                "fast_latency_us": 250,
+                "objective_shares": 100,
+                "slow_fee_adjusted_average_cost_milliticks_per_share": 100_000,
+                "slow_filled_quantity": 75,
+                "slow_latency_us": 2_500,
+            },
+            "events": (("ACTION-0001", 60_000_000, 1),),
+        },
+        "MULTI_VENUE_FRAGMENTATION": {
+            "direction": CandidateDirectionV1.NOT_APPLICABLE,
+            "side": CandidateSideV1.BUY,
+            "venue": "NOT_APPLICABLE",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "VENUE_PAIR",
+            "witness_ids": ("ARCX", "XNAS"),
+            "active_start_us": 60_000_000,
+            "activation_us": 60_005_000,
+            "measurements": {
+                "persistence_us": 5_000,
+                "venue_best_ask_ticks": (101, 103),
+                "venue_best_bid_ticks": (100, 102),
+                "venue_executable_quantities": (100, 100),
+            },
+            "events": (
+                ("FRAGMENTATION-START", 60_000_000, 1),
+                ("FRAGMENTATION-END", 60_005_000, 2),
+            ),
+        },
+        "ROUTING_DILEMMA": {
+            "direction": CandidateDirectionV1.BUY,
+            "side": CandidateSideV1.BUY,
+            "venue": "NOT_APPLICABLE",
+            "price": "NOT_APPLICABLE",
+            "witness_kind": "ROUTE_PAIR",
+            "witness_ids": ("ROUTE-A", "ROUTE-B"),
+            "active_start_us": 60_000_000,
+            "activation_us": 60_000_000,
+            "measurements": {
+                "route_a_executable_quantity": 100,
+                "route_a_expected_receipt_time_us": 2_000,
+                "route_a_fee_adjusted_cost_milliticks_per_share": 9_000,
+                "route_b_executable_quantity": 350,
+                "route_b_expected_receipt_time_us": 1_000,
+                "route_b_fee_adjusted_cost_milliticks_per_share": 10_000,
+            },
+            "events": (
+                ("ROUTE-A-EVIDENCE", 60_000_000, 1),
+                ("ROUTE-B-EVIDENCE", 60_000_000, 2),
+            ),
+        },
+    }
+    specification = specifications[detector_id]
+    row = runtime.threshold_manifest.detector(detector_id)
+    measurements = specification["measurements"]
+    events = specification["events"]
+    if not isinstance(measurements, dict) or not isinstance(events, tuple):
+        raise TypeError("B2 synthetic fixture specification is malformed")
+    return DetectorOpportunityV1(
+        detector_id=detector_id,
+        opportunity_id=f"b2-{detector_id.lower().replace('_', '-')}-qualifying",
+        sampling_unit=str(row["sampling_unit"]),
+        source_start_us=0,
+        source_end_us=100_000_000,
+        active_start_us=int(specification["active_start_us"]),
+        activation_us=int(specification["activation_us"]),
+        direction=specification["direction"],
+        side=specification["side"],
+        venue=str(specification["venue"]),
+        price=specification["price"],
+        witness_kind=str(specification["witness_kind"]),
+        witness_ids=specification["witness_ids"],
+        measurements=tuple(
+            DetectorMeasurementV1(name, value)
+            for name, value in reversed(tuple(measurements.items()))
+        ),
+        contributing_events=tuple(
+            MiningEventReferenceV1(event_id, timestamp_us, source_sequence)
+            for event_id, timestamp_us, source_sequence in reversed(events)
+        ),
+    )
+
+
+def _replace_b2_measurements(
+    opportunity,
+    *,
+    opportunity_id: str,
+    direction: CandidateDirectionV1 | None = None,
+    side: CandidateSideV1 | None = None,
+    **updates: object,
+):
+    from kirby2.mining.runtime import DetectorMeasurementV1
+
+    values = dict(opportunity.measurement_map)
+    unknown = set(updates).difference(values)
+    if unknown:
+        raise ValueError(f"unknown B2 fixture measurement updates: {sorted(unknown)}")
+    values.update(updates)
+    return replace(
+        opportunity,
+        opportunity_id=opportunity_id,
+        direction=opportunity.direction if direction is None else direction,
+        side=opportunity.side if side is None else side,
+        measurements=tuple(
+            DetectorMeasurementV1(name, value) for name, value in values.items()
+        ),
+    )
+
+
+def _derived_measurement_map(report) -> dict[str, object]:
+    if not report.findings:
+        return {}
+    return {
+        measurement.name: measurement.value
+        for measurement in report.findings[0].derived_measurements
+    }
+
+
 def _sample_candidate(
     *,
     bounds: CandidateBoundsV1 | None = None,
@@ -2410,7 +3480,10 @@ __all__ = [
     "WO33A1_THRESHOLD_MANIFEST_SHA256",
     "WO33B1_DETECTOR_COUNT",
     "WO33B1_SYNTHETIC_REPORT_SHA256",
+    "WO33B2_DETECTOR_COUNT",
+    "WO33B2_SYNTHETIC_REPORT_SHA256",
     "audit_drill_mining",
     "audit_wo33a1_drill_mining",
     "audit_wo33b1_drill_mining",
+    "audit_wo33b2_drill_mining",
 ]
