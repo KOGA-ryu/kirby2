@@ -127,6 +127,7 @@ REGISTERABLE_GATE_IDS = (
     "WO33-B1",
     "WO33-B2",
     "WO33-C",
+    "WO33-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -2716,6 +2717,65 @@ def _audit_wo33c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo33d() -> ExpansionGateReport:
+    from kirby2.audit.drill_mining import (
+        WO33D_ASSESSMENT_FIELD_COUNT,
+        WO33D_SOURCE_LINEAGE_FIELD_COUNT,
+        audit_wo33d_drill_mining,
+    )
+
+    cases = audit_wo33d_drill_mining()
+    expected_names = (
+        "d_seven_field_lineage_and_exact_recorded_feed_prefix_parity",
+        "d_warmup_snapshot_and_client_delivery_cut_are_information_fair",
+        "d_closed_blind_surface_and_completed_assessment_reveal_grant",
+        "d_same_source_candidate_and_cuts_replay_byte_identically",
+        "d_player_actions_are_deterministic_parent_linked_overlays_not_history",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if tuple(case.name for case in cases) != expected_names:
+        failures.append("WO33-D cases differ from the fixed evidence inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO33-D extraction cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL
+                    if failed
+                    else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO33-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            (
+                "assessment_field_count",
+                str(WO33D_ASSESSMENT_FIELD_COUNT),
+            ),
+            ("observable_feed_policy", "RECORDED_CLIENT_FEED_EXACT_V1"),
+            (
+                "source_lineage_field_count",
+                str(WO33D_SOURCE_LINEAGE_FIELD_COUNT),
+            ),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -2922,6 +2982,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO33-B1", _audit_wo33b1),
     ("WO33-B2", _audit_wo33b2),
     ("WO33-C", _audit_wo33c),
+    ("WO33-D", _audit_wo33d),
 )
 
 

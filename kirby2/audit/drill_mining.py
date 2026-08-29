@@ -9,6 +9,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from kirby2.audit.historical_lessons import audit_historical_lessons
+from kirby2.historical import (
+    MinedCheckpointReferenceV1,
+    MinedSourceRunReferenceV1,
+)
 from kirby2.mining import (
     DIFFICULTY_ESTIMATE_STATE_V1,
     DIVERSITY_DIMENSIONS_V1,
@@ -52,11 +56,18 @@ from kirby2.mining import (
     SourceWindowOutcomeV1,
     QualificationSourcesManifestV1,
     FrequencyReportV1,
+    MinedLessonAssessmentV1,
+    MinedLessonPlayerActionV1,
+    MinedLessonRevealGrantV1,
+    RecordedClientFeedEventV1,
+    RecordedLessonSourceV1,
     SignalClauseOrientationV1,
     aggressive_conflict_ppm,
     and_legibility_ppm,
     boolean_legibility_ppm,
     build_difficulty_projection,
+    build_playable_lesson_v1,
+    build_player_overlay_v1,
     build_regime_signature_v1,
     canonical_event_token_v1,
     canonical_feature_value_v1,
@@ -68,6 +79,7 @@ from kirby2.mining import (
     duration_legibility_ppm,
     event_five_grams_v1,
     event_price_relation_v1,
+    extract_observable_lesson_source_v1,
     jaccard_ppm,
     load_mining_policy_bundle,
     lower_bound_legibility_ppm,
@@ -77,6 +89,7 @@ from kirby2.mining import (
     or_legibility_ppm,
     orient_signal_magnitude_v1,
     rank_candidates,
+    replay_player_overlay_v1,
     round_div_even,
     select_technical_review_candidates,
     sha256_json,
@@ -84,6 +97,7 @@ from kirby2.mining import (
     time_iou_ppm,
     upper_bound_legibility_ppm,
     source_window_outcome_v1,
+    assessment_replay_sha256_v1,
 )
 
 
@@ -104,6 +118,8 @@ WO33B2_SYNTHETIC_REPORT_SHA256 = (
 WO33C_DIFFICULTY_COMPONENT_COUNT = 11
 WO33C_DIVERSITY_DIMENSION_COUNT = 6
 WO33C_REVIEW_TARGET_COUNT = 20
+WO33D_SOURCE_LINEAGE_FIELD_COUNT = 7
+WO33D_ASSESSMENT_FIELD_COUNT = 12
 
 WO33A1_THRESHOLD_MANIFEST_SHA256 = (
     "4996ddce777527cf5350f3eaaeeff83911d8dd95dc510c704411ec7d8f708899"
@@ -229,6 +245,19 @@ def audit_wo33c_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
         _c_semantic_deduplication_case(),
         _c_diversity_selection_case(),
         _c_shortfall_and_hostile_quota_case(),
+    )
+
+
+def audit_wo33d_drill_mining() -> tuple[DrillMiningAuditCase, ...]:
+    """Exercise exact extraction, blind playback, reveal, and source overlays."""
+
+    candidate, recorded, extracted, lesson = _d_playable_lesson_fixture()
+    return (
+        _d_source_lineage_and_prefix_parity_case(candidate, recorded, extracted),
+        _d_warmup_and_information_fairness_case(candidate, recorded, lesson),
+        _d_blind_boundary_and_reveal_authorization_case(candidate, lesson),
+        _d_deterministic_build_and_replay_case(candidate, recorded, lesson),
+        _d_parent_linked_source_authoritative_overlay_case(lesson),
     )
 
 
@@ -3927,6 +3956,472 @@ def _derived_measurement_map(report) -> dict[str, object]:
     }
 
 
+def _d_source_lineage_and_prefix_parity_case(
+    candidate,
+    recorded,
+    extracted,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    source_before = recorded.semantic_sha256
+    record_payload = extracted.source_record.as_dict()
+    required_fields = {
+        "checkpoint_reference",
+        "detector",
+        "hidden_state_reveal_policy",
+        "historical_provenance",
+        "observable_feed_policy",
+        "source_run_reference",
+        "source_time_bounds",
+    }
+    extracted_ids = tuple(
+        event.client_event_id for event in extracted.envelope.observable_feed
+    )
+    expected_ids = tuple(
+        event.client_event_id
+        for event in recorded.observable_feed
+        if candidate.bounds.warmup_start_us
+        <= event.client_time_us
+        < candidate.bounds.post_end_us
+    )
+    if set(record_payload) != required_fields:
+        failures.append("built source record does not preserve exactly seven lineage fields")
+    if len(record_payload) != WO33D_SOURCE_LINEAGE_FIELD_COUNT:
+        failures.append("built source lineage field count differs from policy")
+    if (
+        extracted.envelope.source_observable_prefix_sha256
+        != extracted.envelope.extracted_observable_prefix_sha256
+    ):
+        failures.append("source and extracted client-feed prefixes differ")
+    if extracted_ids != expected_ids:
+        failures.append("extracted client feed differs from the exact source slice")
+    if (
+        extracted.envelope.authoritative_event_prefix_sha256
+        != candidate.source_ancestry.event_prefix_sha256
+    ):
+        failures.append("source envelope lost the authoritative event-prefix digest")
+    if extracted.envelope.capability_labels != tuple(
+        row.capability for row in candidate.capability_record.records
+    ):
+        failures.append("source envelope lost capability labels")
+    if recorded.semantic_sha256 != source_before:
+        failures.append("source extraction mutated the authoritative replay material")
+    return DrillMiningAuditCase(
+        "d_seven_field_lineage_and_exact_recorded_feed_prefix_parity",
+        (
+            f"lineage_fields={len(record_payload)}/7 "
+            f"feed_events={len(extracted_ids)} "
+            "source_prefix_equals_extracted_prefix=true "
+            "rng_schedule_capabilities_parent_linkage=sealed"
+        ),
+        tuple(failures),
+    )
+
+
+def _d_warmup_and_information_fairness_case(
+    candidate,
+    recorded,
+    lesson,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    initial = lesson.assessment_at(0).as_dict()
+    activation = lesson.assessment_at(lesson.activation_elapsed_us).as_dict()
+    initial_feed = initial["observable_feed"]
+    activation_feed = activation["observable_feed"]
+    if (
+        not isinstance(initial_feed, list)
+        or len(initial_feed) != 1
+        or initial_feed[0]["kind"] != "CLIENT_STATE_SNAPSHOT"
+    ):
+        failures.append("warmup does not begin with the exact recorded client snapshot")
+    activation_ids = {
+        event["client_event_id"]
+        for event in activation_feed
+        if isinstance(event, dict)
+    }
+    contributing_ids = set(
+        candidate.observable_feature_summary.contributing_source_event_ids
+    )
+    if not contributing_ids.issubset(activation_ids):
+        failures.append("classification opened before all contributing evidence arrived")
+    if initial["classification_status"] != "NOT_YET_OPEN":
+        failures.append("classification opened before the recorded activation cut")
+    if activation["classification_status"] != "OPEN":
+        failures.append("classification did not open at the exact activation cut")
+
+    snapshot_id = next(
+        event.client_event_id
+        for event in recorded.observable_feed
+        if event.kind == "CLIENT_STATE_SNAPSHOT"
+    )
+    final_evidence_id = candidate.observable_feature_summary.contributing_source_event_ids[-1]
+    no_snapshot = replace(
+        recorded,
+        observable_feed=tuple(
+            event
+            for event in recorded.observable_feed
+            if event.client_event_id != snapshot_id
+        ),
+    )
+    missing_evidence = replace(
+        recorded,
+        observable_feed=tuple(
+            event
+            for event in recorded.observable_feed
+            if event.client_event_id != final_evidence_id
+        ),
+    )
+    late_evidence = replace(
+        recorded,
+        observable_feed=tuple(
+            replace(event, client_time_us=candidate.bounds.activation_us + 1)
+            if event.client_event_id == final_evidence_id
+            else event
+            for event in recorded.observable_feed
+        ),
+    )
+    late_snapshot = replace(
+        recorded,
+        observable_feed=tuple(
+            replace(event, client_time_us=event.client_time_us + 1)
+            if event.client_event_id == snapshot_id
+            else event
+            for event in recorded.observable_feed
+        ),
+    )
+    probes = (
+        lambda: extract_observable_lesson_source_v1(candidate, no_snapshot),
+        lambda: extract_observable_lesson_source_v1(candidate, missing_evidence),
+        lambda: extract_observable_lesson_source_v1(candidate, late_evidence),
+        lambda: extract_observable_lesson_source_v1(candidate, late_snapshot),
+    )
+    refusals = sum(_raises(probe) for probe in probes)
+    if refusals != len(probes):
+        failures.append("clipped warmup or unavailable/late client evidence was accepted")
+    return DrillMiningAuditCase(
+        "d_warmup_snapshot_and_client_delivery_cut_are_information_fair",
+        (
+            f"warmup_start_us={candidate.bounds.warmup_start_us} "
+            f"activation_us={candidate.bounds.activation_us} "
+            f"contributing_events_visible={len(contributing_ids)} "
+            f"hostile_refusals={refusals}/{len(probes)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _d_blind_boundary_and_reveal_authorization_case(
+    candidate,
+    lesson,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    assessment = lesson.assessment_at(lesson.activation_elapsed_us)
+    payload = assessment.as_dict()
+    expected_fields = {
+        "assessment_policy_id",
+        "classification_status",
+        "lesson_digest",
+        "lesson_id",
+        "objective_kind",
+        "objective_prompt",
+        "observable_feed",
+        "observable_feed_prefix_sha256",
+        "playback_elapsed_us",
+        "record_kind",
+        "schema_version",
+        "source_record_sha256",
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    selection_tie = str(lesson.reveal_payload.selection_reason["tie_digest"])
+    protected_fragments = (
+        candidate.detector.detector_id,
+        candidate.source_window_outcome.value,
+        selection_tie,
+        "difficulty_ppm",
+        "difficulty_projection",
+        "post_end_us",
+        "post_event_boundary_us",
+        "WO33D-RNG-SECRET",
+        "WO33D-HIDDEN-SCHEDULE",
+    )
+    if set(payload) != expected_fields or len(payload) != WO33D_ASSESSMENT_FIELD_COUNT:
+        failures.append("blind assessment wire surface differs from the closed allow-list")
+    if any(fragment in serialized for fragment in protected_fragments):
+        failures.append("blind assessment leaked answer, selection, future, or hidden state")
+    if set(MinedLessonAssessmentV1.__dataclass_fields__) - {
+        key for key in expected_fields if key != "record_kind"
+    }:
+        failures.append("blind assessment type contains a non-wire reveal field")
+
+    precomplete_guard = _raises(
+        lambda: lesson.authorize_reveal(
+            lesson.assessment_at(lesson.activation_elapsed_us)
+        )
+    )
+    unbound_guard = _raises(lambda: lesson.reveal(None))
+    completed = lesson.assessment_at(lesson.duration_us)
+    grant = lesson.authorize_reveal(completed)
+    revealed = lesson.reveal(grant)
+    forged_grant = replace(
+        grant,
+        reveal_payload_sha256=_digest("wo33d-forged-reveal"),
+    )
+    forged_guard = _raises(lambda: lesson.reveal(forged_grant))
+    nested_hidden_guard = _raises(
+        lambda: RecordedClientFeedEventV1(
+            99,
+            1,
+            "hostile-hidden-feed",
+            "CLIENT_BOOK_UPDATE",
+            {"nested": {"hidden_schedule": []}},
+        )
+    )
+    if not all(
+        (precomplete_guard, unbound_guard, forged_guard, nested_hidden_guard)
+    ):
+        failures.append("assessment/reveal boundary accepted an unauthorized path")
+    if (
+        revealed.detector["id"] != candidate.detector.detector_id
+        or revealed.source_window_outcome != candidate.source_window_outcome.value
+        or revealed.post_event_boundary_us != candidate.bounds.post_end_us
+        or "difficulty_ppm" not in revealed.difficulty_projection
+        or revealed.selection_reason["candidate_id"] != candidate.candidate_id
+    ):
+        failures.append("authorized reveal omitted the separately withheld answer key")
+    return DrillMiningAuditCase(
+        "d_closed_blind_surface_and_completed_assessment_reveal_grant",
+        (
+            f"assessment_fields={len(payload)}/12 protected_absent=true "
+            f"precomplete_guarded={str(precomplete_guard).lower()} "
+            f"forged_guarded={str(forged_guard).lower()} "
+            f"nested_hidden_guarded={str(nested_hidden_guard).lower()}"
+        ),
+        tuple(failures),
+    )
+
+
+def _d_deterministic_build_and_replay_case(
+    candidate,
+    recorded,
+    lesson,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    source_before = recorded.semantic_sha256
+    repeated_candidate, repeated_recorded, repeated_extracted, repeated_lesson = (
+        _d_playable_lesson_fixture()
+    )
+    cuts = (
+        0,
+        lesson.activation_elapsed_us - 1,
+        lesson.activation_elapsed_us,
+        lesson.duration_us - 1,
+        lesson.duration_us,
+    )
+    first_replay = assessment_replay_sha256_v1(lesson, cuts)
+    second_replay = assessment_replay_sha256_v1(repeated_lesson, cuts)
+    if candidate.candidate_id != repeated_candidate.candidate_id:
+        failures.append("identical source construction changed candidate identity")
+    if recorded.semantic_sha256 != repeated_recorded.semantic_sha256:
+        failures.append("identical recorded source changed semantic identity")
+    if lesson.canonical_bytes() != repeated_lesson.canonical_bytes():
+        failures.append("identical lesson inputs changed canonical lesson bytes")
+    if lesson.lesson_digest != repeated_lesson.lesson_digest:
+        failures.append("identical lesson inputs changed lesson identity")
+    if first_replay != second_replay:
+        failures.append("identical assessment playback cuts changed replay identity")
+    if (
+        lesson.source.envelope.extracted_observable_prefix_sha256
+        != repeated_extracted.envelope.extracted_observable_prefix_sha256
+    ):
+        failures.append("repeated extraction changed exact client-feed bytes")
+    permutation_guard = _raises(
+        lambda: replace(
+            recorded,
+            observable_feed=tuple(reversed(recorded.observable_feed)),
+        )
+    )
+    if not permutation_guard:
+        failures.append("noncanonical source event order was accepted")
+    if recorded.semantic_sha256 != source_before:
+        failures.append("determinism replay mutated authoritative source material")
+    return DrillMiningAuditCase(
+        "d_same_source_candidate_and_cuts_replay_byte_identically",
+        (
+            f"lesson_sha256={lesson.lesson_digest} "
+            f"assessment_replay_sha256={first_replay} "
+            f"cuts={len(cuts)} permutation_guarded={str(permutation_guard).lower()}"
+        ),
+        tuple(failures),
+    )
+
+
+def _d_parent_linked_source_authoritative_overlay_case(
+    lesson,
+) -> DrillMiningAuditCase:
+    failures: list[str] = []
+    source_before = lesson.source.envelope.sha256
+    mutable_payload = {"classification": "QUEUE_PRESSURE"}
+    first_action = MinedLessonPlayerActionV1(
+        1,
+        lesson.activation_elapsed_us,
+        "SUBMIT_CLASSIFICATION",
+        mutable_payload,
+    )
+    mutable_payload["classification"] = "MUTATED_AFTER_OWNERSHIP_TRANSFER"
+    second_action = MinedLessonPlayerActionV1(
+        2,
+        lesson.activation_elapsed_us + 1,
+        "COUNTERFACTUAL_ORDER",
+        {"order_type": "MARKET", "quantity": 25, "side": "BUY"},
+    )
+    overlay = build_player_overlay_v1(lesson, (first_action, second_action))
+    repeated = build_player_overlay_v1(lesson, (first_action, second_action))
+    replayed = replay_player_overlay_v1(lesson, overlay)
+    if overlay.sha256 != repeated.sha256 or overlay.sha256 != replayed.sha256:
+        failures.append("identical player overlay did not replay deterministically")
+    if first_action.payload["classification"] != "QUEUE_PRESSURE":
+        failures.append("player overlay retained caller-owned mutable action data")
+    if (
+        overlay.parent_lesson_digest != lesson.lesson_digest
+        or overlay.parent_source_record_sha256 != lesson.source.source_record.sha256
+        or overlay.parent_source_envelope_sha256 != source_before
+        or not overlay.source_authoritative
+        or overlay.provenance != "PLAYER_ACTION_OVERLAY_NOT_SOURCE_HISTORY"
+    ):
+        failures.append("player overlay lost parent linkage or source-authority label")
+    if lesson.source.envelope.sha256 != source_before:
+        failures.append("player overlay mutated mined source history")
+    wrong_sequence = MinedLessonPlayerActionV1(
+        2,
+        lesson.activation_elapsed_us,
+        "SUBMIT_CLASSIFICATION",
+        {},
+    )
+    late_action = MinedLessonPlayerActionV1(
+        1,
+        lesson.duration_us,
+        "COUNTERFACTUAL_ORDER",
+        {},
+    )
+    forged_parent = replace(
+        overlay,
+        parent_source_record_sha256=_digest("wo33d-foreign-parent"),
+    )
+    probes = (
+        lambda: build_player_overlay_v1(lesson, (wrong_sequence,)),
+        lambda: build_player_overlay_v1(lesson, (late_action,)),
+        lambda: replay_player_overlay_v1(lesson, forged_parent),
+    )
+    refusals = sum(_raises(probe) for probe in probes)
+    if refusals != len(probes):
+        failures.append("invalid timing, sequence, or parent overlay was accepted")
+    return DrillMiningAuditCase(
+        "d_player_actions_are_deterministic_parent_linked_overlays_not_history",
+        (
+            f"overlay_sha256={overlay.sha256} actions={len(overlay.actions)} "
+            f"source_authoritative=true hostile_refusals={refusals}/{len(probes)}"
+        ),
+        tuple(failures),
+    )
+
+
+def _d_playable_lesson_fixture():
+    candidate = _sample_candidate()
+    ancestry = candidate.source_ancestry
+    checkpoint = candidate.checkpoint
+    if checkpoint is None:
+        raise AssertionError("WO33-D fixture requires a checkpoint")
+    contributing = candidate.observable_feature_summary.contributing_source_event_ids
+    recorded = RecordedLessonSourceV1(
+        source_run_reference=MinedSourceRunReferenceV1(
+            source_kind=ancestry.source_kind.value,
+            source_id=ancestry.source_id,
+            source_sha256=ancestry.source_sha256,
+            source_replay_sha256=_digest("wo33d-authoritative-source-replay"),
+        ),
+        source_start_us=candidate.bounds.source_start_us,
+        source_end_us=candidate.bounds.source_end_us,
+        checkpoint_reference=MinedCheckpointReferenceV1(
+            checkpoint.checkpoint_id,
+            checkpoint.checkpoint_sha256,
+        ),
+        source_ancestry_sha256=ancestry.sha256,
+        parent_source_ancestry_sha256=ancestry.parent_source_ancestry_sha256,
+        authoritative_event_prefix_sha256=ancestry.event_prefix_sha256,
+        observable_feed=(
+            RecordedClientFeedEventV1(
+                1,
+                500_000,
+                "client-pre-window-0001",
+                "CLIENT_BOOK_UPDATE",
+                {"best_ask_ticks": 101, "best_bid_ticks": 100},
+            ),
+            RecordedClientFeedEventV1(
+                2,
+                candidate.bounds.warmup_start_us,
+                "client-warmup-snapshot-0001",
+                "CLIENT_STATE_SNAPSHOT",
+                {
+                    "asks": [{"price_ticks": 101, "quantity": 400}],
+                    "bids": [{"price_ticks": 100, "quantity": 400}],
+                },
+            ),
+            RecordedClientFeedEventV1(
+                3,
+                candidate.bounds.active_start_us,
+                contributing[0],
+                "CLIENT_BOOK_UPDATE",
+                {"best_ask_size": 400, "best_bid_size": 1_600},
+            ),
+            RecordedClientFeedEventV1(
+                4,
+                candidate.bounds.activation_us,
+                contributing[1],
+                "CLIENT_BOOK_UPDATE",
+                {"best_ask_size": 350, "best_bid_size": 1_700},
+            ),
+            RecordedClientFeedEventV1(
+                5,
+                4_500_000,
+                "client-response-window-0001",
+                "CLIENT_TRADE_PRINT",
+                {"price_ticks": 101, "quantity": 50, "side": "BUY"},
+            ),
+            RecordedClientFeedEventV1(
+                6,
+                5_500_000,
+                "client-post-window-0001",
+                "CLIENT_BOOK_UPDATE",
+                {"best_ask_ticks": 102, "best_bid_ticks": 101},
+            ),
+        ),
+        rng_state={"algorithm": "PCG64", "state": "WO33D-RNG-SECRET"},
+        hidden_schedule=(
+            {
+                "label": "WO33D-HIDDEN-SCHEDULE",
+                "simulation_time_us": 4_750_000,
+            },
+        ),
+        capability_labels=tuple(
+            row.capability for row in candidate.capability_record.records
+        ),
+        historical_provenance={
+            "description": "authoritative synthetic qualification replay",
+            "historical_mode": "SYNTHETIC_GROUND_TRUTH",
+            "source_locator": "memory://wo33d/source/0001",
+        },
+    )
+    extracted = extract_observable_lesson_source_v1(candidate, recorded)
+    selected = select_technical_review_candidates((candidate,), target_count=1)
+    if len(selected.decisions) != 1:
+        raise AssertionError("WO33-D fixture candidate was not selected")
+    lesson = build_playable_lesson_v1(
+        candidate,
+        extracted,
+        selected.decisions[0],
+    )
+    return candidate, recorded, extracted, lesson
+
+
 def _sample_candidate(
     *,
     bounds: CandidateBoundsV1 | None = None,
@@ -4189,9 +4684,12 @@ __all__ = [
     "WO33C_DIFFICULTY_COMPONENT_COUNT",
     "WO33C_DIVERSITY_DIMENSION_COUNT",
     "WO33C_REVIEW_TARGET_COUNT",
+    "WO33D_ASSESSMENT_FIELD_COUNT",
+    "WO33D_SOURCE_LINEAGE_FIELD_COUNT",
     "audit_drill_mining",
     "audit_wo33a1_drill_mining",
     "audit_wo33b1_drill_mining",
     "audit_wo33b2_drill_mining",
     "audit_wo33c_drill_mining",
+    "audit_wo33d_drill_mining",
 ]

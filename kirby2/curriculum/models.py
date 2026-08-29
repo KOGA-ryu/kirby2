@@ -4,11 +4,100 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 
 from kirby2.session.objectives import ObjectiveType, SessionObjective
 from kirby2.simulation import LiquidityPreset, SeededRng, VolumePreset
+
+
+MINED_CURRICULUM_LINEAGE_SCHEMA_VERSION = 1
+_MINED_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MINED_CANDIDATE_ID = re.compile(r"^lesson-candidate-[0-9a-f]{64}$")
+_MINED_SKILL_ID = re.compile(r"^[A-Z][A-Z0-9_]{0,95}$")
+
+
+def _require_mined_sha256(value: object, label: str) -> str:
+    if type(value) is not str or _MINED_SHA256.fullmatch(value) is None:
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MinedCurriculumLineageV1:
+    """Curriculum binding for a mined lesson without its withheld answer key."""
+
+    candidate_id: str
+    candidate_digest: str
+    source_record_sha256: str
+    source_envelope_sha256: str
+    primary_skill_id: str
+    supporting_skill_ids: tuple[str, ...]
+    objective_kind: str = "OBSERVE_CLASSIFY_V1"
+    schema_version: int = MINED_CURRICULUM_LINEAGE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.candidate_id) is not str
+            or _MINED_CANDIDATE_ID.fullmatch(self.candidate_id) is None
+        ):
+            raise ValueError("mined curriculum candidate ID is invalid")
+        digest = _require_mined_sha256(
+            self.candidate_digest,
+            "mined curriculum candidate digest",
+        )
+        if self.candidate_id != f"lesson-candidate-{digest}":
+            raise ValueError("mined curriculum candidate ID and digest disagree")
+        _require_mined_sha256(
+            self.source_record_sha256,
+            "mined curriculum source-record digest",
+        )
+        _require_mined_sha256(
+            self.source_envelope_sha256,
+            "mined curriculum source-envelope digest",
+        )
+        if (
+            type(self.primary_skill_id) is not str
+            or _MINED_SKILL_ID.fullmatch(self.primary_skill_id) is None
+        ):
+            raise ValueError("mined curriculum primary skill ID is invalid")
+        if type(self.supporting_skill_ids) is not tuple or any(
+            type(value) is not str or _MINED_SKILL_ID.fullmatch(value) is None
+            for value in self.supporting_skill_ids
+        ):
+            raise ValueError("mined curriculum supporting skill IDs are invalid")
+        if self.supporting_skill_ids != tuple(sorted(set(self.supporting_skill_ids))):
+            raise ValueError("mined curriculum supporting skills must be sorted and unique")
+        if self.primary_skill_id in self.supporting_skill_ids:
+            raise ValueError("mined curriculum primary skill cannot be supporting")
+        if self.objective_kind != "OBSERVE_CLASSIFY_V1":
+            raise ValueError("mined curriculum objective kind is unsupported")
+        if self.schema_version != MINED_CURRICULUM_LINEAGE_SCHEMA_VERSION:
+            raise ValueError("mined curriculum lineage schema version is unsupported")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "candidate_digest": self.candidate_digest,
+            "candidate_id": self.candidate_id,
+            "objective_kind": self.objective_kind,
+            "primary_skill_id": self.primary_skill_id,
+            "schema_version": self.schema_version,
+            "source_envelope_sha256": self.source_envelope_sha256,
+            "source_record_sha256": self.source_record_sha256,
+            "supporting_skill_ids": list(self.supporting_skill_ids),
+        }
+
+    @property
+    def sha256(self) -> str:
+        payload = json.dumps(
+            self.as_dict(),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        return hashlib.sha256(payload).hexdigest()
 
 
 class CurriculumMode(str, Enum):

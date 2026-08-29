@@ -5,16 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from typing import Any
 
+from kirby2.immutable import freeze_json, thaw_json
+
 from .models import HistoricalDataMode
 
 
 HISTORICAL_LESSON_SCHEMA_VERSION = 1
+MINED_LESSON_SOURCE_SCHEMA_VERSION = 1
+RECORDED_CLIENT_FEED_POLICY_V1 = "RECORDED_CLIENT_FEED_EXACT_V1"
+MINED_HIDDEN_STATE_REVEAL_POLICY_V1 = "SEPARATE_AUTHORIZED_REVEAL_V1"
 _LESSON_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_STABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,191}$")
 
 
 class RevealPolicy(str, Enum):
@@ -96,6 +104,196 @@ class LessonSource:
             "fixture_id": self.fixture_id,
             "source_locator": self.source_locator,
         }
+
+
+def _require_mined_digest(value: object, label: str) -> str:
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return value
+
+
+def _require_mined_id(value: object, label: str) -> str:
+    if type(value) is not str or _STABLE_ID.fullmatch(value) is None:
+        raise ValueError(f"{label} must be one stable identifier")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MinedSourceRunReferenceV1:
+    """Content-addressed authoritative run used to extract a mined lesson."""
+
+    source_kind: str
+    source_id: str
+    source_sha256: str
+    source_replay_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.source_kind not in {"RUN", "DATASET", "RECONSTRUCTION"}:
+            raise ValueError("mined source kind is outside the closed V1 vocabulary")
+        _require_mined_id(self.source_id, "mined source ID")
+        _require_mined_digest(self.source_sha256, "mined source digest")
+        _require_mined_digest(
+            self.source_replay_sha256,
+            "mined source replay digest",
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "source_id": self.source_id,
+            "source_kind": self.source_kind,
+            "source_replay_sha256": self.source_replay_sha256,
+            "source_sha256": self.source_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinedSourceTimeBoundsV1:
+    """The complete six-bound half-open candidate window."""
+
+    source_start_us: int
+    source_end_us: int
+    warmup_start_us: int
+    active_start_us: int
+    active_end_us: int
+    post_end_us: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.source_start_us,
+            self.source_end_us,
+            self.warmup_start_us,
+            self.active_start_us,
+            self.active_end_us,
+            self.post_end_us,
+        )
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError("mined lesson bounds must be nonnegative integers")
+        if not (
+            self.source_start_us
+            <= self.warmup_start_us
+            <= self.active_start_us
+            < self.active_end_us
+            <= self.post_end_us
+            <= self.source_end_us
+        ):
+            raise ValueError("mined lesson half-open bounds are inconsistent")
+
+    @property
+    def activation_us(self) -> int:
+        return self.active_end_us - 1
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "active_end_us": self.active_end_us,
+            "active_start_us": self.active_start_us,
+            "post_end_us": self.post_end_us,
+            "source_end_us": self.source_end_us,
+            "source_start_us": self.source_start_us,
+            "warmup_start_us": self.warmup_start_us,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinedCheckpointReferenceV1:
+    checkpoint_id: str
+    checkpoint_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_mined_id(self.checkpoint_id, "mined checkpoint ID")
+        _require_mined_digest(self.checkpoint_sha256, "mined checkpoint digest")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "checkpoint_id": self.checkpoint_id,
+            "checkpoint_sha256": self.checkpoint_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinedDetectorReferenceV1:
+    detector_id: str
+    detector_version: int
+    threshold_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_mined_id(self.detector_id, "mined detector ID")
+        if type(self.detector_version) is not int or self.detector_version <= 0:
+            raise ValueError("mined detector version must be positive")
+        _require_mined_digest(self.threshold_sha256, "detector threshold digest")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "detector_id": self.detector_id,
+            "detector_version": self.detector_version,
+            "threshold_sha256": self.threshold_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinedLessonSourceRecordV1:
+    """Seven-field immutable lineage record for one playable mined lesson.
+
+    This record is intentionally not a blind-presentation model.  A client receives
+    only its digest during assessment; the full record is separately disclosed in
+    the authorized reveal/debrief payload.
+    """
+
+    source_run_reference: MinedSourceRunReferenceV1
+    source_time_bounds: MinedSourceTimeBoundsV1
+    checkpoint_reference: MinedCheckpointReferenceV1 | None
+    observable_feed_policy: str
+    hidden_state_reveal_policy: str
+    historical_provenance: Mapping[str, object]
+    detector: MinedDetectorReferenceV1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_run_reference, MinedSourceRunReferenceV1):
+            raise TypeError("mined lesson source-run reference is invalid")
+        if not isinstance(self.source_time_bounds, MinedSourceTimeBoundsV1):
+            raise TypeError("mined lesson source bounds are invalid")
+        if self.checkpoint_reference is not None and not isinstance(
+            self.checkpoint_reference,
+            MinedCheckpointReferenceV1,
+        ):
+            raise TypeError("mined lesson checkpoint reference is invalid")
+        if self.observable_feed_policy != RECORDED_CLIENT_FEED_POLICY_V1:
+            raise ValueError("mined lesson observable-feed policy is unsupported")
+        if self.hidden_state_reveal_policy != MINED_HIDDEN_STATE_REVEAL_POLICY_V1:
+            raise ValueError("mined lesson hidden-state reveal policy is unsupported")
+        if not isinstance(self.detector, MinedDetectorReferenceV1):
+            raise TypeError("mined lesson detector reference is invalid")
+        frozen = freeze_json(self.historical_provenance)
+        if not isinstance(frozen, Mapping) or not frozen:
+            raise ValueError("mined lesson historical provenance must be a record")
+        object.__setattr__(self, "historical_provenance", frozen)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "checkpoint_reference": (
+                None
+                if self.checkpoint_reference is None
+                else self.checkpoint_reference.as_dict()
+            ),
+            "detector": self.detector.as_dict(),
+            "hidden_state_reveal_policy": self.hidden_state_reveal_policy,
+            "historical_provenance": thaw_json(self.historical_provenance),
+            "observable_feed_policy": self.observable_feed_policy,
+            "source_run_reference": self.source_run_reference.as_dict(),
+            "source_time_bounds": self.source_time_bounds.as_dict(),
+        }
+
+    def canonical_json(self) -> str:
+        return json.dumps(
+            self.as_dict(),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.canonical_json().encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
