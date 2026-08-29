@@ -10,6 +10,8 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from kirby2.discovery.ast import StrategyAstV1
+
     from .state_machine import StateMachineDefinition
 
 
@@ -202,6 +204,22 @@ def parse_strategy(source: str) -> StrategyDefinition | StateMachineDefinition:
         source=source,
         unavailable_policy=unavailable_policy,
     )
+
+
+def parse_strategy_semantic_ast(source: str) -> StrategyAstV1:
+    """Import legacy strategy text through the strict canonical-AST boundary."""
+
+    from kirby2.discovery.ast import parse_strategy_ast
+
+    return parse_strategy_ast(source)
+
+
+def render_canonical_strategy_source(source: str) -> str:
+    """Return deterministic source without changing legacy source-byte identity."""
+
+    from kirby2.discovery.ast import canonicalize_strategy_source
+
+    return canonicalize_strategy_source(source)
 
 
 def _meaningful_lines(source: str) -> list[tuple[int, str]]:

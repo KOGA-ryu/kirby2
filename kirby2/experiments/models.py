@@ -8,10 +8,13 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kirby2.exchange import Side
 from kirby2.strategy import TrafficState, parse_strategy
+
+if TYPE_CHECKING:
+    from kirby2.discovery.identity import StrategyIdentityV1
 
 
 EXPERIMENT_MANIFEST_SCHEMA_VERSION = 1
@@ -32,11 +35,48 @@ class StrategyVariant:
     def __post_init__(self) -> None:
         if not _IDENTIFIER.fullmatch(self.name):
             raise ValueError("strategy variant has an invalid name")
+        if self.source_path is not None and (
+            type(self.source_path) is not str or not self.source_path
+        ):
+            raise ValueError("strategy variant source path must be nonempty text")
         parse_strategy(self.source)
 
     @property
     def source_sha256(self) -> str:
         return hashlib.sha256(self.source.encode("utf-8")).hexdigest()
+
+    @property
+    def strategy_identity(self) -> StrategyIdentityV1:
+        """Expose semantic identity beside, never in place of, the legacy hash."""
+
+        from kirby2.discovery.identity import (
+            StrategyImportOriginV1,
+            strategy_identity_from_source,
+        )
+
+        imported_file = self.source_path is not None
+        return strategy_identity_from_source(
+            self.source,
+            import_origin=(
+                StrategyImportOriginV1.EXPERIMENT_RULE_FILE
+                if imported_file
+                else StrategyImportOriginV1.EXPERIMENT_INLINE_SOURCE
+            ),
+            logical_source=(
+                self.source_path
+                if imported_file
+                else f"experiment-inline:{self.name}"
+            ),
+        )
+
+    @property
+    def semantic_ast_sha256(self) -> str:
+        return self.strategy_identity.semantic_ast_sha256
+
+    def discovery_identity_dict(self) -> dict[str, object]:
+        """New sidecar projection; legacy ``as_dict`` remains byte-compatible."""
+
+        return self.strategy_identity.as_dict()
 
     def as_dict(self) -> dict[str, object]:
         return {
