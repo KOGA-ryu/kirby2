@@ -24,6 +24,14 @@ def _require_mined_sha256(value: object, label: str) -> str:
     return value
 
 
+def _require_stable_skill(value: str) -> str:
+    # Kept behind the model helper so every legacy and mined lesson uses the
+    # same closed WO34-A validator without depending on the mining package.
+    from .skills import require_stable_skill_v1
+
+    return require_stable_skill_v1(value)
+
+
 @dataclass(frozen=True, slots=True)
 class MinedCurriculumLineageV1:
     """Curriculum binding for a mined lesson without its withheld answer key."""
@@ -62,6 +70,7 @@ class MinedCurriculumLineageV1:
             or _MINED_SKILL_ID.fullmatch(self.primary_skill_id) is None
         ):
             raise ValueError("mined curriculum primary skill ID is invalid")
+        _require_stable_skill(self.primary_skill_id)
         if type(self.supporting_skill_ids) is not tuple or any(
             type(value) is not str or _MINED_SKILL_ID.fullmatch(value) is None
             for value in self.supporting_skill_ids
@@ -71,6 +80,8 @@ class MinedCurriculumLineageV1:
             raise ValueError("mined curriculum supporting skills must be sorted and unique")
         if self.primary_skill_id in self.supporting_skill_ids:
             raise ValueError("mined curriculum primary skill cannot be supporting")
+        for skill_id in self.supporting_skill_ids:
+            _require_stable_skill(skill_id)
         if self.objective_kind != "OBSERVE_CLASSIFY_V1":
             raise ValueError("mined curriculum objective kind is unsupported")
         if self.schema_version != MINED_CURRICULUM_LINEAGE_SCHEMA_VERSION:
@@ -161,6 +172,8 @@ class CurriculumLesson:
     lesson_id: str
     title: str
     learning_objective: str
+    primary_skill_id: str
+    supporting_skill_ids: tuple[str, ...]
     scenario_name: str
     volumes: tuple[VolumePreset, ...]
     liquidities: tuple[LiquidityPreset, ...]
@@ -174,6 +187,16 @@ class CurriculumLesson:
             raise ValueError("lesson ID must contain exactly two digits")
         if not self.title or not self.learning_objective or not self.scenario_name:
             raise ValueError("lesson title, objective, and scenario must not be empty")
+        _require_stable_skill(self.primary_skill_id)
+        if (
+            type(self.supporting_skill_ids) is not tuple
+            or self.supporting_skill_ids
+            != tuple(sorted(set(self.supporting_skill_ids)))
+            or self.primary_skill_id in self.supporting_skill_ids
+        ):
+            raise ValueError("lesson supporting skills must be sorted and unique")
+        for skill_id in self.supporting_skill_ids:
+            _require_stable_skill(skill_id)
         if not self.post_session_explanation:
             raise ValueError("lesson requires a post-session explanation")
         if not self.volumes or not self.liquidities:
@@ -216,8 +239,10 @@ class CurriculumLesson:
             "lesson_id": self.lesson_id,
             "liquidity": liquidity.value,
             "objective": objective.as_dict(),
+            "primary_skill_id": self.primary_skill_id,
             "scenario_name": self.scenario_name,
             "scenario_seed": scenario_seed,
+            "supporting_skill_ids": list(self.supporting_skill_ids),
             "volume": volume.value,
         }
         variation_id = _variation_id(selected)
@@ -226,6 +251,8 @@ class CurriculumLesson:
             title=self.title,
             mode=mode,
             learning_objective=self.learning_objective,
+            primary_skill_id=self.primary_skill_id,
+            supporting_skill_ids=self.supporting_skill_ids,
             scenario_name=self.scenario_name,
             scenario_seed=scenario_seed,
             volume=volume,
@@ -241,7 +268,9 @@ class CurriculumLesson:
         return {
             "learning_objective": self.learning_objective,
             "lesson_id": self.lesson_id,
+            "primary_skill_id": self.primary_skill_id,
             "player_objective": self.player_objective.as_dict(),
+            "supporting_skill_ids": list(self.supporting_skill_ids),
             "title": self.title,
             "variation_dimensions": {
                 "duration_count": len(self.duration_seconds),
@@ -257,6 +286,8 @@ class CurriculumLesson:
             drill.lesson_id != self.lesson_id
             or drill.title != self.title
             or drill.learning_objective != self.learning_objective
+            or drill.primary_skill_id != self.primary_skill_id
+            or drill.supporting_skill_ids != self.supporting_skill_ids
             or drill.scenario_name != self.scenario_name
             or drill.post_session_explanation != self.post_session_explanation
         ):
@@ -291,6 +322,8 @@ class CurriculumDrill:
     title: str
     mode: CurriculumMode
     learning_objective: str
+    primary_skill_id: str
+    supporting_skill_ids: tuple[str, ...]
     scenario_name: str
     scenario_seed: int
     volume: VolumePreset
@@ -317,6 +350,16 @@ class CurriculumDrill:
             )
         ):
             raise ValueError("curriculum drill text fields must not be empty")
+        _require_stable_skill(self.primary_skill_id)
+        if (
+            type(self.supporting_skill_ids) is not tuple
+            or self.supporting_skill_ids
+            != tuple(sorted(set(self.supporting_skill_ids)))
+            or self.primary_skill_id in self.supporting_skill_ids
+        ):
+            raise ValueError("curriculum drill supporting skills are invalid")
+        for skill_id in self.supporting_skill_ids:
+            _require_stable_skill(skill_id)
         if type(self.scenario_seed) is not int or self.scenario_seed < 0:
             raise ValueError("curriculum scenario seed must be nonnegative")
         if type(self.variation_seed) is not int or self.variation_seed < 0:
@@ -353,6 +396,11 @@ class CurriculumDrill:
                 f"MODE {self.mode.value}",
                 f"DRILL {drill}",
                 f"LEARNING_OBJECTIVE {learning}",
+                (
+                    f"PRIMARY_SKILL {self.primary_skill_id}"
+                    if self.mode is CurriculumMode.LEARN
+                    else "PRIMARY_SKILL WITHHELD UNTIL COMPLETION"
+                ),
                 f"PLAYER_OBJECTIVE {self.player_objective.describe()}",
                 f"VARIATION_ID {self.variation_id}",
                 "HIDDEN_CONFIGURATION concealed_until_completion=true",
@@ -366,6 +414,8 @@ class CurriculumDrill:
                 f"LESSON {self.lesson_id} {self.title}",
                 f"MODE {self.mode.value}",
                 f"LEARNING_OBJECTIVE {self.learning_objective}",
+                f"PRIMARY_SKILL {self.primary_skill_id}",
+                f"SUPPORTING_SKILLS {','.join(self.supporting_skill_ids) or 'NONE'}",
                 (
                     f"CONFIG scenario={self.scenario_name} seed={self.scenario_seed} "
                     f"volume={self.volume.value} liquidity={self.liquidity.value} "
@@ -384,11 +434,13 @@ class CurriculumDrill:
             "lesson_id": self.lesson_id,
             "liquidity": self.liquidity.value,
             "mode": self.mode.value,
+            "primary_skill_id": self.primary_skill_id,
             "player_objective": self.player_objective.as_dict(),
             "post_session_explanation": self.post_session_explanation,
             "scenario_name": self.scenario_name,
             "scenario_seed": self.scenario_seed,
             "title": self.title,
+            "supporting_skill_ids": list(self.supporting_skill_ids),
             "variation_id": self.variation_id,
             "variation_seed": self.variation_seed,
             "volume": self.volume.value,
@@ -399,11 +451,16 @@ class CurriculumDrill:
         objective = payload.get("player_objective")
         if not isinstance(objective, dict):
             raise ValueError("curriculum drill player objective must be an object")
+        supporting = payload.get("supporting_skill_ids")
+        if not isinstance(supporting, list):
+            raise ValueError("curriculum drill supporting skills must be an array")
         drill = cls(
             lesson_id=str(payload["lesson_id"]),
             title=str(payload["title"]),
             mode=CurriculumMode.parse(str(payload["mode"])),
             learning_objective=str(payload["learning_objective"]),
+            primary_skill_id=str(payload["primary_skill_id"]),
+            supporting_skill_ids=tuple(str(item) for item in supporting),
             scenario_name=str(payload["scenario_name"]),
             scenario_seed=int(payload["scenario_seed"]),
             volume=VolumePreset.parse(str(payload["volume"])),
@@ -419,9 +476,11 @@ class CurriculumDrill:
             "lesson_id": drill.lesson_id,
             "liquidity": drill.liquidity.value,
             "objective": drill.player_objective.as_dict(),
+            "primary_skill_id": drill.primary_skill_id,
             "scenario_name": drill.scenario_name,
             "scenario_seed": drill.scenario_seed,
             "volume": drill.volume.value,
+            "supporting_skill_ids": list(drill.supporting_skill_ids),
         }
         if drill.variation_id != _variation_id(selected):
             raise ValueError("curriculum variation ID does not match selected bounds")
