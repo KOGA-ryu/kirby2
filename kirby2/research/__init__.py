@@ -11,6 +11,7 @@ from .models import (
 )
 from .store import (
     DEFAULT_RESEARCH_STORE,
+    LearnerArtifactStore,
     LessonMiningStore,
     SUPPORTED_SCHEMA_VERSIONS,
     RunStore,
@@ -24,6 +25,7 @@ __all__ = [
     "RUN_CONFIGURATION_SCHEMA_VERSION",
     "RUN_MANIFEST_SCHEMA_VERSION",
     "LessonMiningStore",
+    "LearnerArtifactStore",
     "RunManifest",
     "RunStore",
     "RunType",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 
+from kirby2.curriculum.adaptive_commands import ADAPTIVE_CURRICULUM_COMMAND_MODULE
 from kirby2.full_day.commands import FULL_DAY_COMMAND_MODULE
 from kirby2.mining.commands import MINING_COMMAND_MODULE
 from kirby2.scenario_lang.commands import SCENARIO_SOURCE_COMMAND_MODULE
@@ -47,6 +48,7 @@ EXPANSION_COMMAND_MODULES = (
     FULL_DAY_COMMAND_MODULE,
     SCENARIO_SOURCE_COMMAND_MODULE,
     MINING_COMMAND_MODULE,
+    ADAPTIVE_CURRICULUM_COMMAND_MODULE,
 )
 
 

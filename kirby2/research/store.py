@@ -41,6 +41,7 @@ from .tables import (
     artifact_registry_rows,
     attach_run_id,
     evidence_digest,
+    learner_artifact_registry_rows,
     lesson_mining_artifact_registry_rows,
     read_parquet_table,
     qualification_artifact_registry_rows,
@@ -374,6 +375,8 @@ class RunStore:
             RunType.LESSON_BUILD,
         }:
             return LessonMiningStore(self.root).verify_run(run_id)
+        if manifest.run_type is RunType.LEARNER_UPDATE:
+            return LearnerArtifactStore(self.root).verify_run(run_id)
         directory = self.run_directory(run_id)
         expected_artifact_schemas = {
             "configuration": RUN_CONFIGURATION_SCHEMA_VERSION,
@@ -699,6 +702,16 @@ class RunStore:
                 ]
             )
         )
+        expected_learner_artifacts = tuple(
+            learner_artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -739,6 +752,14 @@ class RunStore:
                         "ORDER BY run_id, artifact_type, artifact_name"
                     ).fetchall()
                 )
+                actual_learner_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM learner_artifacts "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
@@ -750,6 +771,7 @@ class RunStore:
             and actual_qualification_artifacts
             == expected_qualification_artifacts
             and actual_lesson_artifacts == expected_lesson_artifacts
+            and actual_learner_artifacts == expected_learner_artifacts
         )
 
     @contextmanager
@@ -840,6 +862,33 @@ class RunStore:
         finally:
             connection.close()
 
+    def query_learner_artifacts(
+        self, run_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return typed learner evidence-update and projection artifacts."""
+
+        self._ensure_catalog()
+        duckdb = _duckdb()
+        connection = duckdb.connect(str(self.catalog_path), read_only=True)
+        try:
+            if run_id is None:
+                cursor = connection.execute(
+                    "SELECT * FROM learner_artifacts "
+                    "ORDER BY run_id, artifact_type, artifact_name"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM learner_artifacts "
+                    "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
+                    [run_id],
+                )
+            columns = tuple(item[0] for item in cursor.description)
+            return tuple(
+                dict(zip(columns, row, strict=True)) for row in cursor.fetchall()
+            )
+        finally:
+            connection.close()
+
     def inspect_run(self, run_id: str) -> dict[str, Any]:
         self._ensure_catalog()
         duckdb = _duckdb()
@@ -863,6 +912,343 @@ class RunStore:
             "summary": summary,
             "verification": self.verify_run(run_id).as_dict(),
         }
+
+
+_LEARNER_ARTIFACT_SPECS = (
+    (
+        "learner_evidence_update",
+        "learner-update.json",
+        ArtifactType.LEARNER_EVIDENCE_UPDATE,
+        "application/json",
+    ),
+    (
+        "learner_state_projection",
+        "learner-projection.json",
+        ArtifactType.LEARNER_STATE_PROJECTION,
+        "application/json",
+    ),
+)
+
+
+class LearnerArtifactStore:
+    """Persist one immutable evidence update with its rebuildable projection."""
+
+    def __init__(self, root: Path = DEFAULT_RESEARCH_STORE) -> None:
+        self.root = root
+        self.runs_directory = root / "runs"
+        self.staging_directory = root / ".staging"
+        self.runs_directory.mkdir(parents=True, exist_ok=True)
+        self.staging_directory.mkdir(parents=True, exist_ok=True)
+
+    def run_directory(self, run_id: str) -> Path:
+        if not re.fullmatch(r"run-[0-9a-f]{24}", run_id):
+            raise ValueError("invalid run ID")
+        return self.runs_directory / run_id
+
+    def load_manifest(self, run_id: str) -> RunManifest:
+        path = self.run_directory(run_id) / "manifest.toml"
+        if not path.is_file():
+            raise ValueError(f"unknown run ID: {run_id}")
+        manifest = RunManifest.from_dict(load_toml(path))
+        if manifest.run_type is not RunType.LEARNER_UPDATE:
+            raise ValueError("run is not a learner update/projection artifact")
+        return manifest
+
+    def record_update(
+        self,
+        ledger,
+        projection,
+        *,
+        seed: int | None = None,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.curriculum.evidence import LearnerEvidenceLedgerV1
+        from kirby2.curriculum.learner import build_learner_projection_v1
+        from kirby2.curriculum.projections import LearnerProjectionV1
+
+        if not isinstance(ledger, LearnerEvidenceLedgerV1):
+            raise TypeError("learner update persistence requires a typed ledger")
+        if not isinstance(projection, LearnerProjectionV1):
+            raise TypeError("learner update persistence requires a typed projection")
+        if seed is not None and type(seed) is not int:
+            raise TypeError("learner update seed must be an integer or absent")
+        if parent_run_id is not None and not re.fullmatch(
+            r"run-[0-9a-f]{24}", parent_run_id
+        ):
+            raise ValueError("learner update parent run ID is invalid")
+        final_ordinal = (
+            0 if not ledger.assessments else ledger.assessments[-1].attempt_ordinal
+        )
+        if projection.learner_id != ledger.learner_id:
+            raise ValueError("learner update ledger and projection identities differ")
+        if projection.as_of_attempt_ordinal != final_ordinal:
+            raise ValueError("learner projection must cover the complete update")
+        rebuilt = build_learner_projection_v1(
+            ledger,
+            as_of_attempt_ordinal=final_ordinal,
+        )
+        if rebuilt.canonical_bytes() != projection.canonical_bytes():
+            raise ValueError("learner projection is not rebuilt from the update")
+
+        payloads = {
+            "learner-update.json": ledger.canonical_bytes(),
+            "learner-projection.json": projection.canonical_bytes(),
+        }
+        references = _learner_artifact_references(payloads, ledger, projection)
+        configuration_digest, evidence_digest_value, result_digest = (
+            _learner_artifact_digests(ledger, projection)
+        )
+        simulation_times = tuple(
+            item.observable_context.simulation_time_us for item in ledger.assessments
+        )
+        repository_path = repository or Path(__file__).resolve().parents[2]
+        manifest = RunManifest.create(
+            parent_run_id=parent_run_id,
+            run_type=RunType.LEARNER_UPDATE,
+            scenario_id=None,
+            lesson_id=None,
+            seed=seed,
+            flow_model=projection.model_id,
+            market_profile="LEARNER_EVIDENCE_V1",
+            strategy_id="NONE",
+            hotkey_layout_id="NONE",
+            session_objective="PERSIST_IMMUTABLE_LEARNER_UPDATE_AND_PROJECTION",
+            simulation_start_us=min(simulation_times, default=0),
+            simulation_end_us=max(simulation_times, default=0),
+            software_version=software_version(),
+            git_commit=git_commit(repository_path),
+            schema_versions=_learner_schema_versions(),
+            input_dataset_references=(
+                f"learner-evidence:{ledger.learner_id}:{ledger.ledger_sha256}",
+            ),
+            configuration_digest=configuration_digest,
+            evidence_digest=evidence_digest_value,
+            result_digest=result_digest,
+            creation_timestamp_utc=(
+                "1970-01-01T00:00:00Z"
+                if not ledger.assessments
+                else ledger.assessments[-1].study_timestamp_utc
+            ),
+            artifacts=references,
+        )
+        return self._persist(manifest, payloads)
+
+    def load_update(self, run_id: str):
+        from kirby2.curriculum.evidence import LearnerEvidenceLedgerV1
+        from kirby2.curriculum.projections import LearnerProjectionV1
+
+        manifest = self.load_manifest(run_id)
+        directory = self.run_directory(run_id)
+        ledger = LearnerEvidenceLedgerV1.from_json_bytes(
+            (directory / "learner-update.json").read_bytes()
+        )
+        projection = LearnerProjectionV1.from_json_bytes(
+            (directory / "learner-projection.json").read_bytes()
+        )
+        if tuple(item.relative_path for item in manifest.artifacts) != tuple(
+            item[1] for item in _LEARNER_ARTIFACT_SPECS
+        ):
+            raise ValueError("learner artifact manifest inventory differs")
+        return ledger, projection
+
+    def verify_run(self, run_id: str) -> VerificationReport:
+        failures: list[str] = []
+        flags = {
+            "manifest_loaded": False,
+            "references_exist": False,
+            "artifact_digests_match": False,
+            "artifact_row_counts_match": False,
+            "event_sequence_complete": False,
+            "replay_configuration_available": False,
+            "replay_passed": False,
+            "result_digest_match": False,
+            "evidence_digest_match": False,
+            "schema_versions_supported": False,
+            "run_identity_match": False,
+        }
+        try:
+            manifest = self.load_manifest(run_id)
+            flags["manifest_loaded"] = True
+            flags["run_identity_match"] = manifest.run_id == run_id
+            if not flags["run_identity_match"]:
+                raise ValueError("learner manifest run ID differs from directory")
+        except (OSError, TypeError, ValueError) as error:
+            failures.append(f"manifest invalid: {error}")
+            return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+
+        expected_inventory = tuple(
+            (name, path, artifact_type, media_type)
+            for name, path, artifact_type, media_type in _LEARNER_ARTIFACT_SPECS
+        )
+        actual_inventory = tuple(
+            (item.name, item.relative_path, item.artifact_type, item.media_type)
+            for item in manifest.artifacts
+        )
+        flags["schema_versions_supported"] = (
+            manifest.schema_versions == _learner_schema_versions()
+            and actual_inventory == expected_inventory
+            and all(item.schema_version == 1 for item in manifest.artifacts)
+        )
+        if not flags["schema_versions_supported"]:
+            failures.append("learner typed artifact or schema inventory differs")
+
+        directory = self.run_directory(run_id)
+        payloads: dict[str, bytes] = {}
+        try:
+            for reference in manifest.artifacts:
+                path = directory / reference.relative_path
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(
+                        f"unsafe or missing learner artifact: {reference.relative_path}"
+                    )
+                payloads[reference.relative_path] = path.read_bytes()
+            extras = {
+                path.name for path in directory.iterdir() if path.name != "manifest.toml"
+            } - {Path(name).name for name in payloads}
+            if extras:
+                raise ValueError("learner run contains unregistered artifact files")
+            flags["references_exist"] = len(payloads) == len(_LEARNER_ARTIFACT_SPECS)
+            flags["artifact_digests_match"] = all(
+                hashlib.sha256(payloads[item.relative_path]).hexdigest() == item.sha256
+                for item in manifest.artifacts
+            )
+            if not flags["artifact_digests_match"]:
+                failures.append("one or more learner artifact digests differ")
+        except (OSError, ValueError) as error:
+            failures.append(f"learner artifact inventory invalid: {error}")
+
+        try:
+            ledger, projection = self.load_update(run_id)
+            from kirby2.curriculum.learner import build_learner_projection_v1
+
+            final_ordinal = (
+                0 if not ledger.assessments else ledger.assessments[-1].attempt_ordinal
+            )
+            rebuilt = build_learner_projection_v1(
+                ledger,
+                as_of_attempt_ordinal=final_ordinal,
+            )
+            flags["artifact_row_counts_match"] = tuple(
+                item.row_count for item in manifest.artifacts
+            ) == (len(ledger.assessments), len(projection.skill_projections))
+            flags["event_sequence_complete"] = (
+                projection.as_of_attempt_ordinal == final_ordinal
+                and projection.input_assessment_count == len(ledger.assessments)
+            )
+            flags["replay_configuration_available"] = True
+            flags["replay_passed"] = (
+                rebuilt.canonical_bytes() == projection.canonical_bytes()
+            )
+            configuration_digest, evidence_digest_value, result_digest = (
+                _learner_artifact_digests(ledger, projection)
+            )
+            flags["evidence_digest_match"] = (
+                manifest.evidence_digest == evidence_digest_value
+            )
+            flags["result_digest_match"] = manifest.result_digest == result_digest
+            if manifest.configuration_digest != configuration_digest:
+                failures.append("learner projection configuration digest differs")
+            if not flags["artifact_row_counts_match"]:
+                failures.append("learner artifact row counts differ")
+            if not flags["event_sequence_complete"]:
+                failures.append("learner projection does not cover the complete update")
+            if not flags["replay_passed"]:
+                failures.append("learner projection rebuild differs")
+            if not flags["evidence_digest_match"]:
+                failures.append("learner evidence digest differs")
+            if not flags["result_digest_match"]:
+                failures.append("learner projection result digest differs")
+        except Exception as error:
+            failures.append(f"learner artifact replay invalid: {error}")
+        return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+
+    def _persist(
+        self,
+        manifest: RunManifest,
+        payloads: dict[str, bytes],
+    ) -> RunManifest:
+        target = self.run_directory(manifest.run_id)
+        if target.exists():
+            existing = self.load_manifest(manifest.run_id)
+            if existing.identity_dict() != manifest.identity_dict():
+                raise RuntimeError("content-derived learner run ID collision")
+            report = self.verify_run(manifest.run_id)
+            if not report.passed:
+                raise RuntimeError(
+                    "existing immutable learner run is invalid: "
+                    + "; ".join(report.failures)
+                )
+            return existing
+        with tempfile.TemporaryDirectory(
+            dir=self.staging_directory,
+            prefix=f"{manifest.run_id}-",
+        ) as temporary:
+            staging = Path(temporary) / manifest.run_id
+            staging.mkdir()
+            for relative_path, raw in payloads.items():
+                (staging / relative_path).write_bytes(raw)
+            (staging / "manifest.toml").write_text(
+                manifest.to_toml(), encoding="utf-8"
+            )
+            staging.rename(target)
+        report = self.verify_run(manifest.run_id)
+        if not report.passed:
+            raise RuntimeError(
+                "new immutable learner run failed verification: "
+                + "; ".join(report.failures)
+            )
+        RunStore(self.root).refresh_catalog()
+        return self.load_manifest(manifest.run_id)
+
+
+def _learner_schema_versions() -> dict[str, int]:
+    return {
+        "learner_evidence": 1,
+        "learner_projection": 1,
+        "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
+    }
+
+
+def _learner_artifact_references(
+    payloads: dict[str, bytes],
+    ledger,
+    projection,
+) -> tuple[ArtifactReference, ...]:
+    expected_paths = {item[1] for item in _LEARNER_ARTIFACT_SPECS}
+    if set(payloads) != expected_paths:
+        raise ValueError("learner artifact payload inventory differs")
+    row_counts = {
+        "learner-update.json": len(ledger.assessments),
+        "learner-projection.json": len(projection.skill_projections),
+    }
+    return tuple(
+        ArtifactReference(
+            name=name,
+            relative_path=relative_path,
+            sha256=hashlib.sha256(payloads[relative_path]).hexdigest(),
+            schema_version=1,
+            row_count=row_counts[relative_path],
+            media_type=media_type,
+            artifact_type=artifact_type,
+        )
+        for name, relative_path, artifact_type, media_type in _LEARNER_ARTIFACT_SPECS
+    )
+
+
+def _learner_artifact_digests(ledger, projection) -> tuple[str, str, str]:
+    return (
+        canonical_digest(
+            {
+                "model_id": projection.model_id,
+                "model_policy_digest": projection.model_policy_digest,
+                "policy": "LEARNER_UPDATE_PROJECTION_V1",
+                "schema_version": 1,
+            }
+        ),
+        hashlib.sha256(ledger.canonical_bytes()).hexdigest(),
+        hashlib.sha256(projection.canonical_bytes()).hexdigest(),
+    )
 
 
 _LESSON_MINING_ARTIFACT_SPECS = (
@@ -1547,6 +1933,7 @@ def _duckdb():
 _CATALOG_VIEWS = (
     "full_day_qualification_artifacts",
     "lesson_mining_artifacts",
+    "learner_artifacts",
     "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
@@ -1619,6 +2006,16 @@ def _create_summary_views(connection) -> None:
             'LESSON_TECHNICAL_REVIEW_PACKET',
             'LESSON_REVIEW_SIDECAR',
             'LESSON_BUILD_PROPOSAL'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW learner_artifacts AS
+        SELECT * FROM run_artifact_registry
+        WHERE artifact_type IN (
+            'LEARNER_EVIDENCE_UPDATE',
+            'LEARNER_STATE_PROJECTION'
         )
         """
     )

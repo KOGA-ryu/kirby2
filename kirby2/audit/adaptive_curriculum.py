@@ -7,6 +7,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from kirby2.curriculum.catalog import load_curriculum, prepare_lesson
 from kirby2.curriculum.errors import (
@@ -119,6 +120,11 @@ WO34B_PROJECTION_POLICY_SHA256 = (
 WO34C_AUDIT_CASE_COUNT = 6
 WO34C_SELECTION_POLICY_SHA256 = (
     "47261cc202a532d8b01d9f1dbabddacd01fd7d0d60a26833ff7cb4e02cf0b8cf"
+)
+WO34D_AUDIT_CASE_COUNT = 4
+WO34D_SYNTHETIC_LEARNER_COUNT = 6
+WO34D_DEMO_SHA256 = (
+    "d88a2d0bad0c4ccfac25cacbc68ee632ffc29b951fb5698677471f1fe03e6b29"
 )
 _DIGEST = "1" * 64
 
@@ -2235,6 +2241,355 @@ def audit_wo34c_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]
     )
 
 
+def _synthetic_fixture_and_sequence_case(demo) -> AdaptiveCurriculumAuditCase:
+    from kirby2.curriculum.adaptive_commands import (
+        SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1,
+        SYNTHETIC_LEARNER_FIXTURES_V1,
+        SYNTHETIC_PRACTICE_TARGET_SKILLS_V1,
+        build_synthetic_learner_evidence_v1,
+    )
+
+    failures: list[str] = []
+    expected_labels = (
+        "strong reader / weak execution",
+        "weak reader / strong hotkeys",
+        "over-aggressive trader",
+        "over-passive trader",
+        "hidden-liquidity confusion",
+        "new learner with insufficient evidence",
+    )
+    expected_first_routes = {
+        "STRONG_READER_WEAK_EXECUTION": "POSITION_MANAGEMENT",
+        "WEAK_READER_STRONG_HOTKEYS": "BOOK_READING",
+        "OVER_AGGRESSIVE_TRADER": "PASSIVE_ENTRY",
+        "OVER_PASSIVE_TRADER": "AGGRESSIVE_ENTRY",
+        "HIDDEN_LIQUIDITY_CONFUSION": "LIQUIDITY_WITHDRAWAL",
+    }
+    if (
+        len(SYNTHETIC_LEARNER_FIXTURES_V1) != WO34D_SYNTHETIC_LEARNER_COUNT
+        or tuple(item.label for item in SYNTHETIC_LEARNER_FIXTURES_V1)
+        != expected_labels
+        or tuple(item.fixture for item in demo.learners)
+        != SYNTHETIC_LEARNER_FIXTURES_V1
+    ):
+        failures.append("six fixed synthetic learner identities or ordering differ")
+    sequences = tuple(item.selected_skill_sequence for item in demo.learners)
+    if len(set(sequences)) != WO34D_SYNTHETIC_LEARNER_COUNT:
+        failures.append("synthetic evidence did not produce six distinct sequences")
+    for learner in demo.learners:
+        fixture = learner.fixture
+        fixture_field_names = tuple(fixture.__dataclass_fields__)
+        if any(
+            token in field_name.lower()
+            for field_name in fixture_field_names
+            for token in ("expected", "recommendation", "selected")
+        ):
+            failures.append(
+                f"{fixture.fixture_id} injects a recommendation-shaped fixture field"
+            )
+        ledger, history = build_synthetic_learner_evidence_v1(fixture)
+        if fixture.initial_evidence:
+            expected_count = (
+                SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1
+                * len(SYNTHETIC_PRACTICE_TARGET_SKILLS_V1)
+            )
+            projection = build_learner_projection_v1(
+                ledger,
+                as_of_attempt_ordinal=ledger.assessments[-1].attempt_ordinal,
+            )
+            pattern = fixture.pattern_primary_skill_id
+            if pattern is None:
+                failures.append(
+                    f"{fixture.fixture_id} established fixture lacks a pattern skill"
+                )
+                continue
+            pattern_row = projection.skill(pattern)
+            other_target_masteries = tuple(
+                projection.skill(skill_id).mastery_ppm
+                for skill_id in SYNTHETIC_PRACTICE_TARGET_SKILLS_V1
+                if skill_id != pattern
+            )
+            if (
+                len(ledger.assessments) != expected_count
+                or len(history) != expected_count
+                or learner.initial_assessment_count != expected_count
+                or {
+                    item.observable_context.source_class
+                    for item in ledger.assessments
+                }
+                != {EvidenceSourceClassV1.SYNTHETIC}
+                or pattern_row.sufficiency is not ProjectionSufficiencyV1.SUFFICIENT
+                or pattern_row.mastery_ppm >= min(other_target_masteries)
+                or learner.selected_skill_sequence[0]
+                != expected_first_routes[fixture.fixture_id]
+            ):
+                failures.append(
+                    f"{fixture.fixture_id} evidence does not isolate its routed pattern"
+                )
+            observed_errors = tuple(
+                error.error_type
+                for assessment in ledger.assessments
+                for error in assessment.errors
+            )
+            if fixture.observed_error_type is None:
+                if observed_errors:
+                    failures.append(
+                        f"{fixture.fixture_id} contains undeclared synthetic errors"
+                    )
+            elif (
+                set(observed_errors) != {fixture.observed_error_type}
+                or len(observed_errors) != SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1
+            ):
+                failures.append(
+                    f"{fixture.fixture_id} observed error pattern is not isolated"
+                )
+        else:
+            projection = build_learner_projection_v1(
+                ledger,
+                as_of_attempt_ordinal=0,
+            )
+            if (
+                ledger.assessments
+                or history
+                or learner.initial_assessment_count != 0
+                or any(
+                    item.sufficiency is not ProjectionSufficiencyV1.INSUFFICIENT
+                    for item in projection.skill_projections
+                )
+            ):
+                failures.append("new learner fixture contains injected prior evidence")
+    return AdaptiveCurriculumAuditCase(
+        "d_six_evidence_only_fixtures_route_to_distinct_sequences",
+        (
+            f"learners={len(demo.learners)} sequences={len(set(sequences))} "
+            f"established_assessments={SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1 * len(SYNTHETIC_PRACTICE_TARGET_SKILLS_V1)} "
+            "new_learner_assessments=0 source=SYNTHETIC recommendation_fixture_fields=0"
+        ),
+        tuple(failures),
+    )
+
+
+def _adaptive_replay_and_projection_case(demo) -> AdaptiveCurriculumAuditCase:
+    from kirby2.curriculum.adaptive_commands import (
+        ADAPTIVE_CURRICULUM_DEMO_SEQUENCE_LENGTH_V1,
+    )
+
+    failures: list[str] = []
+    for learner in demo.learners:
+        rebuilt = build_learner_projection_v1(
+            learner.final_ledger,
+            as_of_attempt_ordinal=learner.final_projection.as_of_attempt_ordinal,
+        )
+        if rebuilt.canonical_bytes() != learner.final_projection.canonical_bytes():
+            failures.append(
+                f"{learner.fixture.fixture_id} final projection rebuild differs"
+            )
+        if len(learner.steps) != ADAPTIVE_CURRICULUM_DEMO_SEQUENCE_LENGTH_V1:
+            failures.append(
+                f"{learner.fixture.fixture_id} update sequence length differs"
+            )
+            continue
+        expected_pre_ledger = learner.initial_ledger_sha256
+        expected_projection = learner.steps[0].projection_digest
+        expected_update = learner.initial_assessment_count + 1
+        for step in learner.steps:
+            explanation = step.explanation
+            if (
+                step.update_sequence != expected_update
+                or step.pre_update_ledger_sha256 != expected_pre_ledger
+                or step.projection_digest != expected_projection
+                or not step.eligible_candidate_ids
+                or step.selected_candidate_id not in step.eligible_candidate_ids
+                or explanation.get("selected_skill_id") != step.selected_skill_id
+                or explanation.get("model_status")
+                != LEARNER_PROJECTION_STATUS_V1
+                or not any(
+                    "unvalidated" in str(statement).lower()
+                    for statement in explanation.get("statements", [])
+                )
+                or len(step.replay_digest) != 64
+            ):
+                failures.append(
+                    f"{learner.fixture.fixture_id} step {step.selection_ordinal} log or explanation differs"
+                )
+            expected_update += 1
+            expected_pre_ledger = step.post_update_ledger_sha256
+            expected_projection = step.post_update_projection_digest
+        if (
+            expected_pre_ledger != learner.final_ledger.ledger_sha256
+            or expected_projection != projection_digest_v1(learner.final_projection)
+            or len(learner.replay_digest) != 64
+        ):
+            failures.append(
+                f"{learner.fixture.fixture_id} replay chain does not reach final artifacts"
+            )
+    if demo.demo_digest != WO34D_DEMO_SHA256:
+        failures.append("seed-42 adaptive curriculum demonstration digest differs")
+    return AdaptiveCurriculumAuditCase(
+        "d_update_projection_selection_and_replay_chain_is_exact",
+        (
+            f"steps={sum(len(item.steps) for item in demo.learners)} "
+            f"demo_sha256={demo.demo_digest} projection_rebuilds=6 "
+            "eligible_sets_logged=true rationales_logged=true replays=PASS"
+        ),
+        tuple(failures),
+    )
+
+
+def _learner_artifact_store_case(demo) -> AdaptiveCurriculumAuditCase:
+    from kirby2.research import (
+        ArtifactType,
+        LearnerArtifactStore,
+        RunStore,
+        RunType,
+    )
+
+    failures: list[str] = []
+    with TemporaryDirectory() as directory:
+        root = Path(directory) / "research"
+        learner_store = LearnerArtifactStore(root)
+        repository = Path(__file__).resolve().parents[2]
+        manifests = []
+        for learner in demo.learners:
+            manifest = learner_store.record_update(
+                learner.final_ledger,
+                learner.final_projection,
+                seed=demo.seed,
+                repository=repository,
+            )
+            manifests.append(manifest)
+            loaded_ledger, loaded_projection = learner_store.load_update(
+                manifest.run_id
+            )
+            verification = RunStore(root).verify_run(manifest.run_id)
+            typed = RunStore(root).query_learner_artifacts(manifest.run_id)
+            if (
+                manifest.run_type is not RunType.LEARNER_UPDATE
+                or tuple(item.artifact_type for item in manifest.artifacts)
+                != (
+                    ArtifactType.LEARNER_EVIDENCE_UPDATE,
+                    ArtifactType.LEARNER_STATE_PROJECTION,
+                )
+                or loaded_ledger.canonical_bytes()
+                != learner.final_ledger.canonical_bytes()
+                or loaded_projection.canonical_bytes()
+                != learner.final_projection.canonical_bytes()
+                or not verification.passed
+                or len(typed) != 2
+                or {item["artifact_type"] for item in typed}
+                != {
+                    ArtifactType.LEARNER_EVIDENCE_UPDATE.value,
+                    ArtifactType.LEARNER_STATE_PROJECTION.value,
+                }
+            ):
+                failures.append(
+                    f"{learner.fixture.fixture_id} learner artifacts did not persist and rebuild"
+                )
+        first = manifests[0]
+        manifest_path = learner_store.run_directory(first.run_id) / "manifest.toml"
+        original_manifest = manifest_path.read_bytes()
+        repeated = learner_store.record_update(
+            demo.learners[0].final_ledger,
+            demo.learners[0].final_projection,
+            seed=demo.seed,
+            repository=repository,
+        )
+        if (
+            repeated.run_id != first.run_id
+            or manifest_path.read_bytes() != original_manifest
+        ):
+            failures.append("idempotent learner persistence rewrote immutable evidence")
+        all_typed = RunStore(root).query_learner_artifacts()
+        if len(all_typed) != 2 * WO34D_SYNTHETIC_LEARNER_COUNT:
+            failures.append("learner artifact catalog projection is incomplete")
+        projection_path = (
+            learner_store.run_directory(first.run_id) / "learner-projection.json"
+        )
+        projection_path.write_bytes(projection_path.read_bytes() + b"\n")
+        tampered = RunStore(root).verify_run(first.run_id)
+        if tampered.passed or tampered.artifact_digests_match or tampered.replay_passed:
+            failures.append("learner projection tamper did not fail closed")
+    return AdaptiveCurriculumAuditCase(
+        "d_typed_learner_update_and_projection_artifacts_rebuild_and_fail_closed",
+        (
+            f"runs={len(demo.learners)} typed_artifacts={2 * len(demo.learners)} "
+            "idempotent=true catalog_projected=true projection_tamper=REFUSED"
+        ),
+        tuple(failures),
+    )
+
+
+def _adaptive_claim_boundary_case(demo) -> AdaptiveCurriculumAuditCase:
+    from kirby2.curriculum.adaptive_commands import (
+        ADAPTIVE_ROUTING_CLAIM_V1,
+        CROSS_LEARNER_COMPARISON_POLICY_V1,
+        render_adaptive_curriculum_demo_v1,
+    )
+
+    failures: list[str] = []
+    payload = demo.as_dict()
+    rendered = render_adaptive_curriculum_demo_v1(demo)
+    forbidden_keys: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in {
+                    "leaderboard",
+                    "public_rank",
+                    "cross_learner_score",
+                    "educational_effectiveness_score",
+                }:
+                    forbidden_keys.append(str(key))
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    exposure_signatures = {
+        tuple(sha256_json(list(step.eligible_candidate_ids)) for step in learner.steps)
+        for learner in demo.learners
+    }
+    if (
+        payload.get("claim_scope") != ADAPTIVE_ROUTING_CLAIM_V1
+        or payload.get("comparison_policy")
+        != CROSS_LEARNER_COMPARISON_POLICY_V1
+        or payload.get("model_status") != LEARNER_PROJECTION_STATUS_V1
+        or len(exposure_signatures) <= 1
+        or forbidden_keys
+        or "real_weakness_measurement=false" not in rendered
+        or "educational_effectiveness=false" not in rendered
+        or f"MODEL_STATUS {LEARNER_PROJECTION_STATUS_V1}" not in rendered
+    ):
+        failures.append(
+            "adaptive demonstration overclaims measurement, effectiveness, or comparability"
+        )
+    return AdaptiveCurriculumAuditCase(
+        "d_claims_remain_unvalidated_and_cross_learner_scores_are_not_compared",
+        (
+            f"claim_scope={ADAPTIVE_ROUTING_CLAIM_V1} "
+            f"exposure_signatures={len(exposure_signatures)} "
+            "real_measurement=false effectiveness=false leaderboard_fields=0"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo34d_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]:
+    from kirby2.curriculum.adaptive_commands import (
+        run_adaptive_curriculum_demo_v1,
+    )
+
+    demo = run_adaptive_curriculum_demo_v1(42)
+    return (
+        _synthetic_fixture_and_sequence_case(demo),
+        _adaptive_replay_and_projection_case(demo),
+        _learner_artifact_store_case(demo),
+        _adaptive_claim_boundary_case(demo),
+    )
+
+
 __all__ = [
     "WO34A_EDGE_COUNT",
     "WO34A_ERROR_COUNT",
@@ -2248,8 +2603,12 @@ __all__ = [
     "WO34B_SKILL_PROJECTION_COUNT",
     "WO34C_AUDIT_CASE_COUNT",
     "WO34C_SELECTION_POLICY_SHA256",
+    "WO34D_AUDIT_CASE_COUNT",
+    "WO34D_DEMO_SHA256",
+    "WO34D_SYNTHETIC_LEARNER_COUNT",
     "AdaptiveCurriculumAuditCase",
     "audit_wo34a_adaptive_curriculum",
     "audit_wo34b_adaptive_curriculum",
     "audit_wo34c_adaptive_curriculum",
+    "audit_wo34d_adaptive_curriculum",
 ]

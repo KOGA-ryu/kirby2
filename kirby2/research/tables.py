@@ -253,6 +253,14 @@ LESSON_MINING_ARTIFACT_TYPES = frozenset(
 )
 
 
+LEARNER_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.LEARNER_EVIDENCE_UPDATE,
+        ArtifactType.LEARNER_STATE_PROJECTION,
+    }
+)
+
+
 def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
     """Project typed immutable artifacts into the rebuildable research catalog."""
 
@@ -298,6 +306,18 @@ def lesson_mining_artifact_registry_rows(
         row
         for row in artifact_registry_rows(manifests)
         if ArtifactType(str(row[1])) in LESSON_MINING_ARTIFACT_TYPES
+    ]
+
+
+def learner_artifact_registry_rows(
+    manifests: list[RunManifest],
+) -> list[tuple[object, ...]]:
+    """Project only typed learner evidence updates and derived projections."""
+
+    return [
+        row
+        for row in artifact_registry_rows(manifests)
+        if ArtifactType(str(row[1])) in LEARNER_ARTIFACT_TYPES
     ]
 
 

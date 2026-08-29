@@ -132,6 +132,7 @@ REGISTERABLE_GATE_IDS = (
     "WO34-A",
     "WO34-B",
     "WO34-C",
+    "WO34-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3043,6 +3044,76 @@ def _audit_wo34c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo34d() -> ExpansionGateReport:
+    from kirby2.audit.adaptive_curriculum import (
+        WO34D_AUDIT_CASE_COUNT,
+        WO34D_DEMO_SHA256,
+        WO34D_SYNTHETIC_LEARNER_COUNT,
+        audit_wo34d_adaptive_curriculum,
+    )
+    from kirby2.curriculum.adaptive_commands import (
+        ADAPTIVE_CURRICULUM_DEMO_SEQUENCE_LENGTH_V1,
+        ADAPTIVE_ROUTING_CLAIM_V1,
+        CROSS_LEARNER_COMPARISON_POLICY_V1,
+    )
+    from kirby2.curriculum.projections import LEARNER_PROJECTION_STATUS_V1
+
+    cases = audit_wo34d_adaptive_curriculum()
+    expected_names = (
+        "d_six_evidence_only_fixtures_route_to_distinct_sequences",
+        "d_update_projection_selection_and_replay_chain_is_exact",
+        "d_typed_learner_update_and_projection_artifacts_rebuild_and_fail_closed",
+        "d_claims_remain_unvalidated_and_cross_learner_scores_are_not_compared",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO34D_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO34-D cases differ from the fixed demonstration inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO34-D demonstration cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO34-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("audit_case_count", str(WO34D_AUDIT_CASE_COUNT)),
+            ("claim_scope", ADAPTIVE_ROUTING_CLAIM_V1),
+            ("comparison_policy", CROSS_LEARNER_COMPARISON_POLICY_V1),
+            ("demo_sha256", WO34D_DEMO_SHA256),
+            ("model_status", LEARNER_PROJECTION_STATUS_V1),
+            (
+                "selection_steps",
+                str(
+                    WO34D_SYNTHETIC_LEARNER_COUNT
+                    * ADAPTIVE_CURRICULUM_DEMO_SEQUENCE_LENGTH_V1
+                ),
+            ),
+            ("synthetic_learner_count", str(WO34D_SYNTHETIC_LEARNER_COUNT)),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3254,6 +3325,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO34-A", _audit_wo34a),
     ("WO34-B", _audit_wo34b),
     ("WO34-C", _audit_wo34c),
+    ("WO34-D", _audit_wo34d),
 )
 
 
