@@ -30,6 +30,8 @@ from .models import (
     SCENARIO_TARGET_CONTRACTS_V1,
     CompiledScenarioArtifactV1,
     ResolvedScenarioBundleV1,
+    ScenarioCapabilityDecisionStatusV1,
+    ScenarioCapabilityDecisionV1,
     ScenarioCompiledSeedPolicyV1,
     ScenarioPlanEnvelopeV1,
     ScenarioRecordV1,
@@ -50,6 +52,8 @@ NativeReplayer = Callable[[bytes], object]
 
 _ADAPTER_OPERATION_NAMES = ("parse", "persist", "replay", "run", "validate")
 SCENARIO_REFERENCE_MAX_DEPTH_V1 = 64
+SCENARIO_TARGET_REPLAY_MISMATCH_REASON_V1 = "TARGET_REPLAY_MISMATCH"
+SCENARIO_TARGET_SEED_MISMATCH_REASON_V1 = "TARGET_SEED_POLICY_MISMATCH"
 _UNSAFE_RECORD_TOKENS = frozenset(
     {"EVAL", "EVALUATOR", "EXPRESSION", "PYTHON", "REFLECT", "REFLECTION", "SHELL"}
 )
@@ -136,9 +140,33 @@ class ScenarioTargetAdapterV1:
     def run(
         self,
         payload: object,
-        seed_policy: ScenarioCompiledSeedPolicyV1,
+        seed_policy: ScenarioCompiledSeedPolicyV1 | None = None,
     ) -> object:
-        return self._run(payload, seed_policy)
+        if type(payload) is CompiledScenarioArtifactV1:
+            if seed_policy is not None:
+                raise TypeError(
+                    "validated scenario adapter run derives its seed policy from the artifact"
+                )
+            artifact = payload
+            if not artifact.execution_eligible:
+                raise ScenarioExecutionRefused(artifact.execution_reason_code)
+            if (
+                artifact.target_kind is not self.target_kind
+                or artifact.target_version != self.target_version
+                or artifact.adapter_id != self.adapter_id
+                or artifact.adapter_version != self.adapter_version
+                or artifact.as_dict()["adapter_operations"]
+                != dict(self.operation_ids)
+            ):
+                raise ScenarioExecutionRefused("TARGET_ADAPTER_MISMATCH")
+            return self._run(
+                artifact.plan_envelope.payload,
+                artifact.seed_policy,
+            )
+        if type(seed_policy) is not ScenarioCompiledSeedPolicyV1:
+            raise TypeError("scenario run adapter requires a compiled seed policy")
+        self.validate(payload)
+        raise ScenarioExecutionRefused(SCENARIO_EXECUTION_INELIGIBLE_REASON_V1)
 
     def persist(self, payload: object) -> bytes:
         return self._persist(payload)
@@ -217,7 +245,47 @@ def _target_adapter(target_kind: ScenarioTargetKindV1) -> ScenarioTargetAdapterV
         canonical_native_payload_bytes(target_kind, payload)
         if type(seed_policy) is not ScenarioCompiledSeedPolicyV1:
             raise TypeError("scenario run adapter requires a compiled seed policy")
-        raise ScenarioExecutionRefused(SCENARIO_EXECUTION_INELIGIBLE_REASON_V1)
+        if target_kind is ScenarioTargetKindV1.FULL_DAY_PLAN_V1:
+            from kirby2.full_day.runtime import FullDayRuntime
+
+            native_seed = payload.seed_policy.root_seed
+            if native_seed != seed_policy.selected_root_seed:
+                raise ScenarioExecutionRefused(
+                    SCENARIO_TARGET_SEED_MISMATCH_REASON_V1
+                )
+            runtime = FullDayRuntime.create(payload)
+            runtime.advance_to(payload.calendar.end_time_us)
+            return runtime
+        if target_kind is ScenarioTargetKindV1.MARKET_SCENARIO_V1:
+            from kirby2.scenarios.market import run_market_scenario
+
+            return run_market_scenario(
+                payload,
+                seed=seed_policy.selected_root_seed,
+            )
+        if target_kind is ScenarioTargetKindV1.HIDDEN_LIQUIDITY_RECORDING_V1:
+            from kirby2.observability.replay import replay_observability_recording
+
+            report = replay_observability_recording(payload)
+            if not report.passed:
+                raise ScenarioExecutionRefused(
+                    SCENARIO_TARGET_REPLAY_MISMATCH_REASON_V1
+                )
+            return report
+        if target_kind is ScenarioTargetKindV1.MULTIVENUE_RECORDING_V1:
+            from kirby2.multivenue.replay import replay_multivenue_recording
+
+            report = replay_multivenue_recording(payload)
+            if not report.passed:
+                raise ScenarioExecutionRefused(
+                    SCENARIO_TARGET_REPLAY_MISMATCH_REASON_V1
+                )
+            return report
+        if target_kind is ScenarioTargetKindV1.HISTORICAL_LESSON_V1:
+            from kirby2.historical.lesson_runner import run_historical_lesson
+
+            return run_historical_lesson(payload)
+        raise AssertionError(f"unhandled scenario target kind: {target_kind.value}")
 
     def persist(payload: object) -> bytes:
         return canonical_native_payload_bytes(target_kind, payload)
@@ -280,6 +348,37 @@ def compile_scenario(
         native_payload,
         cli_seed_override=cli_seed_override,
         warnings=warnings,
+        target_registry=target_registry,
+    )
+
+
+def compile_validated_scenario(
+    source_root: Path,
+    entry_path: str,
+    native_payload: object,
+    *,
+    activated_pack_namespaces: Mapping[str, Path] | None = None,
+    limits: ScenarioImportLimitsV1 = ScenarioImportLimitsV1(),
+    cli_seed_override: int | None = None,
+    warnings: tuple[str, ...] = (),
+    target_registry: ScenarioTargetRegistry = DEFAULT_SCENARIO_TARGET_REGISTRY,
+) -> CompiledScenarioArtifactV1:
+    """Compile, statically validate, and finalize one execution-eligible artifact."""
+
+    artifact = compile_scenario(
+        source_root,
+        entry_path,
+        native_payload,
+        activated_pack_namespaces=activated_pack_namespaces,
+        limits=limits,
+        cli_seed_override=cli_seed_override,
+        warnings=warnings,
+        target_registry=target_registry,
+    )
+    from .validation import finalize_compiled_scenario
+
+    return finalize_compiled_scenario(
+        artifact,
         target_registry=target_registry,
     )
 
@@ -363,6 +462,8 @@ def compile_resolved_scenario(
         "source_schema_version": SCENARIO_SOURCE_SCHEMA_VERSION,
         "target_kind": target_kind.value,
         "target_version": adapter.target_version,
+        "validation_report_digest": None,
+        "validation_report_json": None,
         "warnings": list(normalized_warnings),
     }
     artifact_digest = compiled_artifact_digest(
@@ -384,7 +485,7 @@ def run_compiled_scenario(
     *,
     target_registry: ScenarioTargetRegistry = DEFAULT_SCENARIO_TARGET_REGISTRY,
 ) -> object:
-    """Run only a future validator-finalized artifact; WO32-C always fails closed."""
+    """Dispatch only a self-verifying WO32-D validation-finalized artifact."""
 
     if type(artifact) is not CompiledScenarioArtifactV1:
         raise TypeError("scenario runtime requires a compiled V1 artifact")
@@ -395,7 +496,7 @@ def run_compiled_scenario(
     expected_operations = artifact.as_dict()["adapter_operations"]
     if expected_operations != dict(adapter.operation_ids):
         raise ScenarioExecutionRefused("TARGET_ADAPTER_MISMATCH")
-    return adapter.run(artifact.plan_envelope.payload, artifact.seed_policy)
+    return adapter.run(artifact)
 
 
 def replay_compiled_scenario(raw: bytes) -> CompiledScenarioArtifactV1:
@@ -484,38 +585,70 @@ def _materialized_plan(
 
 def _capability_inventory(
     materialized_plan: Mapping[str, object],
-) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, str], ...]]:
+) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
     root = materialized_plan["root_source"]
     if not isinstance(root, Mapping):
         raise TypeError("materialized scenario root must be an object")
     section = root["required_source_capabilities"]
     if not isinstance(section, Mapping) or type(section.get("records")) is not list:
         raise TypeError("materialized capability section is malformed")
-    declarations = tuple(
-        sorted(
-            (
-                {
-                    "declaration_id": str(record["logical_name"]),
-                    "record": dict(record),
-                }
-                for record in section["records"]
-                if isinstance(record, Mapping)
-            ),
-            key=lambda item: item["declaration_id"],
+    declarations_list: list[dict[str, object]] = []
+    for record in section["records"]:
+        if not isinstance(record, Mapping):
+            raise TypeError("materialized capability record is not an object")
+        declaration_id = record.get("logical_name")
+        if type(declaration_id) is not str:
+            raise TypeError("materialized capability declaration ID is invalid")
+        fields = record.get("fields")
+        if type(fields) is not list or any(
+            not isinstance(field, Mapping) for field in fields
+        ):
+            raise TypeError("materialized capability fields are malformed")
+        field_values = {
+            str(field["name"]): next(
+                value
+                for key, value in field.items()
+                if key != "name"
+            )
+            for field in fields
+            if type(field.get("name")) is str and len(field) == 2
+        }
+        if len(field_values) != len(fields):
+            raise ValueError("materialized capability fields are not exact")
+        capability_id = field_values.get("capability")
+        required = field_values.get("required", True)
+        if type(capability_id) is not str:
+            raise ValueError("capability declaration requires an identifier capability")
+        if type(required) is not bool:
+            raise ValueError("capability declaration required flag must be a bool")
+        declarations_list.append(
+            {
+                "capability_id": capability_id,
+                "declaration_id": declaration_id,
+                "record": dict(record),
+                "required": required,
+                "source_location": (
+                    "root_source.required_source_capabilities.records"
+                    f"[{declaration_id}]"
+                ),
+            }
         )
+    declarations = tuple(
+        sorted(declarations_list, key=lambda item: str(item["declaration_id"]))
     )
-    if len(declarations) != len(section["records"]):
-        raise TypeError("materialized capability record is not an object")
     declaration_ids = tuple(item["declaration_id"] for item in declarations)
     if len(declaration_ids) != len(set(declaration_ids)):
         raise ValueError("capability declaration IDs must be unique")
     decisions = tuple(
-        {
-            "decision": "PENDING_VALIDATOR",
-            "declaration_id": declaration_id,
-            "reason_code": SCENARIO_EXECUTION_INELIGIBLE_REASON_V1,
-        }
-        for declaration_id in declaration_ids
+        ScenarioCapabilityDecisionV1(
+            declaration_id=str(declaration["declaration_id"]),
+            capability_id=str(declaration["capability_id"]),
+            required=bool(declaration["required"]),
+            decision=ScenarioCapabilityDecisionStatusV1.PENDING_VALIDATOR,
+            reason_code=SCENARIO_EXECUTION_INELIGIBLE_REASON_V1,
+            source_location=str(declaration["source_location"]),
+        ).as_dict()
+        for declaration in declarations
     )
     return declarations, decisions
 
@@ -550,12 +683,15 @@ def _sha256(raw: bytes) -> str:
 __all__ = [
     "DEFAULT_SCENARIO_TARGET_REGISTRY",
     "SCENARIO_REFERENCE_MAX_DEPTH_V1",
+    "SCENARIO_TARGET_REPLAY_MISMATCH_REASON_V1",
+    "SCENARIO_TARGET_SEED_MISMATCH_REASON_V1",
     "ScenarioExecutionRefused",
     "ScenarioTargetAdapterV1",
     "ScenarioTargetRegistry",
     "build_scenario_target_registry_v1",
     "compile_resolved_scenario",
     "compile_scenario",
+    "compile_validated_scenario",
     "replay_compiled_scenario",
     "run_compiled_scenario",
 ]

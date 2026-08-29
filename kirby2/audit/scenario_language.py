@@ -12,12 +12,17 @@ from tempfile import TemporaryDirectory
 from typing import Callable
 
 from kirby2.research.toml_codec import canonical_toml
+from kirby2.scenario_lang.capabilities import (
+    ScenarioCapabilityRequirementV1,
+    scenario_capability_contract_digest_v1,
+)
 from kirby2.scenario_lang.compiler import (
     DEFAULT_SCENARIO_TARGET_REGISTRY,
     ScenarioExecutionRefused,
     ScenarioTargetRegistry,
     compile_resolved_scenario,
     compile_scenario,
+    compile_validated_scenario,
     replay_compiled_scenario,
     run_compiled_scenario,
 )
@@ -43,10 +48,13 @@ from kirby2.scenario_lang.models import (
     DEFINITION_MERGE_POLICIES_V1,
     SCENARIO_BEHAVIOR_SECTION_NAMES,
     SCENARIO_COMPILATION_PHASES_V1,
+    SCENARIO_EXECUTION_ELIGIBLE_REASON_V1,
     SCENARIO_EXECUTION_INELIGIBLE_REASON_V1,
+    SCENARIO_FINALIZED_COMPILATION_PHASES_V1,
     SCENARIO_PENDING_COMPILATION_PHASES_V1,
     SCENARIO_SOURCE_SECTION_NAMES,
     SCENARIO_TARGET_CONTRACTS_V1,
+    SCENARIO_VALIDATION_FAMILIES_V1,
     ExactFixedPointV1,
     CompiledScenarioArtifactV1,
     ScenarioDefinitionTypeV1,
@@ -59,6 +67,8 @@ from kirby2.scenario_lang.models import (
     ScenarioSectionV1,
     ScenarioSourceV1,
     ScenarioTargetKindV1,
+    ScenarioValidationReportV1,
+    ScenarioValidationSeverityV1,
     ScenarioValueKindV1,
     VolumeMultiplierV1,
 )
@@ -73,12 +83,19 @@ from kirby2.scenario_lang.schema import (
     parse_scenario_source,
     scenario_source_round_trip,
 )
+from kirby2.scenario_lang.validation import (
+    ScenarioValidationRefused,
+    finalize_compiled_scenario,
+    validate_compiled_scenario,
+)
 
 
 WO32A_STRICT_REFUSAL_COUNT = 13
 WO32B_IMPORT_REFUSAL_COUNT = 18
 WO32B_DEFINITION_REFUSAL_COUNT = 9
 WO32C_COMPILER_REFUSAL_COUNT = 15
+WO32D_VALIDATION_FAMILY_COUNT = 12
+WO32D_FINALIZATION_REFUSAL_COUNT = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +150,7 @@ def audit_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
         *audit_wo32a_scenario_language(),
         *audit_wo32b_scenario_language(),
         *audit_wo32c_scenario_language(),
+        *audit_wo32d_scenario_language(),
     )
 
 
@@ -157,6 +175,18 @@ def audit_wo32c_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
         _compiler_seed_policy_case(),
         _target_registry_and_runtime_case(),
         _hostile_compiler_refusal_case(),
+    )
+
+
+def audit_wo32d_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
+    """Exercise complete static validation and capability-bound finalization."""
+
+    return (
+        _validation_wo32abc_regression_case(),
+        _validation_report_and_finalization_case(),
+        _validation_family_diagnostics_case(),
+        _validation_target_capability_matrix_case(),
+        _validation_required_unknown_and_refusal_case(),
     )
 
 
@@ -1918,6 +1948,803 @@ def _hostile_compiler_refusal_case() -> ScenarioLanguageAuditCase:
     )
 
 
+def _validation_wo32abc_regression_case() -> ScenarioLanguageAuditCase:
+    cases = (
+        *audit_wo32a_scenario_language(),
+        *audit_wo32b_scenario_language(),
+        *audit_wo32c_scenario_language(),
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ScenarioLanguageAuditCase(
+        "scenario_validation_wo32abc_regression",
+        (
+            f"prior_cases={len(cases)} passing="
+            f"{sum(not case.failures for case in cases)}"
+        ),
+        failures,
+    )
+
+
+def _validation_report_and_finalization_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    requirement = ScenarioCapabilityRequirementV1(
+        declaration_id="top_of_book_required",
+        capability_id="TOP_OF_BOOK_V1",
+        required=True,
+        source_location=(
+            "root_source.required_source_capabilities.records"
+            "[top_of_book_required]"
+        ),
+    )
+    with TemporaryDirectory(prefix="kirby2-wo32d-finalization-") as temp:
+        source_root = _write_validation_fixture(
+            Path(temp),
+            sections={
+                "required_source_capabilities": (
+                    _record(
+                        "top_of_book_required",
+                        record_type="CAPABILITY_REQUIREMENT",
+                        fields=(
+                            _field(
+                                "capability",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "TOP_OF_BOOK_V1",
+                            ),
+                        ),
+                    ),
+                )
+            },
+            requirements=(requirement,),
+        )
+        native = replace(_balanced_native_scenario(), duration_seconds=1)
+        unvalidated = compile_scenario(source_root, "main.toml", native)
+        report = validate_compiled_scenario(unvalidated)
+        repeated_report = validate_compiled_scenario(unvalidated)
+        if not report.passed or report.error_count != 0:
+            failures.append("valid compiled scenario did not produce a passing report")
+        if report.canonical_bytes() != repeated_report.canonical_bytes():
+            failures.append("repeated static validation changed report bytes")
+        if report.completed_families != SCENARIO_VALIDATION_FAMILIES_V1:
+            failures.append("validation report omitted or reordered a family")
+        if len(report.capability_decisions) != 1 or (
+            report.capability_decisions[0].decision.value != "SUPPORTED"
+        ):
+            failures.append("required top-of-book capability was not supported")
+        finalized = finalize_compiled_scenario(unvalidated, report)
+        direct = compile_validated_scenario(
+            source_root,
+            "main.toml",
+            replace(_balanced_native_scenario(), duration_seconds=1),
+        )
+        if finalized.canonical_bytes() != direct.canonical_bytes():
+            failures.append("direct validated compilation changed finalized bytes")
+        if (
+            not finalized.execution_eligible
+            or finalized.execution_reason_code
+            != SCENARIO_EXECUTION_ELIGIBLE_REASON_V1
+            or tuple(finalized.as_dict()["completed_phases"])
+            != SCENARIO_FINALIZED_COMPILATION_PHASES_V1
+            or finalized.as_dict()["pending_phases"]
+        ):
+            failures.append("passing report did not finalize exact execution state")
+        if finalized.validation_report != report or (
+            finalized.validation_report_digest
+            != report.validation_report_digest
+        ):
+            failures.append("finalized artifact did not bind the exact report")
+        for name in (
+            "source_bundle_digest",
+            "semantic_plan_digest",
+            "native_plan_digest",
+            "run_identity_digest",
+        ):
+            if getattr(finalized, name) != getattr(unvalidated, name):
+                failures.append(f"validation finalization changed {name}")
+        if finalized.compiled_artifact_digest == unvalidated.compiled_artifact_digest:
+            failures.append("validation report did not enter compiled artifact identity")
+        restored = replay_compiled_scenario(finalized.canonical_bytes())
+        if restored != finalized or restored.validation_report != report:
+            failures.append("validation-finalized artifact did not replay exactly")
+        before_run = _filesystem_snapshot(Path(temp))
+        run = run_compiled_scenario(finalized)
+        if (
+            getattr(run, "seed", None)
+            != finalized.seed_policy.selected_root_seed
+            or getattr(run, "duration_seconds", None) != 1
+        ):
+            failures.append("validated artifact did not reach its native run adapter")
+        if _filesystem_snapshot(Path(temp)) != before_run:
+            failures.append("validated in-memory runtime wrote to the fixture tree")
+        detached = finalized.validation_report.as_dict()
+        detached["findings"].append({"detached": True})
+        if finalized.canonical_bytes() != direct.canonical_bytes():
+            failures.append("detached report mutation changed finalized artifact")
+    return ScenarioLanguageAuditCase(
+        "scenario_validation_report_and_finalization",
+        (
+            f"families={len(SCENARIO_VALIDATION_FAMILIES_V1)} "
+            "report=canonical subject_digest=bound execution_eligible=true "
+            "runtime_handoff=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _validation_family_diagnostics_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    family_fixtures = _validation_family_fixtures()
+    observed: dict[str, str] = {}
+    with TemporaryDirectory(prefix="kirby2-wo32d-families-") as temp:
+        fixture_root = Path(temp)
+        for ordinal, (family, expected_code, sections, valid_digest) in enumerate(
+            family_fixtures,
+            start=1,
+        ):
+            case_root = fixture_root / f"family-{ordinal:02d}"
+            source_root = _write_validation_fixture(
+                case_root,
+                sections=sections,
+                valid_capability_digest=valid_digest,
+            )
+            artifact = compile_scenario(
+                source_root,
+                "main.toml",
+                _balanced_native_scenario(),
+            )
+            before = _filesystem_snapshot(case_root)
+            first = validate_compiled_scenario(artifact)
+            second = validate_compiled_scenario(artifact)
+            after = _filesystem_snapshot(case_root)
+            if before != after:
+                failures.append(f"{family} validation wrote to its fixture tree")
+            if first.canonical_bytes() != second.canonical_bytes():
+                failures.append(f"{family} diagnostics were not byte-stable")
+            matching = tuple(
+                item
+                for item in first.findings
+                if item.family == family and item.code == expected_code
+            )
+            if len(matching) != 1:
+                failures.append(
+                    f"{family} did not emit exactly one {expected_code} diagnostic"
+                )
+                continue
+            finding = matching[0]
+            if (
+                not finding.source_location
+                or finding.suggested_correction is None
+                or not finding.blocks_execution
+                or first.passed
+            ):
+                failures.append(f"{family} diagnostic was not useful and blocking")
+            observed[family] = finding.code
+    expected_families = set(SCENARIO_VALIDATION_FAMILIES_V1)
+    if set(observed) != expected_families:
+        failures.append(
+            "validation fixture matrix did not cover every fixed family: "
+            f"missing={sorted(expected_families.difference(observed))}"
+        )
+    if len(family_fixtures) != WO32D_VALIDATION_FAMILY_COUNT:
+        failures.append("WO32-D validation family fixture count changed")
+    return ScenarioLanguageAuditCase(
+        "scenario_validation_family_diagnostics",
+        (
+            f"families={len(family_fixtures)} stable_paths={len(observed)} "
+            "corrections=present writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _validation_target_capability_matrix_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    payloads = _compiler_native_payloads()
+    validated_kinds: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32d-targets-") as temp:
+        root = Path(temp)
+        for target_kind in ScenarioTargetKindV1:
+            sections: dict[str, tuple[ScenarioRecordV1, ...]] = {}
+            if target_kind is ScenarioTargetKindV1.FULL_DAY_PLAN_V1:
+                sections["seed_policy"] = (
+                    _seed_policy_record(
+                        extra_fields=(
+                            _field(
+                                "root_seed",
+                                ScenarioValueKindV1.SEED,
+                                payloads[target_kind].seed_policy.root_seed,
+                            ),
+                        ),
+                    ),
+                )
+            source_root = _write_validation_fixture(
+                root / target_kind.value.lower(),
+                sections=sections,
+                target_kind=target_kind,
+            )
+            artifact = compile_scenario(
+                source_root,
+                "main.toml",
+                payloads[target_kind],
+            )
+            report = validate_compiled_scenario(artifact)
+            if not report.passed:
+                failures.append(
+                    f"{target_kind.value} separately tagged target failed: "
+                    f"{[item.code for item in report.findings]}"
+                )
+                continue
+            finalized = finalize_compiled_scenario(artifact, report)
+            if (
+                finalized.target_kind is not target_kind
+                or finalized.plan_envelope.target_kind is not target_kind
+                or type(finalized.plan_envelope.payload)
+                is not type(payloads[target_kind])
+            ):
+                failures.append(f"{target_kind.value} was silently coerced")
+                continue
+            validated_kinds.append(target_kind.value)
+    if tuple(validated_kinds) != tuple(kind.value for kind in ScenarioTargetKindV1):
+        failures.append("not every closed target validated independently")
+    return ScenarioLanguageAuditCase(
+        "scenario_validation_target_capability_matrix",
+        (
+            f"targets={len(validated_kinds)}/5 persist_replay=true "
+            "coercions=false separately_tagged=true"
+        ),
+        tuple(failures),
+    )
+
+
+def _validation_required_unknown_and_refusal_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    refusals = 0
+    with TemporaryDirectory(prefix="kirby2-wo32d-refusals-") as temp:
+        root = Path(temp)
+        unknown_root = _write_validation_fixture(
+            root / "required-unknown",
+            sections={
+                "strategy": (
+                    _record(
+                        "general_strategy",
+                        record_type="STRATEGY_V1",
+                        fields=(
+                            _field(
+                                "requires_general_proof",
+                                ScenarioValueKindV1.FLAG,
+                                True,
+                            ),
+                        ),
+                    ),
+                )
+            },
+        )
+        unknown_artifact = compile_scenario(
+            unknown_root,
+            "main.toml",
+            _balanced_native_scenario(),
+        )
+        unknown_report = validate_compiled_scenario(unknown_artifact)
+        blocking_unknown = tuple(
+            item
+            for item in unknown_report.findings
+            if item.severity
+            is ScenarioValidationSeverityV1.NOT_PROVABLE_STATICALLY
+            and item.required
+        )
+        if (
+            len(blocking_unknown) != 1
+            or unknown_report.passed
+            or unknown_report.blocking_not_provable_count != 1
+        ):
+            failures.append("required unknown proof was translated into a pass")
+
+        optional_requirement = ScenarioCapabilityRequirementV1(
+            declaration_id="optional_unknown",
+            capability_id="FUTURE_UNDECLARED_CAPABILITY_V1",
+            required=False,
+            source_location=(
+                "root_source.required_source_capabilities.records"
+                "[optional_unknown]"
+            ),
+        )
+        optional_root = _write_validation_fixture(
+            root / "optional-unknown",
+            sections={
+                "required_source_capabilities": (
+                    _record(
+                        "optional_unknown",
+                        record_type="CAPABILITY_REQUIREMENT",
+                        fields=(
+                            _field(
+                                "capability",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "FUTURE_UNDECLARED_CAPABILITY_V1",
+                            ),
+                            _field(
+                                "required",
+                                ScenarioValueKindV1.FLAG,
+                                False,
+                            ),
+                        ),
+                    ),
+                )
+            },
+            requirements=(optional_requirement,),
+        )
+        optional_artifact = compile_scenario(
+            optional_root,
+            "main.toml",
+            _balanced_native_scenario(),
+        )
+        optional_report = validate_compiled_scenario(optional_artifact)
+        if (
+            not optional_report.passed
+            or len(optional_report.capability_decisions) != 1
+            or optional_report.capability_decisions[0].decision.value
+            != "UNSUPPORTED"
+        ):
+            failures.append("optional unknown capability was hidden or made blocking")
+        finalized_optional = finalize_compiled_scenario(
+            optional_artifact,
+            optional_report,
+        )
+
+        valid_root = _write_validation_fixture(root / "valid", sections={})
+        valid_artifact = compile_scenario(
+            valid_root,
+            "main.toml",
+            _balanced_native_scenario(),
+        )
+        valid_report = validate_compiled_scenario(valid_artifact)
+        finalized = finalize_compiled_scenario(valid_artifact, valid_report)
+        alternate_root = _write_validation_fixture(
+            root / "alternate",
+            sections={"flow_model": (_record("alternate_flow"),)},
+        )
+        alternate_artifact = compile_scenario(
+            alternate_root,
+            "main.toml",
+            _balanced_native_scenario(),
+        )
+
+        probes: list[tuple[str, Callable[[], object]]] = [
+            (
+                "failing report finalization",
+                lambda: finalize_compiled_scenario(
+                    unknown_artifact,
+                    unknown_report,
+                ),
+            ),
+            (
+                "cross-artifact validation report",
+                lambda: finalize_compiled_scenario(
+                    alternate_artifact,
+                    valid_report,
+                ),
+            ),
+            (
+                "eligibility without report",
+                lambda: CompiledScenarioArtifactV1(
+                    _tampered_final_artifact_bytes(
+                        valid_artifact,
+                        lambda payload: payload.update(
+                            {
+                                "completed_phases": list(
+                                    SCENARIO_FINALIZED_COMPILATION_PHASES_V1
+                                ),
+                                "execution_eligible": True,
+                                "execution_reason_code": (
+                                    SCENARIO_EXECUTION_ELIGIBLE_REASON_V1
+                                ),
+                                "pending_phases": [],
+                            }
+                        ),
+                    )
+                ),
+            ),
+            (
+                "forged validation report digest",
+                lambda: CompiledScenarioArtifactV1(
+                    _tampered_final_artifact_bytes(
+                        finalized,
+                        lambda payload: payload.__setitem__(
+                            "validation_report_digest",
+                            "0" * 64,
+                        ),
+                    )
+                ),
+            ),
+            (
+                "noncanonical validation report JSON",
+                lambda: CompiledScenarioArtifactV1(
+                    _tampered_final_artifact_bytes(
+                        finalized,
+                        lambda payload: payload.__setitem__(
+                            "validation_report_json",
+                            str(payload["validation_report_json"]) + " ",
+                        ),
+                    )
+                ),
+            ),
+            (
+                "pending decision in finalized artifact",
+                lambda: CompiledScenarioArtifactV1(
+                    _tampered_final_artifact_bytes(
+                        finalized_optional,
+                        lambda payload: payload.__setitem__(
+                            "capability_decisions",
+                            optional_artifact.as_dict()["capability_decisions"],
+                        ),
+                    )
+                ),
+            ),
+            (
+                "validator-bypassing passing report",
+                lambda: finalize_compiled_scenario(
+                    unknown_artifact,
+                    _forged_passing_validation_report(unknown_report),
+                ),
+            ),
+        ]
+        for label, operation in probes:
+            failure = _expect_refusal(operation, label)
+            if failure is None:
+                refusals += 1
+            else:
+                failures.append(failure)
+        try:
+            run_compiled_scenario(valid_artifact)
+        except ScenarioExecutionRefused as error:
+            if error.reason_code == SCENARIO_EXECUTION_INELIGIBLE_REASON_V1:
+                refusals += 1
+            else:
+                failures.append("unvalidated runtime refused with wrong reason")
+        else:
+            failures.append("unvalidated artifact reached a target runtime")
+        if not finalized_optional.execution_eligible:
+            failures.append("optional unsupported capability could not finalize")
+    if refusals != WO32D_FINALIZATION_REFUSAL_COUNT:
+        failures.append("WO32-D finalization refusal inventory count changed")
+    return ScenarioLanguageAuditCase(
+        "scenario_validation_required_unknown_and_refusals",
+        (
+            f"required_unknown=blocked optional_unknown=explicit "
+            f"refused={refusals}/{WO32D_FINALIZATION_REFUSAL_COUNT}"
+        ),
+        tuple(failures),
+    )
+
+
+def _validation_family_fixtures() -> tuple[
+    tuple[
+        str,
+        str,
+        dict[str, tuple[ScenarioRecordV1, ...]],
+        bool,
+    ],
+    ...,
+]:
+    return (
+        (
+            "SESSION_AUCTION_HALT",
+            "INVALID_TIME_RANGE",
+            {
+                "session_schedule": (
+                    _record(
+                        "bad_window",
+                        record_type="SESSION_WINDOW_V1",
+                        fields=(
+                            _field("start_us", ScenarioValueKindV1.LATENCY_US, 20),
+                            _field("end_us", ScenarioValueKindV1.LATENCY_US, 10),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "STATE_GRAPH_REACHABILITY",
+            "UNREACHABLE_STRATEGY_STATE",
+            {
+                "day_local_states": (
+                    _record(
+                        "initial_state",
+                        record_type="STATE_V1",
+                        fields=(
+                            _field("initial", ScenarioValueKindV1.FLAG, True),
+                        ),
+                    ),
+                    _record(
+                        "orphan_state",
+                        record_type="STATE_V1",
+                        fields=(
+                            _field("initial", ScenarioValueKindV1.FLAG, False),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "TRANSITION_NUMERICS",
+            "INVALID_TRANSITION_WEIGHT",
+            {
+                "transition_rules": (
+                    _record(
+                        "zero_weight",
+                        record_type="STATE_TRANSITION_V1",
+                        fields=(
+                            _field(
+                                "from_state",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "first",
+                            ),
+                            _field(
+                                "to_state",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "second",
+                            ),
+                            _field(
+                                "probability_weight",
+                                ScenarioValueKindV1.COUNT,
+                                0,
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "HAWKES_STABILITY",
+            "HAWKES_PROFILE_UNKNOWN",
+            {
+                "flow_model": (
+                    _record(
+                        "unstable_hawkes",
+                        record_type="HAWKES_FLOW_V1",
+                        fields=(
+                            _field(
+                                "accepted_profile",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "not_accepted",
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "VENUE_INSTRUMENT_COMPATIBILITY",
+            "UNSUPPORTED_ORDER_INSTRUCTION",
+            {
+                "venues": (
+                    _record(
+                        "venue_a",
+                        record_type="VENUE_V1",
+                        fields=(
+                            _field(
+                                "supported_order_instructions",
+                                ScenarioValueKindV1.IDENTIFIERS,
+                                ("LIMIT", "PEGGED_TO_FUTURE"),
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "LATENCY_REPLAY_COMPATIBILITY",
+            "EXACT_REPLAY_REQUIRES_STRONGER_DATA",
+            {
+                "latency": (
+                    _record(
+                        "weak_replay",
+                        record_type="RECORDED_LATENCY_V1",
+                        fields=(
+                            _field(
+                                "replay_mode",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "EXACT_REPLAY",
+                            ),
+                            _field(
+                                "source_capability",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "BARS_ONLY",
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "FEATURE_OBSERVABILITY",
+            "HIDDEN_TRUTH_EXPOSED",
+            {
+                "strategy": (
+                    _record(
+                        "truth_strategy",
+                        record_type="STRATEGY_V1",
+                        fields=(
+                            _field(
+                                "required_features",
+                                ScenarioValueKindV1.IDENTIFIERS,
+                                ("GROUND_TRUTH",),
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "STRATEGY_NO_LOOKAHEAD",
+            "FUTURE_INFORMATION_EXPOSED",
+            {
+                "strategy": (
+                    _record(
+                        "future_strategy",
+                        record_type="STRATEGY_V1",
+                        fields=(
+                            _field(
+                                "future_offset_us",
+                                ScenarioValueKindV1.LATENCY_US,
+                                1,
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "RESOURCE_LIMITS",
+            "AGENT_BUDGET_UNBOUNDED",
+            {
+                "agent_populations": (
+                    _record(
+                        "unbounded_agents",
+                        record_type="AGENT_POPULATION_V1",
+                        fields=(
+                            _field(
+                                "agent_count",
+                                ScenarioValueKindV1.COUNT,
+                                10,
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "CHECKPOINT_ADAPTERS",
+            "CHECKPOINT_ADAPTER_UNSUPPORTED",
+            {
+                "checkpoint_policy": (
+                    _record(
+                        "unsupported_checkpoint",
+                        record_type="CHECKPOINT_POLICY_V1",
+                        fields=(
+                            _field(
+                                "required_adapters",
+                                ScenarioValueKindV1.IDENTIFIERS,
+                                ("PYTHON_PICKLE_RUNTIME",),
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "HISTORICAL_CAPABILITY",
+            "HISTORICAL_MBO_REQUIRES_MARKET_BY_ORDER",
+            {
+                "historical_constraints": (
+                    _record(
+                        "weak_historical_source",
+                        record_type="HISTORICAL_SOURCE_V1",
+                        fields=(
+                            _field(
+                                "replay_mode",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "EXACT_REPLAY",
+                            ),
+                            _field(
+                                "requires_market_by_order",
+                                ScenarioValueKindV1.FLAG,
+                                True,
+                            ),
+                            _field(
+                                "source_capability",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "TRADES_AND_QUOTES",
+                            ),
+                        ),
+                    ),
+                )
+            },
+            True,
+        ),
+        (
+            "TARGET_CAPABILITY_CONTRACT",
+            "CAPABILITY_DIGEST_MISMATCH",
+            {},
+            False,
+        ),
+    )
+
+
+def _write_validation_fixture(
+    root: Path,
+    *,
+    sections: dict[str, tuple[ScenarioRecordV1, ...]],
+    target_kind: ScenarioTargetKindV1 = ScenarioTargetKindV1.MARKET_SCENARIO_V1,
+    requirements: tuple[ScenarioCapabilityRequirementV1, ...] = (),
+    valid_capability_digest: bool = True,
+) -> Path:
+    source_root = root / "source"
+    capability_digest = (
+        scenario_capability_contract_digest_v1(target_kind, requirements)
+        if valid_capability_digest
+        else "f" * 64
+    )
+    _write_document(
+        source_root / "main.toml",
+        _source_document_bytes(
+            f"audit_validation_{root.name}_v1",
+            sections=sections,
+            target_kind=target_kind,
+            capability_digest=capability_digest,
+        ),
+    )
+    return source_root
+
+
+def _tampered_final_artifact_bytes(
+    artifact: CompiledScenarioArtifactV1,
+    mutator: Callable[[dict[str, object]], None],
+) -> bytes:
+    payload = artifact.as_dict()
+    mutator(payload)
+    provenance = payload["provenance"]
+    if not isinstance(provenance, dict):
+        raise TypeError("audit compiled provenance must be an object")
+    body = dict(payload)
+    del body["compiled_artifact_digest"]
+    del body["provenance"]
+    payload["compiled_artifact_digest"] = compiled_artifact_digest(
+        canonical_semantic_plan_bytes(body),
+        provenance,
+    )
+    return canonical_semantic_plan_bytes(payload)
+
+
+def _forged_passing_validation_report(
+    report: ScenarioValidationReportV1,
+) -> ScenarioValidationReportV1:
+    payload = report.as_dict()
+    payload.update(
+        {
+            "blocking_not_provable_count": 0,
+            "error_count": 0,
+            "findings": [],
+            "not_provable_count": 0,
+            "passed": True,
+            "warning_count": 0,
+        }
+    )
+    return ScenarioValidationReportV1.from_dict(payload)
+
+
 def _write_compiler_fixture(
     root: Path,
     *,
@@ -2059,15 +2886,44 @@ def _balanced_native_scenario() -> object:
     return load_scenario_definitions()["balanced"]
 
 
-def _compiler_native_payloads() -> dict[ScenarioTargetKindV1, object]:
+def _runnable_full_day_plan() -> object:
     from kirby2.audit.full_day import _sample_plan
+    from kirby2.full_day.composition import (
+        INITIAL_PROFILE_ID,
+        executable_agent_mechanics_composition_matrix,
+    )
+    from kirby2.full_day.models import VersionedReferenceV1
+
+    base = _sample_plan()
+    matrix = executable_agent_mechanics_composition_matrix()
+    shock_policy = replace(
+        base.unscheduled_shock_policy,
+        enabled=False,
+        maximum_accepted_shocks=0,
+        acceptance_numerator=0,
+        acceptance_denominator=1,
+    )
+    return replace(
+        base,
+        composition_profile=VersionedReferenceV1(
+            INITIAL_PROFILE_ID,
+            2,
+            matrix.sha256,
+        ),
+        participant_schedule=(),
+        scheduled_events=(),
+        unscheduled_shock_policy=shock_policy,
+    )
+
+
+def _compiler_native_payloads() -> dict[ScenarioTargetKindV1, object]:
     from kirby2.historical.lesson_catalog import load_historical_lessons
     from kirby2.multivenue.replay import MultiVenueRecording
     from kirby2.observability.replay import ObservabilityRecording
 
     empty_digest = hashlib.sha256(b"{}").hexdigest()
     return {
-        ScenarioTargetKindV1.FULL_DAY_PLAN_V1: _sample_plan(),
+        ScenarioTargetKindV1.FULL_DAY_PLAN_V1: _runnable_full_day_plan(),
         ScenarioTargetKindV1.MARKET_SCENARIO_V1: _balanced_native_scenario(),
         ScenarioTargetKindV1.HIDDEN_LIQUIDITY_RECORDING_V1: ObservabilityRecording(
             rules={},
@@ -2261,12 +3117,16 @@ def _source_document_bytes(
     *,
     sections: dict[str, tuple[ScenarioRecordV1, ...]] | None = None,
     imports: tuple[ScenarioImportV1, ...] = (),
+    target_kind: ScenarioTargetKindV1 = ScenarioTargetKindV1.MARKET_SCENARIO_V1,
+    capability_digest: str | None = None,
 ) -> bytes:
     return canonical_toml(
         _source_document_payload(
             scenario_id,
             sections=sections,
             imports=imports,
+            target_kind=target_kind,
+            capability_digest=capability_digest,
         )
     ).encode("utf-8")
 
@@ -2276,6 +3136,8 @@ def _source_document_payload(
     *,
     sections: dict[str, tuple[ScenarioRecordV1, ...]] | None = None,
     imports: tuple[ScenarioImportV1, ...] = (),
+    target_kind: ScenarioTargetKindV1 = ScenarioTargetKindV1.MARKET_SCENARIO_V1,
+    capability_digest: str | None = None,
 ) -> dict[str, object]:
     selected_sections = sections or {}
     unknown_sections = set(selected_sections).difference(
@@ -2290,6 +3152,7 @@ def _source_document_payload(
         else empty
         for name in SCENARIO_BEHAVIOR_SECTION_NAMES
     }
+    target_contract = SCENARIO_TARGET_CONTRACTS_V1[target_kind]
     source = ScenarioSourceV1(
         schema_version=1,
         metadata=replace(
@@ -2297,6 +3160,15 @@ def _source_document_payload(
             scenario_id=scenario_id,
             title="WO32-B audit fixture",
             description="Confined import and definition fixture",
+            target_kind=target_kind,
+            target_version=target_contract.target_version,
+            adapter_id=target_contract.adapter_id,
+            adapter_version=target_contract.adapter_version,
+            capability_digest=(
+                _sample_source().metadata.capability_digest
+                if capability_digest is None
+                else capability_digest
+            ),
         ),
         **section_values,
     )
@@ -2392,8 +3264,11 @@ __all__ = [
     "WO32B_DEFINITION_REFUSAL_COUNT",
     "WO32B_IMPORT_REFUSAL_COUNT",
     "WO32C_COMPILER_REFUSAL_COUNT",
+    "WO32D_FINALIZATION_REFUSAL_COUNT",
+    "WO32D_VALIDATION_FAMILY_COUNT",
     "audit_scenario_language",
     "audit_wo32a_scenario_language",
     "audit_wo32b_scenario_language",
     "audit_wo32c_scenario_language",
+    "audit_wo32d_scenario_language",
 ]

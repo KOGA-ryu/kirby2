@@ -24,7 +24,13 @@ SCENARIO_COMPILED_ARTIFACT_SCHEMA_VERSION = 1
 SCENARIO_COMPILER_VERSION = 1
 SCENARIO_SEED_POLICY_SCHEMA_VERSION = 1
 SCENARIO_SEED_DERIVATION_POLICY_VERSION = 1
+SCENARIO_VALIDATION_REPORT_SCHEMA_VERSION = 1
+SCENARIO_VALIDATION_POLICY_VERSION = 1
 SCENARIO_EXECUTION_INELIGIBLE_REASON_V1 = "VALIDATOR_NOT_IMPLEMENTED"
+SCENARIO_EXECUTION_ELIGIBLE_REASON_V1 = "VALIDATION_PASSED"
+SCENARIO_VALIDATION_REPORT_DIGEST_DOMAIN_V1 = (
+    b"KIRBY2_SCENARIO_VALIDATION_REPORT_V1\x00"
+)
 SCENARIO_COMPILATION_PHASES_V1 = (
     "PARSE",
     "IMPORT_RESOLUTION",
@@ -36,6 +42,24 @@ SCENARIO_COMPILATION_PHASES_V1 = (
     "IMMUTABLE_ARTIFACT_CREATION",
 )
 SCENARIO_PENDING_COMPILATION_PHASES_V1 = ("CAPABILITY_VALIDATION",)
+SCENARIO_FINALIZED_COMPILATION_PHASES_V1 = (
+    *SCENARIO_COMPILATION_PHASES_V1,
+    "CAPABILITY_VALIDATION",
+)
+SCENARIO_VALIDATION_FAMILIES_V1 = (
+    "SESSION_AUCTION_HALT",
+    "STATE_GRAPH_REACHABILITY",
+    "TRANSITION_NUMERICS",
+    "HAWKES_STABILITY",
+    "VENUE_INSTRUMENT_COMPATIBILITY",
+    "LATENCY_REPLAY_COMPATIBILITY",
+    "FEATURE_OBSERVABILITY",
+    "STRATEGY_NO_LOOKAHEAD",
+    "RESOURCE_LIMITS",
+    "CHECKPOINT_ADAPTERS",
+    "HISTORICAL_CAPABILITY",
+    "TARGET_CAPABILITY_CONTRACT",
+)
 
 SCENARIO_SOURCE_SECTION_NAMES = (
     "metadata",
@@ -102,6 +126,432 @@ class ScenarioTargetKindV1(str, Enum):
     HIDDEN_LIQUIDITY_RECORDING_V1 = "HIDDEN_LIQUIDITY_RECORDING_V1"
     MULTIVENUE_RECORDING_V1 = "MULTIVENUE_RECORDING_V1"
     HISTORICAL_LESSON_V1 = "HISTORICAL_LESSON_V1"
+
+
+class ScenarioValidationSeverityV1(str, Enum):
+    ERROR = "ERROR"
+    WARNING = "WARNING"
+    NOT_PROVABLE_STATICALLY = "NOT_PROVABLE_STATICALLY"
+
+
+class ScenarioCapabilityDecisionStatusV1(str, Enum):
+    PENDING_VALIDATOR = "PENDING_VALIDATOR"
+    SUPPORTED = "SUPPORTED"
+    UNSUPPORTED = "UNSUPPORTED"
+    NOT_PROVABLE_STATICALLY = "NOT_PROVABLE_STATICALLY"
+
+
+_VALIDATION_SEVERITY_ORDER_V1 = {
+    ScenarioValidationSeverityV1.ERROR: 0,
+    ScenarioValidationSeverityV1.WARNING: 1,
+    ScenarioValidationSeverityV1.NOT_PROVABLE_STATICALLY: 2,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioValidationFindingV1:
+    family: str
+    severity: ScenarioValidationSeverityV1
+    code: str
+    source_location: str
+    message: str
+    suggested_correction: str | None = None
+    required: bool = True
+
+    def __post_init__(self) -> None:
+        if self.family not in SCENARIO_VALIDATION_FAMILIES_V1:
+            raise ValueError("scenario validation finding uses an unknown family")
+        if type(self.severity) is not ScenarioValidationSeverityV1:
+            raise TypeError("scenario validation finding severity is invalid")
+        _validate_identifier(self.code, "scenario validation finding code")
+        _validate_text(self.source_location, "scenario validation source location")
+        _validate_text(self.message, "scenario validation finding message")
+        if self.suggested_correction is not None:
+            _validate_text(
+                self.suggested_correction,
+                "scenario validation suggested correction",
+            )
+        if type(self.required) is not bool:
+            raise TypeError("scenario validation finding required flag must be a bool")
+
+    @property
+    def blocks_execution(self) -> bool:
+        return self.severity is ScenarioValidationSeverityV1.ERROR or (
+            self.required
+            and self.severity
+            is ScenarioValidationSeverityV1.NOT_PROVABLE_STATICALLY
+        )
+
+    def sort_key(self) -> tuple[object, ...]:
+        return (
+            SCENARIO_VALIDATION_FAMILIES_V1.index(self.family),
+            _VALIDATION_SEVERITY_ORDER_V1[self.severity],
+            self.source_location,
+            self.code,
+            self.message,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "family": self.family,
+            "message": self.message,
+            "required": self.required,
+            "severity": self.severity.value,
+            "source_location": self.source_location,
+            "suggested_correction": self.suggested_correction,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ScenarioValidationFindingV1:
+        _require_exact_fields(
+            payload,
+            {
+                "code",
+                "family",
+                "message",
+                "required",
+                "severity",
+                "source_location",
+                "suggested_correction",
+            },
+            "scenario validation finding",
+        )
+        raw_required = payload["required"]
+        raw_correction = payload["suggested_correction"]
+        if type(raw_required) is not bool:
+            raise TypeError("scenario validation finding required flag must be a bool")
+        if raw_correction is not None and type(raw_correction) is not str:
+            raise TypeError("scenario validation correction must be text or null")
+        try:
+            severity = ScenarioValidationSeverityV1(
+                _exact_str(payload, "severity")
+            )
+        except ValueError as error:
+            raise ValueError("unknown scenario validation severity") from error
+        return cls(
+            family=_exact_str(payload, "family"),
+            severity=severity,
+            code=_exact_str(payload, "code"),
+            source_location=_exact_str(payload, "source_location"),
+            message=_exact_str(payload, "message"),
+            suggested_correction=raw_correction,
+            required=raw_required,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioCapabilityDecisionV1:
+    declaration_id: str
+    capability_id: str
+    required: bool
+    decision: ScenarioCapabilityDecisionStatusV1
+    reason_code: str
+    source_location: str
+
+    def __post_init__(self) -> None:
+        _validate_identifier(self.declaration_id, "scenario capability declaration ID")
+        _validate_identifier(self.capability_id, "scenario capability ID")
+        if type(self.required) is not bool:
+            raise TypeError("scenario capability required flag must be a bool")
+        if type(self.decision) is not ScenarioCapabilityDecisionStatusV1:
+            raise TypeError("scenario capability decision status is invalid")
+        _validate_identifier(self.reason_code, "scenario capability reason code")
+        _validate_text(self.source_location, "scenario capability source location")
+
+    @property
+    def blocks_execution(self) -> bool:
+        return self.required and self.decision is not (
+            ScenarioCapabilityDecisionStatusV1.SUPPORTED
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "capability_id": self.capability_id,
+            "decision": self.decision.value,
+            "declaration_id": self.declaration_id,
+            "reason_code": self.reason_code,
+            "required": self.required,
+            "source_location": self.source_location,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ScenarioCapabilityDecisionV1:
+        _require_exact_fields(
+            payload,
+            {
+                "capability_id",
+                "decision",
+                "declaration_id",
+                "reason_code",
+                "required",
+                "source_location",
+            },
+            "scenario capability decision",
+        )
+        raw_required = payload["required"]
+        if type(raw_required) is not bool:
+            raise TypeError("scenario capability required flag must be a bool")
+        try:
+            decision = ScenarioCapabilityDecisionStatusV1(
+                _exact_str(payload, "decision")
+            )
+        except ValueError as error:
+            raise ValueError("unknown scenario capability decision") from error
+        return cls(
+            declaration_id=_exact_str(payload, "declaration_id"),
+            capability_id=_exact_str(payload, "capability_id"),
+            required=raw_required,
+            decision=decision,
+            reason_code=_exact_str(payload, "reason_code"),
+            source_location=_exact_str(payload, "source_location"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioValidationReportV1:
+    schema_version: int
+    policy_version: int
+    subject_artifact_digest: str
+    source_bundle_digest: str
+    semantic_plan_digest: str
+    native_plan_digest: str
+    run_identity_digest: str
+    target_kind: ScenarioTargetKindV1
+    target_version: int
+    adapter_id: str
+    adapter_version: int
+    completed_families: tuple[str, ...]
+    findings: tuple[ScenarioValidationFindingV1, ...]
+    capability_decisions: tuple[ScenarioCapabilityDecisionV1, ...]
+    error_count: int
+    warning_count: int
+    not_provable_count: int
+    blocking_not_provable_count: int
+    passed: bool
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != SCENARIO_VALIDATION_REPORT_SCHEMA_VERSION
+        ):
+            raise ValueError("scenario validation report schema version must be 1")
+        if (
+            type(self.policy_version) is not int
+            or self.policy_version != SCENARIO_VALIDATION_POLICY_VERSION
+        ):
+            raise ValueError("scenario validation policy version must be 1")
+        for name in (
+            "subject_artifact_digest",
+            "source_bundle_digest",
+            "semantic_plan_digest",
+            "native_plan_digest",
+            "run_identity_digest",
+        ):
+            _validate_sha256(getattr(self, name), f"scenario validation {name}")
+        if type(self.target_kind) is not ScenarioTargetKindV1:
+            raise TypeError("scenario validation target kind is invalid")
+        contract = SCENARIO_TARGET_CONTRACTS_V1[self.target_kind]
+        if (
+            self.target_version != contract.target_version
+            or self.adapter_id != contract.adapter_id
+            or self.adapter_version != contract.adapter_version
+        ):
+            raise ValueError("scenario validation target contract is inconsistent")
+        if self.completed_families != SCENARIO_VALIDATION_FAMILIES_V1:
+            raise ValueError("scenario validation family inventory is incomplete")
+        if type(self.findings) is not tuple or any(
+            type(item) is not ScenarioValidationFindingV1 for item in self.findings
+        ):
+            raise TypeError("scenario validation findings must be an immutable tuple")
+        if self.findings != tuple(sorted(self.findings, key=lambda item: item.sort_key())):
+            raise ValueError("scenario validation findings are not canonically ordered")
+        finding_keys = tuple(
+            (item.family, item.code, item.source_location) for item in self.findings
+        )
+        if len(finding_keys) != len(set(finding_keys)):
+            raise ValueError("scenario validation findings contain duplicates")
+        if type(self.capability_decisions) is not tuple or any(
+            type(item) is not ScenarioCapabilityDecisionV1
+            for item in self.capability_decisions
+        ):
+            raise TypeError("scenario capability decisions must be an immutable tuple")
+        decision_ids = tuple(
+            item.declaration_id for item in self.capability_decisions
+        )
+        if decision_ids != tuple(sorted(set(decision_ids))):
+            raise ValueError("scenario capability decisions are not unique and sorted")
+        expected_counts = {
+            "error_count": sum(
+                item.severity is ScenarioValidationSeverityV1.ERROR
+                for item in self.findings
+            ),
+            "warning_count": sum(
+                item.severity is ScenarioValidationSeverityV1.WARNING
+                for item in self.findings
+            ),
+            "not_provable_count": sum(
+                item.severity
+                is ScenarioValidationSeverityV1.NOT_PROVABLE_STATICALLY
+                for item in self.findings
+            ),
+            "blocking_not_provable_count": sum(
+                item.required
+                and item.severity
+                is ScenarioValidationSeverityV1.NOT_PROVABLE_STATICALLY
+                for item in self.findings
+            ),
+        }
+        for name, expected in expected_counts.items():
+            if type(getattr(self, name)) is not int or getattr(self, name) != expected:
+                raise ValueError(f"scenario validation {name} is inconsistent")
+        if type(self.passed) is not bool:
+            raise TypeError("scenario validation passed state must be a bool")
+        expected_passed = not any(
+            item.blocks_execution for item in self.findings
+        ) and not any(
+            item.blocks_execution for item in self.capability_decisions
+        )
+        if self.passed is not expected_passed:
+            raise ValueError("scenario validation passed state is inconsistent")
+        if any(
+            item.decision is ScenarioCapabilityDecisionStatusV1.PENDING_VALIDATOR
+            for item in self.capability_decisions
+        ):
+            raise ValueError("completed validation report retains pending capabilities")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "adapter_id": self.adapter_id,
+            "adapter_version": self.adapter_version,
+            "blocking_not_provable_count": self.blocking_not_provable_count,
+            "capability_decisions": [
+                item.as_dict() for item in self.capability_decisions
+            ],
+            "completed_families": list(self.completed_families),
+            "error_count": self.error_count,
+            "findings": [item.as_dict() for item in self.findings],
+            "native_plan_digest": self.native_plan_digest,
+            "not_provable_count": self.not_provable_count,
+            "passed": self.passed,
+            "policy_version": self.policy_version,
+            "run_identity_digest": self.run_identity_digest,
+            "schema_version": self.schema_version,
+            "semantic_plan_digest": self.semantic_plan_digest,
+            "source_bundle_digest": self.source_bundle_digest,
+            "subject_artifact_digest": self.subject_artifact_digest,
+            "target_kind": self.target_kind.value,
+            "target_version": self.target_version,
+            "warning_count": self.warning_count,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        from .identity import canonical_semantic_plan_bytes
+
+        return canonical_semantic_plan_bytes(self.as_dict())
+
+    @property
+    def validation_report_digest(self) -> str:
+        return scenario_validation_report_digest_v1(self.canonical_bytes())
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> ScenarioValidationReportV1:
+        _require_exact_fields(
+            payload,
+            {
+                "adapter_id",
+                "adapter_version",
+                "blocking_not_provable_count",
+                "capability_decisions",
+                "completed_families",
+                "error_count",
+                "findings",
+                "native_plan_digest",
+                "not_provable_count",
+                "passed",
+                "policy_version",
+                "run_identity_digest",
+                "schema_version",
+                "semantic_plan_digest",
+                "source_bundle_digest",
+                "subject_artifact_digest",
+                "target_kind",
+                "target_version",
+                "warning_count",
+            },
+            "scenario validation report",
+        )
+        raw_families = payload["completed_families"]
+        raw_findings = payload["findings"]
+        raw_decisions = payload["capability_decisions"]
+        raw_passed = payload["passed"]
+        if type(raw_families) is not list or any(
+            type(item) is not str for item in raw_families
+        ):
+            raise TypeError("scenario validation families must be a string array")
+        if type(raw_findings) is not list or any(
+            not isinstance(item, Mapping) for item in raw_findings
+        ):
+            raise TypeError("scenario validation findings must be an object array")
+        if type(raw_decisions) is not list or any(
+            not isinstance(item, Mapping) for item in raw_decisions
+        ):
+            raise TypeError("scenario capability decisions must be an object array")
+        if type(raw_passed) is not bool:
+            raise TypeError("scenario validation passed state must be a bool")
+        try:
+            target_kind = ScenarioTargetKindV1(_exact_str(payload, "target_kind"))
+        except ValueError as error:
+            raise ValueError("scenario validation target kind is unsupported") from error
+        return cls(
+            schema_version=_exact_int(payload, "schema_version"),
+            policy_version=_exact_int(payload, "policy_version"),
+            subject_artifact_digest=_exact_str(payload, "subject_artifact_digest"),
+            source_bundle_digest=_exact_str(payload, "source_bundle_digest"),
+            semantic_plan_digest=_exact_str(payload, "semantic_plan_digest"),
+            native_plan_digest=_exact_str(payload, "native_plan_digest"),
+            run_identity_digest=_exact_str(payload, "run_identity_digest"),
+            target_kind=target_kind,
+            target_version=_exact_int(payload, "target_version"),
+            adapter_id=_exact_str(payload, "adapter_id"),
+            adapter_version=_exact_int(payload, "adapter_version"),
+            completed_families=tuple(raw_families),
+            findings=tuple(
+                ScenarioValidationFindingV1.from_dict(item)
+                for item in raw_findings
+            ),
+            capability_decisions=tuple(
+                ScenarioCapabilityDecisionV1.from_dict(item)
+                for item in raw_decisions
+            ),
+            error_count=_exact_int(payload, "error_count"),
+            warning_count=_exact_int(payload, "warning_count"),
+            not_provable_count=_exact_int(payload, "not_provable_count"),
+            blocking_not_provable_count=_exact_int(
+                payload,
+                "blocking_not_provable_count",
+            ),
+            passed=raw_passed,
+        )
+
+
+def scenario_validation_report_digest_v1(raw: bytes) -> str:
+    if type(raw) is not bytes:
+        raise TypeError("scenario validation report digest requires exact bytes")
+    digest = hashlib.sha256()
+    digest.update(SCENARIO_VALIDATION_REPORT_DIGEST_DOMAIN_V1)
+    digest.update(len(raw).to_bytes(8, "big"))
+    digest.update(raw)
+    return digest.hexdigest()
 
 
 class ScenarioDefinitionTypeV1(str, Enum):
@@ -1214,7 +1664,7 @@ def _canonical_native_json_bytes(value: object) -> bytes:
 
 @dataclass(frozen=True, slots=True, init=False)
 class CompiledScenarioArtifactV1:
-    """Self-verifying immutable WO32-C artifact.
+    """Self-verifying immutable compiled scenario artifact.
 
     The native envelope is embedded as canonical JSON text so legacy native plans
     may retain their already-governed finite floats without admitting floats into
@@ -1235,6 +1685,7 @@ class CompiledScenarioArtifactV1:
     run_identity_digest: str
     execution_eligible: bool
     execution_reason_code: str
+    validation_report_digest: str | None
     _canonical_bytes: bytes
 
     def __init__(self, canonical_bytes: bytes) -> None:
@@ -1275,6 +1726,8 @@ class CompiledScenarioArtifactV1:
                 "source_schema_version",
                 "target_kind",
                 "target_version",
+                "validation_report_digest",
+                "validation_report_json",
                 "warnings",
             },
             "compiled scenario artifact",
@@ -1326,22 +1779,26 @@ class CompiledScenarioArtifactV1:
 
         completed_phases = payload["completed_phases"]
         pending_phases = payload["pending_phases"]
-        if (
-            type(completed_phases) is not list
-            or tuple(completed_phases) != SCENARIO_COMPILATION_PHASES_V1
-            or type(pending_phases) is not list
-            or tuple(pending_phases) != SCENARIO_PENDING_COMPILATION_PHASES_V1
-        ):
-            raise ValueError("compiled scenario phase inventory is inconsistent")
-
         execution_eligible = payload["execution_eligible"]
         execution_reason_code = _exact_str(payload, "execution_reason_code")
         if type(execution_eligible) is not bool:
             raise TypeError("compiled scenario execution eligibility must be a bool")
-        if execution_eligible or (
+        if type(completed_phases) is not list or type(pending_phases) is not list:
+            raise TypeError("compiled scenario phases must be arrays")
+        if execution_eligible:
+            if (
+                execution_reason_code != SCENARIO_EXECUTION_ELIGIBLE_REASON_V1
+                or tuple(completed_phases)
+                != SCENARIO_FINALIZED_COMPILATION_PHASES_V1
+                or pending_phases
+            ):
+                raise ValueError("validated scenario phase inventory is inconsistent")
+        elif (
             execution_reason_code != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+            or tuple(completed_phases) != SCENARIO_COMPILATION_PHASES_V1
+            or tuple(pending_phases) != SCENARIO_PENDING_COMPILATION_PHASES_V1
         ):
-            raise ValueError("WO32-C artifacts must fail closed before validation")
+            raise ValueError("unvalidated scenario phase inventory is inconsistent")
 
         for key in (
             "source_bundle_digest",
@@ -1415,39 +1872,109 @@ class CompiledScenarioArtifactV1:
         ):
             raise TypeError("compiled capability decisions must be an object array")
         declaration_ids: list[str] = []
+        declaration_capabilities: dict[str, str] = {}
+        declaration_required: dict[str, bool] = {}
+        declaration_locations: dict[str, str] = {}
         for declaration in declarations:
             _require_exact_fields(
                 declaration,
-                {"declaration_id", "record"},
+                {
+                    "capability_id",
+                    "declaration_id",
+                    "record",
+                    "required",
+                    "source_location",
+                },
                 "compiled capability declaration",
             )
-            declaration_ids.append(
-                _validate_identifier(
-                    _exact_str(declaration, "declaration_id"),
-                    "compiled capability declaration ID",
-                )
+            declaration_id = _validate_identifier(
+                _exact_str(declaration, "declaration_id"),
+                "compiled capability declaration ID",
             )
+            capability_id = _validate_identifier(
+                _exact_str(declaration, "capability_id"),
+                "compiled capability ID",
+            )
+            required = declaration["required"]
+            if type(required) is not bool:
+                raise TypeError("compiled capability required flag must be a bool")
+            source_location = _exact_str(declaration, "source_location")
+            _validate_text(source_location, "compiled capability source location")
             if not isinstance(declaration["record"], Mapping):
                 raise TypeError("compiled capability declaration record must be an object")
-        decision_ids: list[str] = []
-        for decision in decisions:
-            _require_exact_fields(
-                decision,
-                {"decision", "declaration_id", "reason_code"},
-                "compiled capability decision",
-            )
-            decision_ids.append(_exact_str(decision, "declaration_id"))
-            if (
-                _exact_str(decision, "decision") != "PENDING_VALIDATOR"
-                or _exact_str(decision, "reason_code")
-                != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
-            ):
-                raise ValueError("WO32-C capability decisions must remain pending")
+            declaration_ids.append(declaration_id)
+            declaration_capabilities[declaration_id] = capability_id
+            declaration_required[declaration_id] = required
+            declaration_locations[declaration_id] = source_location
+        parsed_decisions = tuple(
+            ScenarioCapabilityDecisionV1.from_dict(decision)
+            for decision in decisions
+        )
+        decision_ids = [item.declaration_id for item in parsed_decisions]
         if (
             declaration_ids != sorted(set(declaration_ids))
             or decision_ids != declaration_ids
         ):
             raise ValueError("compiled capability declaration inventory is inconsistent")
+        for decision in parsed_decisions:
+            declaration_id = decision.declaration_id
+            if (
+                decision.capability_id
+                != declaration_capabilities[declaration_id]
+                or decision.required != declaration_required[declaration_id]
+                or decision.source_location != declaration_locations[declaration_id]
+            ):
+                raise ValueError("compiled capability decision differs from declaration")
+
+        validation_digest_value = payload["validation_report_digest"]
+        validation_json_value = payload["validation_report_json"]
+        validation_digest: str | None = None
+        validation_report: ScenarioValidationReportV1 | None = None
+        if execution_eligible:
+            validation_digest = _validate_sha256(
+                validation_digest_value,
+                "compiled scenario validation report digest",
+            )
+            if type(validation_json_value) is not str:
+                raise TypeError("validated scenario report must be canonical JSON text")
+            validation_bytes = validation_json_value.encode("utf-8")
+            validation_payload = _strict_json_object(
+                validation_bytes,
+                "compiled scenario validation report",
+            )
+            validation_report = ScenarioValidationReportV1.from_dict(
+                validation_payload
+            )
+            if (
+                validation_report.canonical_bytes() != validation_bytes
+                or validation_report.validation_report_digest != validation_digest
+            ):
+                raise ValueError("compiled scenario validation report is not canonical")
+            if not validation_report.passed:
+                raise ValueError("execution-eligible artifact has a failing report")
+            if (
+                validation_report.source_bundle_digest != source_digest
+                or validation_report.semantic_plan_digest != semantic_digest
+                or validation_report.native_plan_digest != native_digest
+                or validation_report.run_identity_digest != run_digest
+                or validation_report.target_kind is not target_kind
+                or validation_report.target_version != target_version
+                or validation_report.adapter_id != adapter_id
+                or validation_report.adapter_version != adapter_version
+                or parsed_decisions != validation_report.capability_decisions
+            ):
+                raise ValueError("compiled scenario validation report binds another plan")
+        else:
+            if validation_digest_value is not None or validation_json_value is not None:
+                raise ValueError("unvalidated scenario artifact carries a validation report")
+            if any(
+                decision.decision
+                is not ScenarioCapabilityDecisionStatusV1.PENDING_VALIDATOR
+                or decision.reason_code
+                != SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+                for decision in parsed_decisions
+            ):
+                raise ValueError("unvalidated capability decisions must remain pending")
 
         warnings = payload["warnings"]
         if type(warnings) is not list or any(
@@ -1456,6 +1983,40 @@ class CompiledScenarioArtifactV1:
             raise TypeError("compiled scenario warnings must be nonempty strings")
         if warnings != sorted(set(warnings)):
             raise ValueError("compiled scenario warnings must be unique and sorted")
+
+        if validation_report is not None:
+            subject_payload = dict(payload)
+            subject_payload["capability_decisions"] = [
+                ScenarioCapabilityDecisionV1(
+                    declaration_id=declaration_id,
+                    capability_id=declaration_capabilities[declaration_id],
+                    required=declaration_required[declaration_id],
+                    decision=ScenarioCapabilityDecisionStatusV1.PENDING_VALIDATOR,
+                    reason_code=SCENARIO_EXECUTION_INELIGIBLE_REASON_V1,
+                    source_location=declaration_locations[declaration_id],
+                ).as_dict()
+                for declaration_id in declaration_ids
+            ]
+            subject_payload["completed_phases"] = list(
+                SCENARIO_COMPILATION_PHASES_V1
+            )
+            subject_payload["execution_eligible"] = False
+            subject_payload["execution_reason_code"] = (
+                SCENARIO_EXECUTION_INELIGIBLE_REASON_V1
+            )
+            subject_payload["pending_phases"] = list(
+                SCENARIO_PENDING_COMPILATION_PHASES_V1
+            )
+            subject_payload["validation_report_digest"] = None
+            subject_payload["validation_report_json"] = None
+            del subject_payload["compiled_artifact_digest"]
+            del subject_payload["provenance"]
+            expected_subject_digest = compiled_artifact_digest(
+                canonical_semantic_plan_bytes(subject_payload),
+                provenance,
+            )
+            if validation_report.subject_artifact_digest != expected_subject_digest:
+                raise ValueError("validation report subject artifact digest differs")
 
         identity_body = dict(payload)
         del identity_body["compiled_artifact_digest"]
@@ -1481,6 +2042,7 @@ class CompiledScenarioArtifactV1:
         object.__setattr__(self, "run_identity_digest", run_digest)
         object.__setattr__(self, "execution_eligible", execution_eligible)
         object.__setattr__(self, "execution_reason_code", execution_reason_code)
+        object.__setattr__(self, "validation_report_digest", validation_digest)
         object.__setattr__(self, "_canonical_bytes", canonical_bytes)
 
     @classmethod
@@ -1524,6 +2086,19 @@ class CompiledScenarioArtifactV1:
             "compiled native plan envelope",
         )
         return ScenarioPlanEnvelopeV1.from_dict(payload)
+
+    @property
+    def validation_report(self) -> ScenarioValidationReportV1 | None:
+        raw = self.as_dict()["validation_report_json"]
+        if raw is None:
+            return None
+        if type(raw) is not str:  # validated during construction
+            raise AssertionError("compiled scenario validation report ceased to be text")
+        payload = _strict_json_object(
+            raw.encode("utf-8"),
+            "compiled scenario validation report",
+        )
+        return ScenarioValidationReportV1.from_dict(payload)
 
 
 def _strict_json_object(raw: bytes, context: str) -> dict[str, object]:
@@ -1594,7 +2169,9 @@ __all__ = [
     "SCENARIO_COMPILED_ARTIFACT_SCHEMA_VERSION",
     "SCENARIO_COMPILATION_PHASES_V1",
     "SCENARIO_COMPILER_VERSION",
+    "SCENARIO_EXECUTION_ELIGIBLE_REASON_V1",
     "SCENARIO_EXECUTION_INELIGIBLE_REASON_V1",
+    "SCENARIO_FINALIZED_COMPILATION_PHASES_V1",
     "SCENARIO_PENDING_COMPILATION_PHASES_V1",
     "SCENARIO_PLAN_ENVELOPE_SCHEMA_VERSION",
     "SCENARIO_SEED_DERIVATION_POLICY_VERSION",
@@ -1602,6 +2179,12 @@ __all__ = [
     "SCENARIO_SOURCE_SCHEMA_VERSION",
     "SCENARIO_SOURCE_SECTION_NAMES",
     "SCENARIO_TARGET_CONTRACTS_V1",
+    "SCENARIO_VALIDATION_FAMILIES_V1",
+    "SCENARIO_VALIDATION_POLICY_VERSION",
+    "SCENARIO_VALIDATION_REPORT_DIGEST_DOMAIN_V1",
+    "SCENARIO_VALIDATION_REPORT_SCHEMA_VERSION",
+    "ScenarioCapabilityDecisionStatusV1",
+    "ScenarioCapabilityDecisionV1",
     "ScenarioFieldV1",
     "ScenarioDefinitionMergePolicyV1",
     "ScenarioDefinitionTypeV1",
@@ -1622,10 +2205,14 @@ __all__ = [
     "ScenarioTargetContractV1",
     "ScenarioTargetKindV1",
     "ScenarioValueKindV1",
+    "ScenarioValidationFindingV1",
+    "ScenarioValidationReportV1",
+    "ScenarioValidationSeverityV1",
     "ResolvedScenarioBundleV1",
     "ResolvedScenarioDefinitionV1",
     "VolumeMultiplierV1",
     "canonical_native_payload_bytes",
     "parse_native_payload_bytes_v1",
     "parse_native_payload_v1",
+    "scenario_validation_report_digest_v1",
 ]
