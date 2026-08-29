@@ -88,6 +88,109 @@ class ScenarioTargetKindV1(str, Enum):
     HISTORICAL_LESSON_V1 = "HISTORICAL_LESSON_V1"
 
 
+class ScenarioDefinitionTypeV1(str, Enum):
+    """The closed set of reusable definition namespaces in source V1."""
+
+    MARKET = "market"
+    VENUE = "venue"
+    LATENCY = "latency"
+    AGENT_POPULATION = "agent_population"
+    REGIME = "regime"
+    HISTORICAL_SOURCE = "historical_source"
+    OBJECTIVE_TEMPLATE = "objective_template"
+
+
+DEFINITION_SECTION_BY_TYPE_V1: Mapping[ScenarioDefinitionTypeV1, str] = (
+    MappingProxyType(
+        {
+            ScenarioDefinitionTypeV1.MARKET: "market_profile",
+            ScenarioDefinitionTypeV1.VENUE: "venues",
+            ScenarioDefinitionTypeV1.LATENCY: "latency",
+            ScenarioDefinitionTypeV1.AGENT_POPULATION: "agent_populations",
+            ScenarioDefinitionTypeV1.REGIME: "regimes",
+            ScenarioDefinitionTypeV1.HISTORICAL_SOURCE: "historical_constraints",
+            ScenarioDefinitionTypeV1.OBJECTIVE_TEMPLATE: "player_objective",
+        }
+    )
+)
+DEFINITION_TYPE_BY_SECTION_V1: Mapping[str, ScenarioDefinitionTypeV1] = (
+    MappingProxyType(
+        {
+            section: definition_type
+            for definition_type, section in DEFINITION_SECTION_BY_TYPE_V1.items()
+        }
+    )
+)
+
+
+class ScenarioListMergeModeV1(str, Enum):
+    REPLACE = "REPLACE"
+    KEYED_MERGE = "KEYED_MERGE"
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioDefinitionMergePolicyV1:
+    definition_type: ScenarioDefinitionTypeV1
+    scalar_mode: str
+    identifier_list_mode: ScenarioListMergeModeV1
+
+    def __post_init__(self) -> None:
+        if type(self.definition_type) is not ScenarioDefinitionTypeV1:
+            raise TypeError("definition merge policy requires a V1 definition type")
+        if self.scalar_mode != "KEYED_OVERRIDE":
+            raise ValueError("V1 definition scalar merge must be KEYED_OVERRIDE")
+        if type(self.identifier_list_mode) is not ScenarioListMergeModeV1:
+            raise TypeError("definition list merge mode uses the wrong contract")
+
+
+DEFINITION_MERGE_POLICIES_V1: Mapping[
+    ScenarioDefinitionTypeV1, ScenarioDefinitionMergePolicyV1
+] = MappingProxyType(
+    {
+        definition_type: ScenarioDefinitionMergePolicyV1(
+            definition_type,
+            "KEYED_OVERRIDE",
+            list_mode,
+        )
+        for definition_type, list_mode in (
+            (
+                ScenarioDefinitionTypeV1.MARKET,
+                ScenarioListMergeModeV1.REPLACE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.VENUE,
+                ScenarioListMergeModeV1.KEYED_MERGE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.LATENCY,
+                ScenarioListMergeModeV1.REPLACE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.AGENT_POPULATION,
+                ScenarioListMergeModeV1.KEYED_MERGE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.REGIME,
+                ScenarioListMergeModeV1.REPLACE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.HISTORICAL_SOURCE,
+                ScenarioListMergeModeV1.REPLACE,
+            ),
+            (
+                ScenarioDefinitionTypeV1.OBJECTIVE_TEMPLATE,
+                ScenarioListMergeModeV1.KEYED_MERGE,
+            ),
+        )
+    }
+)
+
+
+class ScenarioSourceOriginV1(str, Enum):
+    SOURCE_ROOT = "SOURCE_ROOT"
+    PACK_NAMESPACE = "PACK_NAMESPACE"
+
+
 @dataclass(frozen=True, slots=True)
 class ScenarioTargetContractV1:
     target_kind: ScenarioTargetKindV1
@@ -488,6 +591,235 @@ class ScenarioSourceV1:
 ScenarioSource = ScenarioSourceV1
 
 
+@dataclass(frozen=True, slots=True)
+class ScenarioImportV1:
+    """One lexical source import before confinement resolution."""
+
+    path: str
+    pack_namespace: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_text(self.path, "scenario import path")
+        if "\x00" in self.path:
+            raise ValueError("scenario import path must not contain NUL")
+        if self.pack_namespace is not None:
+            _validate_identifier(self.pack_namespace, "scenario pack namespace")
+
+    def as_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {"path": self.path}
+        if self.pack_namespace is not None:
+            payload["pack_namespace"] = self.pack_namespace
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioSourceDocumentV1:
+    """One parsed document with stable, relocation-independent provenance."""
+
+    logical_path: str
+    origin: ScenarioSourceOriginV1
+    pack_namespace: str | None
+    source: ScenarioSourceV1
+    imports: tuple[ScenarioImportV1, ...]
+    raw_sha256: str
+    raw_byte_count: int
+
+    def __post_init__(self) -> None:
+        _validate_text(self.logical_path, "scenario document logical path")
+        if "\x00" in self.logical_path:
+            raise ValueError("scenario document logical path must not contain NUL")
+        if type(self.origin) is not ScenarioSourceOriginV1:
+            raise TypeError("scenario document origin uses the wrong contract")
+        if self.origin is ScenarioSourceOriginV1.SOURCE_ROOT:
+            if self.pack_namespace is not None:
+                raise ValueError("source-root document cannot claim a pack namespace")
+        elif self.pack_namespace is None:
+            raise ValueError("pack document requires its activated namespace")
+        else:
+            _validate_identifier(self.pack_namespace, "scenario pack namespace")
+        if type(self.source) is not ScenarioSourceV1:
+            raise TypeError("scenario document source uses the wrong contract")
+        if type(self.imports) is not tuple or any(
+            type(item) is not ScenarioImportV1 for item in self.imports
+        ):
+            raise TypeError("scenario document imports must be an immutable tuple")
+        _validate_sha256(self.raw_sha256, "scenario document raw digest")
+        if type(self.raw_byte_count) is not int or self.raw_byte_count <= 0:
+            raise ValueError("scenario document byte count must be positive")
+
+    def provenance_dict(self) -> dict[str, object]:
+        return {
+            "imports": [item.as_dict() for item in self.imports],
+            "logical_path": self.logical_path,
+            "origin": self.origin.value,
+            "pack_namespace": self.pack_namespace,
+            "raw_byte_count": self.raw_byte_count,
+            "raw_sha256": self.raw_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioImportEdgeV1:
+    importer_logical_path: str
+    imported_logical_path: str
+    import_ordinal: int
+
+    def __post_init__(self) -> None:
+        _validate_text(self.importer_logical_path, "scenario importer logical path")
+        _validate_text(self.imported_logical_path, "scenario imported logical path")
+        if type(self.import_ordinal) is not int or self.import_ordinal < 0:
+            raise ValueError("scenario import ordinal must be nonnegative")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "import_ordinal": self.import_ordinal,
+            "imported_logical_path": self.imported_logical_path,
+            "importer_logical_path": self.importer_logical_path,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioImportBundleV1:
+    """Complete ordered import graph and raw-byte identity."""
+
+    root_logical_path: str
+    documents: tuple[ScenarioSourceDocumentV1, ...]
+    edges: tuple[ScenarioImportEdgeV1, ...]
+    source_bundle_digest: str
+    expanded_byte_count: int
+
+    def __post_init__(self) -> None:
+        _validate_text(self.root_logical_path, "scenario root logical path")
+        if not self.documents or type(self.documents) is not tuple or any(
+            type(item) is not ScenarioSourceDocumentV1 for item in self.documents
+        ):
+            raise TypeError("scenario import bundle requires typed documents")
+        logical_paths = tuple(item.logical_path for item in self.documents)
+        if logical_paths[0] != self.root_logical_path:
+            raise ValueError("scenario root document must be first in import order")
+        if len(logical_paths) != len(set(logical_paths)):
+            raise ValueError("scenario import bundle document paths must be unique")
+        if type(self.edges) is not tuple or any(
+            type(item) is not ScenarioImportEdgeV1 for item in self.edges
+        ):
+            raise TypeError("scenario import graph edges must be an immutable tuple")
+        known = set(logical_paths)
+        if any(
+            edge.importer_logical_path not in known
+            or edge.imported_logical_path not in known
+            for edge in self.edges
+        ):
+            raise ValueError("scenario import edge references an unknown document")
+        _validate_sha256(self.source_bundle_digest, "scenario source bundle digest")
+        if (
+            type(self.expanded_byte_count) is not int
+            or self.expanded_byte_count
+            != sum(item.raw_byte_count for item in self.documents)
+        ):
+            raise ValueError("scenario expanded byte count differs from its documents")
+
+    @property
+    def root_source(self) -> ScenarioSourceV1:
+        return self.documents[0].source
+
+    def provenance_dict(self) -> dict[str, object]:
+        return {
+            "documents": [item.provenance_dict() for item in self.documents],
+            "edges": [item.as_dict() for item in self.edges],
+            "expanded_byte_count": self.expanded_byte_count,
+            "root_logical_path": self.root_logical_path,
+            "source_bundle_digest": self.source_bundle_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedScenarioDefinitionV1:
+    definition_type: ScenarioDefinitionTypeV1
+    qualified_name: str
+    source_logical_path: str
+    inheritance_chain: tuple[str, ...]
+    record: ScenarioRecordV1
+
+    def __post_init__(self) -> None:
+        if type(self.definition_type) is not ScenarioDefinitionTypeV1:
+            raise TypeError("resolved definition uses the wrong type contract")
+        expected = f"{self.definition_type.value}:{self.record.logical_name}"
+        if self.qualified_name != expected:
+            raise ValueError("resolved definition qualified name is inconsistent")
+        _validate_text(self.source_logical_path, "definition source logical path")
+        if type(self.inheritance_chain) is not tuple or any(
+            type(item) is not str or not item for item in self.inheritance_chain
+        ):
+            raise TypeError("definition inheritance chain must be a string tuple")
+        if len(self.inheritance_chain) != len(set(self.inheritance_chain)):
+            raise ValueError("definition inheritance chain must not contain a cycle")
+        if type(self.record) is not ScenarioRecordV1 or self.record.extends is not None:
+            raise ValueError("resolved definition must contain a flattened record")
+
+    def semantic_dict(self) -> dict[str, object]:
+        return {
+            "definition_type": self.definition_type.value,
+            "qualified_name": self.qualified_name,
+            "record": self.record.as_dict(semantic=True),
+        }
+
+    def provenance_dict(self) -> dict[str, object]:
+        return {
+            "inheritance_chain": list(self.inheritance_chain),
+            "qualified_name": self.qualified_name,
+            "source_logical_path": self.source_logical_path,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedScenarioBundleV1:
+    """Relocation-stable resolved definitions plus separate source provenance."""
+
+    import_bundle: ScenarioImportBundleV1
+    definitions: tuple[ResolvedScenarioDefinitionV1, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.import_bundle) is not ScenarioImportBundleV1:
+            raise TypeError("resolved scenario bundle requires an import bundle")
+        if type(self.definitions) is not tuple or any(
+            type(item) is not ResolvedScenarioDefinitionV1
+            for item in self.definitions
+        ):
+            raise TypeError("resolved scenario definitions must be an immutable tuple")
+        names = tuple(item.qualified_name for item in self.definitions)
+        if names != tuple(sorted(set(names))):
+            raise ValueError("resolved scenario definitions must be unique and sorted")
+
+    @property
+    def root_source(self) -> ScenarioSourceV1:
+        return self.import_bundle.root_source
+
+    def definition(self, qualified_name: str) -> ResolvedScenarioDefinitionV1:
+        for definition in self.definitions:
+            if definition.qualified_name == qualified_name:
+                return definition
+        raise KeyError(f"unknown scenario definition: {qualified_name}")
+
+    def semantic_projection(self) -> dict[str, object]:
+        root = self.root_source.semantic_projection()
+        for section_name in DEFINITION_TYPE_BY_SECTION_V1:
+            root[section_name] = {"records": []}
+        return {
+            "resolved_definitions": [
+                definition.semantic_dict() for definition in self.definitions
+            ],
+            "root_source": root,
+        }
+
+    def provenance_projection(self) -> dict[str, object]:
+        return {
+            "definition_resolution": [
+                definition.provenance_dict() for definition in self.definitions
+            ],
+            "import_bundle": self.import_bundle.provenance_dict(),
+        }
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ScenarioPlanEnvelopeV1:
     """Immutable tagged envelope around one existing native Kirby2 target.
@@ -736,6 +1068,9 @@ def _exact_str(payload: Mapping[str, object], key: str) -> str:
 
 
 __all__ = [
+    "DEFINITION_MERGE_POLICIES_V1",
+    "DEFINITION_SECTION_BY_TYPE_V1",
+    "DEFINITION_TYPE_BY_SECTION_V1",
     "ExactFixedPointV1",
     "SCENARIO_BEHAVIOR_SECTION_NAMES",
     "SCENARIO_PLAN_ENVELOPE_SCHEMA_VERSION",
@@ -743,15 +1078,25 @@ __all__ = [
     "SCENARIO_SOURCE_SECTION_NAMES",
     "SCENARIO_TARGET_CONTRACTS_V1",
     "ScenarioFieldV1",
+    "ScenarioDefinitionMergePolicyV1",
+    "ScenarioDefinitionTypeV1",
+    "ScenarioImportBundleV1",
+    "ScenarioImportEdgeV1",
+    "ScenarioImportV1",
+    "ScenarioListMergeModeV1",
     "ScenarioMetadataV1",
     "ScenarioPlanEnvelopeV1",
     "ScenarioRecordV1",
     "ScenarioSectionV1",
     "ScenarioSource",
+    "ScenarioSourceDocumentV1",
+    "ScenarioSourceOriginV1",
     "ScenarioSourceV1",
     "ScenarioTargetContractV1",
     "ScenarioTargetKindV1",
     "ScenarioValueKindV1",
+    "ResolvedScenarioBundleV1",
+    "ResolvedScenarioDefinitionV1",
     "VolumeMultiplierV1",
     "canonical_native_payload_bytes",
 ]

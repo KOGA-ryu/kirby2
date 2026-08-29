@@ -1,10 +1,14 @@
-"""Non-persisting executable evidence for the WO32-A source contracts."""
+"""Non-persisting executable evidence for the WO32 scenario language."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import os
 from dataclasses import dataclass, replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from kirby2.research.toml_codec import canonical_toml
@@ -15,11 +19,23 @@ from kirby2.scenario_lang.identity import (
     semantic_plan_digest,
     source_bundle_digest,
 )
+from kirby2.scenario_lang.imports import (
+    ScenarioImportLimitsV1,
+    ScenarioImportResolver,
+    parse_scenario_source_document,
+    validate_scenario_import_path,
+)
 from kirby2.scenario_lang.models import (
+    DEFINITION_SECTION_BY_TYPE_V1,
+    DEFINITION_MERGE_POLICIES_V1,
+    SCENARIO_BEHAVIOR_SECTION_NAMES,
     SCENARIO_SOURCE_SECTION_NAMES,
     SCENARIO_TARGET_CONTRACTS_V1,
     ExactFixedPointV1,
+    ScenarioDefinitionTypeV1,
     ScenarioFieldV1,
+    ScenarioImportV1,
+    ScenarioListMergeModeV1,
     ScenarioMetadataV1,
     ScenarioPlanEnvelopeV1,
     ScenarioRecordV1,
@@ -29,6 +45,7 @@ from kirby2.scenario_lang.models import (
     ScenarioValueKindV1,
     VolumeMultiplierV1,
 )
+from kirby2.scenario_lang.resolution import resolve_scenario_bundle
 from kirby2.scenario_lang.schema import (
     canonical_scenario_source_bytes,
     parse_canonical_scenario_source,
@@ -38,6 +55,8 @@ from kirby2.scenario_lang.schema import (
 
 
 WO32A_STRICT_REFUSAL_COUNT = 13
+WO32B_IMPORT_REFUSAL_COUNT = 18
+WO32B_DEFINITION_REFUSAL_COUNT = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +107,22 @@ def audit_wo32a_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
 
 
 def audit_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
-    return audit_wo32a_scenario_language()
+    return (
+        *audit_wo32a_scenario_language(),
+        *audit_wo32b_scenario_language(),
+    )
+
+
+def audit_wo32b_scenario_language() -> tuple[ScenarioLanguageAuditCase, ...]:
+    """Exercise confined imports and deterministic definition inheritance."""
+
+    return (
+        _wo32a_contract_regression_case(),
+        _nested_import_relocation_case(),
+        _definition_inheritance_merge_case(),
+        _hostile_import_graph_case(),
+        _hostile_definition_resolution_case(),
+    )
 
 
 def _sample_source() -> ScenarioSourceV1:
@@ -708,6 +742,868 @@ def _immutable_ownership_case(source: ScenarioSourceV1) -> ScenarioLanguageAudit
     )
 
 
+def _wo32a_contract_regression_case() -> ScenarioLanguageAuditCase:
+    cases = audit_wo32a_scenario_language()
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    if len(cases) != 6:
+        failures = (*failures, "WO32-A evidence inventory no longer has six cases")
+    return ScenarioLanguageAuditCase(
+        "scenario_import_wo32a_contract_regression",
+        f"wo32a_cases={len(cases)} passing={sum(not case.failures for case in cases)}",
+        failures,
+    )
+
+
+def _nested_import_relocation_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32b-relocation-a-") as first_temp, (
+        TemporaryDirectory(prefix="kirby2-wo32b-relocation-b-")
+    ) as second_temp:
+        first_source, first_pack = _write_valid_import_fixture(Path(first_temp))
+        second_source, second_pack = _write_valid_import_fixture(Path(second_temp))
+        first = resolve_scenario_bundle(
+            first_source,
+            "main.toml",
+            activated_pack_namespaces={"audit_pack": first_pack},
+        )
+        second = resolve_scenario_bundle(
+            second_source,
+            "main.toml",
+            activated_pack_namespaces={"audit_pack": second_pack},
+        )
+        expected_documents = (
+            "source-root:main.toml",
+            "source-root:defs/base.toml",
+            "pack:audit_pack:common/venue.toml",
+            "pack:audit_pack:common/latency.toml",
+        )
+        actual_documents = tuple(
+            document.logical_path for document in first.import_bundle.documents
+        )
+        if actual_documents != expected_documents:
+            failures.append("nested import graph did not retain declared DFS order")
+        expected_edges = (
+            (
+                "source-root:main.toml",
+                "source-root:defs/base.toml",
+                0,
+            ),
+            (
+                "source-root:defs/base.toml",
+                "pack:audit_pack:common/venue.toml",
+                0,
+            ),
+            (
+                "pack:audit_pack:common/venue.toml",
+                "pack:audit_pack:common/latency.toml",
+                0,
+            ),
+        )
+        actual_edges = tuple(
+            (
+                edge.importer_logical_path,
+                edge.imported_logical_path,
+                edge.import_ordinal,
+            )
+            for edge in first.import_bundle.edges
+        )
+        if actual_edges != expected_edges:
+            failures.append("nested import provenance omitted or reordered graph edges")
+        if first.semantic_projection() != second.semantic_projection():
+            failures.append("relocating source and pack roots changed resolved behavior")
+        if first.provenance_projection() != second.provenance_projection():
+            failures.append("relocating source and pack roots changed source provenance")
+        if (
+            first.import_bundle.source_bundle_digest
+            != second.import_bundle.source_bundle_digest
+        ):
+            failures.append("relocating roots changed the ordered source bundle digest")
+        encoded_provenance = json.dumps(
+            first.provenance_projection(),
+            sort_keys=True,
+        )
+        if str(first_source) in encoded_provenance or str(first_pack) in encoded_provenance:
+            failures.append("physical root path leaked into stable provenance")
+        if len(first.import_bundle.documents) != len(
+            {document.raw_sha256 for document in first.import_bundle.documents}
+        ):
+            failures.append("audit fixture unexpectedly reused a document byte digest")
+    return ScenarioLanguageAuditCase(
+        "scenario_nested_import_relocation",
+        "documents=4 edges=3 authorities=2 ordered_graph=true relocation_stable=true",
+        tuple(failures),
+    )
+
+
+def _definition_inheritance_merge_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    with TemporaryDirectory(prefix="kirby2-wo32b-inheritance-") as inherited_temp, (
+        TemporaryDirectory(prefix="kirby2-wo32b-flattened-")
+    ) as flattened_temp:
+        inherited_source, inherited_pack = _write_valid_import_fixture(
+            Path(inherited_temp)
+        )
+        flattened_source, flattened_pack = _write_valid_import_fixture(
+            Path(flattened_temp),
+            flattened=True,
+        )
+        inherited = resolve_scenario_bundle(
+            inherited_source,
+            "main.toml",
+            activated_pack_namespaces={"audit_pack": inherited_pack},
+        )
+        flattened = resolve_scenario_bundle(
+            flattened_source,
+            "main.toml",
+            activated_pack_namespaces={"audit_pack": flattened_pack},
+        )
+        market = inherited.definition("market:derived_market")
+        market_fields = {field.name: field for field in market.record.fields}
+        if tuple(market_fields["symbols"].value) != ("CCC",):
+            failures.append("market identifier list was not explicitly replaced")
+        if market_fields["initial_mid"].value != 10_050:
+            failures.append("child market scalar did not override its parent")
+        if market_fields["decision_interval"].value != 250:
+            failures.append("child market omitted an inherited scalar")
+        if market.record.reference != "base_market_reference":
+            failures.append("child market omitted its inherited reference")
+        if market.inheritance_chain != ("market:base_market",):
+            failures.append("market inheritance provenance is incomplete")
+
+        venue = inherited.definition("venue:derived_venue")
+        venue_fields = {field.name: field for field in venue.record.fields}
+        if tuple(venue_fields["supported_orders"].value) != (
+            "LIMIT",
+            "MARKET",
+            "POST_ONLY",
+        ):
+            failures.append("venue identifier list did not use keyed merge")
+        if venue_fields["queue_model"].value != "FIFO":
+            failures.append("child venue omitted an inherited scalar")
+        if venue.record.reference != "derived_venue_reference":
+            failures.append("child venue reference did not explicitly replace its parent")
+        if inherited.semantic_projection() != flattened.semantic_projection():
+            failures.append("inheritance and its explicitly flattened form differ semantically")
+        if semantic_plan_digest(inherited.semantic_projection()) != semantic_plan_digest(
+            flattened.semantic_projection()
+        ):
+            failures.append("flattened and inherited semantic identities differ")
+        if (
+            inherited.import_bundle.source_bundle_digest
+            == flattened.import_bundle.source_bundle_digest
+        ):
+            failures.append("inheritance source change disappeared from provenance identity")
+        if inherited.provenance_projection() == flattened.provenance_projection():
+            failures.append("inheritance chain disappeared from provenance")
+    return ScenarioLanguageAuditCase(
+        "scenario_definition_inheritance_merge",
+        "single_inheritance=true scalar_override=true list_replace=true keyed_merge=true",
+        tuple(failures),
+    )
+
+
+def _hostile_import_graph_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    refusals = 0
+
+    lexical_probes = (
+        ("HTTPS URL", "https://example.invalid/scenario.toml"),
+        ("file URI", "file:///tmp/scenario.toml"),
+        ("absolute POSIX path", "/tmp/scenario.toml"),
+        ("parent traversal", "../scenario.toml"),
+        ("backslash path", "nested\\scenario.toml"),
+        ("Windows drive path", "C:/scenario.toml"),
+        ("Windows UNC path", "//server/share/scenario.toml"),
+        ("NUL path", "scenario\x00.toml"),
+    )
+    for label, path in lexical_probes:
+        failure = _expect_refusal(
+            lambda value=path: validate_scenario_import_path(value),
+            label,
+        )
+        if failure is None:
+            refusals += 1
+        else:
+            failures.append(failure)
+
+    with TemporaryDirectory(prefix="kirby2-wo32b-hostile-imports-") as temp:
+        fixture_root = Path(temp)
+
+        case_root = fixture_root / "symlink_escape"
+        source_root = case_root / "source"
+        outside_root = case_root / "outside"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_symlink_escape_root_v1",
+                imports=(ScenarioImportV1("escape.toml"),),
+            ),
+        )
+        _write_document(
+            outside_root / "escape.toml",
+            _source_document_bytes("audit_symlink_escape_target_v1"),
+        )
+        os.symlink(outside_root / "escape.toml", source_root / "escape.toml")
+        refusals += _record_read_only_refusal(
+            failures,
+            "escaping symlink",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "duplicate_canonical"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_duplicate_canonical_root_v1",
+                imports=(
+                    ScenarioImportV1("target.toml"),
+                    ScenarioImportV1("alias.toml"),
+                ),
+            ),
+        )
+        _write_document(
+            source_root / "target.toml",
+            _source_document_bytes("audit_duplicate_canonical_target_v1"),
+        )
+        os.symlink(source_root / "target.toml", source_root / "alias.toml")
+        refusals += _record_read_only_refusal(
+            failures,
+            "duplicate canonical path",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "cycle"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_import_cycle_root_v1",
+                imports=(ScenarioImportV1("child.toml"),),
+            ),
+        )
+        _write_document(
+            source_root / "child.toml",
+            _source_document_bytes(
+                "audit_import_cycle_child_v1",
+                imports=(ScenarioImportV1("main.toml"),),
+            ),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "import cycle",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "depth_limit"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_depth_root_v1",
+                imports=(ScenarioImportV1("one.toml"),),
+            ),
+        )
+        _write_document(
+            source_root / "one.toml",
+            _source_document_bytes(
+                "audit_depth_one_v1",
+                imports=(ScenarioImportV1("two.toml"),),
+            ),
+        )
+        _write_document(
+            source_root / "two.toml",
+            _source_document_bytes("audit_depth_two_v1"),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "excessive import depth",
+            case_root,
+            lambda: ScenarioImportResolver(
+                source_root,
+                limits=ScenarioImportLimitsV1(maximum_depth=1),
+            ).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "count_limit"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_count_root_v1",
+                imports=(
+                    ScenarioImportV1("one.toml"),
+                    ScenarioImportV1("two.toml"),
+                ),
+            ),
+        )
+        _write_document(
+            source_root / "one.toml",
+            _source_document_bytes("audit_count_one_v1"),
+        )
+        _write_document(
+            source_root / "two.toml",
+            _source_document_bytes("audit_count_two_v1"),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "excessive import count",
+            case_root,
+            lambda: ScenarioImportResolver(
+                source_root,
+                limits=ScenarioImportLimitsV1(maximum_documents=2),
+            ).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "byte_limit"
+        source_root = case_root / "source"
+        byte_limited_source = _source_document_bytes("audit_byte_limit_root_v1")
+        _write_document(source_root / "main.toml", byte_limited_source)
+        refusals += _record_read_only_refusal(
+            failures,
+            "excessive expanded bytes",
+            case_root,
+            lambda: ScenarioImportResolver(
+                source_root,
+                limits=ScenarioImportLimitsV1(
+                    maximum_expanded_bytes=len(byte_limited_source) - 1
+                ),
+            ).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "unactivated_pack"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_unactivated_pack_root_v1",
+                imports=(ScenarioImportV1("definition.toml", "missing_pack"),),
+            ),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "unactivated pack namespace",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "pack_collision"
+        source_root = case_root / "source"
+        first_pack = case_root / "pack_one"
+        second_pack = case_root / "pack_two"
+        source_root.mkdir(parents=True)
+        first_pack.mkdir(parents=True)
+        second_pack.mkdir(parents=True)
+        refusals += _record_read_only_refusal(
+            failures,
+            "activated pack case collision",
+            case_root,
+            lambda: ScenarioImportResolver(
+                source_root,
+                activated_pack_namespaces={
+                    "AuditPack": first_pack,
+                    "auditpack": second_pack,
+                },
+            ),
+        )
+
+        case_root = fixture_root / "unicode_collision"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_unicode_collision_root_v1",
+                imports=(
+                    ScenarioImportV1("A.toml"),
+                    ScenarioImportV1("\uff21.toml"),
+                ),
+            ),
+        )
+        _write_document(
+            source_root / "A.toml",
+            _source_document_bytes("audit_unicode_collision_ascii_v1"),
+        )
+        _write_document(
+            source_root / "\uff21.toml",
+            _source_document_bytes("audit_unicode_collision_nfkc_v1"),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "Unicode logical path collision",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+        case_root = fixture_root / "missing_target"
+        source_root = case_root / "source"
+        _write_document(
+            source_root / "main.toml",
+            _source_document_bytes(
+                "audit_missing_target_root_v1",
+                imports=(ScenarioImportV1("missing.toml"),),
+            ),
+        )
+        refusals += _record_read_only_refusal(
+            failures,
+            "missing import target",
+            case_root,
+            lambda: ScenarioImportResolver(source_root).resolve("main.toml"),
+        )
+
+    if len(lexical_probes) + 10 != WO32B_IMPORT_REFUSAL_COUNT:
+        failures.append("hostile import refusal inventory count changed")
+    return ScenarioLanguageAuditCase(
+        "scenario_hostile_import_graph_refusals",
+        (
+            f"refused={refusals}/{WO32B_IMPORT_REFUSAL_COUNT} "
+            "network=false escape=false resolver_writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _hostile_definition_resolution_case() -> ScenarioLanguageAuditCase:
+    failures: list[str] = []
+    refusals = 0
+    with TemporaryDirectory(prefix="kirby2-wo32b-hostile-definitions-") as temp:
+        fixture_root = Path(temp)
+
+        def run_case(
+            case_name: str,
+            root_sections: dict[str, tuple[ScenarioRecordV1, ...]],
+            *,
+            imported_sections: dict[str, tuple[ScenarioRecordV1, ...]] | None = None,
+            raw_root_mutator: Callable[[dict[str, object]], None] | None = None,
+        ) -> None:
+            nonlocal refusals
+            case_root = fixture_root / case_name
+            source_root = case_root / "source"
+            imports = (
+                (ScenarioImportV1("definitions.toml"),)
+                if imported_sections is not None
+                else ()
+            )
+            root_raw = _source_document_bytes(
+                f"audit_{case_name}_root_v1",
+                sections=root_sections,
+                imports=imports,
+            )
+            if raw_root_mutator is not None:
+                payload = _source_document_payload(
+                    f"audit_{case_name}_root_v1",
+                    sections=root_sections,
+                    imports=imports,
+                )
+                raw_root_mutator(payload)
+                root_raw = canonical_toml(payload).encode("utf-8")
+            _write_document(source_root / "main.toml", root_raw)
+            if imported_sections is not None:
+                _write_document(
+                    source_root / "definitions.toml",
+                    _source_document_bytes(
+                        f"audit_{case_name}_import_v1",
+                        sections=imported_sections,
+                    ),
+                )
+            refusals += _record_read_only_refusal(
+                failures,
+                case_name.replace("_", " "),
+                case_root,
+                lambda: resolve_scenario_bundle(source_root, "main.toml"),
+            )
+
+        base_market = _record(
+            "base_market",
+            fields=(_field("price", ScenarioValueKindV1.PRICE_TICKS, 10_000),),
+        )
+        run_case(
+            "duplicate_definition",
+            {"market_profile": (base_market,)},
+            imported_sections={"market_profile": (base_market,)},
+        )
+        run_case(
+            "definition_case_collision",
+            {"market_profile": (_record("Base"),)},
+            imported_sections={"market_profile": (_record("base"),)},
+        )
+        run_case(
+            "unknown_parent",
+            {
+                "market_profile": (
+                    _record("derived", extends="market:missing"),
+                )
+            },
+        )
+        run_case(
+            "cross_type_inheritance",
+            {
+                "market_profile": (
+                    _record("derived", extends="venue:base_venue"),
+                ),
+                "venues": (_record("base_venue"),),
+            },
+        )
+        run_case(
+            "inheritance_cycle",
+            {
+                "market_profile": (
+                    _record("first", extends="market:second"),
+                    _record("second", extends="market:first"),
+                )
+            },
+        )
+        run_case(
+            "inherited_value_tag_change",
+            {
+                "market_profile": (
+                    base_market,
+                    _record(
+                        "derived",
+                        fields=(
+                            _field("price", ScenarioValueKindV1.COUNT, 10_000),
+                        ),
+                        extends="market:base_market",
+                    ),
+                )
+            },
+        )
+        run_case(
+            "inheritance_in_nondefinition",
+            {
+                "flow_model": (
+                    _record("flow", extends="market:base_market"),
+                )
+            },
+        )
+        run_case(
+            "imported_runtime_behavior",
+            {},
+            imported_sections={"flow_model": (_record("imported_flow"),)},
+        )
+
+        def make_multiple_inheritance(payload: dict[str, object]) -> None:
+            payload["market_profile"]["records"][0]["extends"] = [
+                "market:first",
+                "market:second",
+            ]
+
+        run_case(
+            "multiple_inheritance",
+            {
+                "market_profile": (
+                    _record("derived", extends="market:first"),
+                )
+            },
+            raw_root_mutator=make_multiple_inheritance,
+        )
+
+    policies = tuple(DEFINITION_MERGE_POLICIES_V1.values())
+    if set(DEFINITION_MERGE_POLICIES_V1) != set(ScenarioDefinitionTypeV1):
+        failures.append("definition merge policy does not cover exactly seven types")
+    if set(DEFINITION_SECTION_BY_TYPE_V1) != set(ScenarioDefinitionTypeV1):
+        failures.append("definition section mapping does not cover exactly seven types")
+    if len(ScenarioDefinitionTypeV1) != 7:
+        failures.append("reusable definition type inventory is not exactly seven")
+    if any(policy.scalar_mode != "KEYED_OVERRIDE" for policy in policies):
+        failures.append("definition scalar merge policy is not explicit")
+    list_modes = {
+        mode: sum(policy.identifier_list_mode is mode for policy in policies)
+        for mode in ScenarioListMergeModeV1
+    }
+    if list_modes != {
+        ScenarioListMergeModeV1.REPLACE: 4,
+        ScenarioListMergeModeV1.KEYED_MERGE: 3,
+    }:
+        failures.append("definition list replacement/keyed-merge policy changed")
+    if refusals != WO32B_DEFINITION_REFUSAL_COUNT:
+        failures.append("hostile definition refusal inventory count changed")
+    return ScenarioLanguageAuditCase(
+        "scenario_hostile_definition_refusals",
+        (
+            f"refused={refusals}/{WO32B_DEFINITION_REFUSAL_COUNT} "
+            "definition_types=7 single_inheritance=true resolver_writes=false"
+        ),
+        tuple(failures),
+    )
+
+
+def _write_valid_import_fixture(
+    root: Path,
+    *,
+    flattened: bool = False,
+) -> tuple[Path, Path]:
+    source_root = root / "source"
+    pack_root = root / "pack"
+    market_fields = (
+        _field("decision_interval", ScenarioValueKindV1.DURATION_MS, 250),
+        _field("initial_mid", ScenarioValueKindV1.PRICE_TICKS, 10_050),
+        _field("symbols", ScenarioValueKindV1.IDENTIFIERS, ("CCC",)),
+    )
+    venue_fields = (
+        _field("queue_model", ScenarioValueKindV1.IDENTIFIER, "FIFO"),
+        _field(
+            "supported_orders",
+            ScenarioValueKindV1.IDENTIFIERS,
+            ("LIMIT", "MARKET", "POST_ONLY"),
+        ),
+    )
+    root_market = _record(
+        "derived_market",
+        fields=(
+            market_fields
+            if flattened
+            else (
+                _field("initial_mid", ScenarioValueKindV1.PRICE_TICKS, 10_050),
+                _field("symbols", ScenarioValueKindV1.IDENTIFIERS, ("CCC",)),
+            )
+        ),
+        reference=("base_market_reference" if flattened else None),
+        extends=(None if flattened else "market:base_market"),
+    )
+    root_venue = _record(
+        "derived_venue",
+        fields=(
+            venue_fields
+            if flattened
+            else (
+                _field(
+                    "supported_orders",
+                    ScenarioValueKindV1.IDENTIFIERS,
+                    ("POST_ONLY",),
+                ),
+            )
+        ),
+        reference="derived_venue_reference",
+        extends=(None if flattened else "venue:base_venue"),
+    )
+    root_flow = _record(
+        "root_flow",
+        fields=(_field("message_rate", ScenarioValueKindV1.RATE_PER_SECOND, 40),),
+    )
+    _write_document(
+        source_root / "main.toml",
+        _source_document_bytes(
+            "audit_nested_root_v1",
+            sections={
+                "market_profile": (root_market,),
+                "venues": (root_venue,),
+                "flow_model": (root_flow,),
+            },
+            imports=(ScenarioImportV1("defs/base.toml"),),
+        ),
+    )
+    _write_document(
+        source_root / "defs" / "base.toml",
+        _source_document_bytes(
+            "audit_nested_base_v1",
+            sections={
+                "market_profile": (
+                    _record(
+                        "base_market",
+                        fields=(
+                            _field(
+                                "decision_interval",
+                                ScenarioValueKindV1.DURATION_MS,
+                                250,
+                            ),
+                            _field(
+                                "initial_mid",
+                                ScenarioValueKindV1.PRICE_TICKS,
+                                10_000,
+                            ),
+                            _field(
+                                "symbols",
+                                ScenarioValueKindV1.IDENTIFIERS,
+                                ("AAA", "BBB"),
+                            ),
+                        ),
+                        reference="base_market_reference",
+                    ),
+                )
+            },
+            imports=(
+                ScenarioImportV1("common/venue.toml", "audit_pack"),
+            ),
+        ),
+    )
+    _write_document(
+        pack_root / "common" / "venue.toml",
+        _source_document_bytes(
+            "audit_nested_venue_v1",
+            sections={
+                "venues": (
+                    _record(
+                        "base_venue",
+                        fields=(
+                            _field(
+                                "queue_model",
+                                ScenarioValueKindV1.IDENTIFIER,
+                                "FIFO",
+                            ),
+                            _field(
+                                "supported_orders",
+                                ScenarioValueKindV1.IDENTIFIERS,
+                                ("LIMIT", "MARKET"),
+                            ),
+                        ),
+                        reference="base_venue_reference",
+                    ),
+                )
+            },
+            imports=(ScenarioImportV1("latency.toml"),),
+        ),
+    )
+    _write_document(
+        pack_root / "common" / "latency.toml",
+        _source_document_bytes(
+            "audit_nested_latency_v1",
+            sections={
+                "latency": (
+                    _record(
+                        "base_latency",
+                        fields=(
+                            _field(
+                                "routing_latency",
+                                ScenarioValueKindV1.LATENCY_US,
+                                125,
+                            ),
+                        ),
+                    ),
+                )
+            },
+        ),
+    )
+    return source_root, pack_root
+
+
+def _source_document_bytes(
+    scenario_id: str,
+    *,
+    sections: dict[str, tuple[ScenarioRecordV1, ...]] | None = None,
+    imports: tuple[ScenarioImportV1, ...] = (),
+) -> bytes:
+    return canonical_toml(
+        _source_document_payload(
+            scenario_id,
+            sections=sections,
+            imports=imports,
+        )
+    ).encode("utf-8")
+
+
+def _source_document_payload(
+    scenario_id: str,
+    *,
+    sections: dict[str, tuple[ScenarioRecordV1, ...]] | None = None,
+    imports: tuple[ScenarioImportV1, ...] = (),
+) -> dict[str, object]:
+    selected_sections = sections or {}
+    unknown_sections = set(selected_sections).difference(
+        SCENARIO_BEHAVIOR_SECTION_NAMES
+    )
+    if unknown_sections:
+        raise ValueError(f"unknown audit fixture sections: {sorted(unknown_sections)}")
+    empty = ScenarioSectionV1(())
+    section_values = {
+        name: ScenarioSectionV1(tuple(selected_sections.get(name, ())))
+        if name in selected_sections
+        else empty
+        for name in SCENARIO_BEHAVIOR_SECTION_NAMES
+    }
+    source = ScenarioSourceV1(
+        schema_version=1,
+        metadata=replace(
+            _sample_source().metadata,
+            scenario_id=scenario_id,
+            title="WO32-B audit fixture",
+            description="Confined import and definition fixture",
+        ),
+        **section_values,
+    )
+    payload = source.as_dict()
+    if imports:
+        payload["imports"] = [item.as_dict() for item in imports]
+    return payload
+
+
+def _record(
+    logical_name: str,
+    *,
+    fields: tuple[ScenarioFieldV1, ...] = (),
+    reference: str | None = None,
+    extends: str | None = None,
+) -> ScenarioRecordV1:
+    return ScenarioRecordV1(
+        logical_name=logical_name,
+        record_type="AUDIT_DEFINITION_V1",
+        version=1,
+        fields=fields,
+        reference=reference,
+        extends=extends,
+    )
+
+
+def _field(
+    name: str,
+    value_kind: ScenarioValueKindV1,
+    value: object,
+) -> ScenarioFieldV1:
+    return ScenarioFieldV1(name, value_kind, value)
+
+
+def _write_document(path: Path, raw: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+
+
+def _record_read_only_refusal(
+    failures: list[str],
+    label: str,
+    fixture_root: Path,
+    operation: Callable[[], object],
+) -> int:
+    before = _filesystem_snapshot(fixture_root)
+    failure = _expect_refusal(operation, label)
+    after = _filesystem_snapshot(fixture_root)
+    if after != before:
+        failures.append(f"{label} changed its fixture filesystem")
+    if failure is not None:
+        failures.append(failure)
+        return 0
+    return 1
+
+
+def _filesystem_snapshot(root: Path) -> tuple[tuple[str, str, str], ...]:
+    entries: list[tuple[str, str, str]] = []
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(directory)
+        for name in sorted((*directory_names, *file_names)):
+            path = current / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                entries.append((relative, "symlink", os.readlink(path)))
+            elif path.is_dir():
+                entries.append((relative, "directory", ""))
+            elif path.is_file():
+                entries.append(
+                    (relative, "file", hashlib.sha256(path.read_bytes()).hexdigest())
+                )
+            else:
+                entries.append((relative, "other", ""))
+    return tuple(sorted(entries))
+
+
 def _expect_refusal(operation: Callable[[], object], label: str) -> str | None:
     try:
         operation()
@@ -719,6 +1615,9 @@ def _expect_refusal(operation: Callable[[], object], label: str) -> str | None:
 __all__ = [
     "ScenarioLanguageAuditCase",
     "WO32A_STRICT_REFUSAL_COUNT",
+    "WO32B_DEFINITION_REFUSAL_COUNT",
+    "WO32B_IMPORT_REFUSAL_COUNT",
     "audit_scenario_language",
     "audit_wo32a_scenario_language",
+    "audit_wo32b_scenario_language",
 ]
