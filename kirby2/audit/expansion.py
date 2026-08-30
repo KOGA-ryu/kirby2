@@ -138,6 +138,8 @@ REGISTERABLE_GATE_IDS = (
     "WO35-C",
     "WO35-D",
     "WO35-E",
+    "WO35-F",
+    "WO35-F1",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3539,6 +3541,155 @@ def _audit_wo35e() -> ExpansionGateReport:
     )
 
 
+def _audit_wo35f() -> ExpansionGateReport:
+    from kirby2.audit.strategy_discovery import (
+        WO35F_ARTIFACT_TYPE_FIXTURE_SHA256,
+        WO35F_AUDIT_CASE_COUNT,
+        WO35F_COMPARISON_FIXTURE_SHA256,
+        WO35F_LINEAGE_FIXTURE_SHA256,
+        WO35F_MANIFEST_FIXTURE_SHA256,
+        WO35F_REPORT_FIXTURE_SHA256,
+        audit_wo35f_strategy_lineage,
+    )
+    from kirby2.discovery.commands import (
+        CONTROLLED_EVIDENCE_REASON_V1,
+        LINEAGE_DEVELOPMENT_DATA_SOURCE_V1,
+        LINEAGE_DEVELOPMENT_SCHEMA_ID_V1,
+    )
+    from kirby2.discovery.report import (
+        DISCOVERY_COMPARISON_SCHEMA_ID_V1,
+        DISCOVERY_REPORT_SCHEMA_ID_V1,
+    )
+    from kirby2.discovery.store import (
+        DISCOVERY_BINDING_SCHEMA_ID_V1,
+        DISCOVERY_RECORD_SCHEMA_ID_V1,
+        DISCOVERY_STORE_POLICY_ID_V1,
+    )
+
+    cases = audit_wo35f_strategy_lineage()
+    expected_names = (
+        "f_committed_contract_and_development_manifest_are_exact",
+        "f_append_only_lineage_reloads_and_conflicts_refuse",
+        "f_terminal_fields_are_sealed_and_reveal_is_durably_single_use",
+        "f_lineage_and_comparison_reports_cover_every_scientific_path",
+        "f_discovery_artifacts_project_and_controlled_gate_stays_unexercised",
+    )
+    failures: list[str] = []
+    checks: list[ExpansionGateCheck] = []
+    if (
+        len(cases) != WO35F_AUDIT_CASE_COUNT
+        or tuple(case.name for case in cases) != expected_names
+    ):
+        failures.append("WO35-F cases differ from the frozen lineage inventory")
+    for case in cases:
+        wrapper_failures: list[str] = []
+        if not case.required:
+            wrapper_failures.append("WO35-F lineage cases must all be required")
+        failed = bool(case.failures or wrapper_failures)
+        checks.append(
+            ExpansionGateCheck(
+                code=case.name,
+                status=(
+                    ExpansionGateStatus.FAIL if failed else ExpansionGateStatus.PASS
+                ),
+                detail=case.detail,
+                required=True,
+            )
+        )
+        failures.extend(f"{case.name}: {failure}" for failure in case.failures)
+        failures.extend(
+            f"{case.name}: {failure}" for failure in wrapper_failures
+        )
+    return ExpansionGateReport(
+        card_id="WO35-F",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=tuple(checks),
+        failures=tuple(failures),
+        metadata=(
+            ("artifact_fixture_sha256", WO35F_ARTIFACT_TYPE_FIXTURE_SHA256),
+            ("audit_case_count", str(WO35F_AUDIT_CASE_COUNT)),
+            ("binding_schema_id", DISCOVERY_BINDING_SCHEMA_ID_V1),
+            ("comparison_fixture_sha256", WO35F_COMPARISON_FIXTURE_SHA256),
+            ("comparison_schema_id", DISCOVERY_COMPARISON_SCHEMA_ID_V1),
+            ("controlled_gate_absence_reason", CONTROLLED_EVIDENCE_REASON_V1),
+            ("development_data_source", LINEAGE_DEVELOPMENT_DATA_SOURCE_V1),
+            ("development_manifest_schema_id", LINEAGE_DEVELOPMENT_SCHEMA_ID_V1),
+            ("lineage_fixture_sha256", WO35F_LINEAGE_FIXTURE_SHA256),
+            ("manifest_fixture_sha256", WO35F_MANIFEST_FIXTURE_SHA256),
+            ("real_partition_access_count", "0"),
+            ("record_schema_id", DISCOVERY_RECORD_SCHEMA_ID_V1),
+            ("report_fixture_sha256", WO35F_REPORT_FIXTURE_SHA256),
+            ("report_schema_id", DISCOVERY_REPORT_SCHEMA_ID_V1),
+            ("store_policy_id", DISCOVERY_STORE_POLICY_ID_V1),
+        ),
+    )
+
+
+def _audit_wo35f1() -> ExpansionGateReport:
+    """Validate immutable controlled evidence without generating or rerunning it."""
+
+    from kirby2.discovery.commands import validate_controlled_evidence
+
+    repository = Path(__file__).resolve().parents[2]
+    manifest = repository / "kirby2" / "discovery" / "examples" / "bounded_search.toml"
+    evidence_root = repository / ".kirby2" / "discovery" / "controlled"
+    result = validate_controlled_evidence(
+        manifest_path=manifest,
+        evidence_root=evidence_root,
+    )
+    if result["status"] == ExpansionGateStatus.NOT_EXERCISED.value:
+        return ExpansionGateReport(
+            card_id="WO35-F1",
+            status=ExpansionGateStatus.NOT_EXERCISED,
+            checks=(
+                ExpansionGateCheck(
+                    code="controlled_strategy_discovery_evidence",
+                    status=ExpansionGateStatus.NOT_EXERCISED,
+                    detail=(
+                        "immutable controlled discovery evidence is absent; "
+                        "no search or terminal partition was regenerated"
+                    ),
+                    required=True,
+                ),
+            ),
+            reason_code=str(result["reason_code"]),
+            metadata=(
+                ("evidence_root", ".kirby2/discovery/controlled"),
+                ("generation_authority", "ABSENT_FROM_VALIDATOR"),
+                ("manifest_sha256", str(result["manifest_sha256"])),
+                ("reentry", "VERIFY_ONLY_NEVER_RERUN"),
+            ),
+        )
+    verification = result.get("verification")
+    passed = result["status"] == ExpansionGateStatus.PASS.value and isinstance(
+        verification,
+        dict,
+    ) and verification.get("status") == ExpansionGateStatus.PASS.value
+    failure = () if passed else ("controlled strategy-discovery evidence is invalid",)
+    return ExpansionGateReport(
+        card_id="WO35-F1",
+        status=(ExpansionGateStatus.PASS if passed else ExpansionGateStatus.FAIL),
+        checks=(
+            ExpansionGateCheck(
+                code="controlled_strategy_discovery_evidence",
+                status=(ExpansionGateStatus.PASS if passed else ExpansionGateStatus.FAIL),
+                detail=(
+                    f"immutable discovery_id={result.get('discovery_id', 'UNKNOWN')} "
+                    f"status={result['status']}"
+                ),
+                required=True,
+            ),
+        ),
+        failures=failure,
+        metadata=(
+            ("evidence_root", ".kirby2/discovery/controlled"),
+            ("generation_authority", "ABSENT_FROM_VALIDATOR"),
+            ("manifest_sha256", str(result["manifest_sha256"])),
+            ("reentry", "VERIFY_ONLY_NEVER_RERUN"),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3756,6 +3907,8 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-C", _audit_wo35c),
     ("WO35-D", _audit_wo35d),
     ("WO35-E", _audit_wo35e),
+    ("WO35-F", _audit_wo35f),
+    ("WO35-F1", _audit_wo35f1),
 )
 
 

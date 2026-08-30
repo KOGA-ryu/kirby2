@@ -1,0 +1,9 @@
+setup BOUNDED_BASE_V1
+window 5s
+unavailable REFUSE
+GREEN when
+spread_ticks <= 2
+book_imbalance >= 0.2
+WAIT when
+spread_ticks <= 4
+RED otherwise

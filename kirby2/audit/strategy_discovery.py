@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -259,6 +260,22 @@ WO35E_OVERFIT_FIXTURE_SHA256 = (
 )
 WO35E_REVEAL_FIXTURE_SHA256 = (
     "5907a21418b16db9476c2e96bc46dd6f202973abc3a5bce7fa9d39310de141e2"
+)
+WO35F_AUDIT_CASE_COUNT = 5
+WO35F_MANIFEST_FIXTURE_SHA256 = (
+    "1610f4895d7fa0556b1ae21645619bc0639dd631244aa2ad0296c6d568962842"
+)
+WO35F_LINEAGE_FIXTURE_SHA256 = (
+    "210048d2d51d2fdc612ddb6737859ec10aebc950b04726f28e3f825777903a86"
+)
+WO35F_REPORT_FIXTURE_SHA256 = (
+    "fe22ec2dc725df752e9b04e32dceb3e80fe35b619674760cc970f720a5d021ae"
+)
+WO35F_COMPARISON_FIXTURE_SHA256 = (
+    "0b5bcf3edf580dc593c070d79e3e7fca90f054025fce85a8fdc89e41b0341663"
+)
+WO35F_ARTIFACT_TYPE_FIXTURE_SHA256 = (
+    "c1506e6310698665ccade2ae798a070c2452a8dd3b780773d0fdcfd8daab3eaf"
 )
 
 _TRAFFIC_A = """\
@@ -3297,6 +3314,399 @@ def audit_wo35e_strategy_robustness() -> tuple[StrategyDiscoveryAuditCase, ...]:
     )
 
 
+def _wo35f_contract_case(
+    manifest_path: Path,
+    temporary_root: Path,
+) -> StrategyDiscoveryAuditCase:
+    from kirby2.cli.expansion import declared_expansion_command_names
+    from kirby2.discovery.commands import (
+        LineageDevelopmentManifestV1,
+        inspect_execution_preflight,
+    )
+
+    failures: list[str] = []
+    manifest = LineageDevelopmentManifestV1.load(manifest_path)
+    bounded = load_search_manifest(manifest_path.with_name("bounded_search.toml"))
+    bounded_partitions = thaw_json(bounded.payload)["partitions"]
+    bounded_roots = {
+        root
+        for roots in bounded_partitions.values()
+        for root in roots
+    }
+    development_roots = {
+        root
+        for _partition, roots in manifest.partitions
+        for root in roots
+    }
+    required_commands = (
+        "discover-strategy",
+        "inspect-lineage",
+        "compare-strategies",
+        "strategy-discovery-dev-demo",
+        "strategy-discovery-demo",
+    )
+    declared_commands = declared_expansion_command_names()
+    if any(command not in declared_commands for command in required_commands):
+        failures.append("strategy-discovery command registration is incomplete")
+    if (
+        not manifest.development_only
+        or manifest.real_partition_execution
+        or development_roots & bounded_roots
+    ):
+        failures.append("development fixture is not disjoint and development-only")
+    if manifest.raw_sha256 != WO35F_MANIFEST_FIXTURE_SHA256:
+        failures.append("WO35-F development manifest differs from its frozen bytes")
+
+    repository = temporary_root / "preflight-repository"
+    repository.mkdir()
+    base_path = repository / "base.strategy"
+    experiment_path = repository / "experiment.toml"
+    base_path.write_bytes(manifest.base_source)
+    experiment_path.write_bytes(manifest_path.read_bytes())
+    subprocess.run(
+        ("git", "init", "-q"),
+        cwd=repository,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ("git", "add", "--", "base.strategy", "experiment.toml"),
+        cwd=repository,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Kirby2 Audit",
+            "-c",
+            "user.email=audit@kirby2.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ),
+        cwd=repository,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    fresh_root = temporary_root / "fresh-evidence"
+    clean = inspect_execution_preflight(
+        repository=repository,
+        base_path=base_path,
+        manifest_path=experiment_path,
+        evidence_root=fresh_root,
+    )
+    occupied_root = temporary_root / "occupied-evidence"
+    occupied_root.mkdir()
+    occupied = inspect_execution_preflight(
+        repository=repository,
+        base_path=base_path,
+        manifest_path=experiment_path,
+        evidence_root=occupied_root,
+    )
+    base_path.write_bytes(manifest.base_source + b"# uncommitted drift\n")
+    dirty = inspect_execution_preflight(
+        repository=repository,
+        base_path=base_path,
+        manifest_path=experiment_path,
+        evidence_root=temporary_root / "second-fresh-evidence",
+    )
+    if not clean.passed:
+        failures.append("clean committed-input preflight did not pass")
+    if occupied.fresh_evidence_root:
+        failures.append("preflight accepted an occupied evidence root")
+    if dirty.clean_head or dirty.committed_inputs_match:
+        failures.append("preflight accepted dirty or uncommitted input bytes")
+    return StrategyDiscoveryAuditCase(
+        "f_committed_contract_and_development_manifest_are_exact",
+        (
+            f"manifest_sha256={manifest.raw_sha256} budget={manifest.budget} "
+            f"development_root_count={len(development_roots)} commands={len(required_commands)} "
+            "clean_committed=PASS dirty=REFUSED occupied_root=REFUSED "
+            "real_partition_access_count=0"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo35f_persistence_case(result, store) -> StrategyDiscoveryAuditCase:
+    failures: list[str] = []
+    fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes(result.as_dict())
+    ).hexdigest()
+    primary = store.load(result.primary_discovery_id)
+    recreated = store.create(primary.binding)
+    all_verified = all(
+        store.verify(discovery_id).passed
+        for discovery_id in result.discovery_ids
+    )
+    if not result.passed or not result.crash_reopen_passed:
+        failures.append("development lineage did not reload exactly after reopen")
+    if not result.conflict_refused:
+        failures.append("conflicting immutable result was not refused")
+    if recreated.ledger_sha256 != primary.ledger_sha256 or not all_verified:
+        failures.append("idempotent create or immutable inventory verification changed")
+    if fixture_sha256 != WO35F_LINEAGE_FIXTURE_SHA256:
+        failures.append("WO35-F durable lineage differs from its frozen fixture")
+    return StrategyDiscoveryAuditCase(
+        "f_append_only_lineage_reloads_and_conflicts_refuse",
+        (
+            f"fixture_sha256={fixture_sha256} discovery_count={len(result.discovery_ids)} "
+            f"primary_records={result.record_count} crash_reopen=PASS conflict=REFUSED "
+            "idempotent_create=PASS canonical_records=PASS"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo35f_reveal_case(result, store, manifest) -> StrategyDiscoveryAuditCase:
+    from kirby2.discovery.report import build_lineage_report
+    from kirby2.discovery.store import DiscoveryEventKindV1
+
+    failures: list[str] = []
+    ledger = store.load(result.primary_discovery_id)
+    event_order = tuple(record.event_kind for record in ledger.records)
+    required_order = (
+        DiscoveryEventKindV1.ROBUSTNESS_EVALUATED,
+        DiscoveryEventKindV1.TERMINAL_REVEALED,
+        DiscoveryEventKindV1.HOLDOUT_EVALUATED,
+        DiscoveryEventKindV1.ADVERSARIAL_EVALUATED,
+    )
+    positions = tuple(event_order.index(event) for event in required_order)
+    report = build_lineage_report(ledger)
+    stored_bytes = b"".join(
+        path.read_bytes()
+        for path in sorted(store.root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    )
+    reveal_records = tuple(
+        record
+        for record in ledger.records
+        if record.event_kind is DiscoveryEventKindV1.TERMINAL_REVEALED
+    )
+    if positions != tuple(sorted(positions)):
+        failures.append("robustness, reveal, holdout, and adversarial order changed")
+    if not result.sealed_before_reveal or not result.revealed_after_consume:
+        failures.append("terminal references were not visibly sealed until reveal")
+    if not result.repeat_reveal_refused or len(reveal_records) != 1:
+        failures.append("durable reveal token was not exactly single-use")
+    if manifest.reveal_token.encode("utf-8") in stored_bytes:
+        failures.append("plaintext reveal token leaked into immutable evidence")
+    if report.as_dict()["terminal_references"]["status"] != "REVEALED":
+        failures.append("terminal references were not visible after the receipt")
+    return StrategyDiscoveryAuditCase(
+        "f_terminal_fields_are_sealed_and_reveal_is_durably_single_use",
+        (
+            f"report_sha256={report.report_sha256} sealed_before=YES "
+            "robustness_before_reveal=YES access_record_before_exposure=YES "
+            "token_receipts=1 repeat=REFUSED plaintext_token=ABSENT"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo35f_reporting_case(result, store) -> StrategyDiscoveryAuditCase:
+    from kirby2.discovery.report import build_lineage_report, compare_strategies
+    from kirby2.discovery.store import SEALED_FIELD_MARKER_V1
+
+    failures: list[str] = []
+    report = build_lineage_report(store.load(result.primary_discovery_id))
+    payload = report.as_dict()
+    candidate_rows = payload["candidates"]
+    mutated = tuple(
+        row
+        for row in candidate_rows
+        if row["ancestor_semantic_sha256"] is not None
+    )
+    comparison = compare_strategies(
+        store,
+        mutated[0]["semantic_sha256"],
+        mutated[1]["semantic_sha256"],
+    )
+    comparison_payload = comparison.as_dict()
+    expected_fields = {
+        "ancestor_semantic_sha256",
+        "mutation",
+        "training_result",
+        "validation_result",
+        "holdout_result",
+        "rejection_reason",
+        "selected_descendants",
+    }
+    reports = tuple(
+        build_lineage_report(store.load(discovery_id)).as_dict()
+        for discovery_id in result.discovery_ids
+    )
+    sealed_terminal_paths = tuple(
+        item["terminal_references"].get("status")
+        for item in reports
+        if item["discovery_id"] != result.primary_discovery_id
+    )
+    if any(not expected_fields.issubset(row) for row in candidate_rows):
+        failures.append("lineage browser fields are incomplete")
+    if report.report_sha256 != WO35F_REPORT_FIXTURE_SHA256:
+        failures.append("WO35-F lineage report differs from its frozen fixture")
+    if comparison.comparison_sha256 != WO35F_COMPARISON_FIXTURE_SHA256:
+        failures.append("WO35-F strategy comparison differs from its frozen fixture")
+    if (
+        payload["live_profitability_claim"]
+        or payload["deployability_claim"]
+        or comparison_payload["live_profitability_claim"]
+    ):
+        failures.append("reporting made a profitability or deployability claim")
+    if set(result.outcomes) != {item.value for item in ScientificConclusionV1}:
+        failures.append("scientific terminal outcomes are incomplete")
+    if any(status != SEALED_FIELD_MARKER_V1 for status in sealed_terminal_paths):
+        failures.append("non-revealed terminal report paths are not visibly sealed")
+    return StrategyDiscoveryAuditCase(
+        "f_lineage_and_comparison_reports_cover_every_scientific_path",
+        (
+            f"report_sha256={report.report_sha256} "
+            f"comparison_sha256={comparison.comparison_sha256} "
+            f"outcome_count={len(result.outcomes)} candidate_count={len(candidate_rows)} "
+            "sealed_values=VISIBLE profitability_claim=FALSE deployability_claim=FALSE"
+        ),
+        tuple(failures),
+    )
+
+
+def _wo35f_artifact_and_f1_case(
+    result,
+    temporary_root: Path,
+    bounded_manifest_path: Path,
+) -> StrategyDiscoveryAuditCase:
+    from kirby2.discovery.commands import (
+        CONTROLLED_EVIDENCE_REASON_V1,
+        validate_controlled_evidence,
+    )
+    from kirby2.research.models import (
+        ArtifactReference,
+        RunManifest,
+        RunType,
+    )
+    from kirby2.research.tables import strategy_discovery_artifact_registry_rows
+
+    failures: list[str] = []
+    artifact_types = (
+        ArtifactType.STRATEGY_DISCOVERY_BINDING,
+        ArtifactType.STRATEGY_DISCOVERY_RECORD,
+        ArtifactType.STRATEGY_LINEAGE_REPORT,
+        ArtifactType.STRATEGY_REVEAL_TOKEN,
+        ArtifactType.STRATEGY_SCIENTIFIC_OUTCOME,
+    )
+    references = tuple(
+        ArtifactReference(
+            name=f"discovery-{index}",
+            relative_path=f"discovery/{index}.json",
+            sha256=hashlib.sha256(item.value.encode("utf-8")).hexdigest(),
+            schema_version=1,
+            row_count=None,
+            media_type="application/json",
+            artifact_type=item,
+        )
+        for index, item in enumerate(artifact_types, start=1)
+    )
+    digest = hashlib.sha256(b"WO35-F-artifact-projection").hexdigest()
+    manifest = RunManifest.create(
+        parent_run_id=None,
+        run_type=RunType.EXPERIMENT,
+        scenario_id=None,
+        lesson_id=None,
+        seed=None,
+        flow_model="WO35-F",
+        market_profile="DEVELOPMENT",
+        strategy_id="strategy-discovery-lineage",
+        hotkey_layout_id="NOT_APPLICABLE",
+        session_objective="project typed discovery artifacts",
+        simulation_start_us=0,
+        simulation_end_us=0,
+        software_version="WO35-F",
+        git_commit="f" * 40,
+        schema_versions={"run_manifest": 2},
+        input_dataset_references=(),
+        configuration_digest=digest,
+        evidence_digest=digest,
+        result_digest=digest,
+        creation_timestamp_utc="2000-01-01T00:00:00Z",
+        artifacts=references,
+    )
+    rows = strategy_discovery_artifact_registry_rows([manifest])
+    artifact_fixture_sha256 = hashlib.sha256(
+        canonical_identity_bytes([list(row) for row in rows])
+    ).hexdigest()
+    empty_store = RunStore(temporary_root / "empty-research-store")
+    empty_projection = empty_store.query_strategy_discovery_artifacts()
+    controlled_evidence_root = temporary_root / "controlled-evidence-absent"
+    controlled = validate_controlled_evidence(
+        manifest_path=bounded_manifest_path,
+        evidence_root=controlled_evidence_root,
+    )
+    if tuple(str(row[1]) for row in rows) != tuple(
+        item.value for item in artifact_types
+    ):
+        failures.append("typed strategy-discovery artifact projection changed")
+    if artifact_fixture_sha256 != WO35F_ARTIFACT_TYPE_FIXTURE_SHA256:
+        failures.append("WO35-F artifact projection differs from its frozen fixture")
+    if empty_projection != ():
+        failures.append("empty discovery artifact catalog projection was not empty")
+    if controlled != {
+        "manifest_sha256": load_search_manifest(bounded_manifest_path).manifest_sha256,
+        "reason_code": CONTROLLED_EVIDENCE_REASON_V1,
+        "status": "NOT_EXERCISED",
+    }:
+        failures.append("WO35-F1 validator did not remain honestly unexercised")
+    if controlled_evidence_root.exists():
+        failures.append("WO35-F1 validator mutated the absent evidence root")
+    if result.real_partition_access_count != 0:
+        failures.append("development fixture recorded real partition access")
+    return StrategyDiscoveryAuditCase(
+        "f_discovery_artifacts_project_and_controlled_gate_stays_unexercised",
+        (
+            f"artifact_fixture_sha256={artifact_fixture_sha256} "
+            f"artifact_type_count={len(artifact_types)} catalog_projection=PASS "
+            f"controlled_gate={controlled['status']} reason={controlled['reason_code']} "
+            "validator_generation_authority=ABSENT real_partition_access_count=0"
+        ),
+        tuple(failures),
+    )
+
+
+def audit_wo35f_strategy_lineage() -> tuple[StrategyDiscoveryAuditCase, ...]:
+    from kirby2.discovery.commands import (
+        LineageDevelopmentManifestV1,
+        run_development_lineage_demo,
+    )
+    from kirby2.discovery.store import DiscoveryStore
+
+    examples = Path(__file__).resolve().parents[1] / "discovery" / "examples"
+    manifest_path = examples / "lineage_development.toml"
+    manifest = LineageDevelopmentManifestV1.load(manifest_path)
+    with TemporaryDirectory(prefix="kirby2-wo35f-audit-") as directory:
+        temporary_root = Path(directory)
+        store_root = temporary_root / "discovery-store"
+        result = run_development_lineage_demo(
+            manifest_path,
+            store_root=store_root,
+            implementation_commit="f" * 40,
+        )
+        store = DiscoveryStore(store_root)
+        return (
+            _wo35f_contract_case(manifest_path, temporary_root),
+            _wo35f_persistence_case(result, store),
+            _wo35f_reveal_case(result, store, manifest),
+            _wo35f_reporting_case(result, store),
+            _wo35f_artifact_and_f1_case(
+                result,
+                temporary_root,
+                examples / "bounded_search.toml",
+            ),
+        )
+
+
 __all__ = [
     "WO35A_AUDIT_CASE_COUNT",
     "WO35A_CANONICALIZATION_POLICY_SHA256",
@@ -3322,10 +3732,17 @@ __all__ = [
     "WO35E_PERTURBATION_FIXTURE_SHA256",
     "WO35E_REVEAL_FIXTURE_SHA256",
     "WO35E_ROBUSTNESS_FIXTURE_SHA256",
+    "WO35F_ARTIFACT_TYPE_FIXTURE_SHA256",
+    "WO35F_AUDIT_CASE_COUNT",
+    "WO35F_COMPARISON_FIXTURE_SHA256",
+    "WO35F_LINEAGE_FIXTURE_SHA256",
+    "WO35F_MANIFEST_FIXTURE_SHA256",
+    "WO35F_REPORT_FIXTURE_SHA256",
     "StrategyDiscoveryAuditCase",
     "audit_wo35a_strategy_discovery",
     "audit_wo35b_strategy_partitions",
     "audit_wo35c_strategy_mutations",
     "audit_wo35d_strategy_search",
     "audit_wo35e_strategy_robustness",
+    "audit_wo35f_strategy_lineage",
 ]

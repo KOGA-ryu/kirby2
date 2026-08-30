@@ -46,6 +46,7 @@ from .tables import (
     lesson_mining_artifact_registry_rows,
     read_parquet_table,
     qualification_artifact_registry_rows,
+    strategy_discovery_artifact_registry_rows,
     write_parquet_tables,
 )
 from .toml_codec import canonical_digest, canonical_toml, file_sha256, load_toml
@@ -1130,6 +1131,16 @@ class RunStore:
                 ]
             )
         )
+        expected_strategy_discovery_artifacts = tuple(
+            strategy_discovery_artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -1178,6 +1189,14 @@ class RunStore:
                         "ORDER BY run_id, artifact_type, artifact_name"
                     ).fetchall()
                 )
+                actual_strategy_discovery_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM strategy_discovery_artifacts "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
@@ -1190,6 +1209,8 @@ class RunStore:
             == expected_qualification_artifacts
             and actual_lesson_artifacts == expected_lesson_artifacts
             and actual_learner_artifacts == expected_learner_artifacts
+            and actual_strategy_discovery_artifacts
+            == expected_strategy_discovery_artifacts
         )
 
     @contextmanager
@@ -1297,6 +1318,33 @@ class RunStore:
             else:
                 cursor = connection.execute(
                     "SELECT * FROM learner_artifacts "
+                    "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
+                    [run_id],
+                )
+            columns = tuple(item[0] for item in cursor.description)
+            return tuple(
+                dict(zip(columns, row, strict=True)) for row in cursor.fetchall()
+            )
+        finally:
+            connection.close()
+
+    def query_strategy_discovery_artifacts(
+        self, run_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return typed immutable strategy-discovery lineage artifacts."""
+
+        self._ensure_catalog()
+        duckdb = _duckdb()
+        connection = duckdb.connect(str(self.catalog_path), read_only=True)
+        try:
+            if run_id is None:
+                cursor = connection.execute(
+                    "SELECT * FROM strategy_discovery_artifacts "
+                    "ORDER BY run_id, artifact_type, artifact_name"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM strategy_discovery_artifacts "
                     "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
                     [run_id],
                 )
@@ -2357,6 +2405,7 @@ _CATALOG_VIEWS = (
     "full_day_qualification_artifacts",
     "lesson_mining_artifacts",
     "learner_artifacts",
+    "strategy_discovery_artifacts",
     "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
@@ -2439,6 +2488,19 @@ def _create_summary_views(connection) -> None:
         WHERE artifact_type IN (
             'LEARNER_EVIDENCE_UPDATE',
             'LEARNER_STATE_PROJECTION'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW strategy_discovery_artifacts AS
+        SELECT * FROM run_artifact_registry
+        WHERE artifact_type IN (
+            'STRATEGY_DISCOVERY_BINDING',
+            'STRATEGY_DISCOVERY_RECORD',
+            'STRATEGY_LINEAGE_REPORT',
+            'STRATEGY_REVEAL_TOKEN',
+            'STRATEGY_SCIENTIFIC_OUTCOME'
         )
         """
     )

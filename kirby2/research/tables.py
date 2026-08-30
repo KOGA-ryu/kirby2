@@ -261,6 +261,17 @@ LEARNER_ARTIFACT_TYPES = frozenset(
 )
 
 
+STRATEGY_DISCOVERY_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.STRATEGY_DISCOVERY_BINDING,
+        ArtifactType.STRATEGY_DISCOVERY_RECORD,
+        ArtifactType.STRATEGY_LINEAGE_REPORT,
+        ArtifactType.STRATEGY_REVEAL_TOKEN,
+        ArtifactType.STRATEGY_SCIENTIFIC_OUTCOME,
+    }
+)
+
+
 def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
     """Project typed immutable artifacts into the rebuildable research catalog."""
 
@@ -318,6 +329,18 @@ def learner_artifact_registry_rows(
         row
         for row in artifact_registry_rows(manifests)
         if ArtifactType(str(row[1])) in LEARNER_ARTIFACT_TYPES
+    ]
+
+
+def strategy_discovery_artifact_registry_rows(
+    manifests: list[RunManifest],
+) -> list[tuple[object, ...]]:
+    """Project only immutable strategy-discovery lineage artifacts."""
+
+    return [
+        row
+        for row in artifact_registry_rows(manifests)
+        if ArtifactType(str(row[1])) in STRATEGY_DISCOVERY_ARTIFACT_TYPES
     ]
 
 
