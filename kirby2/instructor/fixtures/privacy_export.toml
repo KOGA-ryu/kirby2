@@ -1,0 +1,60 @@
+schema_id = "KIRBY2_INSTRUCTOR_PRIVACY_EXPORT_FIXTURE_V1"
+schema_version = 1
+
+[selection]
+learner_ordinal = 1
+attempt_number = 1
+selected_causal_trace_ordinal = 1
+
+[consent]
+recorded_at_utc = "2026-01-01T02:00:00Z"
+decision_time_utc = "2026-01-01T02:01:00Z"
+deletion_time_utc = "2026-01-01T02:02:00Z"
+required_scope = "INSTRUCTIONAL_EVIDENCE"
+scopes = [
+  "INSTRUCTIONAL_EVIDENCE",
+  "INSTRUCTOR_REVIEW",
+  "LOCAL_COHORT_ANALYSIS",
+  "LOCAL_RESEARCH_STUDY",
+]
+retention_policy = "RETAIN_WITHOUT_FIXED_END"
+retain_pseudonymous_evidence_after_profile_deletion = true
+export_permission = "PSEUDONYMOUS_REDACTED_EVIDENCE_ONLY"
+withdrawal_policy = "PRESERVE_PREVIOUSLY_AUTHORIZED_RETENTION_REVOKE_EXPORT"
+
+[redaction]
+policy_id = "KIRBY2_INSTRUCTOR_PORTABLE_EVIDENCE_ALLOWLIST_V1"
+policy_version = "1"
+allowlisted_paths = [
+  "/annotations",
+  "/assignment",
+  "/attempt_manifest",
+  "/limitations",
+  "/provenance",
+  "/rubric_scores",
+  "/selected_causal_traces",
+  "/software_version",
+]
+authorized_hidden_paths = []
+
+[export]
+directory_name = "privacy-export-demo"
+software_version = "0.1.0"
+limitations = [
+  "No learner, cohort, educational-effect, or causal claim is made.",
+  "Pseudonymous evidence is not anonymous and remains subject to consent policy.",
+  "Synthetic offline simulator evidence only.",
+]
+omitted_categories = [
+  "direct_identity",
+  "identity_mapping",
+  "local_paths",
+  "secrets",
+  "unauthorized_hidden_or_reveal_data",
+  "unselected_causal_traces",
+]
+
+[export.compatibility_versions]
+attempt_manifest = 1
+review = 1
+rubric_score = 1

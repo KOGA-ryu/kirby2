@@ -11,10 +11,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import tempfile
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 from kirby2.cli.registry import CommandModule, CommandSpec
+from kirby2.research.paths import DataAreaId, DataPaths
 
 from .assignments import (
     AssignmentLocksV1,
@@ -56,6 +60,27 @@ from .consent import (
     EvidenceRetentionPolicyV1,
     WithdrawalPolicyV1,
     create_consent_record,
+    revise_consent_record,
+)
+from .deletion import (
+    RetainedEvidenceKindV1,
+    create_retained_evidence_reference,
+    execute_profile_deletion,
+    plan_profile_deletion,
+)
+from .export import (
+    ExportOmissionReasonV1,
+    ExportOmissionV1,
+    build_export_bundle,
+    create_selected_causal_trace,
+    import_export_directory,
+    verify_export_directory,
+    write_export_directory,
+)
+from .identity import (
+    DirectIdentifierV1,
+    DirectIdentityV1,
+    create_identity_mapping,
 )
 from .console import (
     NOT_APPLICABLE_VERSION,
@@ -90,6 +115,10 @@ from .query import (
     InstructorQueryScopeKindV1,
     InstructorQueryScopeV1,
     build_comparison_view,
+)
+from .redaction import (
+    PORTABLE_EVIDENCE_ALLOWLIST_V1,
+    create_portable_evidence_redaction_policy,
 )
 from .reviews import (
     AttemptReviewBindingV1,
@@ -157,6 +186,23 @@ INSTRUCTOR_DEMO_LEARNER_COUNT = 2
 INSTRUCTOR_DEMO_ATTEMPTS_PER_LEARNER = 3
 INSTRUCTOR_DEMO_ATTEMPT_COUNT = 6
 INSTRUCTOR_DEMO_METRIC_ID = "hidden_liquidity_review_score"
+PRIVACY_EXPORT_FIXTURE_SCHEMA_ID = "KIRBY2_INSTRUCTOR_PRIVACY_EXPORT_FIXTURE_V1"
+PRIVACY_EXPORT_FIXTURE_SCHEMA_VERSION = 1
+INSTRUCTOR_EXPORT_DEMO_SCHEMA_ID = "KIRBY2_INSTRUCTOR_EXPORT_DEMO_V1"
+INSTRUCTOR_EXPORT_DEMO_SCHEMA_VERSION = 1
+PRIVACY_EXPORT_OMITTED_CATEGORIES_V1 = (
+    "direct_identity",
+    "identity_mapping",
+    "local_paths",
+    "secrets",
+    "unauthorized_hidden_or_reveal_data",
+    "unselected_causal_traces",
+)
+PRIVACY_EXPORT_COMPATIBILITY_COMPONENTS_V1 = (
+    "attempt_manifest",
+    "review",
+    "rubric_score",
+)
 _MAX_SEED = (1 << 63) - 1
 
 
@@ -199,6 +245,348 @@ def _seed_argument(value: str) -> int:
         return _seed(int(value))
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _fixture_section(
+    value: object,
+    expected: set[str],
+    label: str,
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != expected:
+        raise ValueError(f"{label} fields differ")
+    return value
+
+
+def _fixture_text(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"{label} must be nonempty text without edge whitespace")
+    if any(character in value for character in "\x00\r\n"):
+        raise ValueError(f"{label} contains a forbidden control character")
+    return value
+
+
+def _fixture_positive_int(value: object, label: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _fixture_text_tuple(
+    value: object,
+    label: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise TypeError(f"{label} must be an exact TOML array")
+    result = tuple(_fixture_text(item, label) for item in value)
+    if not allow_empty and not result:
+        raise ValueError(f"{label} cannot be empty")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{label} must not contain duplicates")
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class PrivacyExportFixtureV1:
+    """Strict, data-only configuration for the WO37-E production demo."""
+
+    learner_ordinal: int
+    attempt_number: int
+    selected_causal_trace_ordinal: int
+    recorded_at_utc: str
+    decision_time_utc: str
+    deletion_time_utc: str
+    required_scope: ConsentScopeV1
+    scopes: tuple[ConsentScopeV1, ...]
+    retention_policy: EvidenceRetentionPolicyV1
+    retain_after_profile_deletion: bool
+    export_permission: EvidenceExportPermissionV1
+    withdrawal_policy: WithdrawalPolicyV1
+    redaction_policy_id: str
+    redaction_policy_version: str
+    allowlisted_paths: tuple[str, ...]
+    authorized_hidden_paths: tuple[str, ...]
+    directory_name: str
+    software_version: str
+    limitations: tuple[str, ...]
+    omitted_categories: tuple[str, ...]
+    compatibility_versions: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        _fixture_positive_int(self.learner_ordinal, "fixture learner ordinal")
+        _fixture_positive_int(self.attempt_number, "fixture attempt number")
+        _fixture_positive_int(
+            self.selected_causal_trace_ordinal,
+            "fixture selected causal-trace ordinal",
+        )
+        if self.learner_ordinal > INSTRUCTOR_DEMO_LEARNER_COUNT:
+            raise ValueError("fixture learner ordinal exceeds the demo learner count")
+        if self.attempt_number > INSTRUCTOR_DEMO_ATTEMPTS_PER_LEARNER:
+            raise ValueError("fixture attempt number exceeds the per-learner limit")
+        expected_trace_ordinal = (
+            (self.learner_ordinal - 1) * INSTRUCTOR_DEMO_ATTEMPTS_PER_LEARNER
+            + self.attempt_number
+        )
+        if self.selected_causal_trace_ordinal != expected_trace_ordinal:
+            raise ValueError(
+                "fixture causal-trace ordinal differs from the selected attempt"
+            )
+        for label, value in (
+            ("fixture consent recorded time", self.recorded_at_utc),
+            ("fixture consent decision time", self.decision_time_utc),
+            ("fixture deletion time", self.deletion_time_utc),
+            ("fixture redaction policy ID", self.redaction_policy_id),
+            ("fixture redaction policy version", self.redaction_policy_version),
+            ("fixture export directory name", self.directory_name),
+            ("fixture software version", self.software_version),
+        ):
+            _fixture_text(value, label)
+        if type(self.required_scope) is not ConsentScopeV1:
+            raise TypeError("fixture required scope is invalid")
+        if type(self.scopes) is not tuple or not self.scopes or any(
+            type(item) is not ConsentScopeV1 for item in self.scopes
+        ):
+            raise TypeError("fixture consent scopes are invalid")
+        if tuple(sorted(set(self.scopes), key=lambda item: item.value)) != self.scopes:
+            raise ValueError("fixture consent scopes must be unique and canonical")
+        if self.scopes != tuple(ConsentScopeV1):
+            raise ValueError(
+                "privacy-export demo requires all evidence, review, cohort, and study scopes"
+            )
+        if self.required_scope not in self.scopes:
+            raise ValueError("fixture required scope is absent from granted scopes")
+        if self.required_scope is not ConsentScopeV1.INSTRUCTIONAL_EVIDENCE:
+            raise ValueError(
+                "privacy-export demo primary scope must be instructional evidence"
+            )
+        if type(self.retention_policy) is not EvidenceRetentionPolicyV1:
+            raise TypeError("fixture retention policy is invalid")
+        if (
+            self.retention_policy
+            is not EvidenceRetentionPolicyV1.RETAIN_WITHOUT_FIXED_END
+        ):
+            raise ValueError(
+                "privacy-export demo requires retention without a fixed end"
+            )
+        if self.retain_after_profile_deletion is not True:
+            raise ValueError("privacy-export fixture must authorize retained evidence")
+        if (
+            self.export_permission
+            is not EvidenceExportPermissionV1.PSEUDONYMOUS_REDACTED_EVIDENCE_ONLY
+        ):
+            raise ValueError("privacy-export fixture must grant redacted export only")
+        if type(self.withdrawal_policy) is not WithdrawalPolicyV1:
+            raise TypeError("fixture withdrawal policy is invalid")
+        for value, label in (
+            (self.allowlisted_paths, "fixture allowlisted paths"),
+            (self.limitations, "fixture limitations"),
+            (self.omitted_categories, "fixture omitted categories"),
+        ):
+            if type(value) is not tuple or not value or any(
+                type(item) is not str or not item for item in value
+            ):
+                raise TypeError(f"{label} must be a nonempty text tuple")
+        if tuple(sorted(set(self.limitations))) != self.limitations:
+            raise ValueError("fixture limitations must be unique and canonical")
+        if type(self.authorized_hidden_paths) is not tuple or any(
+            type(item) is not str or not item for item in self.authorized_hidden_paths
+        ):
+            raise TypeError("fixture authorized hidden paths must be a text tuple")
+        if self.allowlisted_paths != PORTABLE_EVIDENCE_ALLOWLIST_V1:
+            raise ValueError(
+                "privacy-export demo requires the exact portable-evidence allowlist"
+            )
+        create_portable_evidence_redaction_policy(
+            policy_id=self.redaction_policy_id,
+            policy_version=self.redaction_policy_version,
+            allowlisted_paths=self.allowlisted_paths,
+            authorized_hidden_paths=self.authorized_hidden_paths,
+        )
+        if self.omitted_categories != PRIVACY_EXPORT_OMITTED_CATEGORIES_V1:
+            raise ValueError(
+                "privacy-export demo requires the exact prohibited/omitted inventory"
+            )
+        if (
+            type(self.compatibility_versions) is not tuple
+            or not self.compatibility_versions
+            or any(
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or not item[0]
+                or type(item[1]) is not int
+                or item[1] <= 0
+                for item in self.compatibility_versions
+            )
+        ):
+            raise TypeError("fixture compatibility versions are invalid")
+        if tuple(sorted(self.compatibility_versions)) != self.compatibility_versions:
+            raise ValueError("fixture compatibility versions must be canonical")
+        if tuple(item[0] for item in self.compatibility_versions) != (
+            PRIVACY_EXPORT_COMPATIBILITY_COMPONENTS_V1
+        ):
+            raise ValueError(
+                "privacy-export fixture compatibility components differ"
+            )
+        safe_name_characters = frozenset(
+            "abcdefghijklmnopqrstuvwxyz0123456789-_"
+        )
+        if not (
+            self.directory_name[0]
+            in frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+            and all(
+                character in safe_name_characters
+                for character in self.directory_name
+            )
+        ):
+            raise ValueError("fixture directory name must be one lowercase safe name")
+
+    @classmethod
+    def from_toml_bytes(cls, raw: bytes) -> PrivacyExportFixtureV1:
+        if type(raw) is not bytes or not raw or len(raw) > 64 * 1024:
+            raise ValueError("privacy-export fixture byte length is invalid")
+        try:
+            root = tomllib.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+            raise ValueError("privacy-export fixture must be strict UTF-8 TOML") from error
+        payload = _fixture_section(
+            root,
+            {"consent", "export", "redaction", "schema_id", "schema_version", "selection"},
+            "privacy-export fixture",
+        )
+        if (
+            payload["schema_id"] != PRIVACY_EXPORT_FIXTURE_SCHEMA_ID
+            or payload["schema_version"] != PRIVACY_EXPORT_FIXTURE_SCHEMA_VERSION
+        ):
+            raise ValueError("privacy-export fixture schema differs")
+        selection = _fixture_section(
+            payload["selection"],
+            {"attempt_number", "learner_ordinal", "selected_causal_trace_ordinal"},
+            "privacy-export fixture selection",
+        )
+        consent = _fixture_section(
+            payload["consent"],
+            {
+                "decision_time_utc",
+                "deletion_time_utc",
+                "export_permission",
+                "recorded_at_utc",
+                "required_scope",
+                "retain_pseudonymous_evidence_after_profile_deletion",
+                "retention_policy",
+                "scopes",
+                "withdrawal_policy",
+            },
+            "privacy-export fixture consent",
+        )
+        redaction = _fixture_section(
+            payload["redaction"],
+            {
+                "allowlisted_paths",
+                "authorized_hidden_paths",
+                "policy_id",
+                "policy_version",
+            },
+            "privacy-export fixture redaction",
+        )
+        export = _fixture_section(
+            payload["export"],
+            {
+                "compatibility_versions",
+                "directory_name",
+                "limitations",
+                "omitted_categories",
+                "software_version",
+            },
+            "privacy-export fixture export",
+        )
+        raw_compatibility = export["compatibility_versions"]
+        if type(raw_compatibility) is not dict or not raw_compatibility:
+            raise TypeError("fixture compatibility versions must be a TOML table")
+        compatibility_versions = tuple(
+            sorted(
+                (
+                    _fixture_text(key, "fixture compatibility component"),
+                    _fixture_positive_int(
+                        value,
+                        f"fixture compatibility version for {key}",
+                    ),
+                )
+                for key, value in raw_compatibility.items()
+            )
+        )
+        return cls(
+            learner_ordinal=_fixture_positive_int(
+                selection["learner_ordinal"], "fixture learner ordinal"
+            ),
+            attempt_number=_fixture_positive_int(
+                selection["attempt_number"], "fixture attempt number"
+            ),
+            selected_causal_trace_ordinal=_fixture_positive_int(
+                selection["selected_causal_trace_ordinal"],
+                "fixture selected causal-trace ordinal",
+            ),
+            recorded_at_utc=_fixture_text(
+                consent["recorded_at_utc"], "fixture consent recorded time"
+            ),
+            decision_time_utc=_fixture_text(
+                consent["decision_time_utc"], "fixture consent decision time"
+            ),
+            deletion_time_utc=_fixture_text(
+                consent["deletion_time_utc"], "fixture deletion time"
+            ),
+            required_scope=ConsentScopeV1(consent["required_scope"]),
+            scopes=tuple(
+                sorted(
+                    (ConsentScopeV1(item) for item in _fixture_text_tuple(
+                        consent["scopes"], "fixture consent scopes"
+                    )),
+                    key=lambda item: item.value,
+                )
+            ),
+            retention_policy=EvidenceRetentionPolicyV1(consent["retention_policy"]),
+            retain_after_profile_deletion=(
+                consent["retain_pseudonymous_evidence_after_profile_deletion"]
+            ),
+            export_permission=EvidenceExportPermissionV1(consent["export_permission"]),
+            withdrawal_policy=WithdrawalPolicyV1(consent["withdrawal_policy"]),
+            redaction_policy_id=_fixture_text(
+                redaction["policy_id"], "fixture redaction policy ID"
+            ),
+            redaction_policy_version=_fixture_text(
+                redaction["policy_version"], "fixture redaction policy version"
+            ),
+            allowlisted_paths=_fixture_text_tuple(
+                redaction["allowlisted_paths"], "fixture allowlisted paths"
+            ),
+            authorized_hidden_paths=_fixture_text_tuple(
+                redaction["authorized_hidden_paths"],
+                "fixture authorized hidden paths",
+                allow_empty=True,
+            ),
+            directory_name=_fixture_text(
+                export["directory_name"], "fixture export directory name"
+            ),
+            software_version=_fixture_text(
+                export["software_version"], "fixture software version"
+            ),
+            limitations=_fixture_text_tuple(
+                export["limitations"], "fixture limitations"
+            ),
+            omitted_categories=tuple(sorted(_fixture_text_tuple(
+                export["omitted_categories"], "fixture omitted categories"
+            ))),
+            compatibility_versions=compatibility_versions,
+        )
+
+
+def load_privacy_export_fixture(path: Path) -> PrivacyExportFixtureV1:
+    if type(path) is not Path:
+        raise TypeError("privacy-export fixture path must be pathlib.Path")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("privacy-export fixture must be one regular non-symlink file")
+    return PrivacyExportFixtureV1.from_toml_bytes(path.read_bytes())
 
 
 def _demo_digest(seed: int, label: str) -> str:
@@ -942,7 +1330,31 @@ def _build_study(
     seed: int,
     assignment: AssignmentRevisionV1,
     rubric: RubricRevisionV1,
+    *,
+    retention_policy: StudyRetentionPolicyV1 | None = None,
+    data_export_policy: StudyDataExportPolicyV1 | None = None,
 ) -> StudyRevisionV1:
+    selected_retention_policy = (
+        StudyRetentionPolicyV1(
+            policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+            retention_until_utc=None,
+            retain_after_profile_deletion=False,
+        )
+        if retention_policy is None
+        else retention_policy
+    )
+    selected_data_export_policy = (
+        StudyDataExportPolicyV1(
+            permission=EvidenceExportPermissionV1.DENIED,
+            redaction_policy_sha256=None,
+        )
+        if data_export_policy is None
+        else data_export_policy
+    )
+    if type(selected_retention_policy) is not StudyRetentionPolicyV1:
+        raise TypeError("demo study retention policy is invalid")
+    if type(selected_data_export_policy) is not StudyDataExportPolicyV1:
+        raise TypeError("demo study data-export policy is invalid")
     manifest = StudyManifestV1(
         question="Can the complete local instructor workflow be exercised reproducibly?",
         hypothesis="Six synthetic attempts can be isolated, reviewed, and summarized.",
@@ -1043,15 +1455,8 @@ def _build_study(
             required_scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
             require_current_grant_at_inclusion=True,
         ),
-        retention_policy=StudyRetentionPolicyV1(
-            policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
-            retention_until_utc=None,
-            retain_after_profile_deletion=False,
-        ),
-        data_export_policy=StudyDataExportPolicyV1(
-            permission=EvidenceExportPermissionV1.DENIED,
-            redaction_policy_sha256=None,
-        ),
+        retention_policy=selected_retention_policy,
+        data_export_policy=selected_data_export_policy,
     )
     return create_study(manifest)
 
@@ -1452,7 +1857,12 @@ def _build_console_and_comparison(
     return ledger, comparison
 
 
-def build_instructor_demo(seed: int = 42) -> InstructorDemoV1:
+def build_instructor_demo(
+    seed: int = 42,
+    *,
+    study_retention_policy: StudyRetentionPolicyV1 | None = None,
+    study_data_export_policy: StudyDataExportPolicyV1 | None = None,
+) -> InstructorDemoV1:
     """Build the exact deterministic offline WO37-D demonstration artifact."""
 
     selected_seed = _seed(seed)
@@ -1484,7 +1894,13 @@ def build_instructor_demo(seed: int = 42) -> InstructorDemoV1:
         rubric,
         attempts,
     )
-    study = _build_study(selected_seed, assignment, rubric)
+    study = _build_study(
+        selected_seed,
+        assignment,
+        rubric,
+        retention_policy=study_retention_policy,
+        data_export_policy=study_data_export_policy,
+    )
     study_ledger = _build_study_ledger(study, assignment, attempts)
     cohort, cohort_summary = _build_cohort_summary(
         selected_seed,
@@ -1525,6 +1941,261 @@ def build_instructor_demo(seed: int = 42) -> InstructorDemoV1:
     )
 
 
+def _selected_privacy_export_records(
+    demo: InstructorDemoV1,
+    fixture: PrivacyExportFixtureV1,
+) -> tuple[
+    LearnerProfile,
+    AssignmentAttemptManifestV1,
+    RubricScoreSidecarV1,
+    ReviewRevisionV1,
+]:
+    learner = demo.learner_profiles[fixture.learner_ordinal - 1]
+    matches = tuple(
+        item
+        for item in demo.attempts
+        if item.learner_profile_id == learner.profile_id
+        and item.attempt_number == fixture.attempt_number
+    )
+    if len(matches) != 1:
+        raise RuntimeError("privacy-export fixture did not select one exact attempt")
+    attempt = matches[0]
+    scores = tuple(
+        item
+        for item in demo.review_bundle.scores
+        if item.assignment_attempt_id == attempt.attempt_id
+    )
+    reviews = tuple(
+        item
+        for item in demo.review_bundle.reviews
+        if item.attempt_id == attempt.attempt_id
+    )
+    if len(scores) != 1 or len(reviews) != 1:
+        raise RuntimeError("privacy-export attempt lacks one exact score and review")
+    return learner, attempt, scores[0], reviews[0]
+
+
+def _privacy_export_profile_entropy(
+    seed: int,
+    learner: LearnerProfile,
+) -> bytes:
+    for ordinal in range(1, INSTRUCTOR_DEMO_LEARNER_COUNT + 1):
+        entropy = _demo_entropy(seed, f"learner:{ordinal}")
+        if create_learner_profile(entropy).profile_id == learner.profile_id:
+            return entropy
+    raise RuntimeError("selected demo learner has no deterministic local entropy")
+
+
+def _privacy_export_omissions(
+    fixture: PrivacyExportFixtureV1,
+) -> tuple[ExportOmissionV1, ...]:
+    specifications = {
+        "direct_identity": (
+            ExportOmissionReasonV1.PROHIBITED_DIRECT_IDENTITY,
+            "Direct identity is separately erasable local data and is never portable evidence.",
+        ),
+        "identity_mapping": (
+            ExportOmissionReasonV1.PROHIBITED_IDENTITY_MAPPING,
+            "The local pseudonym-to-identity mapping is categorically excluded.",
+        ),
+        "local_paths": (
+            ExportOmissionReasonV1.PROHIBITED_LOCAL_PATH,
+            "Machine-local filesystem paths are not portable evidence.",
+        ),
+        "secrets": (
+            ExportOmissionReasonV1.PROHIBITED_SECRET,
+            "Secrets and credentials are categorically excluded.",
+        ),
+        "unauthorized_hidden_or_reveal_data": (
+            ExportOmissionReasonV1.PROHIBITED_HIDDEN_REVEAL_DATA,
+            "Hidden or reveal data outside an explicit selected-trace authorization is excluded.",
+        ),
+        "unselected_causal_traces": (
+            ExportOmissionReasonV1.NOT_SELECTED,
+            "Only the causal trace bound to the selected attempt is exported.",
+        ),
+    }
+    if tuple(sorted(specifications)) != fixture.omitted_categories:
+        raise ValueError("privacy-export omission inventory differs from the fixture")
+    return tuple(
+        sorted(
+            (
+                ExportOmissionV1(
+                    item_kind=category,
+                    item_id=f"omitted.{category}",
+                    reason=specifications[category][0],
+                    detail=specifications[category][1],
+                )
+                for category in fixture.omitted_categories
+            ),
+            key=lambda item: item.canonical_bytes(),
+        )
+    )
+
+
+def run_instructor_export_demo(
+    fixture: PrivacyExportFixtureV1,
+    *,
+    seed: int = 42,
+) -> dict[str, object]:
+    """Exercise the complete local WO37-E export/import/deletion workflow."""
+
+    if type(fixture) is not PrivacyExportFixtureV1:
+        raise TypeError("instructor export demo requires PrivacyExportFixtureV1")
+    selected_seed = _seed(seed)
+    redaction_policy = create_portable_evidence_redaction_policy(
+        policy_id=fixture.redaction_policy_id,
+        policy_version=fixture.redaction_policy_version,
+        allowlisted_paths=fixture.allowlisted_paths,
+        authorized_hidden_paths=fixture.authorized_hidden_paths,
+    )
+    demo = build_instructor_demo(
+        selected_seed,
+        study_retention_policy=StudyRetentionPolicyV1(
+            policy=fixture.retention_policy,
+            retention_until_utc=None,
+            retain_after_profile_deletion=fixture.retain_after_profile_deletion,
+        ),
+        study_data_export_policy=StudyDataExportPolicyV1(
+            permission=fixture.export_permission,
+            redaction_policy_sha256=redaction_policy.sha256,
+        ),
+    )
+    learner, attempt, score, review = _selected_privacy_export_records(
+        demo,
+        fixture,
+    )
+    base_consents = tuple(
+        item
+        for item in demo.consents
+        if item.pseudonymous_profile_id == learner.profile_id
+    )
+    if len(base_consents) != 1:
+        raise RuntimeError("selected learner does not have one exact consent head")
+    consent = revise_consent_record(
+        base_consents[0],
+        scopes=fixture.scopes,
+        recorded_at_utc=fixture.recorded_at_utc,
+        retention_policy=fixture.retention_policy,
+        retention_until_utc=None,
+        retain_pseudonymous_evidence_after_profile_deletion=(
+            fixture.retain_after_profile_deletion
+        ),
+        export_permission=fixture.export_permission,
+        withdrawal_policy=fixture.withdrawal_policy,
+    )
+    trace_source_bytes = _canonical_json_bytes(
+        {
+            "domain": "KIRBY2_INSTRUCTOR_DEMO_DERIVATION_V1",
+            "label": f"trace:{fixture.selected_causal_trace_ordinal}",
+            "seed": selected_seed,
+        }
+    )
+    selected_trace = create_selected_causal_trace(
+        review.sidecar.attempt.causal_trace_id,
+        trace_source_bytes,
+    )
+    if selected_trace.trace_sha256 != review.sidecar.attempt.causal_trace_sha256:
+        raise RuntimeError("selected causal-trace bytes differ from the review binding")
+    versions = dict(fixture.compatibility_versions)
+    compatibility = VersionSignatureV1(
+        score_version=versions["rubric_score"],
+        score_sha256=score.sha256,
+        model_version=versions["attempt_manifest"],
+        model_sha256=attempt.sha256,
+        analysis_version=versions["review"],
+        analysis_sha256=review.sha256,
+    )
+    bundle = build_export_bundle(
+        current_consent=consent,
+        required_scope=fixture.required_scope,
+        decision_time_utc=fixture.decision_time_utc,
+        assignment=demo.assignment,
+        attempt_manifest=attempt,
+        study_revision=demo.study_revision,
+        study_ledger=demo.study_ledger,
+        scores=(score,),
+        reviews=(review,),
+        selected_causal_traces=(selected_trace,),
+        compatibility_versions=(compatibility,),
+        software_version=fixture.software_version,
+        limitations=fixture.limitations,
+        redaction_policy=redaction_policy,
+        omissions=_privacy_export_omissions(fixture),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="kirby2-instructor-export-") as raw_root:
+        root = Path(raw_root).resolve()
+        source_paths = DataPaths((root / "source").resolve())
+        clean_import_paths = DataPaths((root / "clean-import").resolve())
+        create_identity_mapping(
+            source_paths,
+            learner,
+            DirectIdentityV1(
+                display_name="Local synthetic demo learner",
+                direct_identifiers=(
+                    DirectIdentifierV1(
+                        identifier_kind="demo.local_id",
+                        identifier_value=f"offline-fixture-{selected_seed}",
+                    ),
+                ),
+            ),
+            opaque_entropy=_privacy_export_profile_entropy(selected_seed, learner),
+        )
+        source_paths.ensure((DataAreaId.EVIDENCE,))
+        destination = (source_paths.evidence / fixture.directory_name).resolve()
+        written_directory = write_export_directory(bundle, destination)
+        verified_before_deletion = verify_export_directory(written_directory)
+        if verified_before_deletion.files != bundle.files:
+            raise RuntimeError("written export bytes differ from the built bundle")
+        imported = import_export_directory(
+            written_directory,
+            paths=clean_import_paths,
+        )
+        retained_reference = create_retained_evidence_reference(
+            evidence_kind=RetainedEvidenceKindV1.EVIDENCE,
+            evidence_id=bundle.export_id,
+            evidence_sha256=bundle.manifest_sha256,
+            pseudonymous_profile_id=learner.profile_id,
+        )
+        deletion_plan = plan_profile_deletion(
+            consent,
+            required_scope=fixture.required_scope,
+            requested_pseudonymous_evidence_retention=True,
+            retained_evidence_references=(retained_reference,),
+            decision_time_utc=fixture.decision_time_utc,
+            planned_deletion_time_utc=fixture.deletion_time_utc,
+        )
+        deletion_result = execute_profile_deletion(
+            source_paths,
+            consent,
+            deletion_plan,
+            deletion_time_utc=fixture.deletion_time_utc,
+        )
+        verified_after_deletion = verify_export_directory(written_directory)
+        retained_export_unchanged = (
+            verified_after_deletion.files == verified_before_deletion.files
+            and verified_after_deletion.manifest_sha256
+            == verified_before_deletion.manifest_sha256
+            and verified_after_deletion.inventory_sha256
+            == verified_before_deletion.inventory_sha256
+        )
+        if not retained_export_unchanged:
+            raise RuntimeError("profile deletion mutated retained export evidence")
+        return {
+            "consent_decision": bundle.consent_decision.as_dict(),
+            "deletion_result": deletion_result.as_dict(),
+            "export_manifest": bundle.manifest.as_dict(),
+            "import_receipt": imported.as_dict(),
+            "inventory": bundle.inventory.as_dict(),
+            "redaction_manifest": bundle.redaction_manifest.as_dict(),
+            "retained_export_unchanged": retained_export_unchanged,
+            "schema_id": INSTRUCTOR_EXPORT_DEMO_SCHEMA_ID,
+            "schema_version": INSTRUCTOR_EXPORT_DEMO_SCHEMA_VERSION,
+            "seed": selected_seed,
+        }
+
+
 def _configure_instructor_demo(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--seed",
@@ -1539,6 +2210,28 @@ def _handle_instructor_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_instructor_export_demo(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        required=True,
+        help="strict local WO37-E privacy/export TOML fixture",
+    )
+    parser.add_argument(
+        "--seed",
+        type=_seed_argument,
+        default=42,
+        help="explicit deterministic fixture seed (default: 42)",
+    )
+
+
+def _handle_instructor_export_demo(args: argparse.Namespace) -> int:
+    fixture = load_privacy_export_fixture(args.fixture)
+    result = run_instructor_export_demo(fixture, seed=args.seed)
+    print(_canonical_json_bytes(result).decode("ascii"))
+    return 0
+
+
 INSTRUCTOR_CONSOLE_COMMAND_MODULE = CommandModule(
     module_id="INSTRUCTOR_RESEARCH_CONSOLE",
     commands=(
@@ -1548,6 +2241,13 @@ INSTRUCTOR_CONSOLE_COMMAND_MODULE = CommandModule(
             help="build the exact offline pseudonymous instructor workflow fixture",
             handler=_handle_instructor_demo,
             configure=_configure_instructor_demo,
+        ),
+        CommandSpec(
+            command_id="INSTRUCTOR_EXPORT_DEMO",
+            name="instructor-export-demo",
+            help="exercise authorized redacted export, clean import, and profile deletion",
+            handler=_handle_instructor_export_demo,
+            configure=_configure_instructor_export_demo,
         ),
     ),
 )
@@ -1564,7 +2264,16 @@ __all__ = [
     "INSTRUCTOR_DEMO_REVIEW_BUNDLE_SCHEMA_VERSION",
     "INSTRUCTOR_DEMO_SCHEMA_ID",
     "INSTRUCTOR_DEMO_SCHEMA_VERSION",
+    "INSTRUCTOR_EXPORT_DEMO_SCHEMA_ID",
+    "INSTRUCTOR_EXPORT_DEMO_SCHEMA_VERSION",
+    "PRIVACY_EXPORT_COMPATIBILITY_COMPONENTS_V1",
+    "PRIVACY_EXPORT_FIXTURE_SCHEMA_ID",
+    "PRIVACY_EXPORT_FIXTURE_SCHEMA_VERSION",
+    "PRIVACY_EXPORT_OMITTED_CATEGORIES_V1",
     "InstructorDemoReviewBundleV1",
     "InstructorDemoV1",
+    "PrivacyExportFixtureV1",
     "build_instructor_demo",
+    "load_privacy_export_fixture",
+    "run_instructor_export_demo",
 ]
