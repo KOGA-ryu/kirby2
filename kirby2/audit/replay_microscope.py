@@ -60,6 +60,35 @@ from kirby2.microscope.policy import (
     SourceCapabilityEvidence,
     SourceCapabilityUnavailableReason,
 )
+from kirby2.microscope.overlays import (
+    OVERLAY_KIND_ORDER,
+    OVERLAY_SET_SCHEMA_ID,
+    OVERLAY_SPECIFICATIONS,
+    OverlayAvailability,
+    OverlayInputSelection,
+    OverlayUnavailableReason,
+    build_overlay_set,
+    build_overlay_window_projection,
+)
+from kirby2.microscope.panes import (
+    HISTORICAL_PANE_SOURCE_SCHEMA_ID,
+    PANE_CAPABILITY_MANIFEST_SCOPE,
+    PANE_CAPABILITY_SCHEMA_ID,
+    PANE_CAPABILITY_SCHEMA_VERSION,
+    PANE_ORDER,
+    PANE_SNAPSHOT_SCHEMA_ID,
+    PANE_SOURCE_SCHEMA_VERSION,
+    SYNTHETIC_PANE_SOURCE_SCHEMA_ID,
+    PaneAvailability,
+    PaneCapabilityAuthority,
+    PaneKind,
+    PaneUnavailableReason,
+    QueueCapability,
+    QueueTruthAvailability,
+    bind_pane_capabilities,
+    build_synchronized_panes,
+    load_verified_pane_capabilities,
+)
 from kirby2.microscope.query import (
     CLIENT_DELIVERED_ARTIFACT_SCHEMA_ID,
     DECISION_SNAPSHOT_ARTIFACT_SCHEMA_ID,
@@ -78,6 +107,22 @@ from kirby2.microscope.query import (
     query_postmortem,
     reveal_artifact_sha256,
 )
+from kirby2.microscope.timeline import (
+    TIMELINE_RECEIPT_SCHEMA_ID,
+    TIMELINE_SCHEMA_ID,
+    TimelineDirection,
+    TimelineEventKind,
+    TimelineEvidenceEvent,
+    TimelineEvidenceSource,
+    TimelineJumpTarget,
+    TimelineNavigationAvailability,
+    TimelineNavigationUnavailableReason,
+    TimelinePlaybackState,
+    TimelineSidecarRefusalReason,
+    build_replay_timeline,
+    derive_timeline_event,
+    timeline_event_from_query_result,
+)
 
 
 WO36A_AUDIT_CASE_COUNT = 5
@@ -95,6 +140,7 @@ WO36A_LEGACY_INDEX_SHA256 = (
 )
 WO36B_AUDIT_CASE_COUNT = 6
 DEV0006_AUDIT_CASE_COUNT = 4
+WO36C_AUDIT_CASE_COUNT = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +545,32 @@ def audit_replay_observation_ingestion() -> tuple[ReplayMicroscopeAuditCase, ...
     )
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("DEV-0006 audit case order or identity changed")
+    return cases
+
+
+def audit_synchronized_replay_read_models() -> tuple[ReplayMicroscopeAuditCase, ...]:
+    """Run the fixed WO36-C synchronized read-model attack inventory."""
+
+    cases = (
+        _timeline_cursor_partition_case(),
+        _synchronized_pane_inventory_case(),
+        _unsupported_pane_explanation_case(),
+        _synthetic_queue_truth_case(),
+        _overlay_contract_case(),
+        _read_model_cross_binding_case(),
+    )
+    if len(cases) != WO36C_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO36-C audit case inventory changed")
+    expected_names = (
+        "timeline_controls_partition_simultaneous_events_deterministically",
+        "all_eighteen_panes_share_one_cursor_policy_and_provenance",
+        "unsupported_depth_and_queue_explain_typed_unavailability",
+        "queue_truth_requires_pinned_synthetic_postmortem_authority",
+        "nine_overlays_preserve_versions_windows_units_and_sources",
+        "read_models_reject_cross_query_future_and_ui_backend_inputs",
+    )
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO36-C audit case order or identity changed")
     return cases
 
 
@@ -2210,6 +2282,2174 @@ def _historical_hidden_unavailable_case() -> ReplayMicroscopeAuditCase:
     )
 
 
+def _timeline_cursor_partition_case() -> ReplayMicroscopeAuditCase:
+    observed = _wo36c_timeline_fixture()
+    at_100 = query_as_observed(observed, ObservationQueryRequest(100, 100))
+    at_200 = query_as_observed(observed, ObservationQueryRequest(200, 200))
+    at_400 = query_as_observed(observed, ObservationQueryRequest(400, 400))
+    player = timeline_event_from_query_result(
+        at_100,
+        "player-action-event-0001",
+        TimelineEventKind.PLAYER_ACTION,
+    )
+    fill = timeline_event_from_query_result(
+        at_200,
+        "fill-event-0001",
+        TimelineEventKind.FILL,
+    )
+    traffic = timeline_event_from_query_result(
+        at_200,
+        "traffic-transition-event-0001",
+        TimelineEventKind.TRAFFIC_LIGHT_TRANSITION,
+    )
+    warning = timeline_event_from_query_result(
+        at_400,
+        "invariant-warning-event-0001",
+        TimelineEventKind.INVARIANT_WARNING,
+    )
+    observed_update = timeline_event_from_query_result(
+        at_400,
+        "observed-update-event-0001",
+        TimelineEventKind.OBSERVED_UPDATE,
+    )
+    branch = derive_timeline_event(
+        "branch-divergence-derived-0001",
+        TimelineEventKind.BRANCH_DIVERGENCE,
+        6,
+        (warning, observed_update),
+    )
+    inventory = (warning, fill, player, branch, observed_update, traffic)
+    timeline, receipt = build_replay_timeline(
+        at_400,
+        inventory,
+    )
+    repeated, repeated_receipt = build_replay_timeline(
+        at_400,
+        tuple(reversed(inventory)),
+    )
+
+    cursor_100 = timeline.cursor(100)
+    next_partition = timeline.step_event(cursor_100, TimelineDirection.NEXT)
+    next_again = timeline.step_event(
+        next_partition.cursor,
+        TimelineDirection.NEXT,
+    )
+    fixed = timeline.step_fixed_time(
+        next_partition.cursor,
+        50,
+        TimelineDirection.NEXT,
+    )
+    playing = timeline.play(next_partition.cursor)
+    paused = timeline.pause(playing)
+    jumps = {
+        target: timeline.jump(
+            timeline.cursor(0),
+            target,
+            TimelineDirection.NEXT,
+        )
+        for target in (
+            TimelineJumpTarget.PLAYER_ACTION,
+            TimelineJumpTarget.FILL,
+            TimelineJumpTarget.TRAFFIC_LIGHT_TRANSITION,
+            TimelineJumpTarget.INVARIANT_WARNING,
+            TimelineJumpTarget.BRANCH_DIVERGENCE,
+        )
+    }
+    reveal_refusal = timeline.jump(
+        timeline.cursor(0),
+        TimelineJumpTarget.REVEALED_REGIME_TRANSITION,
+        TimelineDirection.NEXT,
+    )
+    boundary = timeline.step_event(
+        next_again.cursor,
+        TimelineDirection.NEXT,
+    )
+    bookmark = timeline.bookmark(next_partition.cursor)
+    annotation = timeline.annotate(next_partition.cursor)
+
+    policy_observed = _wo36c_timeline_fixture()
+    policy_reveal = _wo36c_regime_reveal_fixture(policy_observed)
+    policy_request = ObservationQueryRequest(
+        300,
+        action_time_us=300,
+        requested_reveal_capabilities=(RevealCapability.GROUND_TRUTH,),
+    )
+    policy_authorization = _reveal_authorization(
+        policy_reveal,
+        (RevealCapability.GROUND_TRUTH,),
+        observed=policy_observed,
+    )
+    policy_query = query_postmortem(
+        policy_observed,
+        policy_reveal,
+        policy_authorization,
+        policy_request,
+    )
+    regime = timeline_event_from_query_result(
+        policy_query,
+        "regime-transition-event-0001",
+        TimelineEventKind.REVEALED_REGIME_TRANSITION,
+    )
+    postmortem_timeline, _ = build_replay_timeline(
+        policy_query,
+        (regime,),
+    )
+    reveal_jump = postmortem_timeline.jump(
+        postmortem_timeline.cursor(0),
+        TimelineJumpTarget.REVEALED_REGIME_TRANSITION,
+        TimelineDirection.NEXT,
+    )
+    denied_policy_query = query_postmortem(
+        policy_observed,
+        None,
+        None,
+        policy_request,
+    )
+    unproven_postmortem, _ = build_replay_timeline(
+        denied_policy_query,
+        (),
+    )
+    unproven_reveal_jump = unproven_postmortem.jump(
+        unproven_postmortem.cursor(0),
+        TimelineJumpTarget.REVEALED_REGIME_TRANSITION,
+        TimelineDirection.NEXT,
+    )
+    authorized_empty_query = query_postmortem(
+        policy_observed,
+        policy_reveal,
+        policy_authorization,
+        ObservationQueryRequest(
+            0,
+            action_time_us=0,
+            requested_reveal_capabilities=(RevealCapability.GROUND_TRUTH,),
+        ),
+    )
+    authorized_empty_timeline, _ = build_replay_timeline(
+        authorized_empty_query,
+        (),
+    )
+    authorized_empty_jump = authorized_empty_timeline.jump(
+        authorized_empty_timeline.cursor(0),
+        TimelineJumpTarget.REVEALED_REGIME_TRANSITION,
+        TimelineDirection.NEXT,
+    )
+    hidden_regime_rejected = False
+    hidden_reveal = _wo36c_regime_reveal_fixture(
+        policy_observed,
+        capability=RevealCapability.HIDDEN_STATE,
+    )
+    hidden_query = query_postmortem(
+        policy_observed,
+        hidden_reveal,
+        _reveal_authorization(
+            hidden_reveal,
+            (RevealCapability.HIDDEN_STATE,),
+            observed=policy_observed,
+        ),
+        ObservationQueryRequest(
+            300,
+            action_time_us=300,
+            requested_reveal_capabilities=(RevealCapability.HIDDEN_STATE,),
+        ),
+    )
+    try:
+        timeline_event_from_query_result(
+            hidden_query,
+            "regime-transition-event-0001",
+        )
+    except ValueError:
+        hidden_regime_rejected = True
+    cross_grant_event_rejected = False
+    alternate_authorization = replace(
+        policy_authorization,
+        authorization_id="authorization-wo36c-alternate-ground-truth",
+    )
+    alternate_policy_query = query_postmortem(
+        policy_observed,
+        policy_reveal,
+        alternate_authorization,
+        policy_request,
+    )
+    try:
+        build_replay_timeline(alternate_policy_query, (regime,))
+    except ValueError:
+        cross_grant_event_rejected = True
+
+    public_payload = timeline.as_dict()
+    receipt_only_keys = {
+        "event_count",
+        "event_inventory_sha256",
+        "maximum_cursor_time_us",
+        "minimum_cursor_time_us",
+        "partition_count",
+        "partition_inventory_sha256",
+        "reveal_availability",
+        "reveal_authorization_ids",
+        "reveal_evidence_sha256s",
+        "root_query_id",
+        "root_query_sha256",
+        "root_render_cursor_time_us",
+    }
+    failures: list[str] = []
+    expected_200 = ("fill-event-0001", "traffic-transition-event-0001")
+    actual_200 = tuple(item.event_id for item in next_partition.cursor.current_events)
+    if actual_200 != expected_200:
+        failures.append("simultaneous cursor partition is not deterministic")
+    expected_400 = (
+        "invariant-warning-event-0001",
+        "observed-update-event-0001",
+        "branch-divergence-derived-0001",
+    )
+    actual_400 = tuple(item.event_id for item in next_again.cursor.current_events)
+    if actual_400 != expected_400:
+        failures.append("derived and direct hard-boundary events did not partition")
+    if fixed.cursor.render_cursor_time_us != 250 or fixed.cursor.current_events:
+        failures.append("fixed-time step did not preserve an exact empty cursor")
+    if (
+        playing.playback_state is not TimelinePlaybackState.PLAYING
+        or paused.playback_state is not TimelinePlaybackState.PAUSED
+        or next_partition.cursor.playback_state is not TimelinePlaybackState.PAUSED
+    ):
+        failures.append("play/pause was not a pure cursor-state operation")
+    expected_jump_times = {
+        TimelineJumpTarget.PLAYER_ACTION: 100,
+        TimelineJumpTarget.FILL: 200,
+        TimelineJumpTarget.TRAFFIC_LIGHT_TRANSITION: 200,
+        TimelineJumpTarget.INVARIANT_WARNING: 400,
+        TimelineJumpTarget.BRANCH_DIVERGENCE: 400,
+    }
+    for target, destination in expected_jump_times.items():
+        result = jumps[target]
+        if (
+            result.availability is not TimelineNavigationAvailability.AVAILABLE
+            or result.cursor.render_cursor_time_us != destination
+            or any(item.event_kind.value != target.value for item in result.selected_events)
+        ):
+            failures.append(f"{target.value} jump changed semantics")
+    if (
+        reveal_refusal.availability
+        is not TimelineNavigationAvailability.UNAVAILABLE
+        or reveal_refusal.unavailable_reason
+        is not TimelineNavigationUnavailableReason.REVEAL_NOT_AUTHORIZED
+    ):
+        failures.append("AS_OBSERVED revealed-regime jump did not fail closed")
+    if (
+        reveal_jump.availability is not TimelineNavigationAvailability.AVAILABLE
+        or reveal_jump.cursor.render_cursor_time_us != 300
+    ):
+        failures.append("authorized postmortem revealed-regime jump is unavailable")
+    if (
+        unproven_reveal_jump.availability
+        is not TimelineNavigationAvailability.UNAVAILABLE
+        or unproven_reveal_jump.unavailable_reason
+        is not TimelineNavigationUnavailableReason.REVEAL_NOT_AUTHORIZED
+    ):
+        failures.append("POSTMORTEM mode alone implied reveal authorization")
+    if (
+        authorized_empty_jump.availability
+        is not TimelineNavigationAvailability.UNAVAILABLE
+        or authorized_empty_jump.unavailable_reason
+        is not TimelineNavigationUnavailableReason.NO_MATCHING_EVENT_IN_DIRECTION
+    ):
+        failures.append("authorized empty reveal was mislabeled as unauthorized")
+    if not hidden_regime_rejected:
+        failures.append("hidden-state evidence was relabeled as a regime transition")
+    if not cross_grant_event_rejected:
+        failures.append("timeline event crossed reveal authorization grants")
+    if (
+        boundary.availability is not TimelineNavigationAvailability.UNAVAILABLE
+        or boundary.unavailable_reason
+        is not TimelineNavigationUnavailableReason.TIMELINE_BOUNDARY
+    ):
+        failures.append("timeline boundary lacks its typed refusal")
+    if any(
+        item.reason is not TimelineSidecarRefusalReason.DEFERRED_TO_WO36_E
+        for item in (bookmark, annotation)
+    ):
+        failures.append("WO36-C persisted a deferred sidecar operation")
+    if receipt_only_keys & set(public_payload):
+        failures.append("cursor-safe timeline root exposes full-run inventory facts")
+    if (
+        receipt.schema_id != TIMELINE_RECEIPT_SCHEMA_ID
+        or public_payload.get("schema_id") != TIMELINE_SCHEMA_ID
+        or receipt.event_count != 6
+        or receipt.partition_count != 3
+    ):
+        failures.append("timeline backend receipt inventory changed")
+    if (
+        repeated.canonical_bytes() != timeline.canonical_bytes()
+        or repeated_receipt.canonical_bytes() != receipt.canonical_bytes()
+    ):
+        failures.append("timeline build depends on input ordering")
+
+    detail = (
+        f"timeline_id={timeline.timeline_id} events={receipt.event_count} "
+        f"partitions={receipt.partition_count} jumps=6 sidecars=DEFERRED_TO_WO36_E"
+    )
+    return ReplayMicroscopeAuditCase(
+        "timeline_controls_partition_simultaneous_events_deterministically",
+        detail,
+        {
+            "authorized_reveal_jump": reveal_jump.as_dict(),
+            "authorized_empty_reveal_jump": authorized_empty_jump.as_dict(),
+            "cursor_200_event_ids": list(actual_200),
+            "cursor_400_event_ids": list(actual_400),
+            "cross_grant_event_rejected": cross_grant_event_rejected,
+            "public_timeline": public_payload,
+            "receipt_sha256": receipt.receipt_sha256,
+            "reveal_refusal": reveal_refusal.as_dict(),
+            "timeline_id": timeline.timeline_id,
+            "hidden_regime_rejected": hidden_regime_rejected,
+            "unproven_postmortem_refusal": unproven_reveal_jump.as_dict(),
+        },
+        tuple(failures),
+    )
+
+
+def _synchronized_pane_inventory_case() -> ReplayMicroscopeAuditCase:
+    expected_pane_order = (
+        PaneKind.LEVEL_2_LADDER,
+        PaneKind.TIME_AND_SALES,
+        PaneKind.DEPTH_HEATMAP,
+        PaneKind.INDIVIDUAL_QUEUE,
+        PaneKind.PLAYER_ORDERS,
+        PaneKind.ORDER_STATE_LIFECYCLE,
+        PaneKind.POSITION,
+        PaneKind.TRAFFIC_LIGHT,
+        PaneKind.STRATEGY_RULE_EVIDENCE,
+        PaneKind.FEATURE_PROVENANCE,
+        PaneKind.AGENT_ACTIVITY,
+        PaneKind.LATENCY_TIMELINE,
+        PaneKind.VENUE_QUOTES,
+        PaneKind.CONSOLIDATED_QUOTES,
+        PaneKind.FILLS,
+        PaneKind.EXECUTION_METRICS,
+        PaneKind.MECHANISTIC_TRACE,
+        PaneKind.COUNTERFACTUAL_COMPARISON,
+    )
+    observed = _wo36c_read_model_fixture()
+    result = query_as_observed(
+        observed,
+        ObservationQueryRequest(60_000_000, action_time_us=59_750_000),
+    )
+    supported = tuple(
+        item
+        for item in expected_pane_order
+        if item not in {PaneKind.AGENT_ACTIVITY, PaneKind.COUNTERFACTUAL_COMPARISON}
+    )
+    manifest_bytes, manifest_sha256 = _wo36c_capability_manifest(
+        result,
+        source_class="HISTORICAL",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+    )
+    capabilities = load_verified_pane_capabilities(
+        manifest_bytes,
+        manifest_sha256,
+    )
+    snapshot = build_synchronized_panes(result, capabilities=capabilities)
+    verified_ingress_snapshot = build_synchronized_panes(
+        _load_ingress_fixture(_observed_ingress_fixture()).result(400)
+    )
+    verified_ingress_panes = {
+        pane.pane_kind
+        for pane in verified_ingress_snapshot.panes
+        if pane.data
+    }
+
+    reversed_result = query_as_observed(
+        _wo36c_read_model_fixture(reverse=True),
+        ObservationQueryRequest(60_000_000, action_time_us=59_750_000),
+    )
+    reversed_manifest, reversed_pin = _wo36c_capability_manifest(
+        reversed_result,
+        source_class="HISTORICAL",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+    )
+    repeated = build_synchronized_panes(
+        reversed_result,
+        capabilities=load_verified_pane_capabilities(
+            reversed_manifest,
+            reversed_pin,
+        ),
+    )
+
+    before_boundary = query_as_observed(
+        observed,
+        ObservationQueryRequest(59_499_999),
+    )
+    at_boundary = query_as_observed(
+        observed,
+        ObservationQueryRequest(59_500_000),
+    )
+    before_ids = {item.event_id for item in before_boundary.values}
+    boundary_ids = {item.event_id for item in at_boundary.values}
+    result_event_ids = {item.event_id for item in result.values}
+    provenance_ids: set[str] = set()
+    comparison_laundering_rejected = False
+    try:
+        comparison_source = ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            client_delivered=(
+                ObservedValueRecord(
+                    "comparison.counterfactual.fills",
+                    "counterfactual-laundering-event-0001",
+                    1,
+                    _delivered_timing(1, 2, 3),
+                    {"fill_quantity": 999},
+                ),
+            ),
+        )
+        build_synchronized_panes(
+            query_as_observed(
+                comparison_source,
+                ObservationQueryRequest(3),
+            )
+        )
+    except (TypeError, ValueError):
+        comparison_laundering_rejected = True
+    wrong_plane_signal_rejected = False
+    try:
+        wrong_plane_signal = ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            client_delivered=(
+                ObservedValueRecord(
+                    "strategy.signal",
+                    "wrong-plane-signal-event-0001",
+                    1,
+                    _delivered_timing(1, 2, 3),
+                    {"recorded_signal": "GREEN"},
+                ),
+            ),
+        )
+        build_synchronized_panes(
+            query_as_observed(wrong_plane_signal, ObservationQueryRequest(3))
+        )
+    except (TypeError, ValueError):
+        wrong_plane_signal_rejected = True
+    malformed_level2_rejected = False
+    try:
+        malformed_level2 = ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            client_delivered=(
+                ObservedValueRecord(
+                    "book.level2.malformed",
+                    "malformed-level2-event-0001",
+                    1,
+                    _delivered_timing(1, 2, 3),
+                    {"asks": [], "bids": "not-depth", "record_kind": "LEVEL_2"},
+                ),
+            ),
+        )
+        build_synchronized_panes(
+            query_as_observed(malformed_level2, ObservationQueryRequest(3))
+        )
+    except (TypeError, ValueError):
+        malformed_level2_rejected = True
+    unknown_signal_rejected = False
+    try:
+        unknown_signal = ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            decision_snapshots=(
+                ObservedValueRecord(
+                    "strategy.signal",
+                    "unknown-signal-event-0001",
+                    1,
+                    EvidenceTiming(
+                        source_event_time_us=1,
+                        venue_receipt=EvidenceTimestamp.not_applicable(
+                            TimestampAbsenceReason.CLIENT_DECISION
+                        ),
+                        client_receive=EvidenceTimestamp.not_applicable(
+                            TimestampAbsenceReason.RECORDED_SNAPSHOT
+                        ),
+                        client_knowledge=EvidenceTimestamp.recorded(3),
+                    ),
+                    {"recorded_signal": "PURPLE"},
+                ),
+            ),
+        )
+        build_synchronized_panes(
+            query_as_observed(unknown_signal, ObservationQueryRequest(3))
+        )
+    except (TypeError, ValueError):
+        unknown_signal_rejected = True
+
+    def feature_timing(source_time_us: int, knowledge_time_us: int) -> EvidenceTiming:
+        return EvidenceTiming(
+            source_event_time_us=source_time_us,
+            venue_receipt=EvidenceTimestamp.not_applicable(
+                TimestampAbsenceReason.CLIENT_DECISION
+            ),
+            client_receive=EvidenceTimestamp.not_applicable(
+                TimestampAbsenceReason.RECORDED_SNAPSHOT
+            ),
+            client_knowledge=EvidenceTimestamp.recorded(knowledge_time_us),
+        )
+
+    self_feature_event_id = "self-feature-event-0001"
+    self_feature_result = query_as_observed(
+        ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            decision_snapshots=(
+                ObservedValueRecord(
+                    "feature.self-provenance",
+                    self_feature_event_id,
+                    1,
+                    feature_timing(1, 2),
+                    {
+                        "provenance_event_ids": [self_feature_event_id],
+                        "value_ppm": 1,
+                    },
+                ),
+            ),
+        ),
+        ObservationQueryRequest(2),
+    )
+    future_feature_event_id = "future-feature-event-0001"
+    future_quote_event_id = "future-feature-source-event-0001"
+    future_feature_result = query_as_observed(
+        ObservedEvidenceSet(
+            result.source_run_id,
+            result.source_event_sha256,
+            client_delivered=(
+                ObservedValueRecord(
+                    "quote.consolidated.feature-probe",
+                    future_quote_event_id,
+                    2,
+                    _delivered_timing(3, 3, 4),
+                    {"best_ask_ticks": 102, "best_bid_ticks": 100},
+                ),
+            ),
+            decision_snapshots=(
+                ObservedValueRecord(
+                    "feature.future-provenance",
+                    future_feature_event_id,
+                    1,
+                    feature_timing(1, 2),
+                    {
+                        "provenance_event_ids": [future_quote_event_id],
+                        "value_ppm": 1,
+                    },
+                ),
+            ),
+        ),
+        ObservationQueryRequest(4),
+    )
+    reveal_feature_observed = ObservedEvidenceSet(
+        result.source_run_id,
+        result.source_event_sha256,
+        decision_snapshots=(
+            ObservedValueRecord(
+                "feature.reveal-provenance",
+                "reveal-feature-event-0001",
+                1,
+                feature_timing(59_700_000, 59_800_000),
+                {
+                    "provenance_event_ids": ["agent-activity-event-0001"],
+                    "value_ppm": 1,
+                },
+            ),
+        ),
+    )
+    reveal_feature_source = _wo36c_reveal_fixture(
+        reveal_feature_observed,
+        include_queue=False,
+    )
+    reveal_feature_requested = (RevealCapability.HIDDEN_STATE,)
+    reveal_feature_result = query_postmortem(
+        reveal_feature_observed,
+        reveal_feature_source,
+        _reveal_authorization(
+            reveal_feature_source,
+            reveal_feature_requested,
+            observed=reveal_feature_observed,
+        ),
+        ObservationQueryRequest(
+            60_000_000,
+            requested_reveal_capabilities=reveal_feature_requested,
+        ),
+    )
+    feature_provenance_refusals: dict[str, bool] = {}
+    for label, hostile_result in (
+        ("self", self_feature_result),
+        ("future", future_feature_result),
+        ("reveal", reveal_feature_result),
+    ):
+        try:
+            build_synchronized_panes(hostile_result)
+        except (TypeError, ValueError):
+            feature_provenance_refusals[label] = True
+        else:
+            feature_provenance_refusals[label] = False
+    failures: list[str] = []
+    expected_ingress_panes = {
+        PaneKind.PLAYER_ORDERS,
+        PaneKind.ORDER_STATE_LIFECYCLE,
+        PaneKind.TRAFFIC_LIGHT,
+        PaneKind.STRATEGY_RULE_EVIDENCE,
+        PaneKind.FEATURE_PROVENANCE,
+        PaneKind.LATENCY_TIMELINE,
+        PaneKind.CONSOLIDATED_QUOTES,
+        PaneKind.FILLS,
+    }
+    if verified_ingress_panes != expected_ingress_panes:
+        failures.append("verified DEV-0006 ingress no longer satisfies pane contracts")
+    if PANE_ORDER != expected_pane_order or tuple(
+        item.pane_kind for item in snapshot.panes
+    ) != expected_pane_order:
+        failures.append("synchronized pane inventory/order changed")
+    expected_root = (
+        result.request.render_cursor_time_us,
+        result.policy.mode,
+        result.policy.policy_id,
+        result.query_id,
+    )
+    for pane in snapshot.panes:
+        actual_root = (
+            pane.render_cursor_time_us,
+            pane.observation_mode,
+            pane.policy_id,
+            pane.query_id,
+        )
+        if actual_root != expected_root:
+            failures.append(f"{pane.pane_kind.value} differs from the shared root")
+        for datum in pane.data:
+            for source in datum.source_events:
+                provenance_ids.add(source.event_id)
+                if (
+                    source.event_id not in result_event_ids
+                    or source.policy_visible_at_time_us
+                    > result.request.render_cursor_time_us
+                ):
+                    failures.append(
+                        f"{pane.pane_kind.value} cites unauthorized/future evidence"
+                    )
+            if datum.calculation is not None and datum.calculation.source_event_ids != tuple(
+                sorted(item.event_id for item in datum.source_events)
+            ):
+                failures.append(
+                    f"{pane.pane_kind.value} calculation lost its exact sources"
+                )
+        for estimate in pane.queue_estimates:
+            for source in estimate.source_events:
+                provenance_ids.add(source.event_id)
+                if source.event_id not in result_event_ids:
+                    failures.append("queue estimate cites an unqueried event")
+    queue = snapshot.pane(PaneKind.INDIVIDUAL_QUEUE)
+    if (
+        queue.availability is not PaneAvailability.AVAILABLE
+        or len(queue.queue_estimates) != 1
+        or queue.queue_estimates[0].estimator_version != "queue-estimator.v1"
+        or queue.queue_estimates[0].truth_availability
+        is not QueueTruthAvailability.AUTHORIZATION_REQUIRED
+        or queue.queue_estimates[0].truth_quantity_ahead is not None
+    ):
+        failures.append("historical queue estimate capability/truth contract changed")
+    agent = snapshot.pane(PaneKind.AGENT_ACTIVITY)
+    comparison = snapshot.pane(PaneKind.COUNTERFACTUAL_COMPARISON)
+    if (
+        agent.availability is not PaneAvailability.UNAVAILABLE
+        or agent.explanation is None
+        or agent.explanation.reason
+        is not PaneUnavailableReason.AUTHORIZED_REVEAL_REQUIRED
+    ):
+        failures.append("AS_OBSERVED agent activity did not fail closed")
+    if (
+        comparison.availability is not PaneAvailability.UNAVAILABLE
+        or comparison.explanation is None
+        or comparison.explanation.reason
+        is not PaneUnavailableReason.COUNTERFACTUAL_NOT_SELECTED
+    ):
+        failures.append("WO36-E comparison slot is not explicitly unavailable")
+    if not comparison_laundering_rejected:
+        failures.append("WO36-E comparison slot accepted an unowned query namespace")
+    if not wrong_plane_signal_rejected:
+        failures.append("traffic-light pane accepted the wrong evidence plane")
+    if not malformed_level2_rejected:
+        failures.append("Level 2 pane accepted a malformed payload")
+    if not unknown_signal_rejected:
+        failures.append("traffic-light pane accepted an unknown closed state")
+    if not all(feature_provenance_refusals.values()):
+        failures.append("feature pane accepted self, future, or reveal provenance")
+    feature_source_ids = {
+        source.event_id
+        for datum in snapshot.pane(PaneKind.FEATURE_PROVENANCE).data
+        for source in datum.source_events
+    }
+    if feature_source_ids != {"feature-event-0001", "top-book-event-late"}:
+        failures.append("feature provenance did not resolve exact query source events")
+    if snapshot.available_pane_count != 16:
+        failures.append("expected sixteen source-backed ordinary panes")
+    if (
+        "top-book-event-late" in before_ids
+        or "top-book-event-late" not in boundary_ids
+    ):
+        failures.append("hard cursor boundary exposed a quote early or late")
+    if repeated.canonical_bytes() != snapshot.canonical_bytes():
+        failures.append("pane snapshot depends on input ordering")
+    if capabilities.authority is not PaneCapabilityAuthority.PINNED_BACKEND_MANIFEST:
+        failures.append("queue capability was not sourced from a pinned backend manifest")
+
+    detail = (
+        f"snapshot_id={snapshot.snapshot_id} panes={len(snapshot.panes)} "
+        f"available={snapshot.available_pane_count} unavailable="
+        f"{snapshot.unavailable_pane_count} cursor=60000000"
+    )
+    return ReplayMicroscopeAuditCase(
+        "all_eighteen_panes_share_one_cursor_policy_and_provenance",
+        detail,
+        {
+            "available_pane_count": snapshot.available_pane_count,
+            "capability_authority": capabilities.authority.value,
+            "manifest_sha256": manifest_sha256,
+            "pane_order": [item.value for item in expected_pane_order],
+            "provenance_event_ids": sorted(provenance_ids),
+            "query_id": result.query_id,
+            "comparison_laundering_rejected": comparison_laundering_rejected,
+            "feature_provenance_refusals": feature_provenance_refusals,
+            "malformed_level2_rejected": malformed_level2_rejected,
+            "snapshot_id": snapshot.snapshot_id,
+            "unavailable_pane_count": snapshot.unavailable_pane_count,
+            "unknown_signal_rejected": unknown_signal_rejected,
+            "verified_ingress_panes": sorted(
+                item.value for item in verified_ingress_panes
+            ),
+            "wrong_plane_signal_rejected": wrong_plane_signal_rejected,
+        },
+        tuple(failures),
+    )
+
+
+def _unsupported_pane_explanation_case() -> ReplayMicroscopeAuditCase:
+    run_id, source_sha256 = _wo36c_source_identity()
+    result = query_as_observed(
+        ObservedEvidenceSet(run_id, source_sha256),
+        ObservationQueryRequest(0),
+    )
+    snapshot = build_synchronized_panes(result)
+    level_2 = snapshot.pane(PaneKind.LEVEL_2_LADDER)
+    heatmap = snapshot.pane(PaneKind.DEPTH_HEATMAP)
+    queue = snapshot.pane(PaneKind.INDIVIDUAL_QUEUE)
+    local_capability = bind_pane_capabilities(
+        result,
+        supported_panes=(),
+    )
+    local_level_2 = build_synchronized_panes(
+        result,
+        capabilities=local_capability,
+    ).pane(PaneKind.LEVEL_2_LADDER)
+    manifest_bytes, manifest_sha256 = _wo36c_capability_manifest(
+        result,
+        source_class="HISTORICAL",
+        supported_panes=(PaneKind.LEVEL_2_LADDER,),
+        queue_capability=QueueCapability.UNAVAILABLE,
+        queue_estimator_version=None,
+    )
+    recorded_empty = build_synchronized_panes(
+        result,
+        capabilities=load_verified_pane_capabilities(
+            manifest_bytes,
+            manifest_sha256,
+        ),
+    ).pane(PaneKind.LEVEL_2_LADDER)
+    failures: list[str] = []
+    expected = (
+        (level_2, PaneUnavailableReason.LEVEL_2_NOT_RECORDED),
+        (heatmap, PaneUnavailableReason.DEPTH_HISTORY_NOT_RECORDED),
+        (queue, PaneUnavailableReason.QUEUE_CAPABILITY_UNAVAILABLE),
+    )
+    for pane, reason in expected:
+        if (
+            pane.availability is not PaneAvailability.UNAVAILABLE
+            or pane.explanation is None
+            or pane.explanation.reason is not reason
+            or not pane.explanation.detail
+        ):
+            failures.append(f"{pane.pane_kind.value} lacks typed unavailability")
+    if (
+        recorded_empty.availability is not PaneAvailability.RECORDED_EMPTY
+        or recorded_empty.explanation is None
+        or recorded_empty.explanation.reason
+        is not PaneUnavailableReason.NO_VISIBLE_EVENTS_AT_CURSOR
+    ):
+        failures.append("declared empty Level 2 was collapsed into unavailable/success")
+    if (
+        local_level_2.availability is not PaneAvailability.UNAVAILABLE
+        or local_level_2.explanation is None
+        or local_level_2.explanation.reason
+        is not PaneUnavailableReason.LEVEL_2_NOT_RECORDED
+    ):
+        failures.append("local non-authorizing metadata asserted recorded support")
+    if local_capability.authority is not PaneCapabilityAuthority.LOCAL_NONAUTHORIZING:
+        failures.append("local capability hint unexpectedly gained authority")
+    detail = (
+        "level2=LEVEL_2_NOT_RECORDED queue=QUEUE_CAPABILITY_UNAVAILABLE "
+        "declared_empty=RECORDED_EMPTY"
+    )
+    return ReplayMicroscopeAuditCase(
+        "unsupported_depth_and_queue_explain_typed_unavailability",
+        detail,
+        {
+            "depth_heatmap": heatmap.as_dict(),
+            "level_2": level_2.as_dict(),
+            "local_level_2": local_level_2.as_dict(),
+            "queue": queue.as_dict(),
+            "recorded_empty_level_2": recorded_empty.as_dict(),
+        },
+        tuple(failures),
+    )
+
+
+def _synthetic_queue_truth_case() -> ReplayMicroscopeAuditCase:
+    observed = _wo36c_read_model_fixture()
+    reveal = _wo36c_reveal_fixture(observed)
+    requested = (RevealCapability.GROUND_TRUTH, RevealCapability.HIDDEN_STATE)
+    request = ObservationQueryRequest(
+        60_000_000,
+        action_time_us=59_750_000,
+        requested_reveal_capabilities=requested,
+    )
+    authorization = _reveal_authorization(reveal, requested, observed=observed)
+    result = query_postmortem(
+        observed,
+        reveal,
+        authorization,
+        request,
+    )
+    supported = tuple(
+        item for item in PANE_ORDER if item is not PaneKind.COUNTERFACTUAL_COMPARISON
+    )
+    manifest_bytes, manifest_sha256 = _wo36c_capability_manifest(
+        result,
+        source_class="SYNTHETIC",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+        reveal_source=reveal.source,
+        reveal_authorization=authorization,
+    )
+    capabilities = load_verified_pane_capabilities(
+        manifest_bytes,
+        manifest_sha256,
+        query_result=result,
+        reveal_source=reveal.source,
+        reveal_authorization=authorization,
+    )
+    snapshot = build_synchronized_panes(result, capabilities=capabilities)
+    queue = snapshot.pane(PaneKind.INDIVIDUAL_QUEUE)
+    estimate = queue.queue_estimates[0]
+    agent = snapshot.pane(PaneKind.AGENT_ACTIVITY)
+
+    wrong_queue_reveal = _wo36c_reveal_fixture(
+        observed,
+        queue_capability=RevealCapability.HIDDEN_STATE,
+        include_agent=False,
+    )
+    wrong_queue_requested = (RevealCapability.HIDDEN_STATE,)
+    wrong_queue_authorization = _reveal_authorization(
+        wrong_queue_reveal,
+        wrong_queue_requested,
+        observed=observed,
+    )
+    wrong_queue_result = query_postmortem(
+        observed,
+        wrong_queue_reveal,
+        wrong_queue_authorization,
+        ObservationQueryRequest(
+            60_000_000,
+            action_time_us=59_750_000,
+            requested_reveal_capabilities=wrong_queue_requested,
+        ),
+    )
+    wrong_queue_raw, wrong_queue_pin = _wo36c_capability_manifest(
+        wrong_queue_result,
+        source_class="SYNTHETIC",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+        reveal_source=wrong_queue_reveal.source,
+        reveal_authorization=wrong_queue_authorization,
+    )
+    wrong_queue_plane_rejected = False
+    try:
+        build_synchronized_panes(
+            wrong_queue_result,
+            capabilities=load_verified_pane_capabilities(
+                wrong_queue_raw,
+                wrong_queue_pin,
+                query_result=wrong_queue_result,
+                reveal_source=wrong_queue_reveal.source,
+                reveal_authorization=wrong_queue_authorization,
+            ),
+        )
+    except ValueError:
+        wrong_queue_plane_rejected = True
+
+    empty_observed = ObservedEvidenceSet(
+        observed.source_run_id,
+        observed.source_event_sha256,
+    )
+    wrong_agent_reveal = _wo36c_reveal_fixture(
+        empty_observed,
+        agent_capability=RevealCapability.GROUND_TRUTH,
+        include_queue=False,
+    )
+    wrong_agent_requested = (RevealCapability.GROUND_TRUTH,)
+    wrong_agent_result = query_postmortem(
+        empty_observed,
+        wrong_agent_reveal,
+        _reveal_authorization(
+            wrong_agent_reveal,
+            wrong_agent_requested,
+            observed=empty_observed,
+        ),
+        ObservationQueryRequest(
+            60_000_000,
+            requested_reveal_capabilities=wrong_agent_requested,
+        ),
+    )
+    wrong_agent_plane_rejected = False
+    try:
+        build_synchronized_panes(wrong_agent_result)
+    except ValueError:
+        wrong_agent_plane_rejected = True
+
+    local_rejected = False
+    try:
+        build_synchronized_panes(
+            result,
+            capabilities=bind_pane_capabilities(
+                result,
+                supported_panes=(),
+            ),
+        )
+    except ValueError:
+        local_rejected = True
+
+    historical_raw, historical_pin = _wo36c_capability_manifest(
+        result,
+        source_class="HISTORICAL",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+    )
+    historical_rejected = False
+    try:
+        build_synchronized_panes(
+            result,
+            capabilities=load_verified_pane_capabilities(
+                historical_raw,
+                historical_pin,
+            ),
+        )
+    except ValueError:
+        historical_rejected = True
+
+    tampered = json.loads(manifest_bytes.decode("ascii"))
+    tampered["source_class"] = "HISTORICAL"
+    tampered["source_schema_id"] = HISTORICAL_PANE_SOURCE_SCHEMA_ID
+    tamper_rejected = False
+    try:
+        load_verified_pane_capabilities(
+            _audit_canonical_json_bytes(tampered),
+            manifest_sha256,
+        )
+    except ValueError:
+        tamper_rejected = True
+
+    historical_reveal_source = replace(
+        reveal.source,
+        source_schema_id=HISTORICAL_PANE_SOURCE_SCHEMA_ID,
+    )
+    historical_reveal = RevealEvidenceSet(historical_reveal_source, reveal.values)
+    historical_authorization = _reveal_authorization(
+        historical_reveal,
+        requested,
+        observed=observed,
+    )
+    historical_result = query_postmortem(
+        observed,
+        historical_reveal,
+        historical_authorization,
+        request,
+    )
+    forged_raw, forged_pin = _wo36c_capability_manifest(
+        historical_result,
+        source_class="SYNTHETIC",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+        reveal_source=historical_reveal_source,
+        reveal_authorization=historical_authorization,
+    )
+    reveal_relabel_rejected = False
+    try:
+        load_verified_pane_capabilities(
+            forged_raw,
+            forged_pin,
+            query_result=historical_result,
+            reveal_source=historical_reveal_source,
+            reveal_authorization=historical_authorization,
+        )
+    except ValueError:
+        reveal_relabel_rejected = True
+
+    failures: list[str] = []
+    if (
+        queue.availability is not PaneAvailability.AVAILABLE
+        or estimate.truth_availability
+        is not QueueTruthAvailability.AUTHORIZED_SYNTHETIC_POSTMORTEM
+        or estimate.truth_quantity_ahead != 60
+        or estimate.uncertainty_lower_quantity != 50
+        or estimate.uncertainty_upper_quantity != 90
+    ):
+        failures.append("authorized synthetic queue truth/uncertainty changed")
+    if agent.availability is not PaneAvailability.AVAILABLE:
+        failures.append("authorized postmortem agent activity remained unavailable")
+    if not wrong_queue_plane_rejected:
+        failures.append("queue truth accepted hidden-state evidence")
+    if not wrong_agent_plane_rejected:
+        failures.append("agent activity accepted ground-truth evidence")
+    if not local_rejected:
+        failures.append("local capability metadata unlocked protected queue evidence")
+    if not historical_rejected:
+        failures.append("historical source classification unlocked queue truth")
+    if not tamper_rejected:
+        failures.append("source-class manifest relabel survived its original pin")
+    if not reveal_relabel_rejected:
+        failures.append("historical reveal source was relabeled synthetic")
+    if (
+        capabilities.authority is not PaneCapabilityAuthority.PINNED_BACKEND_MANIFEST
+        or capabilities.manifest_sha256 != manifest_sha256
+    ):
+        failures.append("synthetic authority lacks its exact retained manifest pin")
+
+    detail = (
+        f"query_id={result.query_id} truth="
+        f"{estimate.truth_availability.value} manifest_sha256={manifest_sha256}"
+    )
+    return ReplayMicroscopeAuditCase(
+        "queue_truth_requires_pinned_synthetic_postmortem_authority",
+        detail,
+        {
+            "agent_activity": agent.as_dict(),
+            "historical_rejected": historical_rejected,
+            "local_rejected": local_rejected,
+            "manifest_sha256": manifest_sha256,
+            "queue_estimate": estimate.as_dict(),
+            "reveal_relabel_rejected": reveal_relabel_rejected,
+            "tamper_rejected": tamper_rejected,
+            "wrong_agent_plane_rejected": wrong_agent_plane_rejected,
+            "wrong_queue_plane_rejected": wrong_queue_plane_rejected,
+        },
+        tuple(failures),
+    )
+
+
+def _overlay_contract_case() -> ReplayMicroscopeAuditCase:
+    expected_overlay_contracts = (
+        (
+            "SPREAD",
+            "KIRBY2_MICROSCOPE_SPREAD_OVERLAY_V1",
+            1,
+            "TICKS",
+            "INSTANTANEOUS_AT_CURSOR",
+            0,
+        ),
+        (
+            "MICROPRICE",
+            "KIRBY2_MICROSCOPE_MICROPRICE_OVERLAY_V1",
+            1,
+            "MICROTICKS",
+            "INSTANTANEOUS_AT_CURSOR",
+            0,
+        ),
+        (
+            "IMBALANCE",
+            "KIRBY2_MICROSCOPE_IMBALANCE_OVERLAY_V1",
+            1,
+            "SIGNED_RATIO_PPM",
+            "INSTANTANEOUS_AT_CURSOR",
+            0,
+        ),
+        (
+            "TRADE_VELOCITY",
+            "KIRBY2_MICROSCOPE_TRADE_VELOCITY_OVERLAY_V1",
+            1,
+            "MICROTRADES_PER_SECOND",
+            "TRAILING_CLOSED_INTERVAL",
+            1_000_000,
+        ),
+        (
+            "CANCELLATION_VELOCITY",
+            "KIRBY2_MICROSCOPE_CANCELLATION_VELOCITY_OVERLAY_V1",
+            1,
+            "MICROSHARES_PER_SECOND",
+            "TRAILING_CLOSED_INTERVAL",
+            1_000_000,
+        ),
+        (
+            "REPLENISHMENT",
+            "KIRBY2_MICROSCOPE_REPLENISHMENT_OVERLAY_V1",
+            1,
+            "MICROSHARES_PER_SECOND",
+            "TRAILING_CLOSED_INTERVAL",
+            1_000_000,
+        ),
+        (
+            "RELATIVE_VOLUME",
+            "KIRBY2_MICROSCOPE_RELATIVE_VOLUME_OVERLAY_V1",
+            1,
+            "RATIO_PPM",
+            "TRAILING_CLOSED_INTERVAL",
+            60_000_000,
+        ),
+        (
+            "SHORT_TERM_VOLATILITY",
+            "KIRBY2_MICROSCOPE_SHORT_TERM_VOLATILITY_OVERLAY_V1",
+            1,
+            "MICROBASIS_POINTS",
+            "TRAILING_CLOSED_INTERVAL",
+            5_000_000,
+        ),
+        (
+            "IMPLEMENTATION_SHORTFALL",
+            "KIRBY2_MICROSCOPE_IMPLEMENTATION_SHORTFALL_OVERLAY_V1",
+            1,
+            "X2_TICK_SHARES",
+            "SESSION_START_TO_CURSOR",
+            None,
+        ),
+    )
+    observed = _wo36c_read_model_fixture()
+    terminal_request = ObservationQueryRequest(
+        60_000_000,
+        action_time_us=59_750_000,
+    )
+    terminal = query_as_observed(observed, terminal_request)
+    event_times = (
+        1_000_000,
+        10_000_000,
+        56_000_000,
+        59_200_000,
+        59_400_000,
+        59_500_000,
+        59_600_000,
+        59_700_000,
+        59_760_000,
+        59_800_000,
+        59_900_000,
+    )
+    event_queries = tuple(
+        query_as_observed(observed, ObservationQueryRequest(cursor))
+        for cursor in event_times
+    )
+    projection, receipt = build_overlay_window_projection(
+        terminal,
+        event_queries,
+    )
+    selection = OverlayInputSelection(
+        top_of_book_event_ids=(
+            "top-book-event-early",
+            "top-book-event-late",
+        ),
+        trade_event_ids=("trade-event-0001", "trade-event-0002"),
+        cancellation_event_ids=("cancel-event-0001",),
+        replenishment_event_ids=("replenishment-event-0001",),
+        relative_volume_baseline_event_id=(
+            "relative-volume-baseline-event-0001"
+        ),
+        execution_arrival_event_id="execution-arrival-event-0001",
+        execution_fill_event_ids=(
+            "execution-fill-event-0001",
+            "execution-fill-event-0002",
+        ),
+    )
+    overlay_set = build_overlay_set(terminal, projection, selection)
+
+    reversed_observed = _wo36c_read_model_fixture(reverse=True)
+    reversed_terminal = query_as_observed(reversed_observed, terminal_request)
+    reversed_queries = tuple(
+        query_as_observed(reversed_observed, ObservationQueryRequest(cursor))
+        for cursor in reversed(event_times)
+    )
+    reversed_projection, reversed_receipt = build_overlay_window_projection(
+        reversed_terminal,
+        reversed_queries,
+    )
+    repeated = build_overlay_set(
+        reversed_terminal,
+        reversed_projection,
+        selection,
+    )
+
+    laundered = build_overlay_set(
+        terminal,
+        projection,
+        OverlayInputSelection(
+            top_of_book_event_ids=("strategy-rule-event-0001",),
+        ),
+    )
+
+    early_terminal = query_as_observed(
+        observed,
+        ObservationQueryRequest(500_000),
+    )
+    early_event_query = query_as_observed(
+        observed,
+        ObservationQueryRequest(250_000),
+    )
+    early_projection, _ = build_overlay_window_projection(
+        early_terminal,
+        (early_event_query,),
+    )
+    early_rate = build_overlay_set(
+        early_terminal,
+        early_projection,
+        OverlayInputSelection(trade_event_ids=("trade-event-early",)),
+    ).trade_velocity
+
+    queried_event_ids = {
+        item.event_id
+        for query in (terminal, *event_queries)
+        for item in query.values
+    }
+    failures: list[str] = []
+    actual_overlay_contracts = tuple(
+        (
+            item.kind.value,
+            item.schema_id,
+            item.schema_version,
+            item.unit.value,
+            item.window.basis.value,
+            item.window.lookback_us,
+        )
+        for item in overlay_set.overlays
+    )
+    if (
+        tuple(item.value for item in OVERLAY_KIND_ORDER)
+        != tuple(item[0] for item in expected_overlay_contracts)
+        or actual_overlay_contracts != expected_overlay_contracts
+    ):
+        failures.append("overlay inventory/order changed")
+    if len(overlay_set.overlays) != 9 or any(
+        item.availability is not OverlayAvailability.AVAILABLE
+        for item in overlay_set.overlays
+    ):
+        failures.append("complete fixture did not produce all nine overlays")
+    expected_values = {
+        "SPREAD": 2,
+        "MICROPRICE": 102_500_000,
+        "IMBALANCE": 500_000,
+        "TRADE_VELOCITY": 2_000_000,
+        "CANCELLATION_VELOCITY": 7_000_000,
+        "REPLENISHMENT": 9_000_000,
+        "RELATIVE_VOLUME": 500_000,
+        "IMPLEMENTATION_SHORTFALL": 40,
+    }
+    for item in overlay_set.overlays:
+        if item.kind.value in expected_values and item.value != expected_values[item.kind.value]:
+            failures.append(f"{item.kind.value} exact calculation changed")
+        if type(item.value) is not int:
+            failures.append(f"{item.kind.value} is not exact integer output")
+        expected_spec = OVERLAY_SPECIFICATIONS[OVERLAY_KIND_ORDER.index(item.kind)]
+        if (
+            item.schema_id != expected_spec.schema_id
+            or item.schema_version != expected_spec.schema_version
+            or item.unit is not expected_spec.unit
+            or item.window.basis is not expected_spec.window_basis
+            or item.window.lookback_us != expected_spec.lookback_us
+            or item.calculation.as_dict() != expected_spec.calculation.as_dict()
+        ):
+            failures.append(f"{item.kind.value} version/window/unit contract changed")
+        if not item.source_events or any(
+            source.event_id not in queried_event_ids
+            or source.policy_visible_at_time_us > terminal.request.render_cursor_time_us
+            or not source.query_ids
+            for source in item.source_events
+        ):
+            failures.append(f"{item.kind.value} lacks exact query provenance")
+    if len(overlay_set.short_term_volatility.source_events) != 2:
+        failures.append("repeated same-series quote history was lost")
+    if len(overlay_set.trade_velocity.source_events) != 2:
+        failures.append("repeated same-series trade history was lost")
+    if (
+        laundered.spread.availability is not OverlayAvailability.UNAVAILABLE
+        or laundered.spread.unavailable_reason
+        is not OverlayUnavailableReason.SEMANTIC_ROLE_MISMATCH
+    ):
+        failures.append("strategy evidence was laundered into a quote overlay")
+    if (
+        early_rate.availability is not OverlayAvailability.AVAILABLE
+        or early_rate.window.start_time_us != 0
+        or early_rate.window.end_time_us != 500_000
+        or early_rate.window.duration_us != 500_000
+        or early_rate.value != 2_000_000
+    ):
+        failures.append("early-session rate denominator differs from its window")
+    if (
+        repeated.canonical_bytes() != overlay_set.canonical_bytes()
+        or reversed_receipt.canonical_bytes() != receipt.canonical_bytes()
+        or reversed_projection.canonical_bytes() != projection.canonical_bytes()
+    ):
+        failures.append("overlay projection/output depends on input ordering")
+    projection_payload = projection.as_dict()
+    if {
+        "event_count",
+        "event_inventory_sha256",
+        "query_count",
+        "query_inventory_sha256",
+    } & set(projection_payload):
+        failures.append("cursor-safe overlay projection leaks backend inventory facts")
+
+    detail = (
+        f"overlay_set_id={overlay_set.overlay_set_id} overlays=9 "
+        f"projection_id={projection.projection_id} projected_events="
+        f"{receipt.event_count}"
+    )
+    return ReplayMicroscopeAuditCase(
+        "nine_overlays_preserve_versions_windows_units_and_sources",
+        detail,
+        {
+            "early_trade_velocity": early_rate.as_dict(),
+            "overlay_set_id": overlay_set.overlay_set_id,
+            "projection": projection_payload,
+            "projection_receipt_sha256": receipt.receipt_sha256,
+            "semantic_laundering_reason": (
+                None
+                if laundered.spread.unavailable_reason is None
+                else laundered.spread.unavailable_reason.value
+            ),
+            "values": {
+                item.kind.value: item.value for item in overlay_set.overlays
+            },
+        },
+        tuple(failures),
+    )
+
+
+def _read_model_cross_binding_case() -> ReplayMicroscopeAuditCase:
+    observed = _wo36c_read_model_fixture()
+    full_result = query_as_observed(
+        observed,
+        ObservationQueryRequest(60_000_000, action_time_us=59_750_000),
+    )
+    earlier_result = query_as_observed(
+        observed,
+        ObservationQueryRequest(59_499_999),
+    )
+    early_top_query = query_as_observed(
+        observed,
+        ObservationQueryRequest(56_000_000),
+    )
+    early_projection, _ = build_overlay_window_projection(
+        earlier_result,
+        (early_top_query,),
+    )
+    future_selection_rejected = False
+    try:
+        build_overlay_set(
+            earlier_result,
+            early_projection,
+            OverlayInputSelection(
+                top_of_book_event_ids=("top-book-event-late",),
+            ),
+        )
+    except ValueError:
+        future_selection_rejected = True
+
+    full_projection, _ = build_overlay_window_projection(
+        full_result,
+        (
+            query_as_observed(observed, ObservationQueryRequest(59_500_000)),
+        ),
+    )
+    alternate_terminal = query_as_observed(
+        observed,
+        ObservationQueryRequest(60_000_000),
+    )
+    projection_cross_query_rejected = False
+    try:
+        build_overlay_set(
+            alternate_terminal,
+            full_projection,
+            OverlayInputSelection(
+                top_of_book_event_ids=("top-book-event-late",),
+            ),
+        )
+    except ValueError:
+        projection_cross_query_rejected = True
+
+    supported = tuple(
+        item
+        for item in PANE_ORDER
+        if item not in {PaneKind.AGENT_ACTIVITY, PaneKind.COUNTERFACTUAL_COMPARISON}
+    )
+    capability_raw, capability_pin = _wo36c_capability_manifest(
+        full_result,
+        source_class="HISTORICAL",
+        supported_panes=supported,
+        queue_capability=QueueCapability.ESTIMATED,
+        queue_estimator_version="queue-estimator.v1",
+    )
+    full_capabilities = load_verified_pane_capabilities(
+        capability_raw,
+        capability_pin,
+    )
+    pane_cross_query_rejected = False
+    try:
+        build_synchronized_panes(
+            earlier_result,
+            capabilities=full_capabilities,
+        )
+    except ValueError:
+        pane_cross_query_rejected = True
+
+    held_event_rejected = False
+    try:
+        timeline_event_from_query_result(full_result, "top-book-event-late")
+    except ValueError:
+        held_event_rejected = True
+    semantic_relabel_rejected = False
+    try:
+        quote_query = query_as_observed(
+            observed,
+            ObservationQueryRequest(59_820_000),
+        )
+        timeline_event_from_query_result(
+            quote_query,
+            "consolidated-quote-pane-event-0001",
+            TimelineEventKind.FILL,
+        )
+    except ValueError:
+        semantic_relabel_rejected = True
+
+    direct_timeline_event_rejected = False
+    try:
+        TimelineEvidenceEvent(
+            full_result.source_run_id,
+            full_result.source_event_sha256,
+            ObservationMode.AS_OBSERVED,
+            AS_OBSERVED_POLICY_ID,
+            "fabricated-event-0001",
+            TimelineEventKind.OBSERVED_UPDATE,
+            1,
+            0,
+            0,
+            TimelineEvidenceSource.CLIENT_DELIVERED,
+            ("fabricated-event-0001",),
+        )
+    except TypeError:
+        direct_timeline_event_rejected = True
+
+    timeline_source = _wo36c_timeline_fixture()
+    player_query = query_as_observed(
+        timeline_source,
+        ObservationQueryRequest(100, 100),
+    )
+    fill_query = query_as_observed(
+        timeline_source,
+        ObservationQueryRequest(200, 200),
+    )
+    player_event = timeline_event_from_query_result(
+        player_query,
+        "player-action-event-0001",
+    )
+    fill_event = timeline_event_from_query_result(
+        fill_query,
+        "fill-event-0001",
+    )
+    player_timeline, player_receipt = build_replay_timeline(
+        player_query,
+        (player_event,),
+    )
+    fill_timeline, fill_receipt = build_replay_timeline(
+        fill_query,
+        (fill_event,),
+    )
+    timeline_cross_inventory_rejected = False
+    try:
+        fill_timeline.play(player_timeline.cursor(100))
+    except ValueError:
+        timeline_cross_inventory_rejected = True
+
+    run_id, source_sha256 = _wo36c_source_identity()
+    laundered_agent = ObservedEvidenceSet(
+        run_id,
+        source_sha256,
+        client_delivered=(
+            ObservedValueRecord(
+                "agent.fabricated",
+                "agent-fabricated-event-0001",
+                1,
+                _delivered_timing(10, 20, 30),
+                {"activity": "fabricated-observed-agent"},
+            ),
+        ),
+    )
+    observed_agent_rejected = False
+    try:
+        build_synchronized_panes(
+            query_as_observed(laundered_agent, ObservationQueryRequest(30)),
+        )
+    except ValueError:
+        observed_agent_rejected = True
+
+    attack_sources = (
+        "from kirby2.microscope.timeline import "
+        "TimelineEvidenceEvent, ReplayTimeline, build_replay_timeline\n",
+        "from kirby2.microscope.panes import "
+        "PaneCapabilityRead, load_verified_pane_capabilities\n",
+        "from kirby2.microscope.overlays import "
+        "OverlayInputSelection, OverlayWindowProjection, "
+        "build_overlay_window_projection, build_overlay_set\n",
+        "import importlib\n"
+        "backend = importlib.import_module('kirby2.microscope.timeline')\n"
+        "event_type = backend.TimelineEvidenceEvent\n",
+        "backend = __import__('kirby2.microscope.panes', "
+        "fromlist=('PaneCapabilityRead',))\n",
+    )
+    attack_findings = tuple(
+        finding
+        for index, source in enumerate(attack_sources)
+        for finding in _raw_evidence_imports_in_source(
+            source,
+            f"wo36c-attack-{index}.py",
+        )
+    )
+    safe_findings = _raw_evidence_imports_in_source(
+        "from kirby2.microscope.timeline import TimelineCursor\n"
+        "from kirby2.microscope.panes import SynchronizedPaneSnapshot\n"
+        "from kirby2.microscope.overlays import OverlaySet\n",
+        "wo36c-safe-output.py",
+    )
+    live_ui_findings = _ui_raw_evidence_imports()
+
+    failures: list[str] = []
+    expected_refusals = {
+        "future overlay selection": future_selection_rejected,
+        "projection/query cross-binding": projection_cross_query_rejected,
+        "pane/query cross-binding": pane_cross_query_rejected,
+        "held timeline event": held_event_rejected,
+        "timeline semantic relabel": semantic_relabel_rejected,
+        "direct timeline event": direct_timeline_event_rejected,
+        "timeline inventory substitution": timeline_cross_inventory_rejected,
+        "observed agent laundering": observed_agent_rejected,
+    }
+    for label, rejected in expected_refusals.items():
+        if not rejected:
+            failures.append(f"{label} did not fail closed")
+    if player_timeline.timeline_id != fill_timeline.timeline_id:
+        failures.append("public timeline identity leaks a full-inventory comparison oracle")
+    if (
+        player_receipt.event_inventory_sha256
+        == fill_receipt.event_inventory_sha256
+        or player_receipt.receipt_sha256 == fill_receipt.receipt_sha256
+    ):
+        failures.append("backend timeline receipt does not bind the exact inventory")
+    if len(attack_findings) != len(attack_sources):
+        failures.append("UI backend-input import attack inventory was not blocked")
+    if safe_findings:
+        failures.append("UI output-only read-model imports were blocked")
+    if live_ui_findings:
+        failures.append("live UI imports replay backend input authority")
+
+    detail = (
+        f"refusals={sum(expected_refusals.values())}/{len(expected_refusals)} "
+        f"ui_backend_attacks={len(attack_findings)} live_ui_findings="
+        f"{len(live_ui_findings)}"
+    )
+    return ReplayMicroscopeAuditCase(
+        "read_models_reject_cross_query_future_and_ui_backend_inputs",
+        detail,
+        {
+            "attack_findings": list(attack_findings),
+            "live_ui_findings": live_ui_findings,
+            "refusals": expected_refusals,
+            "safe_findings": safe_findings,
+            "timeline_ids": [
+                player_timeline.timeline_id,
+                fill_timeline.timeline_id,
+            ],
+        },
+        tuple(failures),
+    )
+
+
+def _wo36c_timeline_fixture(*, reverse: bool = False) -> ObservedEvidenceSet:
+    run_id, source_sha256 = _wo36c_source_identity()
+    delivered = (
+        ObservedValueRecord(
+            "fill.player-order-1",
+            "fill-event-0001",
+            2,
+            _delivered_timing(180, 190, 200),
+            {"filled_quantity": 10},
+        ),
+        ObservedValueRecord(
+            "warning.invariant.position",
+            "invariant-warning-event-0001",
+            4,
+            _delivered_timing(350, 360, 400),
+            {"warning_code": "position-conservation"},
+        ),
+        ObservedValueRecord(
+            "quote.consolidated.primary",
+            "observed-update-event-0001",
+            5,
+            _delivered_timing(351, 361, 400),
+            {
+                "best_ask_ticks": 102,
+                "best_bid_ticks": 100,
+                "record_kind": "OBSERVED_UPDATE",
+            },
+        ),
+    )
+    decisions = (
+        ObservedValueRecord(
+            "order.client-intention",
+            "player-action-event-0001",
+            1,
+            EvidenceTiming(
+                source_event_time_us=80,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(100),
+            ),
+            {"side": "BUY", "venue_state": "NOT_OBSERVED"},
+        ),
+        ObservedValueRecord(
+            "strategy.signal",
+            "traffic-transition-event-0001",
+            3,
+            EvidenceTiming(
+                source_event_time_us=170,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(200),
+            ),
+            {"recorded_signal": "GREEN"},
+        ),
+    )
+    return ObservedEvidenceSet(
+        run_id,
+        source_sha256,
+        client_delivered=(tuple(reversed(delivered)) if reverse else delivered),
+        decision_snapshots=(tuple(reversed(decisions)) if reverse else decisions),
+    )
+
+
+def _wo36c_read_model_fixture(*, reverse: bool = False) -> ObservedEvidenceSet:
+    run_id, source_sha256 = _wo36c_source_identity()
+    rows = (
+        (
+            "market.top-of-book.primary",
+            "top-book-event-early",
+            56_000_000,
+            {
+                "best_ask_size": 20,
+                "best_ask_ticks": 102,
+                "best_bid_size": 20,
+                "best_bid_ticks": 100,
+                "record_role": "TOP_OF_BOOK",
+            },
+        ),
+        (
+            "market.top-of-book.primary",
+            "top-book-event-late",
+            59_500_000,
+            {
+                "best_ask_size": 10,
+                "best_ask_ticks": 103,
+                "best_bid_size": 30,
+                "best_bid_ticks": 101,
+                "record_role": "TOP_OF_BOOK",
+            },
+        ),
+        (
+            "market.trade.primary",
+            "trade-event-early",
+            250_000,
+            {
+                "price_ticks": 100,
+                "quantity": 10,
+                "record_role": "TRADE",
+            },
+        ),
+        (
+            "market.trade.primary",
+            "trade-event-0001",
+            59_200_000,
+            {
+                "price_ticks": 101,
+                "quantity": 20,
+                "record_role": "TRADE",
+            },
+        ),
+        (
+            "market.trade.primary",
+            "trade-event-0002",
+            59_800_000,
+            {
+                "price_ticks": 102,
+                "quantity": 30,
+                "record_role": "TRADE",
+            },
+        ),
+        (
+            "market.cancellation.primary",
+            "cancel-event-0001",
+            59_400_000,
+            {"cancelled_quantity": 7, "record_role": "CANCELLATION"},
+        ),
+        (
+            "market.replenishment.primary",
+            "replenishment-event-0001",
+            59_600_000,
+            {"added_quantity": 9, "record_role": "REPLENISHMENT"},
+        ),
+        (
+            "execution.fill.exec-1",
+            "execution-fill-event-0001",
+            59_700_000,
+            {
+                "execution_id": "exec-1",
+                "correlation_id": "corr-1",
+                "order_id": "player-order-1",
+                "price_x2": 204,
+                "quantity": 10,
+                "record_role": "EXECUTION_FILL",
+                "side": "BUY",
+            },
+        ),
+        (
+            "execution.fill.exec-1",
+            "execution-fill-event-0002",
+            59_900_000,
+            {
+                "execution_id": "exec-1",
+                "correlation_id": "corr-1",
+                "order_id": "player-order-1",
+                "price_x2": 206,
+                "quantity": 5,
+                "record_role": "EXECUTION_FILL",
+                "side": "BUY",
+            },
+        ),
+        (
+            "trade.pane.primary",
+            "time-and-sales-pane-event-0001",
+            59_810_000,
+            {"price_ticks": 102, "quantity": 30},
+        ),
+        (
+            "quote.consolidated.primary",
+            "consolidated-quote-pane-event-0001",
+            59_820_000,
+            {"best_ask_ticks": 103, "best_bid_ticks": 101},
+        ),
+        (
+            "fill.player-order-1",
+            "fill-pane-event-0001",
+            59_830_000,
+            {"filled_quantity": 15},
+        ),
+        (
+            "book.level2.primary",
+            "level2-event-0001",
+            59_300_000,
+            {
+                "asks": [[103, 10], [104, 20]],
+                "bids": [[101, 30], [100, 40]],
+                "record_kind": "LEVEL_2",
+            },
+        ),
+        (
+            "depth.heatmap.primary",
+            "depth-heatmap-event-0001",
+            59_310_000,
+            {"record_kind": "DEPTH_HEATMAP", "rows": [[101, 30], [103, 10]]},
+        ),
+        (
+            "order.player-order-1",
+            "player-order-event-0001",
+            59_320_000,
+            {"order_id": "player-order-1", "state": "WORKING"},
+        ),
+        (
+            "position.primary",
+            "position-event-0001",
+            59_330_000,
+            {"quantity": 15},
+        ),
+        (
+            "quote.venue.xnas",
+            "venue-quote-event-0001",
+            59_340_000,
+            {"ask_ticks": 103, "bid_ticks": 101, "venue": "XNAS"},
+        ),
+        (
+            "metrics.execution.exec-1",
+            "execution-metrics-event-0001",
+            59_350_000,
+            {"filled_quantity": 15, "implementation_shortfall_x2": 40},
+        ),
+        (
+            "trace.player-order-1",
+            "trace-event-0001",
+            59_360_000,
+            {"trace_id": "trace-player-order-1"},
+        ),
+        (
+            "queue.estimate.player-order-1",
+            "queue-estimate-event-0001",
+            59_370_000,
+            {
+                "estimated_quantity_ahead": 70,
+                "uncertainty_lower_quantity": 50,
+                "uncertainty_upper_quantity": 90,
+            },
+        ),
+    )
+    delivered = tuple(
+        ObservedValueRecord(
+            series_id,
+            event_id,
+            sequence,
+            _delivered_timing(visible_at - 20, visible_at - 10, visible_at),
+            payload,
+        )
+        for sequence, (series_id, event_id, visible_at, payload) in enumerate(
+            rows,
+            start=1,
+        )
+    )
+    decisions = (
+        ObservedValueRecord(
+            "market.relative-volume-baseline.trailing-60s",
+            "relative-volume-baseline-event-0001",
+            28,
+            EvidenceTiming(
+                source_event_time_us=990_000,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(1_000_000),
+            ),
+            {
+                "expected_volume": 100,
+                "record_role": "RELATIVE_VOLUME_BASELINE",
+                "window_duration_us": 60_000_000,
+            },
+        ),
+        ObservedValueRecord(
+            "execution.arrival.exec-1",
+            "execution-arrival-event-0001",
+            29,
+            EvidenceTiming(
+                source_event_time_us=9_990_000,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(10_000_000),
+            ),
+            {
+                "arrival_midpoint_x2": 202,
+                "correlation_id": "corr-1",
+                "execution_id": "exec-1",
+                "order_id": "player-order-1",
+                "record_role": "EXECUTION_ARRIVAL",
+                "side": "BUY",
+            },
+        ),
+        ObservedValueRecord(
+            "traffic-light.primary",
+            "traffic-light-event-0001",
+            30,
+            EvidenceTiming(
+                source_event_time_us=59_740_000,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(59_750_000),
+            ),
+            {"record_kind": "TRAFFIC_LIGHT_TRANSITION", "state": "GREEN"},
+        ),
+        ObservedValueRecord(
+            "strategy.rule.primary",
+            "strategy-rule-event-0001",
+            31,
+            EvidenceTiming(
+                source_event_time_us=59_745_000,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(59_760_000),
+            ),
+            {"recorded_rule_id": "join-bid-if-green", "result": True},
+        ),
+        ObservedValueRecord(
+            "feature.imbalance.primary",
+            "feature-event-0001",
+            32,
+            EvidenceTiming(
+                source_event_time_us=59_746_000,
+                venue_receipt=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.CLIENT_DECISION
+                ),
+                client_receive=EvidenceTimestamp.not_applicable(
+                    TimestampAbsenceReason.RECORDED_SNAPSHOT
+                ),
+                client_knowledge=EvidenceTimestamp.recorded(59_770_000),
+            ),
+            {
+                "provenance_event_ids": ["top-book-event-late"],
+                "value_ppm": 500_000,
+            },
+        ),
+    )
+    return ObservedEvidenceSet(
+        run_id,
+        source_sha256,
+        client_delivered=(tuple(reversed(delivered)) if reverse else delivered),
+        decision_snapshots=(tuple(reversed(decisions)) if reverse else decisions),
+    )
+
+
+def _wo36c_reveal_fixture(
+    observed: ObservedEvidenceSet,
+    *,
+    queue_capability: RevealCapability = RevealCapability.GROUND_TRUTH,
+    agent_capability: RevealCapability = RevealCapability.HIDDEN_STATE,
+    include_queue: bool = True,
+    include_agent: bool = True,
+) -> RevealEvidenceSet:
+    def timing(source_time_us: int) -> EvidenceTiming:
+        return EvidenceTiming(
+            source_event_time_us=source_time_us,
+            venue_receipt=EvidenceTimestamp.recorded(source_time_us),
+            client_receive=EvidenceTimestamp.unavailable(
+                TimestampAbsenceReason.NEVER_CLIENT_DELIVERED
+            ),
+            client_knowledge=EvidenceTimestamp.unavailable(
+                TimestampAbsenceReason.NEVER_CLIENT_KNOWN_DURING_RUN
+            ),
+        )
+
+    values_list: list[RevealValueRecord] = []
+    if include_queue:
+        values_list.append(RevealValueRecord(
+            "queue.truth.player-order-1",
+            "queue-truth-event-0001",
+            100,
+            timing(59_850_000),
+            queue_capability,
+            {"truth_quantity_ahead": 60},
+        ))
+    if include_agent:
+        values_list.append(RevealValueRecord(
+            "agent.primary",
+            "agent-activity-event-0001",
+            101,
+            timing(59_860_000),
+            agent_capability,
+            {"activity": "CANCEL", "agent_id": "synthetic-agent-1"},
+        ))
+    values = tuple(values_list)
+    capability_evidence_list: list[SourceCapabilityEvidence] = []
+    for capability in RevealCapability:
+        capability_values = tuple(
+            item for item in values if item.required_capability is capability
+        )
+        if capability_values:
+            capability_evidence_list.append(
+                SourceCapabilityEvidence(
+                    capability,
+                    SourceCapabilityAvailability.AVAILABLE,
+                    source_artifact_id=(
+                        "wo36c.synthetic."
+                        + capability.value.lower().replace("_", "-")
+                        + ".v1"
+                    ),
+                    source_artifact_sha256=reveal_artifact_sha256(
+                        capability_values
+                    ),
+                )
+            )
+        else:
+            capability_evidence_list.append(
+                SourceCapabilityEvidence(
+                    capability,
+                    SourceCapabilityAvailability.UNAVAILABLE,
+                    unavailable_reason=(
+                        SourceCapabilityUnavailableReason.NOT_RECORDED_BY_SOURCE
+                    ),
+                )
+            )
+    capability_evidence = tuple(capability_evidence_list)
+    source = ReplaySourceCapabilityManifest(
+        observed.source_run_id,
+        observed.source_event_sha256,
+        SYNTHETIC_PANE_SOURCE_SCHEMA_ID,
+        PANE_SOURCE_SCHEMA_VERSION,
+        capability_evidence,
+    )
+    return RevealEvidenceSet(source, values)
+
+
+def _wo36c_regime_reveal_fixture(
+    observed: ObservedEvidenceSet,
+    *,
+    capability: RevealCapability = RevealCapability.GROUND_TRUTH,
+) -> RevealEvidenceSet:
+    value = RevealValueRecord(
+        "regime.transition",
+        "regime-transition-event-0001",
+        100,
+        EvidenceTiming(
+            source_event_time_us=300,
+            venue_receipt=EvidenceTimestamp.recorded(300),
+            client_receive=EvidenceTimestamp.unavailable(
+                TimestampAbsenceReason.NEVER_CLIENT_DELIVERED
+            ),
+            client_knowledge=EvidenceTimestamp.unavailable(
+                TimestampAbsenceReason.NEVER_CLIENT_KNOWN_DURING_RUN
+            ),
+        ),
+        capability,
+        {"from_regime": "QUIET", "to_regime": "BUSY"},
+    )
+    value_tuple = (value,)
+    capability_evidence = tuple(
+        SourceCapabilityEvidence(
+            item,
+            (
+                SourceCapabilityAvailability.AVAILABLE
+                if item is capability
+                else SourceCapabilityAvailability.UNAVAILABLE
+            ),
+            source_artifact_id=(
+                "wo36c.regime."
+                + item.value.lower().replace("_", "-")
+                + ".v1"
+                if item is capability
+                else None
+            ),
+            source_artifact_sha256=(
+                reveal_artifact_sha256(value_tuple)
+                if item is capability
+                else None
+            ),
+            unavailable_reason=(
+                None
+                if item is capability
+                else SourceCapabilityUnavailableReason.NOT_RECORDED_BY_SOURCE
+            ),
+        )
+        for item in RevealCapability
+    )
+    source = ReplaySourceCapabilityManifest(
+        observed.source_run_id,
+        observed.source_event_sha256,
+        "KIRBY2_WO36C_REGIME_REVEAL_SOURCE_V1",
+        1,
+        capability_evidence,
+    )
+    return RevealEvidenceSet(source, value_tuple)
+
+
+def _wo36c_capability_manifest(
+    result: ObservationQueryResult,
+    *,
+    source_class: str,
+    supported_panes: tuple[PaneKind, ...],
+    queue_capability: QueueCapability,
+    queue_estimator_version: str | None,
+    reveal_source: ReplaySourceCapabilityManifest | None = None,
+    reveal_authorization: RevealAuthorization | None = None,
+) -> tuple[bytes, str]:
+    source_schema_id = {
+        "HISTORICAL": HISTORICAL_PANE_SOURCE_SCHEMA_ID,
+        "SYNTHETIC": SYNTHETIC_PANE_SOURCE_SCHEMA_ID,
+    }[source_class]
+    if source_class == "SYNTHETIC":
+        if reveal_source is None or reveal_authorization is None:
+            raise ValueError("synthetic pane fixture requires exact reveal authority")
+        reveal_authorization_id = reveal_authorization.authorization_id
+        reveal_authorization_sha256 = _audit_sha256(
+            reveal_authorization.as_dict()
+        )
+        reveal_evidence_sha256 = result.reveal_evidence_sha256
+        reveal_source_manifest_sha256 = reveal_source.manifest_sha256
+    else:
+        if reveal_source is not None or reveal_authorization is not None:
+            raise ValueError("historical pane fixture cannot bind reveal authority")
+        reveal_authorization_id = None
+        reveal_authorization_sha256 = None
+        reveal_evidence_sha256 = None
+        reveal_source_manifest_sha256 = None
+    payload = {
+        "capability_scope": PANE_CAPABILITY_MANIFEST_SCOPE,
+        "observation_mode": result.policy.mode.value,
+        "observed_projection_sha256": result.observed_projection_sha256,
+        "policy_id": result.policy.policy_id,
+        "query_id": result.query_id,
+        "queue_capability": queue_capability.value,
+        "queue_estimator_version": queue_estimator_version,
+        "render_cursor_time_us": result.request.render_cursor_time_us,
+        "reveal_authorization_id": reveal_authorization_id,
+        "reveal_authorization_sha256": reveal_authorization_sha256,
+        "reveal_evidence_sha256": reveal_evidence_sha256,
+        "reveal_source_capability_manifest_sha256": (
+            reveal_source_manifest_sha256
+        ),
+        "schema_id": PANE_CAPABILITY_SCHEMA_ID,
+        "schema_version": PANE_CAPABILITY_SCHEMA_VERSION,
+        "source_class": source_class,
+        "source_event_sha256": result.source_event_sha256,
+        "source_run_id": result.source_run_id,
+        "source_schema_id": source_schema_id,
+        "source_schema_version": PANE_SOURCE_SCHEMA_VERSION,
+        "supported_panes": [item.value for item in supported_panes],
+    }
+    raw = _audit_canonical_json_bytes(payload)
+    return raw, hashlib.sha256(raw).hexdigest()
+
+
+def _wo36c_source_identity() -> tuple[str, str]:
+    digest = hashlib.sha256(b"wo36-c-synchronized-read-model-source-v1").hexdigest()
+    return "run-" + digest[:24], digest
+
+
 def _observed_policy_fixture(*, reverse: bool = False) -> ObservedEvidenceSet:
     run_id, source_sha256 = _wo36b_source_identity()
     payloads = (
@@ -2773,16 +5013,59 @@ def _ui_raw_evidence_imports() -> list[str]:
 def _raw_evidence_imports_in_source(source: str, filename: str) -> list[str]:
     sensitive_modules = {
         "kirby2.microscope.ingestion",
+        "kirby2.microscope.overlays",
+        "kirby2.microscope.panes",
         "kirby2.microscope.policy",
         "kirby2.microscope.query",
+        "kirby2.microscope.timeline",
     }
     relative_sensitive_modules = {
         "microscope.ingestion",
+        "microscope.overlays",
+        "microscope.panes",
         "microscope.policy",
         "microscope.query",
+        "microscope.timeline",
     }
     ui_safe_imports = {
         "kirby2.microscope.ingestion": frozenset(),
+        "kirby2.microscope.overlays": frozenset(
+            {
+                "CancellationVelocityOverlay",
+                "ImplementationShortfallOverlay",
+                "ImbalanceOverlay",
+                "MicropriceOverlay",
+                "OverlayAvailability",
+                "OverlayKind",
+                "OverlaySet",
+                "OverlaySourceEvent",
+                "OverlayUnavailableReason",
+                "OverlayUnit",
+                "OverlayWindow",
+                "OverlayWindowBasis",
+                "RelativeVolumeOverlay",
+                "ReplenishmentOverlay",
+                "ShortTermVolatilityOverlay",
+                "SpreadOverlay",
+                "TradeVelocityOverlay",
+            }
+        ),
+        "kirby2.microscope.panes": frozenset(
+            {
+                "CalculationKind",
+                "DeclaredCalculation",
+                "PaneAvailability",
+                "PaneDatum",
+                "PaneExplanation",
+                "PaneKind",
+                "PaneSourceEvent",
+                "PaneUnavailableReason",
+                "QueueEstimate",
+                "QueueTruthAvailability",
+                "ReplayPane",
+                "SynchronizedPaneSnapshot",
+            }
+        ),
         "kirby2.microscope.policy": frozenset(
             {
                 "ObservationMode",
@@ -2799,10 +5082,48 @@ def _raw_evidence_imports_in_source(source: str, filename: str) -> list[str]:
                 "SelectionKind",
             }
         ),
+        "kirby2.microscope.timeline": frozenset(
+            {
+                "TimelineCursor",
+                "TimelineDirection",
+                "TimelineEventKind",
+                "TimelineEventLink",
+                "TimelineJumpTarget",
+                "TimelineNavigationAvailability",
+                "TimelineNavigationKind",
+                "TimelineNavigationResult",
+                "TimelineNavigationUnavailableReason",
+                "TimelinePlaybackState",
+                "TimelineSidecarOperation",
+                "TimelineSidecarRefusal",
+                "TimelineSidecarRefusalReason",
+                "TimelineSidecarStatus",
+            }
+        ),
     }
     findings: list[str] = []
     tree = ast.parse(source, filename=filename)
     for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            dynamic_import = (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "__import__"
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "import_module"
+            )
+            if (
+                dynamic_import
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                module_name = node.args[0].value
+                if module_name == "kirby2" or module_name.startswith("kirby2."):
+                    findings.append(
+                        f"{filename}:{node.lineno}:dynamic import {module_name}"
+                    )
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "kirby2" or alias.name.startswith("kirby2."):

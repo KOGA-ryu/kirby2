@@ -146,6 +146,7 @@ REGISTERABLE_GATE_IDS = (
     "WO36-B",
     "DEV-0005",
     "DEV-0006",
+    "WO36-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4105,6 +4106,66 @@ def _audit_dev0006() -> ExpansionGateReport:
     )
 
 
+def _audit_wo36c() -> ExpansionGateReport:
+    """Verify synchronized cursor, pane, queue, and overlay read models."""
+
+    from kirby2.audit.replay_microscope import (
+        WO36C_AUDIT_CASE_COUNT,
+        audit_synchronized_replay_read_models,
+    )
+    from kirby2.microscope.overlays import (
+        OVERLAY_KIND_ORDER,
+        OVERLAY_SET_SCHEMA_ID,
+    )
+    from kirby2.microscope.panes import PANE_ORDER, PANE_SNAPSHOT_SCHEMA_ID
+    from kirby2.microscope.timeline import (
+        TIMELINE_RECEIPT_SCHEMA_ID,
+        TIMELINE_SCHEMA_ID,
+    )
+
+    cases = audit_synchronized_replay_read_models()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO36-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO36C_AUDIT_CASE_COUNT)),
+            ("capability_pin_origin", "EXTERNAL_TRUST_ROOT_REQUIRED"),
+            ("cursor_policy", "ONE_EXACT_INTEGER_SIMULATION_TIME"),
+            ("future_inventory_ui_visibility", "REFUSED"),
+            ("overlay_count", str(len(OVERLAY_KIND_ORDER))),
+            ("overlay_set_schema_id", OVERLAY_SET_SCHEMA_ID),
+            ("pane_count", str(len(PANE_ORDER))),
+            ("pane_snapshot_schema_id", PANE_SNAPSHOT_SCHEMA_ID),
+            (
+                "queue_truth_policy",
+                "PINNED_SYNTHETIC_AUTHORIZED_POSTMORTEM_ONLY",
+            ),
+            ("timeline_receipt_schema_id", TIMELINE_RECEIPT_SCHEMA_ID),
+            ("timeline_schema_id", TIMELINE_SCHEMA_ID),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4153,6 +4214,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO36-B", _audit_wo36b),
     ("DEV-0005", _audit_dev0005),
     ("DEV-0006", _audit_dev0006),
+    ("WO36-C", _audit_wo36c),
 )
 
 
