@@ -6,6 +6,8 @@ import ast
 import hashlib
 import inspect
 import json
+import shutil
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -26,6 +28,11 @@ from kirby2.microscope import (
     complete_trace_fixture,
     incomplete_legacy_trace_fixture,
     verify_trace_index,
+)
+from kirby2.microscope.commands import (
+    MICROSCOPE_COMMAND_MODULE,
+    STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+    build_microscope_demo_artifact,
 )
 from kirby2.microscope.data_age import (
     NOT_OBSERVED_AS_OF_CLIENT_KNOWLEDGE,
@@ -107,6 +114,19 @@ from kirby2.microscope.query import (
     query_postmortem,
     reveal_artifact_sha256,
 )
+from kirby2.microscope.report import (
+    OVERLAY_FORMATTERS,
+    REPORT_ASSET_SHA256,
+    REPORT_SECTION_ORDER,
+    PortableReportBundle,
+    PortableReplayReportV1,
+    ReplayPresentationFrameV1,
+    ReportSectionAvailability,
+    ReportSectionKind,
+    build_portable_replay_report,
+    verify_portable_report_bundle,
+    write_portable_report_bundle,
+)
 from kirby2.microscope.timeline import (
     TIMELINE_RECEIPT_SCHEMA_ID,
     TIMELINE_SCHEMA_ID,
@@ -141,6 +161,7 @@ WO36A_LEGACY_INDEX_SHA256 = (
 WO36B_AUDIT_CASE_COUNT = 6
 DEV0006_AUDIT_CASE_COUNT = 4
 WO36C_AUDIT_CASE_COUNT = 6
+WO36D_AUDIT_CASE_COUNT = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +593,859 @@ def audit_synchronized_replay_read_models() -> tuple[ReplayMicroscopeAuditCase, 
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO36-C audit case order or identity changed")
     return cases
+
+
+def audit_portable_replay_reports() -> tuple[ReplayMicroscopeAuditCase, ...]:
+    """Run the fixed WO36-D presentation and portable-report attack inventory."""
+
+    cases = (
+        _portable_atomic_frame_case(),
+        _portable_observation_boundary_case(),
+        _portable_presentation_contract_case(),
+        _portable_offline_relocation_case(),
+        _portable_tamper_refusal_case(),
+        _portable_factory_boundary_case(),
+    )
+    if len(cases) != WO36D_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO36-D audit case inventory changed")
+    expected_names = (
+        "named_demo_builds_three_atomic_frames_deterministically",
+        "observation_watermarks_and_reveal_payloads_remain_separate",
+        "presentation_preserves_panes_overlays_provenance_and_deferred_sections",
+        "portable_bundle_is_relocatable_offline_and_digest_bound",
+        "portable_verifier_rejects_repinned_manifest_and_asset_tampering",
+        "presentation_and_report_factories_reject_cross_root_and_backend_material",
+    )
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO36-D audit case order or identity changed")
+    return cases
+
+
+def _portable_atomic_frame_case() -> ReplayMicroscopeAuditCase:
+    first = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    repeated = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    expected_times_us = (59_750_000, 59_830_000, 60_000_000)
+    member_names = (
+        "assets/report.css",
+        "assets/report.js",
+        "index.html",
+        "manifest.json",
+    )
+    deterministic = (
+        first.report.canonical_bytes() == repeated.report.canonical_bytes()
+        and first.report.report_id == repeated.report.report_id
+        and first.bundle.bundle_id == repeated.bundle.bundle_id
+        and all(
+            first.bundle.member_bytes(name) == repeated.bundle.member_bytes(name)
+            for name in member_names
+        )
+    )
+    command_inventory = tuple(
+        (item.command_id, item.name)
+        for item in MICROSCOPE_COMMAND_MODULE.commands
+    )
+    failures: list[str] = []
+    if first.fixture_name != STALE_PARTIAL_CANCEL_RACE_FIXTURE:
+        failures.append("named demo returned a different fixture identity")
+    if first.mode is not ObservationMode.AS_OBSERVED:
+        failures.append("named demo returned a different observation mode")
+    if command_inventory != (("MICROSCOPE_DEMO", "microscope-demo"),):
+        failures.append("microscope command inventory changed")
+    if len(first.report.frames) != 3:
+        failures.append("named fixture did not produce exactly three frames")
+    if tuple(
+        thaw_json(item.identity)["render_cursor_time_us"]
+        for item in first.report.frames
+    ) != expected_times_us:
+        failures.append("named fixture frame cursor inventory changed")
+    if not deterministic:
+        failures.append("repeated named-fixture construction changed canonical output")
+
+    for frame in first.report.frames:
+        payload = frame.as_dict()
+        identity = payload["identity"]
+        timeline = payload["timeline_root"]
+        cursor = payload["cursor"]
+        pane_snapshot = payload["pane_snapshot"]
+        overlay_set = payload["overlay_set"]
+        presentation = payload["presentation"]
+        if not all(
+            isinstance(item, dict)
+            for item in (
+                identity,
+                timeline,
+                cursor,
+                pane_snapshot,
+                overlay_set,
+                presentation,
+            )
+        ):
+            failures.append(f"{frame.frame_id} contains a non-object root")
+            continue
+        root_keys = (
+            "source_run_id",
+            "source_event_sha256",
+            "observation_mode",
+            "policy_id",
+            "render_cursor_time_us",
+        )
+        authority = tuple(identity[key] for key in root_keys)
+        if any(
+            tuple(root[key] for key in root_keys) != authority
+            for root in (cursor, pane_snapshot, overlay_set)
+        ):
+            failures.append(f"{frame.frame_id} cross-root authority differs")
+        if tuple(timeline[key] for key in root_keys[:-1]) != authority[:-1]:
+            failures.append(f"{frame.frame_id} timeline authority differs")
+        if (
+            identity["timeline_id"] != timeline["timeline_id"]
+            or identity["timeline_id"] != cursor["timeline_id"]
+            or identity["cursor_id"] != cursor["cursor_id"]
+            or identity["query_id"] != pane_snapshot["query_id"]
+            or identity["query_id"] != overlay_set["query_id"]
+            or identity["snapshot_id"] != pane_snapshot["snapshot_id"]
+            or identity["overlay_set_id"] != overlay_set["overlay_set_id"]
+        ):
+            failures.append(f"{frame.frame_id} cross-root content ID differs")
+        pane_kinds = tuple(item["pane_kind"] for item in pane_snapshot["panes"])
+        overlay_kinds = tuple(item["kind"] for item in overlay_set["overlays"])
+        if pane_kinds != tuple(item.value for item in PANE_ORDER):
+            failures.append(f"{frame.frame_id} pane inventory changed")
+        if overlay_kinds != tuple(item.value for item in OVERLAY_KIND_ORDER):
+            failures.append(f"{frame.frame_id} overlay inventory changed")
+        if tuple(item["pane_kind"] for item in presentation["panes"]) != pane_kinds:
+            failures.append(f"{frame.frame_id} presentation pane order differs")
+        if tuple(item["kind"] for item in presentation["overlays"]) != overlay_kinds:
+            failures.append(f"{frame.frame_id} presentation overlay order differs")
+        if tuple(item["event_id"] for item in presentation["events"]) != tuple(
+            item["event_id"] for item in cursor["current_events"]
+        ):
+            failures.append(f"{frame.frame_id} cursor event presentation differs")
+        identity_payload = dict(payload)
+        declared_frame_id = identity_payload.pop("frame_id")
+        expected_frame_id = (
+            "replay-presentation-frame-"
+            + _audit_sha256(identity_payload)[:24]
+        )
+        if declared_frame_id != expected_frame_id:
+            failures.append(f"{frame.frame_id} is not content-derived")
+
+    return ReplayMicroscopeAuditCase(
+        "named_demo_builds_three_atomic_frames_deterministically",
+        (
+            f"frames={len(first.report.frames)} "
+            f"report={first.report.report_id} deterministic={deterministic}"
+        ),
+        {
+            "bundle_id": first.bundle.bundle_id,
+            "command_inventory": [list(item) for item in command_inventory],
+            "deterministic": deterministic,
+            "frame_ids": [item.frame_id for item in first.report.frames],
+            "frame_times_us": list(expected_times_us),
+            "report_id": first.report.report_id,
+        },
+        tuple(failures),
+    )
+
+
+def _portable_observation_boundary_case() -> ReplayMicroscopeAuditCase:
+    observed = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    postmortem = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.POSTMORTEM,
+    )
+    expected_capabilities = [item.value for item in RevealCapability]
+    observed_frames_valid = True
+    postmortem_frames_valid = True
+    hidden_reveal_referenced = True
+    for frame in observed.report.frames:
+        identity = thaw_json(frame.identity)
+        presentation = frame.presentation.as_dict()
+        agent = next(
+            item
+            for item in presentation["panes"]
+            if item["pane_kind"] == PaneKind.AGENT_ACTIVITY.value
+        )
+        observed_frames_valid = observed_frames_valid and (
+            identity["observation_mode"] == ObservationMode.AS_OBSERVED.value
+            and identity["requested_reveal_capabilities"] == []
+            and identity["reveal_availability"]
+            == RevealAvailability.NOT_REQUESTED.value
+            and identity["reveal_evidence_sha256"] is None
+            and presentation["watermark"]["semantic_role"] == "AS_OBSERVED"
+            and agent["availability"] == PaneAvailability.UNAVAILABLE.value
+            and agent["source_references"] == []
+        )
+    for frame in postmortem.report.frames:
+        identity = thaw_json(frame.identity)
+        presentation = frame.presentation.as_dict()
+        agent = next(
+            item
+            for item in presentation["panes"]
+            if item["pane_kind"] == PaneKind.AGENT_ACTIVITY.value
+        )
+        postmortem_frames_valid = postmortem_frames_valid and (
+            identity["observation_mode"] == ObservationMode.POSTMORTEM.value
+            and identity["requested_reveal_capabilities"]
+            == expected_capabilities
+            and identity["reveal_availability"] == RevealAvailability.AVAILABLE.value
+            and isinstance(identity["reveal_evidence_sha256"], str)
+            and presentation["watermark"]["semantic_role"] == "POSTMORTEM"
+            and agent["availability"] == PaneAvailability.AVAILABLE.value
+        )
+        hidden_reveal_referenced = hidden_reveal_referenced and any(
+            item["source_kind"] == EvidenceSourceKind.REVEALED_HIDDEN_STATE.value
+            for item in agent["source_references"]
+        )
+    observed_payload = observed.report.canonical_bytes()
+    leaked_reveal_tokens = tuple(
+        token
+        for token in (
+            EvidenceSourceKind.REVEALED_GROUND_TRUTH.value,
+            EvidenceSourceKind.REVEALED_HIDDEN_STATE.value,
+            "AUTHORIZED_GROUND_TRUTH",
+            "AUTHORIZED_HIDDEN_STATE",
+            "authorization_id",
+            "reveal_authorization",
+        )
+        if token.encode("ascii") in observed_payload
+    )
+    source_roots_match = (
+        thaw_json(observed.report.frames[0].identity)["source_run_id"]
+        == thaw_json(postmortem.report.frames[0].identity)["source_run_id"]
+        and thaw_json(observed.report.frames[0].identity)["source_event_sha256"]
+        == thaw_json(postmortem.report.frames[0].identity)["source_event_sha256"]
+    )
+    failures: list[str] = []
+    if not observed_frames_valid:
+        failures.append("AS_OBSERVED frames lost their non-reveal policy boundary")
+    if not postmortem_frames_valid:
+        failures.append("POSTMORTEM frames lost their authorized reveal boundary")
+    if not hidden_reveal_referenced:
+        failures.append("POSTMORTEM agent presentation lacks hidden-state provenance")
+    if leaked_reveal_tokens:
+        failures.append("AS_OBSERVED report contains reveal-only material")
+    if not source_roots_match:
+        failures.append("mode comparison did not use one shared recording root")
+    if observed.report.report_id == postmortem.report.report_id:
+        failures.append(
+            "observation mode and reveal scope did not affect report identity"
+        )
+    return ReplayMicroscopeAuditCase(
+        "observation_watermarks_and_reveal_payloads_remain_separate",
+        (
+            f"observed={observed.report.report_id} "
+            f"postmortem={postmortem.report.report_id} "
+            f"reveal_leaks={len(leaked_reveal_tokens)}"
+        ),
+        {
+            "hidden_reveal_referenced": hidden_reveal_referenced,
+            "observed_frames_valid": observed_frames_valid,
+            "observed_reveal_tokens": list(leaked_reveal_tokens),
+            "postmortem_frames_valid": postmortem_frames_valid,
+            "report_ids_distinct": (
+                observed.report.report_id != postmortem.report.report_id
+            ),
+            "source_roots_match": source_roots_match,
+        },
+        tuple(failures),
+    )
+
+
+def _portable_presentation_contract_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    expected_formatters = (
+        ("SPREAD", "SPREAD_TICKS_V1", 1),
+        ("MICROPRICE", "MICROPRICE_TICKS_V1", 1_000_000),
+        ("IMBALANCE", "IMBALANCE_PERCENT_V1", 10_000),
+        ("TRADE_VELOCITY", "TRADE_VELOCITY_V1", 1_000_000),
+        ("CANCELLATION_VELOCITY", "CANCEL_VELOCITY_V1", 1_000_000),
+        ("REPLENISHMENT", "REPLENISHMENT_V1", 1_000_000),
+        ("RELATIVE_VOLUME", "RELATIVE_VOLUME_V1", 1_000_000),
+        ("SHORT_TERM_VOLATILITY", "VOLATILITY_BPS_V1", 1_000_000),
+        (
+            "IMPLEMENTATION_SHORTFALL",
+            "SHORTFALL_TICK_SHARES_V1",
+            2,
+        ),
+    )
+    formatter_inventory = tuple(
+        (item.kind.value, item.formatter_id, item.display_divisor)
+        for item in OVERLAY_FORMATTERS
+    )
+    presentation_inventory_valid = all(
+        tuple(item["pane_kind"] for item in frame.presentation.as_dict()["panes"])
+        == tuple(item.value for item in PANE_ORDER)
+        and tuple(item["kind"] for item in frame.presentation.as_dict()["overlays"])
+        == tuple(item.value for item in OVERLAY_KIND_ORDER)
+        for frame in artifact.report.frames
+    )
+    middle_presentation = artifact.report.frames[1].presentation.as_dict()
+    consolidated = next(
+        item
+        for item in middle_presentation["panes"]
+        if item["pane_kind"] == PaneKind.CONSOLIDATED_QUOTES.value
+    )
+    crossed_without_verdict = (
+        consolidated["market_classification"] == "CROSSED_COMPOSITE"
+        and consolidated["integrity_assessment"] == "NOT_ASSESSED"
+    )
+    first_overlays = {
+        item["kind"]: item
+        for item in artifact.report.frames[0].presentation.as_dict()["overlays"]
+    }
+    final_overlays = {
+        item["kind"]: item
+        for item in artifact.report.frames[-1].presentation.as_dict()["overlays"]
+    }
+    expected_final_values = {
+        "SPREAD": ("2", "2 ticks"),
+        "MICROPRICE": ("102500000", "102.5 ticks"),
+        "IMBALANCE": ("500000", "+50.00%"),
+        "RELATIVE_VOLUME": ("600000", "0.6×"),
+        "IMPLEMENTATION_SHORTFALL": ("40", "+20.0 tick-shares"),
+    }
+    display_values_valid = all(
+        (
+            final_overlays[kind]["raw_value_decimal"],
+            final_overlays[kind]["display_value"],
+        )
+        == expected
+        for kind, expected in expected_final_values.items()
+    )
+    early_relative_volume_unavailable = (
+        first_overlays["RELATIVE_VOLUME"]["availability"]
+        == OverlayAvailability.UNAVAILABLE.value
+        and first_overlays["RELATIVE_VOLUME"]["display_value"] is None
+        and first_overlays["RELATIVE_VOLUME"]["raw_value_decimal"] is None
+    )
+    source_references: list[dict[str, object]] = []
+    for frame in artifact.report.frames:
+        presentation = frame.presentation.as_dict()
+        for item in (*presentation["panes"], *presentation["overlays"]):
+            source_references.extend(item["source_references"])
+    provenance_observations_valid = bool(source_references)
+    for reference in source_references:
+        observations = reference.get("source_observations")
+        if not isinstance(observations, list) or not observations:
+            provenance_observations_valid = False
+            continue
+        for observation in observations:
+            data_age = observation.get("data_age")
+            if (
+                not isinstance(data_age, dict)
+                or type(observation.get("query_id")) is not str
+                or type(observation.get("query_render_cursor_time_us")) is not int
+                or observation.get("selection_kind")
+                not in {item.value for item in SelectionKind}
+                or type(observation.get("is_current")) is not bool
+                or observation["is_current"]
+                != (observation["selection_kind"] == SelectionKind.EXACT_RECORDED.value)
+                or data_age.get("render_cursor_time_us")
+                != observation["query_render_cursor_time_us"]
+            ):
+                provenance_observations_valid = False
+    authority_valid = all(
+        frame.presentation.as_dict().get("metadata_authority")
+        == {
+            "authority": "SOURCE_BOUND_DISPLAY_DECLARATION",
+            "evidence_classification": "PRESENTATION_ONLY_NOT_MARKET_EVIDENCE",
+            "source_event_sha256": thaw_json(frame.identity)[
+                "source_event_sha256"
+            ],
+            "source_run_id": thaw_json(frame.identity)["source_run_id"],
+        }
+        for frame in artifact.report.frames
+    )
+    section_inventory_valid = (
+        tuple(item.kind for item in artifact.report.sections)
+        == REPORT_SECTION_ORDER
+    )
+    deferred_kinds = (
+        ReportSectionKind.BOOKMARKS,
+        ReportSectionKind.ANNOTATIONS,
+        ReportSectionKind.BRANCH_COMPARISON,
+    )
+    sections = {item.kind: item for item in artifact.report.sections}
+    deferred_sections_valid = all(
+        sections[kind].availability
+        is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+        and thaw_json(sections[kind].payload)
+        == {"reason": "NOT_AVAILABLE_UNTIL_WO36_E", "records": []}
+        for kind in deferred_kinds
+    )
+    partial = build_portable_replay_report(artifact.report.frames[:2])
+    trace_availability_valid = (
+        sections[ReportSectionKind.CAUSAL_TRACES].availability
+        is ReportSectionAvailability.AVAILABLE
+        and next(
+            item
+            for item in partial.sections
+            if item.kind is ReportSectionKind.CAUSAL_TRACES
+        ).availability
+        is ReportSectionAvailability.UNAVAILABLE
+    )
+    first_timestamp = build_portable_replay_report(
+        artifact.report.frames,
+        display_generated_at="2026-08-29T00:00:00Z",
+    )
+    second_timestamp = build_portable_replay_report(
+        artifact.report.frames,
+        display_generated_at="2026-08-29T00:00:01Z",
+    )
+    reordered = build_portable_replay_report(
+        tuple(reversed(artifact.report.frames)),
+        display_generated_at="2026-08-29T00:00:00Z",
+    )
+    report_identity_valid = (
+        first_timestamp.report_id == second_timestamp.report_id
+        and first_timestamp.report_id == reordered.report_id
+        and first_timestamp.canonical_bytes() != second_timestamp.canonical_bytes()
+        and first_timestamp.canonical_bytes() == reordered.canonical_bytes()
+    )
+    failures: list[str] = []
+    if formatter_inventory != expected_formatters:
+        failures.append("overlay formatter inventory or scale changed")
+    if not presentation_inventory_valid:
+        failures.append("presentation pane or overlay inventory changed")
+    if not crossed_without_verdict:
+        failures.append("crossed consolidated quote gained or lost an integrity claim")
+    if not display_values_valid:
+        failures.append("fixed-point overlay display formatting changed")
+    if not early_relative_volume_unavailable:
+        failures.append("early relative volume no longer explains unavailability")
+    if not provenance_observations_valid:
+        failures.append("presentation provenance lost selection or freshness metadata")
+    if not authority_valid:
+        failures.append("safe presentation metadata lost source-bound authority")
+    if not section_inventory_valid or not deferred_sections_valid:
+        failures.append("reserved or deferred report section contract changed")
+    if not trace_availability_valid:
+        failures.append(
+            "causal trace section availability no longer follows recordings"
+        )
+    if not report_identity_valid:
+        failures.append(
+            "report semantic identity depends on order or display-only time"
+        )
+    return ReplayMicroscopeAuditCase(
+        "presentation_preserves_panes_overlays_provenance_and_deferred_sections",
+        (
+            f"panes={len(PANE_ORDER)} overlays={len(OVERLAY_KIND_ORDER)} "
+            f"sections={len(REPORT_SECTION_ORDER)} provenance={len(source_references)}"
+        ),
+        {
+            "crossed_without_integrity_verdict": crossed_without_verdict,
+            "deferred_sections_valid": deferred_sections_valid,
+            "display_values_valid": display_values_valid,
+            "formatter_inventory_valid": formatter_inventory == expected_formatters,
+            "metadata_authority_valid": authority_valid,
+            "presentation_inventory_valid": presentation_inventory_valid,
+            "provenance_observations_valid": provenance_observations_valid,
+            "report_identity_valid": report_identity_valid,
+            "trace_availability_valid": trace_availability_valid,
+        },
+        tuple(failures),
+    )
+
+
+def _portable_offline_relocation_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    expected_members = {
+        "assets/report.css",
+        "assets/report.js",
+        "index.html",
+        "manifest.json",
+    }
+    with tempfile.TemporaryDirectory(prefix="kirby2-wo36d-relocation-") as directory:
+        root = Path(directory).resolve()
+        original = root / "original"
+        relocated = root / "relocated"
+        index_path = write_portable_report_bundle(artifact.bundle, original)
+        original_verification = verify_portable_report_bundle(original)
+        shutil.copytree(original, relocated)
+        relocated_verification = verify_portable_report_bundle(relocated)
+        actual_members = {
+            path.relative_to(original).as_posix()
+            for path in original.rglob("*")
+            if path.is_file()
+        }
+        byte_identical = all(
+            original.joinpath(name).read_bytes()
+            == relocated.joinpath(name).read_bytes()
+            for name in expected_members
+        )
+        asset_digests = {
+            name: hashlib.sha256(
+                original.joinpath("assets", name).read_bytes()
+            ).hexdigest()
+            for name in ("report.css", "report.js")
+        }
+        asset_pins_valid = all(
+            asset_digests[name] == REPORT_ASSET_SHA256[name]
+            for name in asset_digests
+        )
+        local_payload = b"\n".join(
+            original.joinpath(name).read_bytes()
+            for name in (
+                "assets/report.css",
+                "assets/report.js",
+                "index.html",
+            )
+        ).lower()
+        network_tokens = tuple(
+            token.decode("ascii")
+            for token in (
+                b"http://",
+                b"https://",
+                b"fetch(",
+                b"xmlhttprequest",
+                b"websocket",
+                b"eventsource",
+                b"sendbeacon",
+            )
+            if token in local_payload
+        )
+        existing_destination_rejected = _wo36d_rejected(
+            lambda: write_portable_report_bundle(artifact.bundle, original)
+        )
+    verification_valid = (
+        original_verification == relocated_verification
+        and original_verification["status"] == "PASS"
+        and original_verification["member_count"] == 4
+        and original_verification["report_id"] == artifact.report.report_id
+        and original_verification["bundle_id"] == artifact.bundle.bundle_id
+    )
+    failures: list[str] = []
+    if index_path != original / "index.html":
+        failures.append("portable writer returned a noncanonical entry path")
+    if actual_members != expected_members:
+        failures.append("portable bundle materialized an unexpected member inventory")
+    if not byte_identical or not verification_valid:
+        failures.append("relocated portable bundle changed bytes or verification")
+    if not asset_pins_valid:
+        failures.append(
+            "materialized renderer assets differ from installed digest pins"
+        )
+    if network_tokens:
+        failures.append("portable renderer contains a network-capable token")
+    if not existing_destination_rejected:
+        failures.append("portable writer overwrote an existing destination")
+    return ReplayMicroscopeAuditCase(
+        "portable_bundle_is_relocatable_offline_and_digest_bound",
+        (
+            f"members={len(actual_members)} relocated={verification_valid} "
+            f"network_tokens={len(network_tokens)}"
+        ),
+        {
+            "asset_digests": asset_digests,
+            "asset_pins_valid": asset_pins_valid,
+            "bundle_id": artifact.bundle.bundle_id,
+            "byte_identical_after_relocation": byte_identical,
+            "existing_destination_rejected": existing_destination_rejected,
+            "member_inventory": sorted(actual_members),
+            "network_tokens": list(network_tokens),
+            "verification": relocated_verification,
+        },
+        tuple(failures),
+    )
+
+
+def _portable_tamper_refusal_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+
+    def manifest_at(root: Path) -> dict[str, object]:
+        payload = json.loads((root / "manifest.json").read_bytes())
+        if not isinstance(payload, dict):  # pragma: no cover - fixture invariant
+            raise RuntimeError("portable fixture manifest is not an object")
+        return payload
+
+    def write_manifest(root: Path, payload: dict[str, object]) -> None:
+        (root / "manifest.json").write_bytes(
+            _audit_canonical_json_bytes(payload)
+        )
+
+    def repin_member(root: Path, name: str, suffix: bytes) -> None:
+        path = root.joinpath(*name.split("/"))
+        changed = path.read_bytes() + suffix
+        path.write_bytes(changed)
+        manifest = manifest_at(root)
+        rows = manifest["members"]
+        if not isinstance(rows, list):  # pragma: no cover - fixture invariant
+            raise RuntimeError("portable fixture member rows are invalid")
+        row = next(
+            item
+            for item in rows
+            if isinstance(item, dict) and item.get("path") == name
+        )
+        row["sha256"] = hashlib.sha256(changed).hexdigest()
+        row["size_bytes"] = len(changed)
+        write_manifest(root, manifest)
+
+    def change_report_id(root: Path) -> None:
+        manifest = manifest_at(root)
+        manifest["report_id"] = "portable-replay-report-000000000000000000000000"
+        write_manifest(root, manifest)
+
+    def change_semantic_digest(root: Path) -> None:
+        manifest = manifest_at(root)
+        manifest["report_semantic_sha256"] = "0" * 64
+        write_manifest(root, manifest)
+
+    def change_member_path(root: Path) -> None:
+        manifest = manifest_at(root)
+        rows = manifest["members"]
+        if not isinstance(rows, list) or not isinstance(rows[0], dict):
+            raise RuntimeError("portable fixture member rows are invalid")
+        rows[0]["path"] = "../outside.css"
+        write_manifest(root, manifest)
+
+    def drop_manifest_row(root: Path) -> None:
+        manifest = manifest_at(root)
+        rows = manifest["members"]
+        if not isinstance(rows, list):
+            raise RuntimeError("portable fixture member rows are invalid")
+        manifest["members"] = rows[:-1]
+        write_manifest(root, manifest)
+
+    def make_manifest_noncanonical(root: Path) -> None:
+        path = root / "manifest.json"
+        path.write_bytes(path.read_bytes() + b"\n")
+
+    def add_extra_file(root: Path) -> None:
+        (root / "unmanifested.txt").write_bytes(b"not declared")
+
+    attacks = (
+        ("repinned_report_id", change_report_id),
+        ("repinned_semantic_digest", change_semantic_digest),
+        (
+            "repinned_css",
+            lambda root: repin_member(root, "assets/report.css", b"\n/* forged */"),
+        ),
+        (
+            "repinned_javascript",
+            lambda root: repin_member(root, "assets/report.js", b"\n// forged"),
+        ),
+        (
+            "repinned_index",
+            lambda root: repin_member(root, "index.html", b"\n"),
+        ),
+        ("path_traversal", change_member_path),
+        ("missing_manifest_row", drop_manifest_row),
+        ("noncanonical_manifest", make_manifest_noncanonical),
+        ("unmanifested_extra_file", add_extra_file),
+    )
+    with tempfile.TemporaryDirectory(prefix="kirby2-wo36d-tamper-") as directory:
+        root = Path(directory).resolve()
+        baseline = root / "baseline"
+        write_portable_report_bundle(artifact.bundle, baseline)
+        baseline_valid = verify_portable_report_bundle(baseline)["status"] == "PASS"
+        refusals: dict[str, bool] = {}
+        for name, mutate in attacks:
+            target = root / name
+            shutil.copytree(baseline, target)
+            mutate(target)
+            refusals[name] = _wo36d_rejected(
+                lambda target=target: verify_portable_report_bundle(target)
+            )
+    failures: list[str] = []
+    if not baseline_valid:
+        failures.append("portable tamper fixture did not verify before mutation")
+    for name, rejected in refusals.items():
+        if not rejected:
+            failures.append(f"portable verifier accepted hostile {name} mutation")
+    return ReplayMicroscopeAuditCase(
+        "portable_verifier_rejects_repinned_manifest_and_asset_tampering",
+        (
+            f"attacks={len(refusals)} "
+            f"rejected={sum(refusals.values())} baseline={baseline_valid}"
+        ),
+        {
+            "attack_refusals": refusals,
+            "baseline_valid": baseline_valid,
+        },
+        tuple(failures),
+    )
+
+
+def _portable_factory_boundary_case() -> ReplayMicroscopeAuditCase:
+    observed = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    postmortem = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.POSTMORTEM,
+    )
+    mixed_authority_rejected = _wo36d_rejected(
+        lambda: build_portable_replay_report(
+            (observed.report.frames[0], postmortem.report.frames[0])
+        )
+    )
+    duplicate_frame_rejected = _wo36d_rejected(
+        lambda: build_portable_replay_report(
+            (observed.report.frames[0], observed.report.frames[0])
+        )
+    )
+    direct_frame_rejected = _wo36d_rejected(
+        lambda: ReplayPresentationFrameV1(
+            identity={},
+            timeline_root={},
+            cursor={},
+            pane_snapshot={},
+            overlay_set={},
+            presentation=observed.report.frames[0].presentation,
+            _construction_token=None,
+        )
+    )
+    direct_report_rejected = _wo36d_rejected(
+        lambda: PortableReplayReportV1(
+            frames=(),
+            sections=(),
+            renderer_assets=(),
+            _construction_token=None,
+        )
+    )
+    direct_bundle_rejected = _wo36d_rejected(
+        lambda: PortableReportBundle(
+            report_id=observed.report.report_id,
+            members={},
+            manifest={},
+            bundle_id=observed.bundle.bundle_id,
+            _construction_token=None,
+        )
+    )
+    unknown_fixture_rejected = _wo36d_rejected(
+        lambda: build_microscope_demo_artifact(
+            "unknown-fixture",
+            ObservationMode.AS_OBSERVED,
+        )
+    )
+    string_mode_rejected = _wo36d_rejected(
+        lambda: build_microscope_demo_artifact(
+            STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+            "AS_OBSERVED",  # type: ignore[arg-type]
+        )
+    )
+    frame = observed.report.frames[0]
+    before = frame.canonical_bytes()
+    exported = frame.as_dict()
+    identity = exported.get("identity")
+    if not isinstance(identity, dict):  # pragma: no cover - fixture invariant
+        raise RuntimeError("portable frame export identity is not an object")
+    identity["query_id"] = "forged-query"
+    export_detached = frame.canonical_bytes() == before
+    direct_mutation_rejected = False
+    try:
+        frame.identity["query_id"] = "forged-query"  # type: ignore[index]
+    except TypeError:
+        direct_mutation_rejected = True
+
+    forbidden_vocabulary = (
+        "authorization_id",
+        "backend_callback",
+        "backend_handle",
+        "capability_manifest_bytes",
+        "event_count",
+        "event_inventory_sha256",
+        "ingestion_receipt",
+        "inventory_commitment",
+        "maximum_cursor_time_us",
+        "maximum_policy_visible_time_us",
+        "minimum_cursor_time_us",
+        "minimum_policy_visible_time_us",
+        "observation_query_result",
+        "overlay_projection_receipt",
+        "partition_count",
+        "partition_inventory_sha256",
+        "query_inventory_sha256",
+        "raw_observed_evidence",
+        "raw_reveal_evidence",
+        "reveal_authorization",
+        "reveal_authorization_id",
+        "reveal_authorization_ids",
+        "reveal_authorization_sha256",
+        "timeline_receipt",
+    )
+    serialized_payloads = [
+        observed.report.canonical_bytes(),
+        postmortem.report.canonical_bytes(),
+    ]
+    serialized_payloads.extend(
+        artifact.bundle.member_bytes(name)
+        for artifact in (observed, postmortem)
+        for name in (
+            "assets/report.css",
+            "assets/report.js",
+            "index.html",
+            "manifest.json",
+        )
+    )
+    forbidden_findings = tuple(
+        item
+        for item in forbidden_vocabulary
+        if any(
+            (f'"{item}"').encode("ascii") in payload
+            for payload in serialized_payloads
+        )
+    )
+    boundary_checks = {
+        "direct_bundle_rejected": direct_bundle_rejected,
+        "direct_frame_rejected": direct_frame_rejected,
+        "direct_report_rejected": direct_report_rejected,
+        "duplicate_frame_rejected": duplicate_frame_rejected,
+        "export_detached": export_detached,
+        "frozen_direct_mutation_rejected": direct_mutation_rejected,
+        "mixed_authority_rejected": mixed_authority_rejected,
+        "string_mode_rejected": string_mode_rejected,
+        "unknown_fixture_rejected": unknown_fixture_rejected,
+    }
+    failures: list[str] = []
+    for name, passed in boundary_checks.items():
+        if not passed:
+            failures.append(name.replace("_", " "))
+    if forbidden_findings:
+        failures.append("portable output contains backend-only vocabulary")
+    return ReplayMicroscopeAuditCase(
+        "presentation_and_report_factories_reject_cross_root_and_backend_material",
+        (
+            f"boundary_checks={sum(boundary_checks.values())}/{len(boundary_checks)} "
+            f"forbidden_findings={len(forbidden_findings)}"
+        ),
+        {
+            **boundary_checks,
+            "forbidden_vocabulary_findings": list(forbidden_findings),
+        },
+        tuple(failures),
+    )
+
+
+def _wo36d_rejected(operation: object) -> bool:
+    if not callable(operation):  # pragma: no cover
+        raise RuntimeError("WO36-D rejection probe must be callable")
+    try:
+        operation()
+    except (OSError, TypeError, ValueError):
+        return True
+    return False
 
 
 def _verified_ingress_binding_case() -> ReplayMicroscopeAuditCase:

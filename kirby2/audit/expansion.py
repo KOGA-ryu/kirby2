@@ -147,6 +147,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0005",
     "DEV-0006",
     "WO36-C",
+    "WO36-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4166,6 +4167,57 @@ def _audit_wo36c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo36d() -> ExpansionGateReport:
+    """Verify deterministic, self-contained portable replay reports."""
+
+    from kirby2.audit.replay_microscope import (
+        WO36D_AUDIT_CASE_COUNT,
+        audit_portable_replay_reports,
+    )
+    from kirby2.microscope.report import (
+        OFFLINE_RENDERER_ID,
+        OFFLINE_RENDERER_VERSION,
+        PORTABLE_REPLAY_REPORT_BUNDLE_SCHEMA_ID,
+        PORTABLE_REPLAY_REPORT_SCHEMA_ID,
+        REPORT_ASSET_SHA256,
+    )
+
+    cases = audit_portable_replay_reports()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO36-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("asset_count", str(len(REPORT_ASSET_SHA256))),
+            ("audit_case_count", str(WO36D_AUDIT_CASE_COUNT)),
+            ("bundle_schema_id", PORTABLE_REPLAY_REPORT_BUNDLE_SCHEMA_ID),
+            ("network_policy", "OFFLINE_ONLY"),
+            ("renderer_id", OFFLINE_RENDERER_ID),
+            ("renderer_version", str(OFFLINE_RENDERER_VERSION)),
+            ("report_schema_id", PORTABLE_REPLAY_REPORT_SCHEMA_ID),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4215,6 +4267,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0005", _audit_dev0005),
     ("DEV-0006", _audit_dev0006),
     ("WO36-C", _audit_wo36c),
+    ("WO36-D", _audit_wo36d),
 )
 
 

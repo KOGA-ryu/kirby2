@@ -41,3 +41,8 @@ include = ["kirby2*"]
 "kirby2.counterfactual" = ["README.md"]
 "kirby2.agents" = ["README.md"]
 "kirby2.auditlab" = ["README.md"]
+"kirby2.microscope" = [
+  "assets/report.html",
+  "assets/report.css",
+  "assets/report.js",
+]

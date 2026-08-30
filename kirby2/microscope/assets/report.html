@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="@@CSP@@">
+  <meta name="referrer" content="no-referrer">
+  <title>Kirby2 Replay Microscope · @@REPORT_ID@@</title>
+  <link rel="stylesheet" href="assets/report.css" integrity="@@CSS_INTEGRITY@@">
+</head>
+<body>
+  <div class="truth-watermark" id="truth-watermark">@@WATERMARK@@</div>
+  <header class="document-header">
+    <div>
+      <p class="eyebrow">Kirby2 · Offline Replay Microscope</p>
+      <h1 id="report-title">Replay evidence</h1>
+      <p class="lede" id="report-summary">Loading canonical report data…</p>
+    </div>
+    <dl class="identity-grid" id="identity-grid"></dl>
+  </header>
+
+  <main>
+    <section class="document-section" aria-labelledby="timeline-heading">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">01</p>
+          <h2 id="timeline-heading">Timeline</h2>
+        </div>
+        <p class="section-note" id="cursor-label"></p>
+      </div>
+      <nav class="frame-picker" id="frame-picker" aria-label="Selected replay snapshots"></nav>
+      <div class="event-strip" id="event-strip"></div>
+    </section>
+
+    <section class="document-section" aria-labelledby="overlay-heading">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">02</p>
+          <h2 id="overlay-heading">Declared overlays</h2>
+        </div>
+        <p class="section-note">Backend-calculated exact integers · formatter policy applied locally</p>
+      </div>
+      <div class="overlay-grid" id="overlay-grid"></div>
+    </section>
+
+    <section class="document-section" aria-labelledby="pane-heading">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">03</p>
+          <h2 id="pane-heading">Synchronized panes</h2>
+        </div>
+        <p class="section-note">One cursor · one query · one observation policy</p>
+      </div>
+      <div class="pane-grid" id="pane-grid"></div>
+    </section>
+
+    <section class="document-section" aria-labelledby="evidence-heading">
+      <div class="section-heading">
+        <div>
+          <p class="section-number">04</p>
+          <h2 id="evidence-heading">Evidence record</h2>
+        </div>
+        <p class="section-note">Reserved report schema sections</p>
+      </div>
+      <div class="section-grid" id="section-grid"></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>This artifact is static, offline, and contains no network client, account, telemetry, or server connection.</p>
+    <p class="mono" id="footer-id"></p>
+  </footer>
+
+  <noscript>This report requires the bundled local JavaScript renderer. No network access is used.</noscript>
+  <script id="kirby2-report-data" type="application/json">@@REPORT_DATA@@</script>
+  <script defer src="assets/report.js" integrity="@@JS_INTEGRITY@@"></script>
+</body>
+</html>
