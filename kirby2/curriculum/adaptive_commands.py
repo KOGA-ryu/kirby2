@@ -16,6 +16,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from kirby2.cli.registry import CommandModule, CommandSpec
+from kirby2.pseudonyms import (
+    derive_learner_profile_id,
+    require_learner_profile_id,
+)
 from kirby2.curriculum.errors import LearnerErrorTypeV1, mapped_skill_for_error_v1
 from kirby2.curriculum.evidence import (
     SCORING_POLICY_REGISTRY_V1,
@@ -72,6 +76,9 @@ ADAPTIVE_ROUTING_CLAIM_V1 = (
 CROSS_LEARNER_COMPARISON_POLICY_V1 = (
     "NOT_COMPARABLE_ACROSS_LEARNERS_BECAUSE_SELECTION_CHANGES_EXPOSURE"
 )
+SYNTHETIC_LEARNER_ENTROPY_DERIVATION_ID_V1 = (
+    "KIRBY2_WO34D_SYNTHETIC_LEARNER_ENTROPY_V1"
+)
 
 SYNTHETIC_PRACTICE_TARGET_SKILLS_V1 = (
     "ABSORPTION_RECOGNITION",
@@ -103,6 +110,7 @@ class SyntheticLearnerFixtureV1:
     def __post_init__(self) -> None:
         if not self.fixture_id or not self.learner_id or not self.label:
             raise ValueError("synthetic learner fixture identity is required")
+        require_learner_profile_id(self.learner_id)
         if not self.declared_pattern:
             raise ValueError("synthetic learner fixture pattern is required")
         if type(self.initial_evidence) is not bool:
@@ -165,10 +173,23 @@ class SyntheticLearnerFixtureV1:
         }
 
 
+def _synthetic_learner_profile_id(fixture_id: str) -> str:
+    """Derive fixture-only entropy without using any direct identity input."""
+
+    if type(fixture_id) is not str or not fixture_id:
+        raise ValueError("synthetic learner fixture ID is required")
+    entropy = hashlib.sha256(
+        SYNTHETIC_LEARNER_ENTROPY_DERIVATION_ID_V1.encode("ascii")
+        + b"\x00"
+        + fixture_id.encode("ascii")
+    ).digest()
+    return derive_learner_profile_id(entropy)
+
+
 SYNTHETIC_LEARNER_FIXTURES_V1 = (
     SyntheticLearnerFixtureV1(
         "STRONG_READER_WEAK_EXECUTION",
-        "synthetic-strong-reader-weak-execution",
+        _synthetic_learner_profile_id("STRONG_READER_WEAK_EXECUTION"),
         "strong reader / weak execution",
         "BOOK_READING_HIGH_AND_POSITION_MANAGEMENT_LOW",
         True,
@@ -180,7 +201,7 @@ SYNTHETIC_LEARNER_FIXTURES_V1 = (
     ),
     SyntheticLearnerFixtureV1(
         "WEAK_READER_STRONG_HOTKEYS",
-        "synthetic-weak-reader-strong-hotkeys",
+        _synthetic_learner_profile_id("WEAK_READER_STRONG_HOTKEYS"),
         "weak reader / strong hotkeys",
         "BOOK_READING_LOW_AND_HOTKEY_ACCURACY_HIGH",
         True,
@@ -192,7 +213,7 @@ SYNTHETIC_LEARNER_FIXTURES_V1 = (
     ),
     SyntheticLearnerFixtureV1(
         "OVER_AGGRESSIVE_TRADER",
-        "synthetic-over-aggressive-trader",
+        _synthetic_learner_profile_id("OVER_AGGRESSIVE_TRADER"),
         "over-aggressive trader",
         "PASSIVE_ENTRY_LOW_WITH_OBSERVED_RED_STATE_ACTIONS",
         True,
@@ -204,7 +225,7 @@ SYNTHETIC_LEARNER_FIXTURES_V1 = (
     ),
     SyntheticLearnerFixtureV1(
         "OVER_PASSIVE_TRADER",
-        "synthetic-over-passive-trader",
+        _synthetic_learner_profile_id("OVER_PASSIVE_TRADER"),
         "over-passive trader",
         "AGGRESSIVE_ENTRY_LOW_WITH_OBSERVED_GREEN_STATE_OMISSIONS",
         True,
@@ -216,7 +237,7 @@ SYNTHETIC_LEARNER_FIXTURES_V1 = (
     ),
     SyntheticLearnerFixtureV1(
         "HIDDEN_LIQUIDITY_CONFUSION",
-        "synthetic-hidden-liquidity-confusion",
+        _synthetic_learner_profile_id("HIDDEN_LIQUIDITY_CONFUSION"),
         "hidden-liquidity confusion",
         "LIQUIDITY_WITHDRAWAL_LOW_WITH_DISPLAYED_DEPTH_CONFUSION",
         True,
@@ -228,7 +249,7 @@ SYNTHETIC_LEARNER_FIXTURES_V1 = (
     ),
     SyntheticLearnerFixtureV1(
         "NEW_LEARNER_INSUFFICIENT_EVIDENCE",
-        "synthetic-new-learner-insufficient-evidence",
+        _synthetic_learner_profile_id("NEW_LEARNER_INSUFFICIENT_EVIDENCE"),
         "new learner with insufficient evidence",
         "NO_PRIOR_ASSESSMENTS",
         False,
@@ -930,6 +951,7 @@ __all__ = [
     "ADAPTIVE_ROUTING_CLAIM_V1",
     "CROSS_LEARNER_COMPARISON_POLICY_V1",
     "SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1",
+    "SYNTHETIC_LEARNER_ENTROPY_DERIVATION_ID_V1",
     "SYNTHETIC_LEARNER_FIXTURES_V1",
     "SYNTHETIC_PRACTICE_TARGET_SKILLS_V1",
     "AdaptiveCurriculumDemoV1",

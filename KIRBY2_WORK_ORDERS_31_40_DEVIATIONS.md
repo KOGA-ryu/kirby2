@@ -301,3 +301,70 @@ reveal, authorization, ingestion constructors, backend verification, or receipts
 the query facade and its repr expose no full-run receipt commitment; and this
 cooperative in-process boundary makes no claim against arbitrary code already
 executing inside the backend interpreter or a malicious/misconfigured pin issuer.
+
+## DEV-0007 — Enforce pseudonymous learner run identities
+
+- Interrupted canonical card: `WO37-A`
+- Exact first-parent predecessor: `10bb9f2120a36af191a79b05a6a6c670ca904929`
+- Reproducer: create an empty `LearnerEvidenceLedgerV1` and its rebuilt projection
+  with learner ID `ada.learner@example.invalid`, then pass both to
+  `LearnerArtifactStore.record_update` and inspect the resulting manifest and JSON
+  artifacts.
+- Observed terminal result: the update persisted successfully and the email-like
+  learner ID appeared in the immutable manifest, evidence ledger, and projection.
+- Root cause: WO34-D required matching nonempty learner IDs at the ledger/projection
+  boundary but did not distinguish a role-scoped pseudonym from direct identity.
+  WO37-A's erasable identity mapping therefore could not guarantee separation while
+  the already-sealed learner artifact writer still accepted and immortalized an
+  arbitrary caller string.
+- Repair: add a lightweight top-level pseudonym contract with exact lowercase
+  instructor and learner namespaces, 32-to-4096-byte direct-identity-independent
+  entropy, and role-domain-separated SHA-256 derivation. Require a strict opaque
+  learner ID both before `LearnerArtifactStore` writes and after it loads artifact
+  bytes. Migrate the six WO34-D synthetic fixtures to deterministic opaque learner
+  IDs derived from an independent synthetic-only entropy domain; update the sealed
+  seed-42 demonstration pin from
+  `d88a2d0bad0c4ccfac25cacbc68ee632ffc29b951fb5698677471f1fe03e6b29` to
+  `575bf85959fdff9590d10c30071b7d7e24415b0ea0f48f0f399af88309689576` while
+  retaining the established first five pattern routes and the sixth cold-start
+  broad route. Add a deterministic hostile-boundary audit that proves refusal occurs
+  before persistence, valid opaque artifacts write/load/verify, tampered load bytes
+  fail closed, and no direct marker enters a valid run. This is pseudonymization, not
+  anonymity.
+- Owned repair paths: create `kirby2/pseudonyms.py`; modify
+  `kirby2/research/store.py`, `kirby2/curriculum/adaptive_commands.py`, and
+  `kirby2/audit/adaptive_curriculum.py`; create
+  `kirby2/audit/pseudonymous_learner.py`; modify
+  `kirby2/audit/expansion.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0007` through the existing K2X-02 expansion seam,
+  immediately after `WO36-E` and before resumed `WO37-A`.
+- Inherited gates: `WO34-D` with the explicitly recorded identity-derived pin,
+  run-store, `WO36-E`, and `K2X-02` remain required and must remain green.
+- Exact commit subject: `Enforce pseudonymous learner run identities`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0007
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 adaptive-curriculum-demo --seed 42
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO34-D
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-run-store
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO36-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: an email-like learner ID is refused before a staging or run artifact is
+created; strict lowercase learner IDs write, load, and verify through the real store;
+an instructor ID, malformed ID, uppercase digest, short entropy, non-bytes entropy,
+and load-time direct-identity tamper all fail closed; the same entropy produces stable
+but role-distinct instructor and learner pseudonyms; valid persisted bytes contain no
+direct marker; the six synthetic learner IDs are unique deterministic pseudonyms
+derived without direct identity; the seed-42 demo digest is exactly
+`575bf85959fdff9590d10c30071b7d7e24415b0ea0f48f0f399af88309689576`; the first
+five required evidence-pattern routes remain position management, book reading,
+passive entry, aggressive entry, and liquidity withdrawal respectively, and the new
+learner retains its distinct broad cold-start route; no identity mapping, brokerage,
+order-routing, anonymity, educational-effectiveness, or real-trading capability is
+claimed.

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from kirby2.session.live import LiveMarketSession
 from kirby2.session.replay import RECORDING_SCHEMA_VERSION, SessionRecording, replay_recording
+from kirby2.pseudonyms import require_learner_profile_id
 
 from .models import (
     RUN_CONFIGURATION_SCHEMA_VERSION,
@@ -1437,6 +1438,8 @@ class LearnerArtifactStore:
             raise TypeError("learner update persistence requires a typed ledger")
         if not isinstance(projection, LearnerProjectionV1):
             raise TypeError("learner update persistence requires a typed projection")
+        require_learner_profile_id(ledger.learner_id)
+        require_learner_profile_id(projection.learner_id)
         if seed is not None and type(seed) is not int:
             raise TypeError("learner update seed must be an integer or absent")
         if parent_run_id is not None and not re.fullmatch(
@@ -1512,6 +1515,14 @@ class LearnerArtifactStore:
         projection = LearnerProjectionV1.from_json_bytes(
             (directory / "learner-projection.json").read_bytes()
         )
+        require_learner_profile_id(ledger.learner_id)
+        require_learner_profile_id(projection.learner_id)
+        if projection.learner_id != ledger.learner_id:
+            raise ValueError("learner update ledger and projection identities differ")
+        if manifest.input_dataset_references != (
+            f"learner-evidence:{ledger.learner_id}:{ledger.ledger_sha256}",
+        ):
+            raise ValueError("learner artifact manifest identity binding differs")
         if tuple(item.relative_path for item in manifest.artifacts) != tuple(
             item[1] for item in _LEARNER_ARTIFACT_SPECS
         ):

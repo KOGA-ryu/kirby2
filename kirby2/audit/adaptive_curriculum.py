@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -124,7 +125,7 @@ WO34C_SELECTION_POLICY_SHA256 = (
 WO34D_AUDIT_CASE_COUNT = 4
 WO34D_SYNTHETIC_LEARNER_COUNT = 6
 WO34D_DEMO_SHA256 = (
-    "d88a2d0bad0c4ccfac25cacbc68ee632ffc29b951fb5698677471f1fe03e6b29"
+    "575bf85959fdff9590d10c30071b7d7e24415b0ea0f48f0f399af88309689576"
 )
 _DIGEST = "1" * 64
 
@@ -2244,9 +2245,14 @@ def audit_wo34c_adaptive_curriculum() -> tuple[AdaptiveCurriculumAuditCase, ...]
 def _synthetic_fixture_and_sequence_case(demo) -> AdaptiveCurriculumAuditCase:
     from kirby2.curriculum.adaptive_commands import (
         SYNTHETIC_INITIAL_EVIDENCE_ROUNDS_V1,
+        SYNTHETIC_LEARNER_ENTROPY_DERIVATION_ID_V1,
         SYNTHETIC_LEARNER_FIXTURES_V1,
         SYNTHETIC_PRACTICE_TARGET_SKILLS_V1,
         build_synthetic_learner_evidence_v1,
+    )
+    from kirby2.pseudonyms import (
+        derive_learner_profile_id,
+        require_learner_profile_id,
     )
 
     failures: list[str] = []
@@ -2273,6 +2279,25 @@ def _synthetic_fixture_and_sequence_case(demo) -> AdaptiveCurriculumAuditCase:
         != SYNTHETIC_LEARNER_FIXTURES_V1
     ):
         failures.append("six fixed synthetic learner identities or ordering differ")
+    if len({item.learner_id for item in SYNTHETIC_LEARNER_FIXTURES_V1}) != len(
+        SYNTHETIC_LEARNER_FIXTURES_V1
+    ):
+        failures.append("synthetic learner pseudonyms are not unique")
+    for fixture in SYNTHETIC_LEARNER_FIXTURES_V1:
+        entropy = hashlib.sha256(
+            SYNTHETIC_LEARNER_ENTROPY_DERIVATION_ID_V1.encode("ascii")
+            + b"\x00"
+            + fixture.fixture_id.encode("ascii")
+        ).digest()
+        if (
+            _raises(lambda fixture=fixture: require_learner_profile_id(
+                fixture.learner_id
+            ))
+            or fixture.learner_id != derive_learner_profile_id(entropy)
+        ):
+            failures.append(
+                f"{fixture.fixture_id} learner ID is not the deterministic opaque pseudonym"
+            )
     sequences = tuple(item.selected_skill_sequence for item in demo.learners)
     if len(set(sequences)) != WO34D_SYNTHETIC_LEARNER_COUNT:
         failures.append("synthetic evidence did not produce six distinct sequences")

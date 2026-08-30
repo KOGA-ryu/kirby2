@@ -97,6 +97,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0004", "WO31-E6"),
     ("DEV-0005", "WO36-C"),
     ("DEV-0006", "WO36-C"),
+    ("DEV-0007", "WO37-A"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -149,6 +150,7 @@ REGISTERABLE_GATE_IDS = (
     "WO36-C",
     "WO36-D",
     "WO36-E",
+    "DEV-0007",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4297,6 +4299,48 @@ def _audit_wo36e() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0007() -> ExpansionGateReport:
+    """Require opaque learner identities at the immutable run-store boundary."""
+
+    from kirby2.audit.pseudonymous_learner import (
+        DEV0007_AUDIT_CASE_COUNT,
+        audit_dev0007_pseudonymous_learner_runs,
+    )
+    from kirby2.pseudonyms import PSEUDONYMOUS_PROFILE_ID_POLICY
+
+    cases = audit_dev0007_pseudonymous_learner_runs()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0007",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(DEV0007_AUDIT_CASE_COUNT)),
+            ("interrupted_card", "WO37-A"),
+            ("learner_run_identity_policy", PSEUDONYMOUS_PROFILE_ID_POLICY),
+            ("legacy_human_readable_learner_id_write", "REFUSED"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4348,6 +4392,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO36-C", _audit_wo36c),
     ("WO36-D", _audit_wo36d),
     ("WO36-E", _audit_wo36e),
+    ("DEV-0007", _audit_dev0007),
 )
 
 
