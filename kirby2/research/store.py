@@ -43,6 +43,7 @@ from .tables import (
     artifact_registry_rows,
     attach_run_id,
     evidence_digest,
+    instructor_artifact_registry_rows,
     learner_artifact_registry_rows,
     lesson_mining_artifact_registry_rows,
     read_parquet_table,
@@ -797,6 +798,13 @@ class RunStore:
             return LessonMiningStore(self.root).verify_run(run_id)
         if manifest.run_type is RunType.LEARNER_UPDATE:
             return LearnerArtifactStore(self.root).verify_run(run_id)
+        if manifest.run_type in {
+            RunType.INSTRUCTOR_ASSIGNMENT,
+            RunType.INSTRUCTOR_ATTEMPT,
+            RunType.INSTRUCTOR_RUBRIC,
+            RunType.INSTRUCTOR_REVIEW,
+        }:
+            return InstructorArtifactStore(self.root).verify_run(run_id)
         directory = self.run_directory(run_id)
         expected_artifact_schemas = {
             "configuration": RUN_CONFIGURATION_SCHEMA_VERSION,
@@ -1142,6 +1150,16 @@ class RunStore:
                 ]
             )
         )
+        expected_instructor_artifacts = tuple(
+            instructor_artifact_registry_rows(
+                [
+                    RunManifest.from_dict(load_toml(path))
+                    for path in sorted(
+                        self.runs_directory.glob("run-*/manifest.toml")
+                    )
+                ]
+            )
+        )
         duckdb = _duckdb()
         try:
             connection = duckdb.connect(str(self.catalog_path), read_only=True)
@@ -1198,6 +1216,14 @@ class RunStore:
                         "ORDER BY run_id, artifact_type, artifact_name"
                     ).fetchall()
                 )
+                actual_instructor_artifacts = tuple(
+                    connection.execute(
+                        "SELECT run_id, artifact_type, artifact_name, relative_path, "
+                        "sha256, schema_version, row_count, media_type "
+                        "FROM instructor_artifacts "
+                        "ORDER BY run_id, artifact_type, artifact_name"
+                    ).fetchall()
+                )
             finally:
                 connection.close()
         except Exception:
@@ -1212,6 +1238,7 @@ class RunStore:
             and actual_learner_artifacts == expected_learner_artifacts
             and actual_strategy_discovery_artifacts
             == expected_strategy_discovery_artifacts
+            and actual_instructor_artifacts == expected_instructor_artifacts
         )
 
     @contextmanager
@@ -1346,6 +1373,33 @@ class RunStore:
             else:
                 cursor = connection.execute(
                     "SELECT * FROM strategy_discovery_artifacts "
+                    "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
+                    [run_id],
+                )
+            columns = tuple(item[0] for item in cursor.description)
+            return tuple(
+                dict(zip(columns, row, strict=True)) for row in cursor.fetchall()
+            )
+        finally:
+            connection.close()
+
+    def query_instructor_artifacts(
+        self, run_id: str | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return typed assignment, attempt, rubric, score, and review artifacts."""
+
+        self._ensure_catalog()
+        duckdb = _duckdb()
+        connection = duckdb.connect(str(self.catalog_path), read_only=True)
+        try:
+            if run_id is None:
+                cursor = connection.execute(
+                    "SELECT * FROM instructor_artifacts "
+                    "ORDER BY run_id, artifact_type, artifact_name"
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM instructor_artifacts "
                     "WHERE run_id = ? ORDER BY artifact_type, artifact_name",
                     [run_id],
                 )
@@ -1725,6 +1779,415 @@ def _learner_artifact_digests(ledger, projection) -> tuple[str, str, str]:
         ),
         hashlib.sha256(ledger.canonical_bytes()).hexdigest(),
         hashlib.sha256(projection.canonical_bytes()).hexdigest(),
+    )
+
+
+_INSTRUCTOR_ARTIFACT_SPECS = {
+    ArtifactType.INSTRUCTOR_ASSIGNMENT: (
+        RunType.INSTRUCTOR_ASSIGNMENT,
+        "instructor_assignment",
+        "assignment.json",
+    ),
+    ArtifactType.INSTRUCTOR_ATTEMPT_MANIFEST: (
+        RunType.INSTRUCTOR_ATTEMPT,
+        "instructor_attempt_manifest",
+        "attempt-manifest.json",
+    ),
+    ArtifactType.INSTRUCTOR_RUBRIC: (
+        RunType.INSTRUCTOR_RUBRIC,
+        "instructor_rubric",
+        "rubric.json",
+    ),
+    ArtifactType.INSTRUCTOR_RUBRIC_SCORE: (
+        RunType.INSTRUCTOR_RUBRIC,
+        "instructor_rubric_score",
+        "rubric-score.json",
+    ),
+    ArtifactType.INSTRUCTOR_REVIEW_SIDECAR: (
+        RunType.INSTRUCTOR_REVIEW,
+        "instructor_review_sidecar",
+        "review-sidecar.json",
+    ),
+}
+
+
+class InstructorArtifactStore:
+    """Persist immutable WO37-B assignment, rubric, attempt, and review records."""
+
+    def __init__(self, root: Path = DEFAULT_RESEARCH_STORE) -> None:
+        self.root = root
+        self.runs_directory = root / "runs"
+        self.staging_directory = root / ".staging"
+        self.runs_directory.mkdir(parents=True, exist_ok=True)
+        self.staging_directory.mkdir(parents=True, exist_ok=True)
+
+    def run_directory(self, run_id: str) -> Path:
+        if not re.fullmatch(r"run-[0-9a-f]{24}", run_id):
+            raise ValueError("invalid run ID")
+        return self.runs_directory / run_id
+
+    def load_manifest(self, run_id: str) -> RunManifest:
+        path = self.run_directory(run_id) / "manifest.toml"
+        if not path.is_file():
+            raise ValueError(f"unknown run ID: {run_id}")
+        manifest = RunManifest.from_dict(load_toml(path))
+        if manifest.run_type not in {
+            RunType.INSTRUCTOR_ASSIGNMENT,
+            RunType.INSTRUCTOR_ATTEMPT,
+            RunType.INSTRUCTOR_RUBRIC,
+            RunType.INSTRUCTOR_REVIEW,
+        }:
+            raise ValueError("run is not an instructor artifact")
+        return manifest
+
+    def record_assignment(
+        self,
+        assignment,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.instructor.assignments import AssignmentRevisionV1
+
+        if not isinstance(assignment, AssignmentRevisionV1):
+            raise TypeError("assignment persistence requires AssignmentRevisionV1")
+        return self._record(
+            assignment.canonical_bytes(),
+            ArtifactType.INSTRUCTOR_ASSIGNMENT,
+            creation_timestamp_utc=creation_timestamp_utc,
+            parent_run_id=parent_run_id,
+            repository=repository,
+        )
+
+    def record_attempt(
+        self,
+        attempt,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.instructor.assignments import AssignmentAttemptManifestV1
+
+        if not isinstance(attempt, AssignmentAttemptManifestV1):
+            raise TypeError(
+                "attempt persistence requires AssignmentAttemptManifestV1"
+            )
+        return self._record(
+            attempt.canonical_bytes(),
+            ArtifactType.INSTRUCTOR_ATTEMPT_MANIFEST,
+            creation_timestamp_utc=creation_timestamp_utc,
+            parent_run_id=parent_run_id,
+            repository=repository,
+        )
+
+    def record_rubric(
+        self,
+        rubric,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.instructor.rubrics import RubricRevisionV1
+
+        if not isinstance(rubric, RubricRevisionV1):
+            raise TypeError("rubric persistence requires RubricRevisionV1")
+        return self._record(
+            rubric.canonical_bytes(),
+            ArtifactType.INSTRUCTOR_RUBRIC,
+            creation_timestamp_utc=creation_timestamp_utc,
+            parent_run_id=parent_run_id,
+            repository=repository,
+        )
+
+    def record_rubric_score(
+        self,
+        score,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.instructor.rubrics import RubricScoreSidecarV1
+
+        if not isinstance(score, RubricScoreSidecarV1):
+            raise TypeError(
+                "rubric-score persistence requires RubricScoreSidecarV1"
+            )
+        return self._record(
+            score.canonical_bytes(),
+            ArtifactType.INSTRUCTOR_RUBRIC_SCORE,
+            creation_timestamp_utc=creation_timestamp_utc,
+            parent_run_id=parent_run_id,
+            repository=repository,
+        )
+
+    def record_review(
+        self,
+        review,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None = None,
+        repository: Path | None = None,
+    ) -> RunManifest:
+        from kirby2.instructor.reviews import ReviewRevisionV1
+
+        if not isinstance(review, ReviewRevisionV1):
+            raise TypeError("review persistence requires ReviewRevisionV1")
+        return self._record(
+            review.canonical_bytes(),
+            ArtifactType.INSTRUCTOR_REVIEW_SIDECAR,
+            creation_timestamp_utc=creation_timestamp_utc,
+            parent_run_id=parent_run_id,
+            repository=repository,
+        )
+
+    def load_artifact(self, run_id: str):
+        manifest = self.load_manifest(run_id)
+        if len(manifest.artifacts) != 1:
+            raise ValueError("instructor run must contain exactly one artifact")
+        reference = manifest.artifacts[0]
+        expected = _INSTRUCTOR_ARTIFACT_SPECS.get(reference.artifact_type)
+        if expected is None or expected[0] is not manifest.run_type:
+            raise ValueError("instructor artifact type and run type differ")
+        if (reference.name, reference.relative_path) != (expected[1], expected[2]):
+            raise ValueError("instructor artifact identity or path differs")
+        path = self.run_directory(run_id) / reference.relative_path
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("instructor artifact is missing or unsafe")
+        raw = path.read_bytes()
+        if reference.artifact_type is ArtifactType.INSTRUCTOR_ASSIGNMENT:
+            from kirby2.instructor.assignments import AssignmentRevisionV1
+
+            value = AssignmentRevisionV1.from_json_bytes(raw)
+        elif reference.artifact_type is ArtifactType.INSTRUCTOR_ATTEMPT_MANIFEST:
+            from kirby2.instructor.assignments import AssignmentAttemptManifestV1
+
+            value = AssignmentAttemptManifestV1.from_json_bytes(raw)
+        elif reference.artifact_type is ArtifactType.INSTRUCTOR_RUBRIC:
+            from kirby2.instructor.rubrics import RubricRevisionV1
+
+            value = RubricRevisionV1.from_json_bytes(raw)
+        elif reference.artifact_type is ArtifactType.INSTRUCTOR_RUBRIC_SCORE:
+            from kirby2.instructor.rubrics import RubricScoreSidecarV1
+
+            value = RubricScoreSidecarV1.from_json_bytes(raw)
+        else:
+            from kirby2.instructor.reviews import ReviewRevisionV1
+
+            value = ReviewRevisionV1.from_json_bytes(raw)
+        if value.canonical_bytes() != raw:
+            raise ValueError("instructor artifact is not canonical")
+        return value
+
+    def verify_run(self, run_id: str) -> VerificationReport:
+        failures: list[str] = []
+        flags = {
+            "manifest_loaded": False,
+            "references_exist": False,
+            "artifact_digests_match": False,
+            "artifact_row_counts_match": False,
+            "event_sequence_complete": False,
+            "replay_configuration_available": False,
+            "replay_passed": False,
+            "result_digest_match": False,
+            "evidence_digest_match": False,
+            "schema_versions_supported": False,
+            "run_identity_match": False,
+        }
+        try:
+            manifest = self.load_manifest(run_id)
+            flags["manifest_loaded"] = True
+            flags["run_identity_match"] = manifest.run_id == run_id
+            if not flags["run_identity_match"]:
+                raise ValueError("instructor manifest run ID differs from directory")
+        except (OSError, TypeError, ValueError) as error:
+            failures.append(f"manifest invalid: {error}")
+            return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+
+        expected_type = next(
+            (
+                artifact_type
+                for artifact_type, spec in _INSTRUCTOR_ARTIFACT_SPECS.items()
+                if spec[0] is manifest.run_type
+                and len(manifest.artifacts) == 1
+                and manifest.artifacts[0].artifact_type is artifact_type
+            ),
+            None,
+        )
+        expected_spec = (
+            None if expected_type is None else _INSTRUCTOR_ARTIFACT_SPECS[expected_type]
+        )
+        flags["schema_versions_supported"] = bool(
+            expected_type is not None
+            and manifest.schema_versions
+            == _instructor_schema_versions(expected_type)
+            and manifest.artifacts[0].schema_version == 1
+            and manifest.artifacts[0].row_count == 1
+            and (manifest.artifacts[0].name, manifest.artifacts[0].relative_path)
+            == (expected_spec[1], expected_spec[2])
+        )
+        if not flags["schema_versions_supported"]:
+            failures.append("instructor typed artifact or schema inventory differs")
+
+        directory = self.run_directory(run_id)
+        raw: bytes | None = None
+        try:
+            if len(manifest.artifacts) != 1:
+                raise ValueError("instructor run must contain one artifact")
+            reference = manifest.artifacts[0]
+            path = directory / reference.relative_path
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("instructor artifact is missing or unsafe")
+            extras = {
+                item.name for item in directory.iterdir() if item.name != "manifest.toml"
+            } - {Path(reference.relative_path).name}
+            if extras:
+                raise ValueError("instructor run contains unregistered artifact files")
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            flags["references_exist"] = True
+            flags["artifact_digests_match"] = digest == reference.sha256
+            flags["artifact_row_counts_match"] = reference.row_count == 1
+            flags["evidence_digest_match"] = manifest.evidence_digest == digest
+            flags["result_digest_match"] = manifest.result_digest == digest
+            if manifest.input_dataset_references != (
+                f"instructor-artifact:{reference.artifact_type.value}:{digest}",
+            ):
+                raise ValueError("instructor artifact manifest binding differs")
+            if manifest.configuration_digest != _instructor_configuration_digest(
+                reference.artifact_type
+            ):
+                raise ValueError("instructor artifact store policy digest differs")
+        except (OSError, TypeError, ValueError) as error:
+            failures.append(f"instructor artifact inventory invalid: {error}")
+
+        try:
+            value = self.load_artifact(run_id)
+            flags["replay_configuration_available"] = True
+            flags["replay_passed"] = raw is not None and value.canonical_bytes() == raw
+            flags["event_sequence_complete"] = flags["replay_passed"]
+        except Exception as error:
+            failures.append(f"instructor artifact reload invalid: {error}")
+        if not flags["artifact_digests_match"]:
+            failures.append("instructor artifact digest differs")
+        if not flags["artifact_row_counts_match"]:
+            failures.append("instructor artifact row count differs")
+        if not flags["evidence_digest_match"]:
+            failures.append("instructor evidence digest differs")
+        if not flags["result_digest_match"]:
+            failures.append("instructor result digest differs")
+        if not flags["replay_passed"]:
+            failures.append("instructor artifact canonical reload differs")
+        return VerificationReport(run_id=run_id, failures=tuple(failures), **flags)
+
+    def _record(
+        self,
+        raw: bytes,
+        artifact_type: ArtifactType,
+        *,
+        creation_timestamp_utc: str,
+        parent_run_id: str | None,
+        repository: Path | None,
+    ) -> RunManifest:
+        if artifact_type not in _INSTRUCTOR_ARTIFACT_SPECS:
+            raise ValueError("unsupported instructor artifact type")
+        run_type, name, relative_path = _INSTRUCTOR_ARTIFACT_SPECS[artifact_type]
+        digest = hashlib.sha256(raw).hexdigest()
+        reference = ArtifactReference(
+            name=name,
+            relative_path=relative_path,
+            sha256=digest,
+            schema_version=1,
+            row_count=1,
+            media_type="application/json",
+            artifact_type=artifact_type,
+        )
+        repository_path = repository or Path(__file__).resolve().parents[2]
+        manifest = RunManifest.create(
+            parent_run_id=parent_run_id,
+            run_type=run_type,
+            scenario_id=None,
+            lesson_id=None,
+            seed=None,
+            flow_model="IMMUTABLE_INSTRUCTOR_ARTIFACT_V1",
+            market_profile=artifact_type.value,
+            strategy_id="NONE",
+            hotkey_layout_id="NONE",
+            session_objective=f"PERSIST_{artifact_type.value}",
+            simulation_start_us=0,
+            simulation_end_us=0,
+            software_version=software_version(),
+            git_commit=git_commit(repository_path),
+            schema_versions=_instructor_schema_versions(artifact_type),
+            input_dataset_references=(
+                f"instructor-artifact:{artifact_type.value}:{digest}",
+            ),
+            configuration_digest=_instructor_configuration_digest(artifact_type),
+            evidence_digest=digest,
+            result_digest=digest,
+            creation_timestamp_utc=creation_timestamp_utc,
+            artifacts=(reference,),
+        )
+        return self._persist(manifest, {relative_path: raw})
+
+    def _persist(
+        self,
+        manifest: RunManifest,
+        payloads: dict[str, bytes],
+    ) -> RunManifest:
+        target = self.run_directory(manifest.run_id)
+        if target.exists():
+            existing = self.load_manifest(manifest.run_id)
+            if existing.identity_dict() != manifest.identity_dict():
+                raise RuntimeError("content-derived instructor run ID collision")
+            report = self.verify_run(manifest.run_id)
+            if not report.passed:
+                raise RuntimeError(
+                    "existing immutable instructor run is invalid: "
+                    + "; ".join(report.failures)
+                )
+            return existing
+        with tempfile.TemporaryDirectory(
+            dir=self.staging_directory,
+            prefix=f"{manifest.run_id}-",
+        ) as temporary:
+            staging = Path(temporary) / manifest.run_id
+            staging.mkdir()
+            for relative_path, raw in payloads.items():
+                (staging / relative_path).write_bytes(raw)
+            (staging / "manifest.toml").write_text(
+                manifest.to_toml(), encoding="utf-8"
+            )
+            staging.rename(target)
+        report = self.verify_run(manifest.run_id)
+        if not report.passed:
+            raise RuntimeError(
+                "new immutable instructor run failed verification: "
+                + "; ".join(report.failures)
+            )
+        RunStore(self.root).refresh_catalog()
+        return self.load_manifest(manifest.run_id)
+
+
+def _instructor_schema_versions(
+    artifact_type: ArtifactType,
+) -> dict[str, int]:
+    return {
+        f"instructor.{artifact_type.value.lower()}": 1,
+        "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
+    }
+
+
+def _instructor_configuration_digest(artifact_type: ArtifactType) -> str:
+    return canonical_digest(
+        {
+            "artifact_type": artifact_type.value,
+            "policy": "IMMUTABLE_INSTRUCTOR_ARTIFACT_V1",
+            "schema_version": 1,
+        }
     )
 
 
@@ -2417,6 +2880,7 @@ _CATALOG_VIEWS = (
     "lesson_mining_artifacts",
     "learner_artifacts",
     "strategy_discovery_artifacts",
+    "instructor_artifacts",
     "dataset_provenance",
     "invariant_violations",
     "experiment_comparison",
@@ -2512,6 +2976,19 @@ def _create_summary_views(connection) -> None:
             'STRATEGY_LINEAGE_REPORT',
             'STRATEGY_REVEAL_TOKEN',
             'STRATEGY_SCIENTIFIC_OUTCOME'
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE VIEW instructor_artifacts AS
+        SELECT * FROM run_artifact_registry
+        WHERE artifact_type IN (
+            'INSTRUCTOR_ASSIGNMENT',
+            'INSTRUCTOR_ATTEMPT_MANIFEST',
+            'INSTRUCTOR_RUBRIC',
+            'INSTRUCTOR_RUBRIC_SCORE',
+            'INSTRUCTOR_REVIEW_SIDECAR'
         )
         """
     )

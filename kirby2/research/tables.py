@@ -272,6 +272,17 @@ STRATEGY_DISCOVERY_ARTIFACT_TYPES = frozenset(
 )
 
 
+INSTRUCTOR_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.INSTRUCTOR_ASSIGNMENT,
+        ArtifactType.INSTRUCTOR_ATTEMPT_MANIFEST,
+        ArtifactType.INSTRUCTOR_RUBRIC,
+        ArtifactType.INSTRUCTOR_RUBRIC_SCORE,
+        ArtifactType.INSTRUCTOR_REVIEW_SIDECAR,
+    }
+)
+
+
 def artifact_registry_rows(manifests: list[RunManifest]) -> list[tuple[object, ...]]:
     """Project typed immutable artifacts into the rebuildable research catalog."""
 
@@ -341,6 +352,18 @@ def strategy_discovery_artifact_registry_rows(
         row
         for row in artifact_registry_rows(manifests)
         if ArtifactType(str(row[1])) in STRATEGY_DISCOVERY_ARTIFACT_TYPES
+    ]
+
+
+def instructor_artifact_registry_rows(
+    manifests: list[RunManifest],
+) -> list[tuple[object, ...]]:
+    """Project only immutable assignment, rubric, attempt, and review artifacts."""
+
+    return [
+        row
+        for row in artifact_registry_rows(manifests)
+        if ArtifactType(str(row[1])) in INSTRUCTOR_ARTIFACT_TYPES
     ]
 
 
