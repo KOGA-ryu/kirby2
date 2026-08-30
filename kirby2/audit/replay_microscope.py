@@ -831,6 +831,9 @@ def _postmortem_authorization_case() -> ReplayMicroscopeAuditCase:
     request_scope_relabel_rejected = False
     contradictory_result_rejected = False
     duplicate_result_rejected = False
+    reveal_receive_rejected = False
+    reveal_visibility_rejected = False
+    delivered_receive_rejected = False
     if revealed:
         relabeled = replace(
             revealed[0],
@@ -874,6 +877,66 @@ def _postmortem_authorization_case() -> ReplayMicroscopeAuditCase:
             )
         except ValueError:
             request_scope_relabel_rejected = True
+        receive_claim = replace(
+            revealed[0],
+            data_age=replace(
+                revealed[0].data_age,
+                client_receive=EvidenceTimestamp.recorded(350),
+            ),
+        )
+        try:
+            replace(
+                exact,
+                values=tuple(
+                    receive_claim if item is revealed[0] else item
+                    for item in exact.values
+                ),
+            )
+        except ValueError:
+            reveal_receive_rejected = True
+        shifted_visibility = replace(
+            revealed[0],
+            data_age=replace(
+                revealed[0].data_age,
+                policy_visible_at_time_us=(
+                    revealed[0].data_age.source_event_time_us + 1
+                ),
+            ),
+        )
+        try:
+            replace(
+                exact,
+                values=tuple(
+                    shifted_visibility if item is revealed[0] else item
+                    for item in exact.values
+                ),
+            )
+        except ValueError:
+            reveal_visibility_rejected = True
+        delivered = next(
+            item
+            for item in exact.values
+            if item.source_kind is EvidenceSourceKind.CLIENT_DELIVERED
+        )
+        missing_receive = replace(
+            delivered,
+            data_age=replace(
+                delivered.data_age,
+                client_receive=EvidenceTimestamp.unavailable(
+                    NOT_OBSERVED_AS_OF_CLIENT_KNOWLEDGE
+                ),
+            ),
+        )
+        try:
+            replace(
+                exact,
+                values=tuple(
+                    missing_receive if item is delivered else item
+                    for item in exact.values
+                ),
+            )
+        except ValueError:
+            delivered_receive_rejected = True
     if not relabel_rejected:
         failures.append("revealed truth could be relabeled as observed output")
     if not contradictory_result_rejected:
@@ -882,6 +945,12 @@ def _postmortem_authorization_case() -> ReplayMicroscopeAuditCase:
         failures.append("query result accepted a duplicate selected source series")
     if not request_scope_relabel_rejected:
         failures.append("query result accepted a request/reveal scope mismatch")
+    if not reveal_receive_rejected:
+        failures.append("revealed value retroactively claimed client receipt")
+    if not reveal_visibility_rejected:
+        failures.append("revealed value accepted a delayed policy visibility time")
+    if not delivered_receive_rejected:
+        failures.append("client-delivered value accepted absent receipt timing")
     detail = (
         f"matrix_cases={len(expected_reasons) + 1} exact_revealed={len(revealed)} "
         f"closed_types={subclass_rejected} relabel_rejected={relabel_rejected}"
@@ -912,6 +981,9 @@ def _postmortem_authorization_case() -> ReplayMicroscopeAuditCase:
                 "duplicate_source_series_rejected": duplicate_result_rejected,
                 "reveal_relabel_rejected": relabel_rejected,
                 "request_scope_relabel_rejected": request_scope_relabel_rejected,
+                "reveal_client_receive_rejected": reveal_receive_rejected,
+                "reveal_visibility_rejected": reveal_visibility_rejected,
+                "client_delivered_receive_rejected": delivered_receive_rejected,
             },
             "scrubbed_authorization_available": (
                 scrubbed.reveal.availability is RevealAvailability.AVAILABLE

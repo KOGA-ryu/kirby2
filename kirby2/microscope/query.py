@@ -585,19 +585,34 @@ class ObservationQueryResult:
                     != item.data_age.policy_visible_at_time_us
                 ):
                     raise ValueError("observed value lacks exact client knowledge timing")
+                if (
+                    item.source_kind is EvidenceSourceKind.CLIENT_DELIVERED
+                    and item.data_age.client_receive.availability
+                    is not TimestampAvailability.RECORDED
+                ):
+                    raise ValueError("client-delivered value lacks exact receipt timing")
                 continue
             capability = _REVEALED_SOURCE_CAPABILITIES[item.source_kind]
             if capability not in self.reveal.requested_capabilities:
                 raise ValueError("revealed value exceeds the requested capability scope")
             if item.disposition is not RecordDisposition.VALUE:
                 raise ValueError("reveal values cannot carry observed tombstones")
+            if (
+                item.data_age.policy_visible_at_time_us
+                != item.data_age.source_event_time_us
+            ):
+                raise ValueError("reveal visibility differs from its source event time")
             if item.source_evidence_sha256 != self.reveal_evidence_sha256:
                 raise ValueError("revealed value has the wrong evidence identity")
             if (
-                item.data_age.client_knowledge.availability
+                item.data_age.client_receive.availability
+                is TimestampAvailability.RECORDED
+                or item.data_age.client_knowledge.availability
                 is TimestampAvailability.RECORDED
             ):
-                raise ValueError("revealed value retroactively claims client knowledge")
+                raise ValueError(
+                    "revealed value retroactively claims client receipt or knowledge"
+                )
         if (
             self.schema_id != OBSERVATION_QUERY_SCHEMA_ID
             or type(self.schema_version) is not int
