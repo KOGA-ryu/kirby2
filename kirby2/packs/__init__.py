@@ -1,8 +1,8 @@
 """Canonical, data-only portable pack contracts.
 
-This WO39-A surface defines logical identity and byte-format declarations only.
-Untrusted archive validation, staging, installation, and domain-specific builders
-are deliberately introduced by later work orders.
+WO39-A defines logical identity and byte-format declarations.  WO39-B adds hostile
+archive preflight plus private activation-eligible staging.  Installation, registry
+mutation, and domain-specific builders remain owned by later work orders.
 """
 
 from .formats import (
@@ -43,6 +43,12 @@ from .identity import (
     verify_pack_id,
     verify_pack_payload_identity,
 )
+from .archive import (
+    PackArchiveMemberV1,
+    PackArchivePreflightV1,
+    preflight_pack_archive_bytes,
+    read_pack_archive_bytes,
+)
 from .models import (
     PACK_FORMAT_ID,
     PACK_FORMAT_VERSION,
@@ -65,10 +71,38 @@ from .models import (
     PackTypeV1,
     PackVersionRequirementV1,
 )
+from .staging import (
+    PACK_STAGE_CAPABILITY_SCHEMA_ID,
+    PACK_STAGE_CAPABILITY_SCHEMA_VERSION,
+    PACK_STAGE_VERIFICATION_SCHEMA_ID,
+    PACK_STAGE_VERIFICATION_SCHEMA_VERSION,
+    ActivationEligiblePackStageV1,
+    PackStageVerificationV1,
+    discard_pack_stage,
+    revalidate_pack_stage,
+    stage_pack_archive_bytes,
+    stage_preflighted_pack,
+)
+from .validation import (
+    ALLOWED_PACK_ZIP_COMPRESSION_METHODS_V1,
+    DEFAULT_PACK_VALIDATION_LIMITS_V1,
+    PACK_VALIDATION_POLICY_ALGORITHM,
+    PACK_VALIDATION_POLICY_SCHEMA_ID,
+    PACK_VALIDATION_POLICY_SCHEMA_VERSION,
+    PackRefusalCodeV1,
+    PackRefusalV1,
+    PackValidationLimitsV1,
+    PackValidationPhaseV1,
+    PackValidationRefused,
+    validation_policy_id,
+)
 
 
 __all__ = [
+    "ALLOWED_PACK_ZIP_COMPRESSION_METHODS_V1",
+    "ActivationEligiblePackStageV1",
     "CREATOR_ID_ALGORITHM",
+    "DEFAULT_PACK_VALIDATION_LIMITS_V1",
     "K2PACK_CANONICALIZATION_ID",
     "K2PACK_CANONICALIZATION_VERSION",
     "K2PACK_MANIFEST_PATH",
@@ -82,7 +116,16 @@ __all__ = [
     "PACK_IDENTITY_PROJECTION_SCHEMA_VERSION",
     "PACK_MANIFEST_SCHEMA_ID",
     "PACK_MANIFEST_SCHEMA_VERSION",
+    "PACK_STAGE_CAPABILITY_SCHEMA_ID",
+    "PACK_STAGE_CAPABILITY_SCHEMA_VERSION",
+    "PACK_STAGE_VERIFICATION_SCHEMA_ID",
+    "PACK_STAGE_VERIFICATION_SCHEMA_VERSION",
+    "PACK_VALIDATION_POLICY_ALGORITHM",
+    "PACK_VALIDATION_POLICY_SCHEMA_ID",
+    "PACK_VALIDATION_POLICY_SCHEMA_VERSION",
     "TRANSPORT_IDENTITY_ALGORITHM",
+    "PackArchiveMemberV1",
+    "PackArchivePreflightV1",
     "PackCompatibilityLevelV1",
     "PackCompatibilityV1",
     "PackContentFormatV1",
@@ -96,9 +139,15 @@ __all__ = [
     "PackPayloadIdentityVerificationV1",
     "PackProvenanceV1",
     "PackRedistributionPolicyV1",
+    "PackRefusalCodeV1",
+    "PackRefusalV1",
     "PackRegistryKeyV1",
     "PackSchemaRequirementV1",
     "PackTypeV1",
+    "PackStageVerificationV1",
+    "PackValidationLimitsV1",
+    "PackValidationPhaseV1",
+    "PackValidationRefused",
     "PackVersionRequirementV1",
     "UnverifiedPackTransportIdentityV1",
     "canonical_creator_metadata_bytes",
@@ -109,6 +158,7 @@ __all__ = [
     "derive_creator_id",
     "derive_pack_id",
     "describe_archive_transport",
+    "discard_pack_stage",
     "inspect_payload_format_claim",
     "inventory_sha256",
     "load_canonical_json_bytes",
@@ -117,9 +167,15 @@ __all__ = [
     "normalized_archive_paths",
     "normalized_zip_info",
     "pack_identity_projection",
+    "preflight_pack_archive_bytes",
+    "read_pack_archive_bytes",
+    "revalidate_pack_stage",
     "require_semver",
     "require_semver_range",
+    "stage_pack_archive_bytes",
+    "stage_preflighted_pack",
     "transport_sha256",
+    "validation_policy_id",
     "verify_pack_id",
     "verify_pack_payload_identity",
 ]
