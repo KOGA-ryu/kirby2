@@ -48,6 +48,7 @@ class DataAreaId(str, Enum):
     RELEASE_ARTIFACTS = "release"
 
 
+PACK_INSTALLATION_AREA_IDS = (DataAreaId.PACKS, DataAreaId.STAGING)
 IMMUTABLE_EVIDENCE_AREA_IDS = (DataAreaId.RUNS, DataAreaId.EVIDENCE)
 ERASABLE_IDENTITY_AREA_IDS = (DataAreaId.IDENTITY_MAPPINGS,)
 
@@ -250,6 +251,12 @@ class DataPaths:
         # returning any unpinned write target.
         self.validate()
         return tuple(self._areas[area_id] for area_id in selected)
+
+    def ensure_pack_installation_areas(self) -> tuple[Path, Path]:
+        """Create the one installed-pack/staging pair owned by WO39-C."""
+
+        installed, staging = self.ensure(PACK_INSTALLATION_AREA_IDS)
+        return installed, staging
 
     def as_dict(self) -> dict[str, object]:
         """Return a deterministic inspection payload; paths are display metadata."""
@@ -594,6 +601,7 @@ __all__ = [
     "DATA_PATHS_SCHEMA_VERSION",
     "ERASABLE_IDENTITY_AREA_IDS",
     "IMMUTABLE_EVIDENCE_AREA_IDS",
+    "PACK_INSTALLATION_AREA_IDS",
     "DataAreaId",
     "DataPaths",
 ]
