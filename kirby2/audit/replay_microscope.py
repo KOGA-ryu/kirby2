@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
+import json
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from kirby2.immutable import thaw_json
 from kirby2.microscope import (
@@ -31,6 +34,17 @@ from kirby2.microscope.data_age import (
     TimestampAbsenceReason,
     TimestampAvailability,
 )
+from kirby2.microscope.ingestion import (
+    OBSERVED_INGEST_ADAPTER_ID,
+    OBSERVED_INGEST_ADAPTER_VERSION,
+    OBSERVED_INGEST_MANIFEST_SCHEMA_ID,
+    OBSERVED_INGEST_MANIFEST_SCHEMA_VERSION,
+    ObservationIngestionReceipt,
+    ObservedArtifactBytes,
+    VerifiedObservationSource,
+    load_verified_observation_source,
+    verify_observation_ingestion,
+)
 from kirby2.microscope.policy import (
     AS_OBSERVED_POLICY_ID,
     OBSERVATION_POLICY_SCHEMA_ID,
@@ -47,6 +61,8 @@ from kirby2.microscope.policy import (
     SourceCapabilityUnavailableReason,
 )
 from kirby2.microscope.query import (
+    CLIENT_DELIVERED_ARTIFACT_SCHEMA_ID,
+    DECISION_SNAPSHOT_ARTIFACT_SCHEMA_ID,
     OBSERVATION_QUERY_SCHEMA_ID,
     EvidenceSourceKind,
     ObservationQueryRequest,
@@ -78,6 +94,7 @@ WO36A_LEGACY_INDEX_SHA256 = (
     "422b1893997dfae18876ddb6542b6480274da32da08922bf48c8cb6f109230a2"
 )
 WO36B_AUDIT_CASE_COUNT = 6
+DEV0006_AUDIT_CASE_COUNT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +116,16 @@ class ReplayMicroscopeAuditCase:
             "name": self.name,
             "status": "PASS" if self.passed else "FAIL",
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedIngressFixture:
+    observed: ObservedEvidenceSet
+    manifest_bytes: bytes
+    manifest_sha256: str
+    artifacts: tuple[ObservedArtifactBytes, ...]
+    client_artifact_id: str
+    decision_artifact_id: str
 
 
 def audit_replay_microscope() -> tuple[ReplayMicroscopeAuditCase, ...]:
@@ -451,6 +478,653 @@ def audit_replay_observation_policies() -> tuple[ReplayMicroscopeAuditCase, ...]
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO36-B audit case order or identity changed")
     return cases
+
+
+def audit_replay_observation_ingestion() -> tuple[ReplayMicroscopeAuditCase, ...]:
+    """Run the fixed DEV-0006 immutable observed-source attack inventory."""
+
+    cases = (
+        _verified_ingress_binding_case(),
+        _ingress_tamper_case(),
+        _ingress_wire_contract_case(),
+        _ingress_query_facade_case(),
+    )
+    if len(cases) != DEV0006_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0006 audit case inventory changed")
+    expected_names = (
+        "pinned_manifest_binds_raw_and_normalized_observed_planes",
+        "manifest_and_artifact_tampering_fails_closed",
+        "wire_schema_semantics_and_source_identity_fail_closed",
+        "query_facade_revalidates_bytes_and_hides_raw_evidence",
+    )
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("DEV-0006 audit case order or identity changed")
+    return cases
+
+
+def _verified_ingress_binding_case() -> ReplayMicroscopeAuditCase:
+    fixture = _observed_ingress_fixture()
+    source = load_verified_observation_source(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        fixture.artifacts,
+    )
+    request = ObservationQueryRequest(500, action_time_us=300)
+    expected = query_as_observed(fixture.observed, request)
+    result = source.query(request)
+    repeated = load_verified_observation_source(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        tuple(reversed(fixture.artifacts)),
+    )
+    receipt = verify_observation_ingestion(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        fixture.artifacts,
+    )
+    repeated_receipt = verify_observation_ingestion(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        tuple(reversed(fixture.artifacts)),
+    )
+    empty_fixture = _observed_ingress_fixture(
+        ObservedEvidenceSet(
+            fixture.observed.source_run_id,
+            fixture.observed.source_event_sha256,
+            client_delivered=fixture.observed.client_delivered,
+        )
+    )
+    empty_source = load_verified_observation_source(
+        empty_fixture.manifest_bytes,
+        empty_fixture.manifest_sha256,
+        empty_fixture.artifacts,
+    )
+    empty_receipt = verify_observation_ingestion(
+        empty_fixture.manifest_bytes,
+        empty_fixture.manifest_sha256,
+        empty_fixture.artifacts,
+    )
+    receipt_binding = (
+        type(receipt) is ObservationIngestionReceipt
+        and receipt.manifest_sha256 == fixture.manifest_sha256
+        and receipt.evidence_sha256 == fixture.observed.evidence_sha256
+        and receipt.client_delivered_raw_sha256
+        == fixture.artifacts[0].sha256
+        and receipt.client_delivered_normalized_plane_sha256
+        == fixture.observed.client_delivered_artifact_sha256
+        and receipt.decision_snapshot_raw_sha256
+        == fixture.artifacts[1].sha256
+        and receipt.decision_snapshot_normalized_plane_sha256
+        == fixture.observed.decision_snapshot_artifact_sha256
+        and receipt.client_delivered_record_count
+        == len(fixture.observed.client_delivered)
+        and receipt.decision_snapshot_record_count
+        == len(fixture.observed.decision_snapshots)
+    )
+    deterministic = (
+        result.canonical_bytes() == expected.canonical_bytes()
+        and source.canonical_bytes(request) == repeated.canonical_bytes(request)
+        and receipt.canonical_bytes() == repeated_receipt.canonical_bytes()
+    )
+    recorded_empty_preserved = (
+        empty_receipt.decision_snapshot_record_count == 0
+        and empty_receipt.decision_snapshot_raw_sha256
+        == empty_fixture.artifacts[1].sha256
+        and empty_source.query(request).policy.mode is ObservationMode.AS_OBSERVED
+    )
+    failures: list[str] = []
+    if type(source) is not VerifiedObservationSource:
+        failures.append("verified ingestion returned an open or substituted service")
+    if not receipt_binding:
+        failures.append("ingestion receipt lost a raw or normalized source binding")
+    if not deterministic:
+        failures.append("repeated ingestion/query output differs from canonical evidence")
+    if not recorded_empty_preserved:
+        failures.append("a recorded empty plane was confused with source omission")
+    return ReplayMicroscopeAuditCase(
+        "pinned_manifest_binds_raw_and_normalized_observed_planes",
+        (
+            f"records={receipt.client_delivered_record_count}+"
+            f"{receipt.decision_snapshot_record_count} "
+            f"receipt={receipt.receipt_sha256[:24]} deterministic={deterministic}"
+        ),
+        {
+            "adapter_id": OBSERVED_INGEST_ADAPTER_ID,
+            "adapter_version": OBSERVED_INGEST_ADAPTER_VERSION,
+            "deterministic": deterministic,
+            "manifest_sha256": fixture.manifest_sha256,
+            "pin_origin_authenticated_by_loader": False,
+            "receipt": receipt.as_dict(),
+            "receipt_binding": receipt_binding,
+            "receipt_cursor_safe": False,
+            "recorded_empty_plane_preserved": recorded_empty_preserved,
+            "result_query_id": result.query_id,
+        },
+        tuple(failures),
+    )
+
+
+def _ingress_tamper_case() -> ReplayMicroscopeAuditCase:
+    fixture = _observed_ingress_fixture()
+    rewritten = _rewrite_client_source_artifact(
+        fixture,
+        _rewrite_first_best_bid,
+    )
+    client, decisions = fixture.artifacts
+    probes = {
+        "manifest_bytes": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes + b"\n",
+                fixture.manifest_sha256,
+                fixture.artifacts,
+            )
+        ),
+        "artifact_bytes": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes,
+                fixture.manifest_sha256,
+                (
+                    ObservedArtifactBytes(client.artifact_id, client.raw_bytes + b"\n"),
+                    decisions,
+                ),
+            )
+        ),
+        "self_consistent_cotamper": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                rewritten.manifest_bytes,
+                fixture.manifest_sha256,
+                rewritten.artifacts,
+            )
+        ),
+        "swapped_planes": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes,
+                fixture.manifest_sha256,
+                (
+                    ObservedArtifactBytes(client.artifact_id, decisions.raw_bytes),
+                    ObservedArtifactBytes(decisions.artifact_id, client.raw_bytes),
+                ),
+            )
+        ),
+        "missing_plane": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes,
+                fixture.manifest_sha256,
+                (client,),
+            )
+        ),
+        "duplicate_artifact_id": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes,
+                fixture.manifest_sha256,
+                (client, ObservedArtifactBytes(client.artifact_id, decisions.raw_bytes)),
+            )
+        ),
+        "extra_artifact": _ingestion_rejected(
+            lambda: load_verified_observation_source(
+                fixture.manifest_bytes,
+                fixture.manifest_sha256,
+                (
+                    *fixture.artifacts,
+                    ObservedArtifactBytes("wo36b.observed.extra.v1", b"{}"),
+                ),
+            )
+        ),
+    }
+    failures = [
+        f"ingestion accepted {name.replace('_', ' ')} tampering"
+        for name, rejected in probes.items()
+        if not rejected
+    ]
+    return ReplayMicroscopeAuditCase(
+        "manifest_and_artifact_tampering_fails_closed",
+        f"attacks={len(probes)} rejected={sum(probes.values())}",
+        {
+            "independent_manifest_pin": fixture.manifest_sha256,
+            "rejections": probes,
+            "rewritten_manifest_sha256": rewritten.manifest_sha256,
+        },
+        tuple(failures),
+    )
+
+
+def _ingress_wire_contract_case() -> ReplayMicroscopeAuditCase:
+    fixture = _observed_ingress_fixture()
+
+    def unknown_kind(payload: dict[str, object]) -> None:
+        _first_source_record(payload)["record_kind"] = "REVEALED_GROUND_TRUTH"
+
+    def truth_smuggle(payload: dict[str, object]) -> None:
+        record = _first_source_record(payload)
+        value = _source_payload(record)
+        value["reserve_quantity"] = 999
+        record["payload_sha256"] = _audit_sha256(value)
+
+    def foreign_run(payload: dict[str, object]) -> None:
+        payload["source_run_id"] = "run-111111111111111111111111"
+
+    def boolean_sequence(payload: dict[str, object]) -> None:
+        _first_source_record(payload)["sequence"] = True
+
+    def descending_sequence(payload: dict[str, object]) -> None:
+        records = payload["records"]
+        if type(records) is list:
+            records.reverse()
+
+    def missing_receive(payload: dict[str, object]) -> None:
+        timing = _source_timing(_first_source_record(payload))
+        timing["client_receive"] = {
+            "availability": "UNAVAILABLE",
+            "reason": "NOT_OBSERVED_AS_OF_CLIENT_KNOWLEDGE",
+            "time_us": None,
+        }
+
+    def incompatible_delivered_venue_reason(payload: dict[str, object]) -> None:
+        timing = _source_timing(_first_source_record(payload))
+        timing["venue_receipt"] = {
+            "availability": "NOT_APPLICABLE",
+            "reason": "CLIENT_DECISION",
+            "time_us": None,
+        }
+
+    def inverted_delivered_hops(payload: dict[str, object]) -> None:
+        timing = _source_timing(_first_source_record(payload))
+        venue_receipt = timing.get("venue_receipt")
+        client_knowledge = timing.get("client_knowledge")
+        if type(venue_receipt) is not dict or type(client_knowledge) is not dict:
+            raise RuntimeError("source timing fixture lacks recorded hops")
+        venue_receipt["time_us"] = 225
+        client_knowledge["time_us"] = 250
+
+    def neutral_unavailable_venue(payload: dict[str, object]) -> None:
+        timing = _source_timing(_first_source_record(payload))
+        timing["venue_receipt"] = {
+            "availability": "UNAVAILABLE",
+            "reason": "NOT_OBSERVED_AS_OF_CLIENT_KNOWLEDGE",
+            "time_us": None,
+        }
+
+    def client_local_no_venue_hop(payload: dict[str, object]) -> None:
+        record = _source_record_for_series(payload, "feature.imbalance")
+        timing = _source_timing(record)
+        timing["venue_receipt"] = {
+            "availability": "NOT_APPLICABLE",
+            "reason": "NO_VENUE_HOP",
+            "time_us": None,
+        }
+
+    def float_payload(payload: dict[str, object]) -> None:
+        record = _first_source_record(payload)
+        value = _source_payload(record)
+        value["best_bid_ticks"] = 100.5
+        record["payload_sha256"] = _audit_sha256(value)
+
+    def wrong_record_plane(payload: dict[str, object]) -> None:
+        record = _first_source_record(payload)
+        record["record_kind"] = "STRATEGY_SIGNAL"
+        record["series_id"] = "strategy.signal"
+        record["payload"] = {"recorded_signal": "GREEN"}
+        record["payload_sha256"] = _audit_sha256(record["payload"])
+
+    def incompatible_decision_timing(payload: dict[str, object]) -> None:
+        timing = _source_timing(_first_source_record(payload))
+        timing["client_receive"] = {
+            "availability": "NOT_APPLICABLE",
+            "reason": "OUTBOUND_CLIENT_INTENTION",
+            "time_us": None,
+        }
+
+    def duplicate_cross_plane_sequence(payload: dict[str, object]) -> None:
+        _first_source_record(payload)["sequence"] = 1
+
+    def foreign_decision_source(payload: dict[str, object]) -> None:
+        payload["source_event_sha256"] = "1" * 64
+
+    malformed_sources = {
+        "unknown_record_kind": unknown_kind,
+        "truth_payload_smuggling": truth_smuggle,
+        "foreign_run": foreign_run,
+        "boolean_sequence": boolean_sequence,
+        "descending_sequence": descending_sequence,
+        "missing_client_receive": missing_receive,
+        "incompatible_delivered_venue_reason": (
+            incompatible_delivered_venue_reason
+        ),
+        "inverted_delivered_hops": inverted_delivered_hops,
+        "binary_float_payload": float_payload,
+        "record_kind_in_wrong_plane": wrong_record_plane,
+    }
+    probes = {
+        name: _ingestion_rejected(
+            lambda mutation=mutation: _load_ingress_fixture(
+                _rewrite_client_source_artifact(fixture, mutation)
+            )
+        )
+        for name, mutation in malformed_sources.items()
+    }
+    decision_sources = {
+        "incompatible_decision_timing": incompatible_decision_timing,
+        "duplicate_cross_plane_sequence": duplicate_cross_plane_sequence,
+        "foreign_decision_source": foreign_decision_source,
+    }
+    probes.update(
+        {
+            name: _ingestion_rejected(
+                lambda mutation=mutation: _load_ingress_fixture(
+                    _rewrite_decision_source_artifact(fixture, mutation)
+                )
+            )
+            for name, mutation in decision_sources.items()
+        }
+    )
+    valid_venue_semantics = {
+        "neutral_unavailable": not _ingestion_rejected(
+            lambda: _load_ingress_fixture(
+                _rewrite_client_source_artifact(
+                    fixture,
+                    neutral_unavailable_venue,
+                )
+            )
+        ),
+        "client_local_no_venue_hop": not _ingestion_rejected(
+            lambda: _load_ingress_fixture(
+                _rewrite_client_source_artifact(
+                    fixture,
+                    client_local_no_venue_hop,
+                )
+            )
+        ),
+    }
+
+    unknown_manifest = _rewrite_ingest_manifest(
+        fixture,
+        lambda payload: payload.__setitem__("unexpected", "field"),
+    )
+    dynamic_adapter = _rewrite_ingest_manifest(
+        fixture,
+        lambda payload: payload.__setitem__(
+            "adapter_id",
+            "python.module:CallerSelectedAdapter",
+        ),
+    )
+    wrong_schema = _rewrite_ingest_manifest(
+        fixture,
+        lambda payload: payload.__setitem__("schema_version", 2),
+    )
+    boolean_schema = _rewrite_ingest_manifest(
+        fixture,
+        lambda payload: payload.__setitem__("schema_version", True),
+    )
+    foreign_manifest = _rewrite_ingest_manifest(
+        fixture,
+        lambda payload: payload.__setitem__(
+            "source_run_id",
+            "run-111111111111111111111111",
+        ),
+    )
+
+    def duplicate_role(payload: dict[str, object]) -> None:
+        artifacts = payload.get("artifacts")
+        if type(artifacts) is not list or type(artifacts[1]) is not dict:
+            raise RuntimeError("manifest fixture lacks its second artifact")
+        artifacts[1]["artifact_kind"] = "CLIENT_DELIVERED"
+        artifacts[1]["artifact_schema_id"] = (
+            "KIRBY2_OBSERVED_CLIENT_DELIVERED_SOURCE_ARTIFACT_V1"
+        )
+
+    duplicate_role_manifest = _rewrite_ingest_manifest(fixture, duplicate_role)
+
+    def omitted_role(payload: dict[str, object]) -> None:
+        artifacts = payload.get("artifacts")
+        if type(artifacts) is not list:
+            raise RuntimeError("manifest fixture lacks its artifact inventory")
+        artifacts.pop()
+
+    omitted_role_manifest = _rewrite_ingest_manifest(fixture, omitted_role)
+    duplicate_key_manifest = (
+        b'{"adapter_id":"duplicate",' + fixture.manifest_bytes[1:]
+    )
+    bom_manifest = b"\xef\xbb\xbf" + fixture.manifest_bytes
+    trailing_manifest = fixture.manifest_bytes + b"{}"
+    probes.update(
+        {
+            "unknown_manifest_field": _ingestion_rejected(
+                lambda: _load_ingress_fixture(unknown_manifest)
+            ),
+            "dynamic_adapter": _ingestion_rejected(
+                lambda: _load_ingress_fixture(dynamic_adapter)
+            ),
+            "unknown_schema": _ingestion_rejected(
+                lambda: _load_ingress_fixture(wrong_schema)
+            ),
+            "boolean_schema_alias": _ingestion_rejected(
+                lambda: _load_ingress_fixture(boolean_schema)
+            ),
+            "foreign_manifest_source": _ingestion_rejected(
+                lambda: _load_ingress_fixture(foreign_manifest)
+            ),
+            "duplicate_artifact_role": _ingestion_rejected(
+                lambda: _load_ingress_fixture(duplicate_role_manifest)
+            ),
+            "omitted_artifact_role": _ingestion_rejected(
+                lambda: _load_ingress_fixture(omitted_role_manifest)
+            ),
+            "duplicate_json_key": _ingestion_rejected(
+                lambda: load_verified_observation_source(
+                    duplicate_key_manifest,
+                    hashlib.sha256(duplicate_key_manifest).hexdigest(),
+                    fixture.artifacts,
+                )
+            ),
+            "utf8_bom": _ingestion_rejected(
+                lambda: load_verified_observation_source(
+                    bom_manifest,
+                    hashlib.sha256(bom_manifest).hexdigest(),
+                    fixture.artifacts,
+                )
+            ),
+            "trailing_json": _ingestion_rejected(
+                lambda: load_verified_observation_source(
+                    trailing_manifest,
+                    hashlib.sha256(trailing_manifest).hexdigest(),
+                    fixture.artifacts,
+                )
+            ),
+        }
+    )
+    failures = [
+        f"wire contract accepted {name.replace('_', ' ')}"
+        for name, rejected in probes.items()
+        if not rejected
+    ]
+    failures.extend(
+        f"wire contract rejected valid {name.replace('_', ' ')} venue timing"
+        for name, accepted in valid_venue_semantics.items()
+        if not accepted
+    )
+    return ReplayMicroscopeAuditCase(
+        "wire_schema_semantics_and_source_identity_fail_closed",
+        f"attacks={len(probes)} rejected={sum(probes.values())}",
+        {
+            "closed_adapter_registry": probes["dynamic_adapter"],
+            "closed_record_registry": probes["unknown_record_kind"],
+            "rejections": probes,
+            "source_scope": "OBSERVED_ONLY",
+            "valid_venue_semantics": valid_venue_semantics,
+        },
+        tuple(failures),
+    )
+
+
+def _ingress_query_facade_case() -> ReplayMicroscopeAuditCase:
+    fixture = _observed_ingress_fixture()
+    source = _load_ingress_fixture(fixture)
+    backend_receipt = verify_observation_ingestion(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        fixture.artifacts,
+    )
+    request = ObservationQueryRequest(200, action_time_us=200)
+    baseline = source.canonical_bytes(request)
+    detached = source.query(request).export_payload()
+    detached["values"] = []
+    policy = detached.get("policy")
+    if type(policy) is dict:
+        policy["mode"] = "POSTMORTEM"
+    detached_receipt = verify_observation_ingestion(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        fixture.artifacts,
+    )
+    object.__setattr__(detached_receipt, "evidence_sha256", "f" * 64)
+
+    direct_record = min(
+        fixture.observed.client_delivered,
+        key=lambda item: item.sequence,
+    )
+    smuggled = {
+        "future_fill": True,
+        "hidden_reserve_quantity": 999,
+    }
+    object.__setattr__(direct_record, "payload", smuggled)
+    object.__setattr__(direct_record, "payload_sha256", _audit_sha256(smuggled))
+    direct_smuggle_visible = b"hidden_reserve_quantity" in query_as_observed(
+        fixture.observed,
+        request,
+    ).canonical_bytes()
+    service_revalidated = (
+        source.canonical_bytes(request) == baseline
+        and b"hidden_reserve_quantity" not in baseline
+    )
+    ui_findings = _ui_raw_evidence_imports()
+    ui_guard_sources = {
+        "absolute_module_alias": "import kirby2.microscope.query as raw_query\n",
+        "parent_submodule_alias": (
+            "from kirby2.microscope import query as raw_query\n"
+        ),
+        "raw_query_entrypoint": (
+            "from kirby2.microscope.query import query_as_observed\n"
+        ),
+        "relative_raw_constructor": (
+            "from ..microscope.query import ObservedEvidenceSet\n"
+        ),
+        "relative_private_ingestion": (
+            "from ..microscope.ingestion import _ingest_verified\n"
+        ),
+        "root_package_alias": "from kirby2 import microscope\n",
+        "root_package_import": "import kirby2\n",
+        "root_package_import_alias": "import kirby2 as package_root\n",
+        "sibling_import_exposes_root": "import kirby2.session.live\n",
+        "backend_receipt_api": (
+            "from kirby2.microscope.ingestion import "
+            "verify_observation_ingestion\n"
+        ),
+        "unlisted_policy_constructor": (
+            "from kirby2.microscope.policy import "
+            "ReplaySourceCapabilityManifest\n"
+        ),
+        "unlisted_query_constructor": (
+            "from kirby2.microscope.query import QueriedValue\n"
+        ),
+        "future_parent_reexport": (
+            "from kirby2.microscope import ObservedEvidenceSet\n"
+        ),
+        "safe_query_dto": (
+            "from kirby2.microscope.query import ObservationQueryResult\n"
+        ),
+        "safe_policy_enum": (
+            "from kirby2.microscope.policy import ObservationMode\n"
+        ),
+    }
+    ui_guard_detected = {
+        name: bool(_raw_evidence_imports_in_source(source_text, f"{name}.py"))
+        for name, source_text in ui_guard_sources.items()
+    }
+    ui_guard_expected = {
+        name: not name.startswith("safe_") for name in ui_guard_sources
+    }
+    ui_guard_regressions = {
+        name: {
+            "detected": ui_guard_detected[name],
+            "expected": expected,
+        }
+        for name, expected in ui_guard_expected.items()
+        if ui_guard_detected[name] is not expected
+    }
+    result_signature = tuple(inspect.signature(source.result).parameters)
+    query_signature = tuple(inspect.signature(source.query).parameters)
+    constructor_closed = _ingestion_rejected(
+        lambda: VerifiedObservationSource(
+            fixture.manifest_bytes,
+            fixture.manifest_sha256,
+            fixture.artifacts,
+            backend_receipt,
+        )
+    )
+    public_surface = tuple(
+        sorted(name for name in dir(source) if not name.startswith("_"))
+    )
+    safe_repr = (
+        "raw_bytes" not in repr(source)
+        and "best_bid_ticks" not in repr(source)
+        and fixture.manifest_bytes.decode("ascii") not in repr(source)
+        and backend_receipt.receipt_sha256 not in repr(source)
+        and backend_receipt.evidence_sha256 not in repr(source)
+    )
+    detached_result = source.canonical_bytes(request) == baseline
+    backend_receipt_isolated = (
+        backend_receipt.evidence_sha256 != "f" * 64
+        and source.canonical_bytes(request) == baseline
+    )
+    facade_closed = (
+        result_signature == ("render_cursor_time_us", "action_time_us")
+        and query_signature == ("request",)
+        and constructor_closed
+        and public_surface == ("canonical_bytes", "query", "result")
+    )
+    failures: list[str] = []
+    if not direct_smuggle_visible:
+        failures.append("attack fixture no longer reproduces direct evidence laundering")
+    if not service_revalidated:
+        failures.append("verified query reused a mutated caller-held evidence object")
+    if not detached_result:
+        failures.append("mutating a detached result changed the next verified query")
+    if not backend_receipt_isolated:
+        failures.append("mutating a backend receipt changed the query-only source")
+    if not facade_closed:
+        failures.append("query facade accepts raw evidence, reveal state, or open construction")
+    if not safe_repr:
+        failures.append("verified source repr exposed private source bytes")
+    if ui_findings:
+        failures.append("first-party UI imports raw evidence or ingestion internals")
+    if ui_guard_regressions:
+        failures.append("first-party UI import guard missed a static bypass")
+    return ReplayMicroscopeAuditCase(
+        "query_facade_revalidates_bytes_and_hides_raw_evidence",
+        (
+            f"direct_attack={direct_smuggle_visible} revalidated={service_revalidated} "
+            f"ui_findings={len(ui_findings)} "
+            f"ui_guard={sum(ui_guard_detected.values())}/"
+            f"{sum(ui_guard_expected.values())}"
+        ),
+        {
+            "cooperative_process_boundary": True,
+            "constructor_closed": constructor_closed,
+            "detached_result": detached_result,
+            "backend_receipt_isolated": backend_receipt_isolated,
+            "direct_attack_reproduced": direct_smuggle_visible,
+            "public_surface": list(public_surface),
+            "query_signature": list(query_signature),
+            "receipt_exposed_by_facade": "receipt" in public_surface,
+            "result_signature": list(result_signature),
+            "safe_repr": safe_repr,
+            "service_revalidated": service_revalidated,
+            "ui_raw_import_findings": ui_findings,
+            "ui_import_guard": ui_guard_detected,
+            "ui_import_guard_regressions": ui_guard_regressions,
+        },
+        tuple(failures),
+    )
 
 
 def _observed_source_separation_case() -> ReplayMicroscopeAuditCase:
@@ -1751,3 +2425,423 @@ def _wo36b_source_identity() -> tuple[str, str]:
     label = b"wo36-b-observation-policy-source-v1"
     digest = hashlib.sha256(label).hexdigest()
     return "run-" + digest[:24], digest
+
+
+def _observed_ingress_fixture(
+    observed: ObservedEvidenceSet | None = None,
+) -> _ObservedIngressFixture:
+    source = _observed_policy_fixture() if observed is None else observed
+    client_artifact_id = "wo36b.observed.client-delivered.v1"
+    decision_artifact_id = "wo36b.observed.decision-snapshots.v1"
+    client_schema = "KIRBY2_OBSERVED_CLIENT_DELIVERED_SOURCE_ARTIFACT_V1"
+    decision_schema = "KIRBY2_OBSERVED_DECISION_SNAPSHOT_SOURCE_ARTIFACT_V1"
+
+    def raw_records(
+        records: tuple[ObservedValueRecord, ...],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                **record.as_dict(),
+                "record_kind": _ingress_record_kind(record.series_id),
+            }
+            for record in sorted(records, key=lambda item: item.sequence)
+        ]
+
+    client_payload = {
+        "artifact_schema_id": client_schema,
+        "artifact_schema_version": 1,
+        "records": raw_records(source.client_delivered),
+        "source_event_sha256": source.source_event_sha256,
+        "source_run_id": source.source_run_id,
+    }
+    decision_payload = {
+        "artifact_schema_id": decision_schema,
+        "artifact_schema_version": 1,
+        "records": raw_records(source.decision_snapshots),
+        "source_event_sha256": source.source_event_sha256,
+        "source_run_id": source.source_run_id,
+    }
+    client_bytes = _audit_canonical_json_bytes(client_payload)
+    decision_bytes = _audit_canonical_json_bytes(decision_payload)
+    manifest_payload = {
+        "adapter_id": OBSERVED_INGEST_ADAPTER_ID,
+        "adapter_version": OBSERVED_INGEST_ADAPTER_VERSION,
+        "artifacts": [
+            {
+                "artifact_id": client_artifact_id,
+                "artifact_kind": "CLIENT_DELIVERED",
+                "artifact_schema_id": client_schema,
+                "artifact_schema_version": 1,
+                "byte_length": len(client_bytes),
+                "normalized_plane_sha256": (
+                    source.client_delivered_artifact_sha256
+                ),
+                "record_count": len(source.client_delivered),
+                "sha256": hashlib.sha256(client_bytes).hexdigest(),
+            },
+            {
+                "artifact_id": decision_artifact_id,
+                "artifact_kind": "DECISION_SNAPSHOT",
+                "artifact_schema_id": decision_schema,
+                "artifact_schema_version": 1,
+                "byte_length": len(decision_bytes),
+                "normalized_plane_sha256": (
+                    source.decision_snapshot_artifact_sha256
+                ),
+                "record_count": len(source.decision_snapshots),
+                "sha256": hashlib.sha256(decision_bytes).hexdigest(),
+            },
+        ],
+        "schema_id": OBSERVED_INGEST_MANIFEST_SCHEMA_ID,
+        "schema_version": OBSERVED_INGEST_MANIFEST_SCHEMA_VERSION,
+        "source_event_sha256": source.source_event_sha256,
+        "source_run_id": source.source_run_id,
+        "source_scope": "OBSERVED_ONLY",
+    }
+    manifest_bytes = _audit_canonical_json_bytes(manifest_payload)
+    return _ObservedIngressFixture(
+        source,
+        manifest_bytes,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        (
+            ObservedArtifactBytes(client_artifact_id, client_bytes),
+            ObservedArtifactBytes(decision_artifact_id, decision_bytes),
+        ),
+        client_artifact_id,
+        decision_artifact_id,
+    )
+
+
+def _ingress_record_kind(series_id: str) -> str:
+    exact = {
+        "feature.imbalance": "IMBALANCE_FEATURE",
+        "order.client-intention": "CLIENT_ORDER_INTENTION",
+        "quote.best-bid": "BEST_BID_QUOTE",
+        "quote.processed-best-bid": "BEST_BID_QUOTE",
+        "strategy.signal": "STRATEGY_SIGNAL",
+    }
+    if series_id in exact:
+        return exact[series_id]
+    prefixes = (
+        ("ack.", "ORDER_ACKNOWLEDGEMENT"),
+        ("fill.", "PLAYER_FILL"),
+        ("order.", "PLAYER_ORDER_STATE"),
+    )
+    for prefix, record_kind in prefixes:
+        if series_id.startswith(prefix):
+            return record_kind
+    raise ValueError(f"fixture series lacks an ingestion record kind: {series_id}")
+
+
+def _rewrite_client_source_artifact(
+    fixture: _ObservedIngressFixture,
+    mutation: object,
+) -> _ObservedIngressFixture:
+    client, decisions = fixture.artifacts
+    payload = json.loads(client.raw_bytes.decode("ascii"))
+    if type(payload) is not dict or not callable(mutation):  # pragma: no cover
+        raise RuntimeError("invalid ingestion rewrite fixture")
+    mutation(payload)
+    client_bytes = _audit_canonical_json_bytes(payload)
+    manifest = json.loads(fixture.manifest_bytes.decode("ascii"))
+    if type(manifest) is not dict or type(manifest.get("artifacts")) is not list:
+        raise RuntimeError("invalid ingestion manifest fixture")
+    row = manifest["artifacts"][0]
+    if type(row) is not dict:
+        raise RuntimeError("invalid client artifact manifest fixture")
+    row["byte_length"] = len(client_bytes)
+    row["record_count"] = len(payload.get("records", ()))
+    row["normalized_plane_sha256"] = _normalized_source_plane_sha256(
+        payload,
+        CLIENT_DELIVERED_ARTIFACT_SCHEMA_ID,
+    )
+    row["sha256"] = hashlib.sha256(client_bytes).hexdigest()
+    manifest_bytes = _audit_canonical_json_bytes(manifest)
+    return _ObservedIngressFixture(
+        fixture.observed,
+        manifest_bytes,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        (
+            ObservedArtifactBytes(client.artifact_id, client_bytes),
+            decisions,
+        ),
+        fixture.client_artifact_id,
+        fixture.decision_artifact_id,
+    )
+
+
+def _rewrite_decision_source_artifact(
+    fixture: _ObservedIngressFixture,
+    mutation: object,
+) -> _ObservedIngressFixture:
+    client, decisions = fixture.artifacts
+    payload = json.loads(decisions.raw_bytes.decode("ascii"))
+    if type(payload) is not dict or not callable(mutation):  # pragma: no cover
+        raise RuntimeError("invalid decision ingestion rewrite fixture")
+    mutation(payload)
+    decision_bytes = _audit_canonical_json_bytes(payload)
+    manifest = json.loads(fixture.manifest_bytes.decode("ascii"))
+    if type(manifest) is not dict or type(manifest.get("artifacts")) is not list:
+        raise RuntimeError("invalid ingestion manifest fixture")
+    row = manifest["artifacts"][1]
+    if type(row) is not dict:
+        raise RuntimeError("invalid decision artifact manifest fixture")
+    row["byte_length"] = len(decision_bytes)
+    row["record_count"] = len(payload.get("records", ()))
+    row["normalized_plane_sha256"] = _normalized_source_plane_sha256(
+        payload,
+        DECISION_SNAPSHOT_ARTIFACT_SCHEMA_ID,
+    )
+    row["sha256"] = hashlib.sha256(decision_bytes).hexdigest()
+    manifest_bytes = _audit_canonical_json_bytes(manifest)
+    return _ObservedIngressFixture(
+        fixture.observed,
+        manifest_bytes,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        (
+            client,
+            ObservedArtifactBytes(decisions.artifact_id, decision_bytes),
+        ),
+        fixture.client_artifact_id,
+        fixture.decision_artifact_id,
+    )
+
+
+def _rewrite_ingest_manifest(
+    fixture: _ObservedIngressFixture,
+    mutation: object,
+) -> _ObservedIngressFixture:
+    payload = json.loads(fixture.manifest_bytes.decode("ascii"))
+    if type(payload) is not dict or not callable(mutation):  # pragma: no cover
+        raise RuntimeError("invalid ingestion manifest rewrite")
+    mutation(payload)
+    manifest_bytes = _audit_canonical_json_bytes(payload)
+    return _ObservedIngressFixture(
+        fixture.observed,
+        manifest_bytes,
+        hashlib.sha256(manifest_bytes).hexdigest(),
+        fixture.artifacts,
+        fixture.client_artifact_id,
+        fixture.decision_artifact_id,
+    )
+
+
+def _normalized_source_plane_sha256(
+    payload: dict[str, object],
+    artifact_schema_id: str,
+) -> str:
+    records = payload.get("records")
+    if type(records) is not list or any(type(item) is not dict for item in records):
+        raise RuntimeError("source artifact fixture lacks object records")
+    normalized_records: list[dict[str, object]] = []
+    for item in records:
+        normalized = dict(item)
+        normalized.pop("record_kind", None)
+        normalized_records.append(normalized)
+    normalized_records.sort(key=_normalized_record_sort_key)
+    return _audit_sha256(
+        {
+            "artifact_schema_id": artifact_schema_id,
+            "artifact_schema_version": 1,
+            "records": normalized_records,
+            "source_event_sha256": payload.get("source_event_sha256"),
+            "source_run_id": payload.get("source_run_id"),
+        }
+    )
+
+
+def _normalized_record_sort_key(
+    record: dict[str, object],
+) -> tuple[str, int, int, int, str]:
+    timing = record.get("timing")
+    if type(timing) is not dict:
+        raise RuntimeError("source record fixture lacks timing")
+    client_knowledge = timing.get("client_knowledge")
+    if type(client_knowledge) is not dict:
+        raise RuntimeError("source record fixture lacks client knowledge")
+    knowledge_time = client_knowledge.get("time_us")
+    if knowledge_time is not None and type(knowledge_time) is not int:
+        raise RuntimeError("source record fixture has invalid client knowledge time")
+    series_id = record.get("series_id")
+    source_event_time_us = timing.get("source_event_time_us")
+    sequence = record.get("sequence")
+    event_id = record.get("event_id")
+    if (
+        type(series_id) is not str
+        or type(source_event_time_us) is not int
+        or type(sequence) not in {int, bool}
+        or type(event_id) is not str
+    ):
+        raise RuntimeError("source record fixture lacks a canonical sort key")
+    return (
+        series_id,
+        source_event_time_us,
+        -1 if knowledge_time is None else knowledge_time,
+        sequence,
+        event_id,
+    )
+
+
+def _rewrite_first_best_bid(payload: dict[str, object]) -> None:
+    record = _first_source_record(payload)
+    value = _source_payload(record)
+    value["best_bid_ticks"] = 9_999
+    record["payload_sha256"] = _audit_sha256(value)
+
+
+def _first_source_record(payload: dict[str, object]) -> dict[str, object]:
+    records = payload.get("records")
+    if type(records) is not list or not records or type(records[0]) is not dict:
+        raise RuntimeError("source artifact fixture lacks its first record")
+    return records[0]
+
+
+def _source_record_for_series(
+    payload: dict[str, object],
+    series_id: str,
+) -> dict[str, object]:
+    records = payload.get("records")
+    if type(records) is not list:
+        raise RuntimeError("source artifact fixture lacks records")
+    for record in records:
+        if type(record) is dict and record.get("series_id") == series_id:
+            return record
+    raise RuntimeError(f"source artifact fixture lacks series {series_id}")
+
+
+def _source_payload(record: dict[str, object]) -> dict[str, object]:
+    payload = record.get("payload")
+    if type(payload) is not dict:
+        raise RuntimeError("source record fixture payload is invalid")
+    return payload
+
+
+def _source_timing(record: dict[str, object]) -> dict[str, object]:
+    timing = record.get("timing")
+    if type(timing) is not dict:
+        raise RuntimeError("source record fixture timing is invalid")
+    return timing
+
+
+def _load_ingress_fixture(
+    fixture: _ObservedIngressFixture,
+) -> VerifiedObservationSource:
+    return load_verified_observation_source(
+        fixture.manifest_bytes,
+        fixture.manifest_sha256,
+        fixture.artifacts,
+    )
+
+
+def _ingestion_rejected(operation: object) -> bool:
+    if not callable(operation):  # pragma: no cover
+        raise RuntimeError("ingestion rejection probe must be callable")
+    try:
+        operation()
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _audit_canonical_json_bytes(payload: object) -> bytes:
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def _audit_sha256(payload: object) -> str:
+    return hashlib.sha256(_audit_canonical_json_bytes(payload)).hexdigest()
+
+
+def _ui_raw_evidence_imports() -> list[str]:
+    ui_root = Path(__file__).resolve().parents[1] / "ui"
+    findings: list[str] = []
+    for path in sorted(ui_root.rglob("*.py")):
+        findings.extend(
+            _raw_evidence_imports_in_source(
+                path.read_text(encoding="utf-8"),
+                str(path.relative_to(ui_root)),
+            )
+        )
+    return findings
+
+
+def _raw_evidence_imports_in_source(source: str, filename: str) -> list[str]:
+    sensitive_modules = {
+        "kirby2.microscope.ingestion",
+        "kirby2.microscope.policy",
+        "kirby2.microscope.query",
+    }
+    relative_sensitive_modules = {
+        "microscope.ingestion",
+        "microscope.policy",
+        "microscope.query",
+    }
+    ui_safe_imports = {
+        "kirby2.microscope.ingestion": frozenset(),
+        "kirby2.microscope.policy": frozenset(
+            {
+                "ObservationMode",
+                "RevealAvailability",
+                "RevealUnavailableReason",
+            }
+        ),
+        "kirby2.microscope.query": frozenset(
+            {
+                "EvidenceSourceKind",
+                "ObservationQueryRequest",
+                "ObservationQueryResult",
+                "RecordDisposition",
+                "SelectionKind",
+            }
+        ),
+    }
+    findings: list[str] = []
+    tree = ast.parse(source, filename=filename)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "kirby2" or alias.name.startswith("kirby2."):
+                    findings.append(
+                        f"{filename}:{node.lineno}:import {alias.name}"
+                    )
+        elif not isinstance(node, ast.ImportFrom):
+            continue
+        else:
+            module = node.module or ""
+            imported = {alias.name for alias in node.names}
+            canonical_sensitive_module: str | None = None
+            if module in sensitive_modules:
+                canonical_sensitive_module = module
+            elif node.level > 0 and module in relative_sensitive_modules:
+                canonical_sensitive_module = "kirby2." + module
+            direct_sensitive = canonical_sensitive_module is not None
+            sensitive_parent = module == "kirby2.microscope" or (
+                node.level > 0 and module == "microscope"
+            )
+            root_alias = (
+                (module == "kirby2" or (node.level > 0 and module == ""))
+                and "microscope" in imported
+            )
+            blocked: list[str] = []
+            if direct_sensitive:
+                if canonical_sensitive_module is None:  # pragma: no cover
+                    raise RuntimeError("sensitive UI import lost its module")
+                blocked.extend(
+                    sorted(imported - ui_safe_imports[canonical_sensitive_module])
+                )
+            if sensitive_parent:
+                blocked.extend(sorted(imported))
+            if root_alias:
+                blocked.append("microscope")
+            if blocked:
+                findings.append(
+                    f"{filename}:{node.lineno}:"
+                    f"{'.' * node.level}{module}:"
+                    + ",".join(sorted(set(blocked)))
+                )
+    return findings

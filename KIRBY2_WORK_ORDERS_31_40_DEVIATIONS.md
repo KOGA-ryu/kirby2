@@ -191,3 +191,113 @@ mechanics checkpoint; an in-flight boundary that still owes exact-time GTT work 
 not checkpointable; configured session transitions and overdue timers cannot use the
 deferral; the aggregate expansion gate is green; and no V1 wire schema or unrelated
 runtime capability changes.
+
+## DEV-0005 — Harden replay observation invariants
+
+- Interrupted canonical card: `WO36-C`
+- Exact first-parent predecessor: `da7f7396dc973c87148875ab38636b5969dc22f9`
+- Reproducer: construct an otherwise valid `ObservationQueryResult`, then replace a
+  client-delivered value's recorded receipt with typed absence; independently shift
+  a revealed value's policy-visible time away from its source-event time or attach a
+  recorded client-receipt timestamp to it.
+- Observed terminal result: all three contradictory result roots were accepted by
+  direct dataclass replacement even though the ordinary query builders did not emit
+  them.
+- Root cause: WO36-B validated each value's local timing and policy labels, but the
+  public result root did not yet restate the final cross-object invariants for exact
+  client delivery and reveal-only clocks. A caller could therefore assemble a
+  contradictory result after the query builder returned.
+- Repair: require a recorded client-receipt timestamp for every
+  `CLIENT_DELIVERED` result, require reveal visibility to equal source-event time,
+  reject reveal claims of client receipt while preserving the existing
+  client-knowledge refusal, and retain one hostile root-constructor probe for each
+  newly repaired invariant.
+- Owned repair paths: `kirby2/microscope/query.py`,
+  `kirby2/audit/replay_microscope.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0005` through the K2X-02 expansion seam immediately
+  before `DEV-0006` and resumed `WO36-C`.
+- Inherited gates: `WO36-B`, hidden liquidity, strategy time, and `K2X-02` remain
+  unchanged.
+- Exact commit subject: `Harden replay observation invariants`
+- Published-history note: the exact repair commit was pushed before the retrieval
+  audit classified this prerequisite. This record and its focused gate are appended
+  in the next contiguous deviation commit; published first-parent history is not
+  rewritten and the repair subject is not duplicated.
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0005
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO36-B
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-hidden-liquidity
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-strategy-time
+git diff --check
+```
+
+Acceptance: the three contradictory result roots fail closed; their exact hostile
+probes remain part of the fixed WO36-B audit evidence; the six WO36-B cases and both
+named regression audits remain green; and no published commit is amended or
+duplicated.
+
+## DEV-0006 — Verify replay observation ingestion
+
+- Interrupted canonical card: `WO36-C`
+- Exact first-parent predecessor: `87aad32b7cd7c39fce6773dfa9f0059edc311e63`
+- Reproducer: import `ObservedValueRecord` and `ObservedEvidenceSet` directly,
+  label arbitrary JSON as client-delivered evidence, and query it without presenting
+  immutable recorder bytes or a source-manifest digest supplied by the backend run
+  index.
+- Observed terminal result: the query correctly enforced the supplied observed
+  plane but could not prove that the supplied records originated in the recorded
+  client feed or decision snapshot artifacts. Post-construction mutation could also
+  make a caller-held evidence object disagree with its stored digest.
+- Root cause: WO36-B intentionally assigned external provenance to a future trusted
+  adapter, but no concrete adapter or UI-safe query facade existed. Frozen Python
+  dataclasses and `__all__` document ownership; they are not independent provenance
+  or a hostile same-process security boundary.
+- Repair: add a closed V1 adapter that accepts exact canonical raw bytes only, checks
+  its caller-supplied manifest pin before parsing, requires the exact two
+  observed source roles including a recorded empty plane, validates raw and
+  normalized digests, schemas, run/source identity, record kinds, payload contracts,
+  timing, and sequence order, constructs both planes atomically, and emits an
+  immutable backend-only ingestion receipt. Its query facade retains pinned raw bytes
+  privately, reconstructs and revalidates evidence for every query, accepts no reveal
+  input, exposes no full-run receipt or digest, and returns only policy-enforced result
+  objects or detached canonical bytes. The integration contract—not this byte
+  loader—must obtain the pin from a governed run index, bind it to the requested run,
+  and ensure `source_event_sha256` is a public observed-only identity rather than a
+  commitment to hidden or future outcome bytes.
+- Owned repair paths: create `kirby2/microscope/ingestion.py`; modify
+  `kirby2/audit/replay_microscope.py` and `kirby2/audit/expansion.py`
+- Deviation record path: `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`
+- Gate registration: `DEV-0006` through the existing K2X-02 expansion seam,
+  immediately after `DEV-0005` and before resumed `WO36-C`.
+- Inherited gates: `DEV-0005`, `WO36-B`, `WO36-A`, hidden liquidity, strategy time,
+  and `K2X-02` remain unchanged.
+- Exact commit subject: `Verify replay observation ingestion`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0006
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0005
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO36-B
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO36-A
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-hidden-liquidity
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-strategy-time
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: manifest and artifact bytes cannot be co-tampered under the original
+backend pin; duplicate keys, noncanonical JSON, floats, boolean integer aliases,
+unknown fields, source retargeting, missing/swapped/duplicate roles, unknown record
+kinds, forbidden payload fields, bad timing, and non-monotonic sequences fail closed;
+raw and normalized identities survive in a deterministic receipt; an explicitly
+recorded empty plane is distinct from omission; repeated queries revalidate pinned
+bytes and are byte-identical; first-party UI modules do not import raw evidence,
+reveal, authorization, ingestion constructors, backend verification, or receipts;
+the query facade and its repr expose no full-run receipt commitment; and this
+cooperative in-process boundary makes no claim against arbitrary code already
+executing inside the backend interpreter or a malicious/misconfigured pin issuer.

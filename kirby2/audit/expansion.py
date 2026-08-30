@@ -95,6 +95,8 @@ RECORDED_DEVIATIONS = (
     ("DEV-0002", "WO31-B"),
     ("DEV-0003", "WO31-B"),
     ("DEV-0004", "WO31-E6"),
+    ("DEV-0005", "WO36-C"),
+    ("DEV-0006", "WO36-C"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -142,6 +144,8 @@ REGISTERABLE_GATE_IDS = (
     "WO35-F1",
     "WO36-A",
     "WO36-B",
+    "DEV-0005",
+    "DEV-0006",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3978,6 +3982,129 @@ def _audit_dev0004() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0005() -> ExpansionGateReport:
+    """Classify and retain the post-WO36-B result-root hardening."""
+
+    from kirby2.audit.replay_microscope import audit_replay_observation_policies
+
+    cases = audit_replay_observation_policies()
+    target = next(
+        case
+        for case in cases
+        if case.name == "postmortem_requires_capability_and_bound_authorization"
+    )
+    raw_invariants = target.evidence.get("result_invariants")
+    invariants = raw_invariants if type(raw_invariants) is dict else {}
+    required = (
+        (
+            "CLIENT_DELIVERED_RECEIPT_ROOT",
+            "client_delivered_receive_rejected",
+            "client-delivered results require exact recorded receipt timing",
+        ),
+        (
+            "REVEAL_CLIENT_CLOCK_ROOT",
+            "reveal_client_receive_rejected",
+            "revealed values cannot claim a client receipt clock",
+        ),
+        (
+            "REVEAL_VISIBILITY_ROOT",
+            "reveal_visibility_rejected",
+            "revealed values remain visible from their exact source-event time",
+        ),
+    )
+    checks = tuple(
+        ExpansionGateCheck(
+            code=code,
+            status=(
+                ExpansionGateStatus.PASS
+                if invariants.get(key) is True
+                else ExpansionGateStatus.FAIL
+            ),
+            detail=detail,
+            required=True,
+        )
+        for code, key, detail in required
+    ) + (
+        ExpansionGateCheck(
+            code="WO36B_REGRESSION",
+            status=(
+                ExpansionGateStatus.PASS
+                if all(not case.failures for case in cases)
+                else ExpansionGateStatus.FAIL
+            ),
+            detail="the fixed six-case WO36-B inventory remains green",
+            required=True,
+        ),
+    )
+    failures = tuple(
+        check.code for check in checks if check.status is ExpansionGateStatus.FAIL
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0005",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("classified_commit", "87aad32b7cd7c39fce6773dfa9f0059edc311e63"),
+            ("interrupted_card", "WO36-C"),
+            ("result_root_invariant_count", "3"),
+        ),
+    )
+
+
+def _audit_dev0006() -> ExpansionGateReport:
+    """Verify observed evidence is admitted only from caller-pinned immutable bytes."""
+
+    from kirby2.audit.replay_microscope import (
+        audit_replay_observation_ingestion,
+    )
+    from kirby2.microscope.ingestion import (
+        OBSERVED_INGEST_ADAPTER_ID,
+        OBSERVED_INGEST_ADAPTER_VERSION,
+        OBSERVED_INGEST_MANIFEST_SCHEMA_ID,
+        OBSERVED_INGEST_MANIFEST_SCHEMA_VERSION,
+    )
+
+    cases = audit_replay_observation_ingestion()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0006",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("adapter_id", OBSERVED_INGEST_ADAPTER_ID),
+            ("adapter_version", str(OBSERVED_INGEST_ADAPTER_VERSION)),
+            (
+                "manifest_schema",
+                f"{OBSERVED_INGEST_MANIFEST_SCHEMA_ID}@"
+                f"{OBSERVED_INGEST_MANIFEST_SCHEMA_VERSION}",
+            ),
+            ("pin_origin", "EXTERNAL_TRUST_ROOT_REQUIRED"),
+            ("receipt_ui_visibility", "REFUSED"),
+            ("source_scope", "OBSERVED_ONLY"),
+            ("ui_raw_evidence_input", "REFUSED"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4024,6 +4151,8 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-F1", _audit_wo35f1),
     ("WO36-A", _audit_wo36a),
     ("WO36-B", _audit_wo36b),
+    ("DEV-0005", _audit_dev0005),
+    ("DEV-0006", _audit_dev0006),
 )
 
 
