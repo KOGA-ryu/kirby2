@@ -141,6 +141,7 @@ REGISTERABLE_GATE_IDS = (
     "WO35-F",
     "WO35-F1",
     "WO36-A",
+    "WO36-B",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3745,6 +3746,63 @@ def _audit_wo36a() -> ExpansionGateReport:
     )
 
 
+def _audit_wo36b() -> ExpansionGateReport:
+    from kirby2.audit.replay_microscope import (
+        WO36B_AUDIT_CASE_COUNT,
+        audit_replay_observation_policies,
+    )
+    from kirby2.microscope.policy import (
+        AS_OBSERVED_POLICY_ID,
+        OBSERVATION_POLICY_SCHEMA_ID,
+        OBSERVATION_POLICY_SCHEMA_VERSION,
+        POSTMORTEM_POLICY_ID,
+    )
+    from kirby2.microscope.query import OBSERVATION_QUERY_SCHEMA_ID
+
+    cases = audit_replay_observation_policies()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO36-B",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("as_observed_policy_id", AS_OBSERVED_POLICY_ID),
+            ("audit_case_count", str(WO36B_AUDIT_CASE_COUNT)),
+            ("ground_truth_filtering", "REFUSED"),
+            ("historical_hidden_without_capability", "UNAVAILABLE"),
+            ("interpolation", "REFUSED"),
+            (
+                "observation_policy_schema",
+                f"{OBSERVATION_POLICY_SCHEMA_ID}@{OBSERVATION_POLICY_SCHEMA_VERSION}",
+            ),
+            ("observation_query_schema_id", OBSERVATION_QUERY_SCHEMA_ID),
+            (
+                "observed_source_policy",
+                "CLIENT_DELIVERED_FEED_AND_RECORDED_DECISION_ONLY",
+            ),
+            ("postmortem_policy_id", POSTMORTEM_POLICY_ID),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3965,6 +4023,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-F", _audit_wo35f),
     ("WO35-F1", _audit_wo35f1),
     ("WO36-A", _audit_wo36a),
+    ("WO36-B", _audit_wo36b),
 )
 
 
