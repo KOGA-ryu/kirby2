@@ -1,0 +1,1825 @@
+"""Executable WO37-A audit for pseudonymous profiles and local consent."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from kirby2.curriculum.evidence import LearnerEvidenceLedgerV1
+from kirby2.curriculum.learner import build_learner_projection_v1
+from kirby2.instructor.consent import (
+    CONSENT_DECISION_ID_PREFIX,
+    DIRECT_IDENTITY_POLICY,
+    PSEUDONYMIZATION_CLAIM,
+    ConsentDecisionReasonV1,
+    ConsentDecisionStatusV1,
+    ConsentRecordV1,
+    ConsentScopeV1,
+    ConsentStateV1,
+    EvidenceExportClassV1,
+    EvidenceExportPermissionV1,
+    EvidenceRetentionPolicyV1,
+    WithdrawalPolicyV1,
+    create_consent_record,
+    decide_evidence_export,
+    decide_profile_deletion,
+    decide_retention_after_profile_deletion,
+    revise_consent_record,
+    withdraw_consent,
+)
+from kirby2.instructor.identity import (
+    DEFAULT_EXPORT_AREA_IDS,
+    DEFAULT_PACKAGE_AREA_IDS,
+    IDENTITY_DELETION_RECEIPT_DIRECTORY,
+    DirectIdentifierV1,
+    DirectIdentityV1,
+    IdentityMappingV1,
+    create_identity_mapping,
+    create_local_learner_identity,
+    delete_identity_mapping,
+    identity_deletion_receipt_path,
+    identity_mapping_path,
+    is_default_export_area,
+    recover_pending_identity_deletions,
+    resolve_identity_deletion_receipt,
+    resolve_identity_mapping,
+)
+from kirby2.instructor.models import (
+    INSTRUCTOR_RECORD_TYPES,
+    Assignment,
+    AssignmentAttempt,
+    Cohort,
+    CurriculumPlan,
+    InstructorProfile,
+    LearnerProfile,
+    ResearchStudy,
+    ReviewAnnotation,
+    Rubric,
+    create_assignment_attempt_revision,
+    create_assignment_revision,
+    create_cohort_revision,
+    create_curriculum_plan_revision,
+    create_instructor_profile,
+    create_learner_profile,
+    create_research_study_revision,
+    create_review_annotation_revision,
+    create_rubric_revision,
+)
+from kirby2.research.paths import (
+    ERASABLE_IDENTITY_AREA_IDS,
+    IMMUTABLE_EVIDENCE_AREA_IDS,
+    DataAreaId,
+    DataPaths,
+)
+from kirby2.research.store import LearnerArtifactStore
+
+
+WO37A_AUDIT_CASE_COUNT = 6
+
+_LEARNER_ENTROPY = bytes(range(32))
+_INSTRUCTOR_ENTROPY = bytes(range(32, 64))
+_OTHER_LEARNER_ENTROPY = bytes(reversed(range(32)))
+_DIRECT_MARKERS = (
+    b"Ada Learner",
+    b"ada.learner@example.invalid",
+    b"student-0007",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class InstructorConsoleAuditCase:
+    name: str
+    detail: str
+    evidence: dict[str, object]
+    failures: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        return not self.failures
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "detail": self.detail,
+            "evidence": self.evidence,
+            "failures": list(self.failures),
+            "name": self.name,
+            "status": "PASS" if self.passed else "FAIL",
+        }
+
+
+def audit_pseudonymous_profiles_and_consent() -> tuple[
+    InstructorConsoleAuditCase,
+    ...,
+]:
+    """Run the fixed WO37-A model, policy, and identity-store inventory."""
+
+    cases = (
+        _versioned_model_vocabulary_case(),
+        _consent_permission_case(),
+        _withdrawal_and_expiry_case(),
+        _identity_mapping_separation_case(),
+        _mapping_deletion_receipt_case(),
+        _identity_boundary_attack_case(),
+    )
+    if len(cases) != WO37A_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO37-A audit case inventory changed")
+    expected_names = (
+        "nine_versioned_types_use_opaque_profiles_and_successor_lineage",
+        "consent_retention_and_export_permissions_are_exact_and_fail_closed",
+        "withdrawal_scope_and_expiry_policies_preserve_immutable_history",
+        "direct_identity_exists_only_in_the_separate_local_mapping_area",
+        "profile_deletion_removes_only_mapping_and_writes_a_safe_receipt",
+        "identity_store_rejects_invalid_bindings_rebinding_and_foreign_authority",
+    )
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO37-A audit case order or identity changed")
+    return cases
+
+
+def _raises(operation) -> bool:
+    try:
+        operation()
+    except (
+        AttributeError,
+        FileExistsError,
+        FileNotFoundError,
+        OSError,
+        PermissionError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return True
+    return False
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode("ascii")).hexdigest()
+
+
+def _versioned_model_vocabulary_case() -> InstructorConsoleAuditCase:
+    learner = create_learner_profile(_LEARNER_ENTROPY)
+    repeated_learner = create_learner_profile(_LEARNER_ENTROPY)
+    instructor = create_instructor_profile(_INSTRUCTOR_ENTROPY)
+    builders = (
+        (Assignment, create_assignment_revision),
+        (AssignmentAttempt, create_assignment_attempt_revision),
+        (ReviewAnnotation, create_review_annotation_revision),
+        (Rubric, create_rubric_revision),
+        (CurriculumPlan, create_curriculum_plan_revision),
+        (Cohort, create_cohort_revision),
+        (ResearchStudy, create_research_study_revision),
+    )
+    revisions: list[object] = []
+    lineage_checks: list[bool] = []
+    refusal_checks: list[bool] = []
+    for ordinal, (record_type, builder) in enumerate(builders, start=1):
+        first = builder(_digest(f"wo37a-content-{ordinal}-v1"))
+        successor = builder(
+            _digest(f"wo37a-content-{ordinal}-v2"),
+            predecessor=first,
+        )
+        revisions.append(first)
+        lineage_checks.append(
+            type(first) is record_type
+            and type(successor) is record_type
+            and first.schema_version == 1
+            and successor.lineage_id == first.lineage_id
+            and successor.revision == 2
+            and successor.predecessor_record_id == first.record_id
+            and successor.predecessor_sha256 == first.sha256
+            and successor.record_id != first.record_id
+        )
+        refusal_checks.extend(
+            (
+                _raises(lambda builder=builder, first=first: builder(
+                    first.content_sha256,
+                    predecessor=first,
+                )),
+                _raises(lambda first=first: setattr(first, "revision", 9)),
+            )
+        )
+        force_mutated_predecessor = builder(
+            _digest(f"wo37a-force-mutated-{ordinal}-v1")
+        )
+        object.__setattr__(
+            force_mutated_predecessor,
+            "content_sha256",
+            _digest(f"wo37a-force-mutated-{ordinal}-changed"),
+        )
+        object.__setattr__(
+            force_mutated_predecessor,
+            "record_id",
+            force_mutated_predecessor.record_id[:-64]
+            + hashlib.sha256(
+                _canonical_bytes(force_mutated_predecessor.identity_dict())
+            ).hexdigest(),
+        )
+        refusal_checks.append(
+            _raises(
+                lambda builder=builder, predecessor=force_mutated_predecessor: builder(
+                    _digest("wo37a-force-mutated-successor"),
+                    predecessor=predecessor,
+                )
+            )
+        )
+        force_mutated_second_initial = builder(
+            _digest(f"wo37a-force-mutated-r2-{ordinal}-v1")
+        )
+        force_mutated_second = builder(
+            _digest(f"wo37a-force-mutated-r2-{ordinal}-v2"),
+            predecessor=force_mutated_second_initial,
+        )
+        object.__setattr__(
+            force_mutated_second,
+            "content_sha256",
+            _digest(f"wo37a-force-mutated-r2-{ordinal}-changed"),
+        )
+        object.__setattr__(
+            force_mutated_second,
+            "record_id",
+            force_mutated_second.record_id[:-64]
+            + hashlib.sha256(
+                _canonical_bytes(force_mutated_second.identity_dict())
+            ).hexdigest(),
+        )
+        refusal_checks.append(
+            _raises(
+                lambda builder=builder, predecessor=force_mutated_second: builder(
+                    _digest("wo37a-force-mutated-r2-successor"),
+                    predecessor=predecessor,
+                )
+            )
+        )
+
+    records = (instructor, learner, *revisions)
+    schemas_are_versioned = all(
+        type(record.schema_id) is str
+        and bool(record.schema_id)
+        and type(record.schema_version) is int
+        and record.schema_version == 1
+        for record in records
+    )
+    profile_bytes = instructor.canonical_bytes() + learner.canonical_bytes()
+    profile_payload_is_opaque = all(
+        marker not in profile_bytes for marker in _DIRECT_MARKERS
+    ) and set(learner.as_dict()) == {
+        "profile_id",
+        "profile_kind",
+        "schema_id",
+        "schema_version",
+    }
+    checks = {
+        "distinct_role_namespaces": (
+            learner.profile_id.startswith("learner-profile-")
+            and instructor.profile_id.startswith("instructor-profile-")
+            and learner.profile_id != instructor.profile_id
+        ),
+        "deterministic_injected_entropy": learner == repeated_learner,
+        "exact_nine_type_vocabulary": (
+            len(INSTRUCTOR_RECORD_TYPES) == 9
+            and tuple(type(record) for record in records) == INSTRUCTOR_RECORD_TYPES
+        ),
+        "profile_payload_is_opaque": profile_payload_is_opaque,
+        "schemas_are_versioned": schemas_are_versioned,
+        "successor_lineage_is_exact": all(lineage_checks),
+        "mutation_same_content_and_stale_predecessor_refused": all(
+            refusal_checks
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return InstructorConsoleAuditCase(
+        "nine_versioned_types_use_opaque_profiles_and_successor_lineage",
+        (
+            f"types={len(records)} lineages={len(revisions)} "
+            f"opaque={profile_payload_is_opaque}"
+        ),
+        {
+            "checks": checks,
+            "instructor_profile_id": instructor.profile_id,
+            "learner_profile_id": learner.profile_id,
+            "record_schema_ids": [record.schema_id for record in records],
+        },
+        failures,
+    )
+
+
+def _active_consent() -> ConsentRecordV1:
+    learner = create_learner_profile(_LEARNER_ENTROPY)
+    return create_consent_record(
+        pseudonymous_profile_id=learner.profile_id,
+        scopes=(
+            ConsentScopeV1.INSTRUCTIONAL_EVIDENCE,
+            ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        ),
+        recorded_at_utc="2030-01-01T00:00:00Z",
+        retention_policy=EvidenceRetentionPolicyV1.RETAIN_UNTIL_UTC,
+        retention_until_utc="2031-01-01T00:00:00Z",
+        retain_pseudonymous_evidence_after_profile_deletion=True,
+        export_permission=(
+            EvidenceExportPermissionV1.PSEUDONYMOUS_REDACTED_EVIDENCE_ONLY
+        ),
+        withdrawal_policy=(
+            WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+        ),
+    )
+
+
+def _consent_permission_case() -> InstructorConsoleAuditCase:
+    consent = _active_consent()
+    retention = decide_retention_after_profile_deletion(
+        consent,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        decision_time_utc="2030-06-01T00:00:00Z",
+    )
+    allowed_export = decide_evidence_export(
+        consent,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        requested_export=EvidenceExportClassV1.PSEUDONYMOUS_REDACTED_EVIDENCE,
+        decision_time_utc="2030-06-01T00:00:00Z",
+    )
+    refused_exports = tuple(
+        decide_evidence_export(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_export=export_class,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        for export_class in (
+            EvidenceExportClassV1.DIRECT_IDENTITY,
+            EvidenceExportClassV1.IDENTITY_MAPPING,
+            EvidenceExportClassV1.UNREDACTED_EVIDENCE,
+        )
+    )
+    missing_scope = decide_evidence_export(
+        consent,
+        required_scope=ConsentScopeV1.INSTRUCTOR_REVIEW,
+        requested_export=EvidenceExportClassV1.PSEUDONYMOUS_REDACTED_EVIDENCE,
+        decision_time_utc="2030-06-01T00:00:00Z",
+    )
+    deletion = decide_profile_deletion(
+        consent,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        requested_pseudonymous_evidence_retention=True,
+        decision_time_utc="2030-06-01T00:00:00Z",
+    )
+    denied_consent = create_consent_record(
+        pseudonymous_profile_id=consent.pseudonymous_profile_id,
+        scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
+        recorded_at_utc="2030-01-01T00:00:00Z",
+        retention_policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+        retention_until_utc=None,
+        retain_pseudonymous_evidence_after_profile_deletion=False,
+        export_permission=EvidenceExportPermissionV1.DENIED,
+        withdrawal_policy=(
+            WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+        ),
+    )
+    object.__setattr__(
+        denied_consent,
+        "export_permission",
+        EvidenceExportPermissionV1.PSEUDONYMOUS_REDACTED_EVIDENCE_ONLY,
+    )
+    object.__setattr__(
+        denied_consent,
+        "consent_id",
+        denied_consent.consent_id[:-24]
+        + hashlib.sha256(
+            _canonical_bytes(denied_consent.identity_dict())
+        ).hexdigest()[:24],
+    )
+    payload = consent.canonical_bytes()
+    checks = {
+        "canonical_round_trip": ConsentRecordV1.from_json_bytes(payload) == consent,
+        "active_retention_authorized": retention.allowed,
+        "redacted_pseudonymous_export_authorized": allowed_export.allowed,
+        "direct_and_mapping_exports_refused": all(
+            not decision.allowed
+            and decision.status is ConsentDecisionStatusV1.REFUSED
+            for decision in refused_exports
+        ),
+        "missing_scope_refused": (
+            not missing_scope.allowed
+            and missing_scope.reason is ConsentDecisionReasonV1.SCOPE_NOT_GRANTED
+        ),
+        "retaining_deletion_binds_prior_decision": (
+            deletion.allowed
+            and deletion.retention_decision_id == retention.decision_id
+            and deletion.retention_decision_sha256 == retention.decision_sha256
+        ),
+        "privacy_claim_is_pseudonymous": (
+            consent.pseudonymization_claim == PSEUDONYMIZATION_CLAIM
+            and PSEUDONYMIZATION_CLAIM == "PSEUDONYMOUS_NOT_ANONYMOUS"
+            and consent.direct_identity_policy == DIRECT_IDENTITY_POLICY
+        ),
+        "no_direct_identity_in_consent": all(
+            marker not in payload for marker in _DIRECT_MARKERS
+        ),
+        "invalid_retention_combination_refused": _raises(
+            lambda: create_consent_record(
+                pseudonymous_profile_id=consent.pseudonymous_profile_id,
+                scopes=(ConsentScopeV1.INSTRUCTIONAL_EVIDENCE,),
+                recorded_at_utc="2030-01-01T00:00:00Z",
+                retention_policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+                retention_until_utc=None,
+                retain_pseudonymous_evidence_after_profile_deletion=True,
+                export_permission=EvidenceExportPermissionV1.DENIED,
+                withdrawal_policy=(
+                    WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+                ),
+            )
+        ),
+        "force_mutated_consent_refused": _raises(
+            lambda: decide_evidence_export(
+                denied_consent,
+                required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+                requested_export=(
+                    EvidenceExportClassV1.PSEUDONYMOUS_REDACTED_EVIDENCE
+                ),
+                decision_time_utc="2030-06-01T00:00:00Z",
+            )
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return InstructorConsoleAuditCase(
+        "consent_retention_and_export_permissions_are_exact_and_fail_closed",
+        (
+            f"authorized=retention+redacted-export "
+            f"refused_exports={sum(not item.allowed for item in refused_exports)}"
+        ),
+        {
+            "checks": checks,
+            "consent_id": consent.consent_id,
+            "deletion_decision_id": deletion.decision_id,
+            "refused_export_reasons": [item.reason.value for item in refused_exports],
+        },
+        failures,
+    )
+
+
+def _withdrawal_and_expiry_case() -> InstructorConsoleAuditCase:
+    active = _active_consent()
+    withdrawn = withdraw_consent(
+        active,
+        recorded_at_utc="2030-07-01T00:00:00Z",
+    )
+    withdrawn_retention = decide_retention_after_profile_deletion(
+        withdrawn,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        decision_time_utc="2030-08-01T00:00:00Z",
+    )
+    withdrawn_export = decide_evidence_export(
+        withdrawn,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        requested_export=EvidenceExportClassV1.PSEUDONYMOUS_REDACTED_EVIDENCE,
+        decision_time_utc="2030-08-01T00:00:00Z",
+    )
+    expired_retention = decide_retention_after_profile_deletion(
+        active,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        decision_time_utc="2031-01-01T00:00:01Z",
+    )
+    refused_deletion = decide_profile_deletion(
+        active,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        requested_pseudonymous_evidence_retention=True,
+        decision_time_utc="2031-01-01T00:00:01Z",
+    )
+    nonretaining_deletion = decide_profile_deletion(
+        withdrawn,
+        required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+        requested_pseudonymous_evidence_retention=False,
+        decision_time_utc="2030-08-01T00:00:00Z",
+    )
+    force_mutated_revision_source = _active_consent()
+    object.__setattr__(
+        force_mutated_revision_source,
+        "pseudonymous_profile_id",
+        create_learner_profile(_OTHER_LEARNER_ENTROPY).profile_id,
+    )
+    force_mutated_revision_refused = _raises(
+        lambda: revise_consent_record(
+            force_mutated_revision_source,
+            scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
+            recorded_at_utc="2030-07-01T00:00:00Z",
+            retention_policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+            retention_until_utc=None,
+            retain_pseudonymous_evidence_after_profile_deletion=False,
+            export_permission=EvidenceExportPermissionV1.DENIED,
+            withdrawal_policy=(
+                WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+            ),
+        )
+    )
+    force_mutated_withdrawal_refused = _raises(
+        lambda: withdraw_consent(
+            force_mutated_revision_source,
+            recorded_at_utc="2030-07-01T00:00:00Z",
+        )
+    )
+    checks = {
+        "withdrawal_is_successor": (
+            withdrawn.state is ConsentStateV1.WITHDRAWN
+            and withdrawn.revision == active.revision + 1
+            and withdrawn.predecessor_consent_id == active.consent_id
+            and withdrawn.predecessor_sha256 == active.consent_sha256
+        ),
+        "source_grant_remains_unchanged": active.state is ConsentStateV1.GRANTED,
+        "revoking_withdrawal_refuses_retention": (
+            not withdrawn_retention.allowed
+            and withdrawn_retention.reason
+            is ConsentDecisionReasonV1.CONSENT_WITHDRAWN
+        ),
+        "withdrawal_always_refuses_export": (
+            not withdrawn_export.allowed
+            and withdrawn_export.reason is ConsentDecisionReasonV1.CONSENT_WITHDRAWN
+        ),
+        "expired_retention_refused": (
+            not expired_retention.allowed
+            and expired_retention.reason
+            is ConsentDecisionReasonV1.RETENTION_EXPIRED
+        ),
+        "unauthorized_retaining_deletion_refused": not refused_deletion.allowed,
+        "mapping_only_deletion_still_authorized": (
+            nonretaining_deletion.allowed
+            and not nonretaining_deletion.requested_pseudonymous_evidence_retention
+        ),
+        "backdated_decision_refused": _raises(
+            lambda: decide_evidence_export(
+                active,
+                required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+                requested_export=(
+                    EvidenceExportClassV1.PSEUDONYMOUS_REDACTED_EVIDENCE
+                ),
+                decision_time_utc="2029-12-31T23:59:59Z",
+            )
+        ),
+        "consent_is_frozen": _raises(
+            lambda: setattr(active, "state", ConsentStateV1.WITHDRAWN)
+        ),
+        "stale_force_mutated_predecessor_refused": (
+            force_mutated_revision_refused
+            and force_mutated_withdrawal_refused
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return InstructorConsoleAuditCase(
+        "withdrawal_scope_and_expiry_policies_preserve_immutable_history",
+        (
+            f"revision={withdrawn.revision} withdrawn_retention="
+            f"{withdrawn_retention.status.value} "
+            f"expired={expired_retention.status.value}"
+        ),
+        {
+            "checks": checks,
+            "withdrawal_consent_id": withdrawn.consent_id,
+            "withdrawal_policy": withdrawn.withdrawal_policy.value,
+        },
+        failures,
+    )
+
+
+def _identity_mapping_separation_case() -> InstructorConsoleAuditCase:
+    direct_identity = _direct_identity()
+    with TemporaryDirectory(prefix="kirby2-wo37a-separation-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        profile = creation.profile
+        mapping = creation.mapping
+        mapping_path = identity_mapping_path(paths, profile.profile_id)
+        mapping_bytes = mapping_path.read_bytes()
+        resolved = resolve_identity_mapping(paths, profile.profile_id)
+        file_mode = stat.S_IMODE(mapping_path.stat().st_mode)
+        area_mode = stat.S_IMODE(paths.identity_mappings.stat().st_mode)
+        nonmapping_material = (
+            profile.canonical_bytes()
+            + _active_consent().canonical_bytes()
+        )
+        checks = {
+            "create_and_resolve_are_exact": (
+                resolved == mapping
+                and resolved.canonical_bytes() == mapping.canonical_bytes()
+            ),
+            "mapping_is_in_erasable_area": (
+                mapping_path.parent == paths.identity_mappings
+                and mapping_path.name == f"{profile.profile_id}.json"
+            ),
+            "direct_identity_is_only_in_mapping_bytes": (
+                all(marker in mapping_bytes for marker in _DIRECT_MARKERS)
+                and all(marker not in nonmapping_material for marker in _DIRECT_MARKERS)
+            ),
+            "representations_redact_direct_values": all(
+                marker.decode("ascii") not in repr(value)
+                for marker in _DIRECT_MARKERS
+                for value in (direct_identity, mapping)
+            ),
+            "default_package_excludes_mapping_area": (
+                DataAreaId.IDENTITY_MAPPINGS not in DEFAULT_PACKAGE_AREA_IDS
+                and DataAreaId.IDENTITY_MAPPINGS not in DEFAULT_EXPORT_AREA_IDS
+                and not is_default_export_area(DataAreaId.IDENTITY_MAPPINGS)
+            ),
+            "default_inventory_is_closed": (
+                DEFAULT_PACKAGE_AREA_IDS
+                == IMMUTABLE_EVIDENCE_AREA_IDS
+                and DEFAULT_EXPORT_AREA_IDS == DEFAULT_PACKAGE_AREA_IDS
+                and ERASABLE_IDENTITY_AREA_IDS
+                == (DataAreaId.IDENTITY_MAPPINGS,)
+            ),
+            "sensitive_permissions_are_private": (
+                area_mode == 0o700 and file_mode == 0o600
+            ),
+            "unrelated_areas_not_created": (
+                not paths.runs.exists() and not paths.evidence.exists()
+            ),
+        }
+        failures = tuple(
+            name.replace("_", " ")
+            for name, passed in checks.items()
+            if not passed
+        )
+        evidence = {
+            "checks": checks,
+            "default_area_ids": [item.value for item in DEFAULT_EXPORT_AREA_IDS],
+            "identity_area_mode": oct(area_mode),
+            "mapping_file_mode": oct(file_mode),
+            "profile_id": profile.profile_id,
+        }
+    return InstructorConsoleAuditCase(
+        "direct_identity_exists_only_in_the_separate_local_mapping_area",
+        (
+            f"profile={profile.profile_id} mapping_mode={oct(file_mode)} "
+            f"default_export=excluded"
+        ),
+        evidence,
+        failures,
+    )
+
+
+def _mapping_deletion_receipt_case() -> InstructorConsoleAuditCase:
+    direct_identity = _direct_identity()
+    with TemporaryDirectory(prefix="kirby2-wo37a-deletion-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        profile = creation.profile
+        mapping = creation.mapping
+        ledger = LearnerEvidenceLedgerV1(profile.profile_id, ())
+        projection = build_learner_projection_v1(
+            ledger,
+            as_of_attempt_ordinal=0,
+        )
+        learner_store = LearnerArtifactStore(paths.root)
+        manifest = learner_store.record_update(
+            ledger,
+            projection,
+            seed=37,
+            repository=Path(__file__).resolve().parents[2],
+        )
+        run_directory = learner_store.run_directory(manifest.run_id)
+        run_files = tuple(
+            path for path in sorted(run_directory.rglob("*")) if path.is_file()
+        )
+        run_snapshot = {path: path.read_bytes() for path in run_files}
+        run_bytes = b"".join(
+            path.relative_to(run_directory).as_posix().encode("ascii")
+            + b"\x00"
+            + run_snapshot[path]
+            for path in run_files
+        )
+        paths.ensure((DataAreaId.EVIDENCE,))
+        receipt_directory = (
+            paths.evidence / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        receipt_directory.mkdir(mode=0o777)
+        os.chmod(receipt_directory, 0o777)
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        receipt = delete_identity_mapping(
+            paths,
+            profile.profile_id,
+            decision,
+            consent,
+            deletion_time_utc="2030-06-01T00:00:01Z",
+        )
+        receipt_path = identity_deletion_receipt_path(paths, receipt.receipt_id)
+        receipt_bytes = receipt_path.read_bytes()
+        receipt_directory_mode = stat.S_IMODE(receipt_directory.stat().st_mode)
+        receipt_file_metadata = receipt_path.stat()
+        restored = resolve_identity_deletion_receipt(paths, receipt.receipt_id)
+        receipt_payload = restored.as_dict()
+        receipt_keys = set(receipt_payload)
+        forbidden_receipt_keys = {
+            "direct_identity",
+            "display_name",
+            "direct_identifiers",
+            "mapping_id",
+            "mapping_sha256",
+        }
+        evidence_files = tuple(
+            path
+            for path in paths.evidence.rglob("*")
+            if path.is_file()
+        )
+        immutable_files = (*run_files, *evidence_files)
+        loaded_ledger, loaded_projection = learner_store.load_update(
+            manifest.run_id
+        )
+        checks = {
+            "mapping_deleted": (
+                not identity_mapping_path(paths, profile.profile_id).exists()
+                and _raises(
+                    lambda: resolve_identity_mapping(paths, profile.profile_id)
+                )
+            ),
+            "run_evidence_is_byte_identical": (
+                all(path.read_bytes() == raw for path, raw in run_snapshot.items())
+                and learner_store.verify_run(manifest.run_id).passed
+            ),
+            "run_contains_only_pseudonymous_profile": (
+                profile.profile_id.encode("ascii") in run_bytes
+                and all(marker not in run_bytes for marker in _DIRECT_MARKERS)
+                and loaded_ledger.learner_id == profile.profile_id
+                and loaded_projection.learner_id == profile.profile_id
+            ),
+            "receipt_is_exact_and_content_addressed": (
+                restored == receipt
+                and restored.canonical_bytes() == receipt_bytes
+                and receipt_path.name == f"{receipt.receipt_id}.json"
+            ),
+            "receipt_storage_is_private_and_unaliased": (
+                receipt_directory_mode == 0o700
+                and stat.S_IMODE(receipt_file_metadata.st_mode) == 0o600
+                and receipt_file_metadata.st_nlink == 1
+            ),
+            "receipt_binds_consent_and_decision": (
+                receipt.consent_id == consent.consent_id
+                and receipt.consent_sha256 == consent.consent_sha256
+                and receipt.deletion_decision_id == decision.decision_id
+                and receipt.deletion_decision_sha256 == decision.decision_sha256
+            ),
+            "receipt_has_no_deleted_payload_commitment": (
+                not (receipt_keys & forbidden_receipt_keys)
+                and mapping.mapping_id.encode("ascii") not in receipt_bytes
+                and mapping.mapping_sha256.encode("ascii") not in receipt_bytes
+                and all(marker not in receipt_bytes for marker in _DIRECT_MARKERS)
+            ),
+            "all_immutable_files_exclude_direct_identity": all(
+                all(marker not in path.read_bytes() for marker in _DIRECT_MARKERS)
+                for path in immutable_files
+            ),
+            "second_delete_is_refused": _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:02Z",
+                )
+            ),
+        }
+        failures = tuple(
+            name.replace("_", " ")
+            for name, passed in checks.items()
+            if not passed
+        )
+        evidence = {
+            "checks": checks,
+            "evidence_file_count": len(evidence_files),
+            "profile_id": profile.profile_id,
+            "receipt_id": receipt.receipt_id,
+            "run_sha256": hashlib.sha256(run_bytes).hexdigest(),
+            "stored_run_id": manifest.run_id,
+        }
+    return InstructorConsoleAuditCase(
+        "profile_deletion_removes_only_mapping_and_writes_a_safe_receipt",
+        (
+            f"mapping=deleted run_files={len(run_files)} "
+            f"evidence_files={len(evidence_files)} "
+            f"receipt={receipt.receipt_id}"
+        ),
+        evidence,
+        failures,
+    )
+
+
+def _identity_boundary_attack_case() -> InstructorConsoleAuditCase:
+    direct_identity = _direct_identity()
+    with TemporaryDirectory(prefix="kirby2-wo37a-attacks-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        first = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        second = create_local_learner_identity(
+            paths,
+            DirectIdentityV1(
+                "Grace Learner",
+                (DirectIdentifierV1("student_id", "student-0008"),),
+            ),
+            opaque_entropy=_OTHER_LEARNER_ENTROPY,
+        )
+        refused_consent = create_consent_record(
+            pseudonymous_profile_id=first.profile.profile_id,
+            scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
+            recorded_at_utc="2030-01-01T00:00:00Z",
+            retention_policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+            retention_until_utc=None,
+            retain_pseudonymous_evidence_after_profile_deletion=False,
+            export_permission=EvidenceExportPermissionV1.DENIED,
+            withdrawal_policy=(
+                WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+            ),
+        )
+        refused_decision = decide_profile_deletion(
+            refused_consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-02-01T00:00:00Z",
+        )
+        refused_delete = _raises(
+            lambda: delete_identity_mapping(
+                paths,
+                first.profile.profile_id,
+                refused_decision,
+                refused_consent,
+                deletion_time_utc="2030-02-01T00:00:01Z",
+            )
+        )
+        mapping_survived_refusal = (
+            resolve_identity_mapping(paths, first.profile.profile_id)
+            == first.mapping
+        )
+        mutated_refusal = decide_profile_deletion(
+            refused_consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-02-01T00:00:00Z",
+        )
+        object.__setattr__(mutated_refusal, "allowed", True)
+        object.__setattr__(
+            mutated_refusal,
+            "status",
+            ConsentDecisionStatusV1.AUTHORIZED,
+        )
+        object.__setattr__(
+            mutated_refusal,
+            "reason",
+            ConsentDecisionReasonV1.PROFILE_DELETION_WITH_AUTHORIZED_PSEUDONYMOUS_RETENTION,
+        )
+        object.__setattr__(
+            mutated_refusal,
+            "decision_id",
+            CONSENT_DECISION_ID_PREFIX
+            + hashlib.sha256(
+                _canonical_bytes(mutated_refusal.identity_dict())
+            ).hexdigest()[:24],
+        )
+        force_mutated_delete = _raises(
+            lambda: delete_identity_mapping(
+                paths,
+                first.profile.profile_id,
+                mutated_refusal,
+                refused_consent,
+                deletion_time_utc="2030-02-01T00:00:01Z",
+            )
+        )
+        mapping_survived_force_mutation = (
+            resolve_identity_mapping(paths, first.profile.profile_id)
+            == first.mapping
+        )
+        stale_grant = _active_consent()
+        stale_decision = decide_profile_deletion(
+            stale_grant,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        current_withdrawal = withdraw_consent(
+            stale_grant,
+            recorded_at_utc="2030-07-01T00:00:00Z",
+        )
+        stale_grant_delete = _raises(
+            lambda: delete_identity_mapping(
+                paths,
+                first.profile.profile_id,
+                stale_decision,
+                current_withdrawal,
+                deletion_time_utc="2030-08-01T00:00:00Z",
+            )
+        )
+        mapping_survived_stale_grant = (
+            resolve_identity_mapping(paths, first.profile.profile_id)
+            == first.mapping
+        )
+
+        foreign_consent = create_consent_record(
+            pseudonymous_profile_id=second.profile.profile_id,
+            scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
+            recorded_at_utc="2030-01-01T00:00:00Z",
+            retention_policy=EvidenceRetentionPolicyV1.DELETE_WITH_PROFILE,
+            retention_until_utc=None,
+            retain_pseudonymous_evidence_after_profile_deletion=False,
+            export_permission=EvidenceExportPermissionV1.DENIED,
+            withdrawal_policy=(
+                WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+            ),
+        )
+        foreign_decision = decide_profile_deletion(
+            foreign_consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=False,
+            decision_time_utc="2030-02-01T00:00:00Z",
+        )
+        foreign_delete = _raises(
+            lambda: delete_identity_mapping(
+                paths,
+                first.profile.profile_id,
+                foreign_decision,
+                foreign_consent,
+                deletion_time_utc="2030-02-01T00:00:01Z",
+            )
+        )
+        mapping_survived_foreign_authority = (
+            resolve_identity_mapping(paths, first.profile.profile_id)
+            == first.mapping
+        )
+        duplicate_refused = _raises(
+            lambda: create_identity_mapping(
+                paths,
+                first.profile,
+                direct_identity,
+                opaque_entropy=_LEARNER_ENTROPY,
+            )
+        )
+        wrong_entropy_refused = _raises(
+            lambda: create_identity_mapping(
+                paths,
+                first.profile,
+                direct_identity,
+                opaque_entropy=_OTHER_LEARNER_ENTROPY,
+            )
+        )
+        mapping_path = identity_mapping_path(paths, first.profile.profile_id)
+        os.chmod(mapping_path, 0o644)
+        overexposed_refused = _raises(
+            lambda: resolve_identity_mapping(paths, first.profile.profile_id)
+        )
+        os.chmod(mapping_path, 0o600)
+        hardlink_alias = paths.identity_mappings / "hardlink-alias.json"
+        os.link(mapping_path, hardlink_alias)
+        hardlinked_mapping_refused = _raises(
+            lambda: resolve_identity_mapping(paths, first.profile.profile_id)
+        )
+        hardlink_alias.unlink()
+
+        raw_mapping = json.loads(mapping_path.read_text("ascii"))
+        raw_mapping["profile_sha256"] = "f" * 64
+        identity_payload = dict(raw_mapping)
+        identity_payload.pop("mapping_id")
+        raw_mapping["mapping_id"] = (
+            "identity-mapping-"
+            + hashlib.sha256(_canonical_bytes(identity_payload)).hexdigest()
+        )
+        mapping_path.write_bytes(_canonical_bytes(raw_mapping))
+        os.chmod(mapping_path, 0o600)
+        repinned_profile_cotamper_refused = _raises(
+            lambda: resolve_identity_mapping(paths, first.profile.profile_id)
+        )
+
+        with TemporaryDirectory(prefix="kirby2-wo37a-symlink-") as raw_symlink:
+            symlink_root = Path(raw_symlink).resolve()
+            target = symlink_root / "outside"
+            target.mkdir()
+            (symlink_root / DataAreaId.IDENTITY_MAPPINGS.value).symlink_to(
+                target,
+                target_is_directory=True,
+            )
+            symlink_rebind_refused = _raises(lambda: DataPaths(symlink_root))
+            symlink_target_untouched = not tuple(target.iterdir())
+
+        with TemporaryDirectory(prefix="kirby2-wo37a-recovery-") as raw_recovery:
+            recovery_paths = DataPaths(Path(raw_recovery).resolve())
+            recovery_creation = create_local_learner_identity(
+                recovery_paths,
+                direct_identity,
+                opaque_entropy=_LEARNER_ENTROPY,
+            )
+            recovery_consent = _active_consent()
+            recovery_decision = decide_profile_deletion(
+                recovery_consent,
+                required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+                requested_pseudonymous_evidence_retention=True,
+                decision_time_utc="2030-06-01T00:00:00Z",
+            )
+            with patch(
+                "kirby2.instructor.identity.os.rename",
+                side_effect=OSError("injected receipt publish interruption"),
+            ):
+                interrupted_publish = _raises(
+                    lambda: delete_identity_mapping(
+                        recovery_paths,
+                        recovery_creation.profile.profile_id,
+                        recovery_decision,
+                        recovery_consent,
+                        deletion_time_utc="2030-06-01T00:00:01Z",
+                    )
+                )
+            mapping_absent_after_interruption = not identity_mapping_path(
+                recovery_paths,
+                recovery_creation.profile.profile_id,
+            ).exists()
+            recovered_receipts = recover_pending_identity_deletions(
+                recovery_paths
+            )
+            recovered_receipt = (
+                recovered_receipts[0] if len(recovered_receipts) == 1 else None
+            )
+            recovery_complete = (
+                recovered_receipt is not None
+                and resolve_identity_deletion_receipt(
+                    recovery_paths,
+                    recovered_receipt.receipt_id,
+                )
+                == recovered_receipt
+                and not tuple(
+                    recovery_paths.evidence.rglob(".pending-*.json")
+                )
+                and all(
+                    marker not in recovered_receipt.canonical_bytes()
+                    for marker in _DIRECT_MARKERS
+                )
+            )
+
+        expiry_checks = _expired_delete_and_completed_tombstone_checks(
+            direct_identity
+        )
+        pre_unlink_checks = _pre_unlink_pending_fsync_cleanup_checks(
+            direct_identity
+        )
+        fsync_checks = _post_unlink_fsync_recovery_checks(direct_identity)
+        fstat_checks = _post_unlink_fstat_recovery_checks(direct_identity)
+        root_generation_checks = _root_generation_swap_checks(direct_identity)
+        recreation_checks = _interrupted_deletion_recreation_checks(
+            direct_identity
+        )
+        conflict_checks = _pending_live_mapping_conflict_checks(
+            direct_identity
+        )
+        hardlink_race_checks = _hardlink_insertion_race_checks(direct_identity)
+        lock_checks = _lock_failure_cleanup_checks(direct_identity)
+
+        checks = {
+            "unauthorized_retention_delete_refused": (
+                not refused_decision.allowed
+                and refused_delete
+                and mapping_survived_refusal
+            ),
+            "force_mutated_refusal_revalidated": (
+                force_mutated_delete and mapping_survived_force_mutation
+            ),
+            "stale_grant_rejected_against_current_withdrawal": (
+                stale_grant_delete and mapping_survived_stale_grant
+            ),
+            "foreign_profile_authority_refused": (
+                foreign_delete and mapping_survived_foreign_authority
+            ),
+            "duplicate_mapping_refused": duplicate_refused,
+            "wrong_entropy_proof_refused": wrong_entropy_refused,
+            "overexposed_mapping_refused": overexposed_refused,
+            "hardlinked_mapping_refused": hardlinked_mapping_refused,
+            "repinned_profile_digest_cotamper_refused": (
+                repinned_profile_cotamper_refused
+            ),
+            "symlink_rebind_refused_and_untouched": (
+                symlink_rebind_refused and symlink_target_untouched
+            ),
+            "interrupted_receipt_publish_is_recoverable": (
+                interrupted_publish
+                and mapping_absent_after_interruption
+                and recovery_complete
+            ),
+            **expiry_checks,
+            **pre_unlink_checks,
+            **fsync_checks,
+            **fstat_checks,
+            **root_generation_checks,
+            **recreation_checks,
+            **conflict_checks,
+            **hardlink_race_checks,
+            **lock_checks,
+        }
+        failures = tuple(
+            name.replace("_", " ")
+            for name, passed in checks.items()
+            if not passed
+        )
+        evidence = {
+            "attack_count": len(checks),
+            "checks": checks,
+            "first_profile_id": first.profile.profile_id,
+            "second_profile_id": second.profile.profile_id,
+        }
+    return InstructorConsoleAuditCase(
+        "identity_store_rejects_invalid_bindings_rebinding_and_foreign_authority",
+        f"attacks={len(checks)} rejected={sum(checks.values())}",
+        evidence,
+        failures,
+    )
+
+
+def _expired_delete_and_completed_tombstone_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-expiry-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        retaining = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        expired_refused = _raises(
+            lambda: delete_identity_mapping(
+                paths,
+                creation.profile.profile_id,
+                retaining,
+                consent,
+                deletion_time_utc="2031-01-01T00:00:01Z",
+            )
+        )
+        mapping_survived = (
+            resolve_identity_mapping(paths, creation.profile.profile_id)
+            == creation.mapping
+        )
+        nonretaining = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=False,
+            decision_time_utc="2031-01-01T00:00:01Z",
+        )
+        receipt = delete_identity_mapping(
+            paths,
+            creation.profile.profile_id,
+            nonretaining,
+            consent,
+            deletion_time_utc="2031-01-01T00:00:02Z",
+        )
+        tombstoned_recreation_refused = _raises(
+            lambda: create_identity_mapping(
+                paths,
+                creation.profile,
+                direct_identity,
+                opaque_entropy=_LEARNER_ENTROPY,
+            )
+        )
+        return {
+            "expired_retention_rechecked_at_deletion_time": (
+                expired_refused and mapping_survived
+            ),
+            "nonretaining_delete_remains_allowed_after_expiry": (
+                not receipt.pseudonymous_evidence_retained
+                and resolve_identity_deletion_receipt(paths, receipt.receipt_id)
+                == receipt
+            ),
+            "completed_deletion_tombstone_prevents_recreation": (
+                tombstoned_recreation_refused
+                and not identity_mapping_path(
+                    paths,
+                    creation.profile.profile_id,
+                ).exists()
+            ),
+        }
+
+
+def _post_unlink_fsync_recovery_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-fsync-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        mapping_path = identity_mapping_path(paths, creation.profile.profile_id)
+        identity_metadata = paths.identity_mappings.stat()
+        real_fsync = os.fsync
+        injected = False
+
+        def fail_after_mapping_unlink(descriptor: int) -> None:
+            nonlocal injected
+            metadata = os.fstat(descriptor)
+            if (
+                not injected
+                and metadata.st_dev == identity_metadata.st_dev
+                and metadata.st_ino == identity_metadata.st_ino
+                and not mapping_path.exists()
+            ):
+                injected = True
+                raise OSError("injected post-unlink identity-directory fsync failure")
+            real_fsync(descriptor)
+
+        with patch(
+            "kirby2.instructor.identity.os.fsync",
+            side_effect=fail_after_mapping_unlink,
+        ):
+            deletion_raised = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+        pending_before_recovery = tuple(
+            paths.evidence.rglob(".pending-*.json")
+        )
+        recovered = recover_pending_identity_deletions(paths)
+        pending_after_recovery = tuple(
+            paths.evidence.rglob(".pending-*.json")
+        )
+        final_receipts = tuple(
+            (paths.evidence / IDENTITY_DELETION_RECEIPT_DIRECTORY).glob(
+                "identity-deletion-receipt-*.json"
+            )
+        )
+        return {
+            "post_unlink_fsync_failure_keeps_recoverable_intent": (
+                injected
+                and deletion_raised
+                and not mapping_path.exists()
+                and len(pending_before_recovery) == 1
+                and len(recovered) == 1
+                and not pending_after_recovery
+                and len(final_receipts) == 1
+                and resolve_identity_deletion_receipt(
+                    paths,
+                    recovered[0].receipt_id,
+                )
+                == recovered[0]
+            )
+        }
+
+
+def _pre_unlink_pending_fsync_cleanup_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-pre-unlink-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        real_fsync = os.fsync
+        injected = False
+
+        def fail_pending_directory_fsync(descriptor: int) -> None:
+            nonlocal injected
+            metadata = os.fstat(descriptor)
+            if not injected and stat.S_ISDIR(metadata.st_mode):
+                with os.scandir(descriptor) as entries:
+                    names = tuple(entry.name for entry in entries)
+                if any(name.startswith(".pending-") for name in names):
+                    injected = True
+                    raise OSError("injected pre-unlink pending-directory fsync failure")
+            real_fsync(descriptor)
+
+        with patch(
+            "kirby2.instructor.identity.os.fsync",
+            side_effect=fail_pending_directory_fsync,
+        ):
+            deletion_raised = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+
+        receipt_directory = (
+            paths.evidence / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        residue = tuple(receipt_directory.glob("*.json")) + tuple(
+            receipt_directory.glob(".pending-*.json")
+        )
+        mapping_survived = (
+            resolve_identity_mapping(paths, creation.profile.profile_id)
+            == creation.mapping
+        )
+        retry_receipt = delete_identity_mapping(
+            paths,
+            creation.profile.profile_id,
+            decision,
+            consent,
+            deletion_time_utc="2030-06-01T00:00:01Z",
+        )
+        return {
+            "pre_unlink_pending_fsync_failure_rolls_back_and_retries": (
+                injected
+                and deletion_raised
+                and mapping_survived
+                and not residue
+                and resolve_identity_deletion_receipt(
+                    paths,
+                    retry_receipt.receipt_id,
+                )
+                == retry_receipt
+            )
+        }
+
+
+def _post_unlink_fstat_recovery_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-fstat-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        mapping_path = identity_mapping_path(paths, creation.profile.profile_id)
+        mapping_metadata = mapping_path.stat()
+        real_fstat = os.fstat
+        injected = False
+
+        def fail_mapping_fstat_after_unlink(descriptor: int):
+            nonlocal injected
+            metadata = real_fstat(descriptor)
+            if (
+                not injected
+                and metadata.st_dev == mapping_metadata.st_dev
+                and metadata.st_ino == mapping_metadata.st_ino
+                and not mapping_path.exists()
+            ):
+                injected = True
+                raise OSError("injected post-unlink mapping fstat failure")
+            return metadata
+
+        with patch(
+            "kirby2.instructor.identity.os.fstat",
+            side_effect=fail_mapping_fstat_after_unlink,
+        ):
+            deletion_raised = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+        pending_before_recovery = tuple(
+            paths.evidence.rglob(".pending-*.json")
+        )
+        recovered = recover_pending_identity_deletions(paths)
+        pending_after_recovery = tuple(
+            paths.evidence.rglob(".pending-*.json")
+        )
+        return {
+            "post_unlink_fstat_failure_keeps_recoverable_intent": (
+                injected
+                and deletion_raised
+                and not mapping_path.exists()
+                and len(pending_before_recovery) == 1
+                and len(recovered) == 1
+                and not pending_after_recovery
+                and resolve_identity_deletion_receipt(
+                    paths,
+                    recovered[0].receipt_id,
+                )
+                == recovered[0]
+            )
+        }
+
+
+def _root_generation_swap_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    """Prove one recovery cannot cross into a path-rebound root generation."""
+
+    with TemporaryDirectory(prefix="kirby2-wo37a-root-swap-") as raw_parent:
+        parent = Path(raw_parent).resolve()
+        victim_root = parent / "victim"
+        attacker_root = parent / "attacker"
+        victim_paths = DataPaths(victim_root)
+        attacker_paths = DataPaths(attacker_root)
+
+        def leave_pending(paths: DataPaths, entropy: bytes):
+            creation = create_local_learner_identity(
+                paths,
+                direct_identity,
+                opaque_entropy=entropy,
+            )
+            consent = create_consent_record(
+                pseudonymous_profile_id=creation.profile.profile_id,
+                scopes=(ConsentScopeV1.LOCAL_RESEARCH_STUDY,),
+                recorded_at_utc="2030-01-01T00:00:00Z",
+                retention_policy=EvidenceRetentionPolicyV1.RETAIN_UNTIL_UTC,
+                retention_until_utc="2031-01-01T00:00:00Z",
+                retain_pseudonymous_evidence_after_profile_deletion=True,
+                export_permission=EvidenceExportPermissionV1.DENIED,
+                withdrawal_policy=(
+                    WithdrawalPolicyV1.REVOKE_FUTURE_RETENTION_AND_EXPORT
+                ),
+            )
+            decision = decide_profile_deletion(
+                consent,
+                required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+                requested_pseudonymous_evidence_retention=True,
+                decision_time_utc="2030-06-01T00:00:00Z",
+            )
+            with patch(
+                "kirby2.instructor.identity.os.rename",
+                side_effect=OSError("injected receipt publish interruption"),
+            ):
+                interrupted = _raises(
+                    lambda: delete_identity_mapping(
+                        paths,
+                        creation.profile.profile_id,
+                        decision,
+                        consent,
+                        deletion_time_utc="2030-06-01T00:00:01Z",
+                    )
+                )
+            return creation, interrupted
+
+        victim, victim_interrupted = leave_pending(
+            victim_paths,
+            _LEARNER_ENTROPY,
+        )
+        attacker, attacker_interrupted = leave_pending(
+            attacker_paths,
+            _OTHER_LEARNER_ENTROPY,
+        )
+        real_open_area = __import__(
+            "kirby2.instructor.identity",
+            fromlist=["_open_governed_area_from_root"],
+        )._open_governed_area_from_root
+        old_victim_root = parent / "victim-old"
+        swapped = False
+
+        def swap_before_evidence(
+            paths: DataPaths,
+            root_descriptor: int,
+            area_id: DataAreaId,
+            label: str,
+            *,
+            optional: bool = False,
+        ):
+            nonlocal swapped
+            if area_id is DataAreaId.EVIDENCE and not swapped:
+                os.rename(victim_root, old_victim_root)
+                os.rename(attacker_root, victim_root)
+                swapped = True
+            return real_open_area(
+                paths,
+                root_descriptor,
+                area_id,
+                label,
+                optional=optional,
+            )
+
+        with patch(
+            "kirby2.instructor.identity._open_governed_area_from_root",
+            side_effect=swap_before_evidence,
+        ):
+            recovered = recover_pending_identity_deletions(victim_paths)
+
+        victim_receipt_directory = (
+            old_victim_root
+            / DataAreaId.EVIDENCE.value
+            / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        attacker_receipt_directory = (
+            victim_root
+            / DataAreaId.EVIDENCE.value
+            / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        victim_pending = tuple(victim_receipt_directory.glob(".pending-*.json"))
+        victim_finals = tuple(
+            victim_receipt_directory.glob("identity-deletion-receipt-*.json")
+        )
+        attacker_pending = tuple(attacker_receipt_directory.glob(".pending-*.json"))
+        attacker_finals = tuple(
+            attacker_receipt_directory.glob("identity-deletion-receipt-*.json")
+        )
+        return {
+            "root_generation_swap_never_recovers_attacker_receipt": (
+                victim_interrupted
+                and attacker_interrupted
+                and swapped
+                and len(recovered) == 1
+                and recovered[0].pseudonymous_profile_id
+                == victim.profile.profile_id
+                and not victim_pending
+                and len(victim_finals) == 1
+                and len(attacker_pending) == 1
+                and not attacker_finals
+                and attacker_pending[0].read_bytes()
+                != victim_finals[0].read_bytes()
+                and attacker.profile.profile_id
+                in attacker_pending[0].read_text("ascii")
+            )
+        }
+
+
+def _interrupted_deletion_recreation_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-tombstone-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        with patch(
+            "kirby2.instructor.identity.os.rename",
+            side_effect=OSError("injected receipt publish interruption"),
+        ):
+            interrupted = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+        recreation_refused = _raises(
+            lambda: create_identity_mapping(
+                paths,
+                creation.profile,
+                direct_identity,
+                opaque_entropy=_LEARNER_ENTROPY,
+            )
+        )
+        recover_pending_identity_deletions(paths)
+        receipt_directory = (
+            paths.evidence / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        pending = tuple(receipt_directory.glob(".pending-*.json"))
+        finals = tuple(
+            receipt_directory.glob("identity-deletion-receipt-*.json")
+        )
+        final_resolves = False
+        if len(finals) == 1:
+            receipt_id = finals[0].name.removesuffix(".json")
+            final_resolves = (
+                resolve_identity_deletion_receipt(paths, receipt_id).receipt_id
+                == receipt_id
+            )
+        return {
+            "interrupted_deletion_tombstone_prevents_recreation": (
+                interrupted
+                and recreation_refused
+                and not identity_mapping_path(
+                    paths,
+                    creation.profile.profile_id,
+                ).exists()
+                and not pending
+                and len(finals) == 1
+                and final_resolves
+            )
+        }
+
+
+def _lock_failure_cleanup_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-lock-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        captured_descriptors: list[int] = []
+
+        def fail_lock(descriptor: int, operation: int) -> None:
+            del operation
+            captured_descriptors.append(descriptor)
+            raise OSError("injected identity-store lock failure")
+
+        with patch(
+            "kirby2.instructor.identity.fcntl.flock",
+            side_effect=fail_lock,
+        ):
+            creation_refused = _raises(
+                lambda: create_local_learner_identity(
+                    paths,
+                    direct_identity,
+                    opaque_entropy=_LEARNER_ENTROPY,
+                )
+            )
+        descriptor_closed = bool(captured_descriptors) and _raises(
+            lambda: os.fstat(captured_descriptors[0])
+        )
+        mappings = (
+            ()
+            if not paths.identity_mappings.exists()
+            else tuple(
+                path
+                for path in paths.identity_mappings.glob("*.json")
+                if not path.name.startswith(".identity-store")
+            )
+        )
+        return {
+            "lock_acquisition_failure_closes_descriptor": (
+                creation_refused and descriptor_closed and not mappings
+            )
+        }
+
+
+def _pending_live_mapping_conflict_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-conflict-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=True,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        with patch(
+            "kirby2.instructor.identity.os.rename",
+            side_effect=OSError("injected receipt publish interruption"),
+        ):
+            interrupted = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+        mapping_path = identity_mapping_path(paths, creation.profile.profile_id)
+        mapping_path.write_bytes(creation.mapping.canonical_bytes())
+        os.chmod(mapping_path, 0o600)
+        recovery_refused = _raises(
+            lambda: recover_pending_identity_deletions(paths)
+        )
+        pending = tuple(paths.evidence.rglob(".pending-*.json"))
+        return {
+            "pending_receipt_live_mapping_conflict_fails_closed": (
+                interrupted
+                and recovery_refused
+                and mapping_path.exists()
+                and len(pending) == 1
+            )
+        }
+
+
+def _hardlink_insertion_race_checks(
+    direct_identity: DirectIdentityV1,
+) -> dict[str, bool]:
+    with TemporaryDirectory(prefix="kirby2-wo37a-hardlink-race-") as raw_root:
+        paths = DataPaths(Path(raw_root).resolve())
+        creation = create_local_learner_identity(
+            paths,
+            direct_identity,
+            opaque_entropy=_LEARNER_ENTROPY,
+        )
+        consent = _active_consent()
+        decision = decide_profile_deletion(
+            consent,
+            required_scope=ConsentScopeV1.LOCAL_RESEARCH_STUDY,
+            requested_pseudonymous_evidence_retention=False,
+            decision_time_utc="2030-06-01T00:00:00Z",
+        )
+        mapping_path = identity_mapping_path(paths, creation.profile.profile_id)
+        alias_path = paths.identity_mappings / "injected-hardlink-alias.json"
+        real_unlink = os.unlink
+
+        def inject_alias_before_unlink(
+            filename: str,
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
+            if filename == mapping_path.name and dir_fd is not None:
+                os.link(mapping_path, alias_path)
+            real_unlink(filename, dir_fd=dir_fd)
+
+        with patch(
+            "kirby2.instructor.identity.os.unlink",
+            side_effect=inject_alias_before_unlink,
+        ):
+            deletion_refused = _raises(
+                lambda: delete_identity_mapping(
+                    paths,
+                    creation.profile.profile_id,
+                    decision,
+                    consent,
+                    deletion_time_utc="2030-06-01T00:00:01Z",
+                )
+            )
+        receipt_directory = (
+            paths.evidence / IDENTITY_DELETION_RECEIPT_DIRECTORY
+        )
+        receipt_files = tuple(receipt_directory.glob("*.json"))
+        return {
+            "hardlink_inserted_during_delete_never_gets_deleted_receipt": (
+                deletion_refused
+                and not mapping_path.exists()
+                and alias_path.exists()
+                and not receipt_files
+                and all(
+                    marker in alias_path.read_bytes()
+                    for marker in _DIRECT_MARKERS
+                )
+            )
+        }
+
+
+def _direct_identity() -> DirectIdentityV1:
+    return DirectIdentityV1(
+        "Ada Learner",
+        (
+            DirectIdentifierV1("email", "ada.learner@example.invalid"),
+            DirectIdentifierV1("student_id", "student-0007"),
+        ),
+    )
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+
+
+__all__ = [
+    "WO37A_AUDIT_CASE_COUNT",
+    "InstructorConsoleAuditCase",
+    "audit_pseudonymous_profiles_and_consent",
+]

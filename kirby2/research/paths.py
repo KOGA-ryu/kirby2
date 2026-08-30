@@ -48,6 +48,10 @@ class DataAreaId(str, Enum):
     RELEASE_ARTIFACTS = "release"
 
 
+IMMUTABLE_EVIDENCE_AREA_IDS = (DataAreaId.RUNS, DataAreaId.EVIDENCE)
+ERASABLE_IDENTITY_AREA_IDS = (DataAreaId.IDENTITY_MAPPINGS,)
+
+
 _DEFAULT_AREA_CHILDREN: Mapping[DataAreaId, str] = MappingProxyType(
     {area_id: area_id.value for area_id in DataAreaId}
 )
@@ -478,8 +482,10 @@ def _open_or_create_directory_at(
     try:
         return os.open(name, open_flags, dir_fd=parent_fd)
     except FileNotFoundError:
+        created = False
         try:
             os.mkdir(name, dir_fd=parent_fd)
+            created = True
         except FileExistsError:
             # A concurrent creator won the race.  The no-follow open below decides
             # whether the resulting entry is the required real directory.
@@ -489,6 +495,14 @@ def _open_or_create_directory_at(
                 "directory cannot be created safely at governed data path: "
                 f"{display_path}"
             ) from error
+        if created:
+            try:
+                os.fsync(parent_fd)
+            except OSError as error:
+                raise ValueError(
+                    "directory creation cannot be made durable at governed data "
+                    f"path: {display_path}"
+                ) from error
         try:
             return os.open(name, open_flags, dir_fd=parent_fd)
         except (OSError, TypeError, NotImplementedError) as error:
@@ -578,6 +592,8 @@ def _portable_name(name: str) -> str:
 
 __all__ = [
     "DATA_PATHS_SCHEMA_VERSION",
+    "ERASABLE_IDENTITY_AREA_IDS",
+    "IMMUTABLE_EVIDENCE_AREA_IDS",
     "DataAreaId",
     "DataPaths",
 ]

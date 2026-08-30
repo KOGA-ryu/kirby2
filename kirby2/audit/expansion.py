@@ -151,6 +151,7 @@ REGISTERABLE_GATE_IDS = (
     "WO36-D",
     "WO36-E",
     "DEV-0007",
+    "WO37-A",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4341,6 +4342,74 @@ def _audit_dev0007() -> ExpansionGateReport:
     )
 
 
+def _audit_wo37a() -> ExpansionGateReport:
+    """Verify pseudonymous profiles, consent, and erasable identity mappings."""
+
+    from kirby2.audit.instructor_console import (
+        WO37A_AUDIT_CASE_COUNT,
+        audit_pseudonymous_profiles_and_consent,
+    )
+    from kirby2.instructor.identity import (
+        IDENTITY_DELETION_RECEIPT_SCHEMA_ID,
+        IDENTITY_DELETION_RECEIPT_SCHEMA_VERSION,
+        IDENTITY_MAPPING_SCHEMA_ID,
+        IDENTITY_MAPPING_SCHEMA_VERSION,
+        IDENTITY_MAPPING_AUTHORITY_POLICY,
+    )
+    from kirby2.instructor.consent import (
+        CURRENT_CONSENT_AUTHORITY_POLICY,
+        PSEUDONYMIZATION_CLAIM,
+    )
+    from kirby2.instructor.models import INSTRUCTOR_RECORD_TYPES
+
+    cases = audit_pseudonymous_profiles_and_consent()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO37-A",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO37A_AUDIT_CASE_COUNT)),
+            ("consent_head_authority", CURRENT_CONSENT_AUTHORITY_POLICY),
+            ("identity_mapping_default_export", "REFUSED"),
+            ("identity_mapping_authority", IDENTITY_MAPPING_AUTHORITY_POLICY),
+            ("identity_mapping_schema_id", IDENTITY_MAPPING_SCHEMA_ID),
+            (
+                "identity_mapping_schema_version",
+                str(IDENTITY_MAPPING_SCHEMA_VERSION),
+            ),
+            ("model_vocabulary_count", str(len(INSTRUCTOR_RECORD_TYPES))),
+            ("privacy_claim", PSEUDONYMIZATION_CLAIM),
+            (
+                "deletion_receipt_schema_id",
+                IDENTITY_DELETION_RECEIPT_SCHEMA_ID,
+            ),
+            (
+                "deletion_receipt_schema_version",
+                str(IDENTITY_DELETION_RECEIPT_SCHEMA_VERSION),
+            ),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4393,6 +4462,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO36-D", _audit_wo36d),
     ("WO36-E", _audit_wo36e),
     ("DEV-0007", _audit_dev0007),
+    ("WO37-A", _audit_wo37a),
 )
 
 
