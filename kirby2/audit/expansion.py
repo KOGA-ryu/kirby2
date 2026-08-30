@@ -140,6 +140,7 @@ REGISTERABLE_GATE_IDS = (
     "WO35-E",
     "WO35-F",
     "WO35-F1",
+    "WO36-A",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -3690,6 +3691,60 @@ def _audit_wo35f1() -> ExpansionGateReport:
     )
 
 
+def _audit_wo36a() -> ExpansionGateReport:
+    from kirby2.audit.replay_microscope import (
+        WO36A_AUDIT_CASE_COUNT,
+        WO36A_COMPLETE_INDEX_SHA256,
+        WO36A_COMPLETE_SOURCE_SHA256,
+        WO36A_LEGACY_INDEX_SHA256,
+        WO36A_LEGACY_SOURCE_SHA256,
+        audit_replay_microscope,
+    )
+    from kirby2.microscope import (
+        MECHANISTIC_INTERPRETATION,
+        TRACE_INDEX_SCHEMA_ID,
+        TRACE_SOURCE_SCHEMA_ID,
+    )
+
+    cases = audit_replay_microscope()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO36-A",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO36A_AUDIT_CASE_COUNT)),
+            ("complete_index_sha256", WO36A_COMPLETE_INDEX_SHA256),
+            ("complete_source_sha256", WO36A_COMPLETE_SOURCE_SHA256),
+            ("interpretation", MECHANISTIC_INTERPRETATION),
+            ("legacy_index_sha256", WO36A_LEGACY_INDEX_SHA256),
+            ("legacy_source_sha256", WO36A_LEGACY_SOURCE_SHA256),
+            ("source_mutation", "ABSENT"),
+            ("timestamp_causality_inference", "REFUSED"),
+            ("trace_index_schema_id", TRACE_INDEX_SCHEMA_ID),
+            ("trace_source_schema_id", TRACE_SOURCE_SCHEMA_ID),
+        ),
+    )
+
+
 def _audit_wo31e3() -> ExpansionGateReport:
     """Run the passive venue/client delivery and restart evidence."""
 
@@ -3909,6 +3964,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO35-E", _audit_wo35e),
     ("WO35-F", _audit_wo35f),
     ("WO35-F1", _audit_wo35f1),
+    ("WO36-A", _audit_wo36a),
 )
 
 
