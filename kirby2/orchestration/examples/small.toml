@@ -1,0 +1,33 @@
+schema_id = "KIRBY2_ORCHESTRATION_EXPERIMENT_V1"
+schema_version = 1
+experiment_id = "small-complete-run-experiment"
+master_seed = 42
+scenario_name = "balanced"
+duration_seconds = 1
+relative_volume = "1.00x"
+liquidity = "NORMAL"
+resource_class = "cpu-small"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0001"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0002"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0003"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0004"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0005"
+
+[[cells]]
+partition_id = "complete-runs"
+cell_id = "run-0006"
