@@ -25,8 +25,66 @@ from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 
+from kirby2.counterfactual.models import CounterfactualMode
 from kirby2.immutable import freeze_json, thaw_json
 
+from .annotations import (
+    HUMAN_REVIEW_AUTHORITY,
+    REPLAY_ANNOTATION_SCHEMA_ID,
+    REPLAY_ANNOTATION_SCHEMA_VERSION,
+    REPLAY_BOOKMARK_SCHEMA_ID,
+    REPLAY_BOOKMARK_SCHEMA_VERSION,
+    REPLAY_SIDECAR_TARGET_SCHEMA_ID,
+    REPLAY_SIDECAR_TARGET_SCHEMA_VERSION,
+    SOURCE_MUTATION_POLICY,
+    TIMING_LIE_REVIEW_PACKET_SCHEMA_ID,
+    TIMING_LIE_REVIEW_PACKET_SCHEMA_VERSION,
+    TIMING_LIE_REVIEW_RESULT_SCHEMA_ID,
+    TIMING_LIE_REVIEW_RESULT_SCHEMA_VERSION,
+    TIMING_LIE_RUBRIC_ORDER,
+    TIMING_LIE_RUBRIC_PROMPTS,
+    TIMING_LIE_RUBRIC_VERSION,
+    ReplayAnnotationV1,
+    ReplayBookmarkV1,
+    ReplaySidecarTargetV1,
+    TimingLieHumanResult,
+    TimingLieReviewPacketV1,
+    TimingLieReviewResultV1,
+    TimingLieTechnicalStatus,
+)
+from .comparison import (
+    BRANCH_COMPARISON_SCHEMA_ID,
+    BRANCH_COMPARISON_SCHEMA_VERSION,
+    COMPARISON_INTERPRETATION,
+    COMPARISON_OVERLAY_ORDER,
+    COMPARISON_SERIES_ORDER,
+    COMPARISON_EVENT_SCHEMA_ID,
+    COMPARISON_EVENT_SCHEMA_VERSION,
+    COMPARISON_OVERLAY_SCHEMA_ID,
+    COMPARISON_OVERLAY_SCHEMA_VERSION,
+    COMPARISON_RUN_INPUT_SCHEMA_ID,
+    COMPARISON_RUN_INPUT_SCHEMA_VERSION,
+    COMPARISON_SERIES_SCHEMA_ID,
+    COMPARISON_SERIES_SCHEMA_VERSION,
+    COMPARISON_TRACE_SCHEMA_ID,
+    COMPARISON_TRACE_SCHEMA_VERSION,
+    BranchComparisonV1,
+    ComparisonAvailability,
+    ComparisonEvidenceScope,
+    ComparisonRecordStatus,
+    ComparisonTraceAvailability,
+    CounterfactualRngPolicy,
+)
+from .models import (
+    MECHANISTIC_INTERPRETATION,
+    TRACE_EDGE_ORDER,
+    TRACE_INDEX_SCHEMA_ID,
+    TRACE_INDEX_SCHEMA_VERSION,
+    TRACE_STAGE_ORDER,
+    TraceAvailability,
+    TraceLinkStatus,
+    TraceUnavailableReason,
+)
 from .overlays import (
     OVERLAY_KIND_ORDER,
     OverlayAvailability,
@@ -35,13 +93,19 @@ from .overlays import (
     OverlayUnit,
 )
 from .panes import (
+    COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID,
+    COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION,
+    COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID,
+    COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION,
+    COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND,
     PANE_ORDER,
     PaneAvailability,
     PaneKind,
+    PaneUnavailableReason,
     QueueTruthAvailability,
     SynchronizedPaneSnapshot,
 )
-from .policy import ObservationMode, RevealAvailability
+from .policy import ObservationMode, ObservationPolicy, RevealAvailability
 from .query import EvidenceSourceKind, ObservationQueryResult, QueriedValue
 from .timeline import (
     ReplayTimeline,
@@ -72,6 +136,7 @@ REPORT_ASSET_SHA256: Mapping[str, str] = MappingProxyType(
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_RUN_ID = re.compile(r"^run-[0-9a-f]{24}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}$")
 _FRAME_TOKEN = object()
 _PRESENTATION_TOKEN = object()
@@ -189,6 +254,7 @@ class DeferredCapabilityKind(str, Enum):
 
 
 class DeferredCapabilityStatus(str, Enum):
+    AVAILABLE = "AVAILABLE"
     NOT_AVAILABLE_UNTIL_WO36_E = "NOT_AVAILABLE_UNTIL_WO36_E"
 
 
@@ -357,6 +423,7 @@ class ReplayPresentationContext:
     clock: ClockPresentation
     instrument: InstrumentPresentation
     limitations: tuple[str, ...]
+    available_wo36e_capabilities: tuple[DeferredCapabilityKind, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.source_run_id, "presentation source run ID")
@@ -373,6 +440,22 @@ class ReplayPresentationContext:
             raise TypeError("presentation instrument metadata is invalid")
         if type(self.limitations) is not tuple or not self.limitations:
             raise ValueError("presentation limitations must be a nonempty tuple")
+        if type(self.available_wo36e_capabilities) is not tuple or any(
+            type(item) is not DeferredCapabilityKind
+            for item in self.available_wo36e_capabilities
+        ):
+            raise TypeError(
+                "available WO36-E presentation capabilities must be a typed tuple"
+            )
+        canonical_capabilities = tuple(
+            item
+            for item in DeferredCapabilityKind
+            if item in self.available_wo36e_capabilities
+        )
+        if canonical_capabilities != self.available_wo36e_capabilities:
+            raise ValueError(
+                "available WO36-E presentation capabilities are not canonical"
+            )
         for limitation in self.limitations:
             _display_text(limitation, "presentation limitation")
         canonical = tuple(sorted(self.limitations))
@@ -430,7 +513,7 @@ _PANE_PRESENTATION = MappingProxyType(
         PaneKind.MECHANISTIC_TRACE: ("Mechanistic trace", PaneRendererKind.TRACE_REFERENCES),
         PaneKind.COUNTERFACTUAL_COMPARISON: (
             "Counterfactual comparison",
-            PaneRendererKind.TYPED_UNAVAILABLE,
+            PaneRendererKind.EVIDENCE_CARD,
         ),
     }
 )
@@ -1027,14 +1110,25 @@ def _build_presentation_metadata(
         )
     )
     provenance = _presentation_provenance(events, panes, overlays)
-    deferred = tuple(
-        {
-            "capability": item.value,
-            "reason": DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value,
-            "status": DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value,
-        }
-        for item in DeferredCapabilityKind
-    )
+    deferred_rows: list[dict[str, object]] = []
+    for item in DeferredCapabilityKind:
+        status = (
+            DeferredCapabilityStatus.AVAILABLE
+            if item in context.available_wo36e_capabilities
+            else DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E
+        )
+        deferred_rows.append(
+            {
+                "capability": item.value,
+                "reason": (
+                    None
+                    if status is DeferredCapabilityStatus.AVAILABLE
+                    else status.value
+                ),
+                "status": status.value,
+            }
+        )
+    deferred = tuple(deferred_rows)
     if query.policy.mode is ObservationMode.AS_OBSERVED:
         watermark = {
             "label": "AS OBSERVED · CLIENT-KNOWN EVIDENCE ONLY",
@@ -1131,6 +1225,11 @@ def _pane_presentation(
     display_order: int,
 ) -> dict[str, object]:
     title, renderer = _PANE_PRESENTATION[pane.pane_kind]
+    if (
+        pane.pane_kind is PaneKind.COUNTERFACTUAL_COMPARISON
+        and pane.availability is not PaneAvailability.AVAILABLE
+    ):
+        renderer = PaneRendererKind.TYPED_UNAVAILABLE
     references: dict[tuple[str, str], dict[str, object]] = {}
     rows: list[dict[str, object]] = []
     for datum in pane.data:
@@ -1168,6 +1267,25 @@ def _pane_presentation(
                 "source_event_ids": sorted(source_ids),
                 "truth_availability": estimate.truth_availability.value,
                 "unit": "quantity",
+            }
+        )
+    for comparison_reference in pane.comparison_references:
+        reference = comparison_reference.as_dict()
+        binding = reference["binding"]
+        assert isinstance(binding, dict)
+        rows.append(
+            {
+                "branch_run_id": binding["branch_run_id"],
+                "cited_comparison_reference_id": reference["reference_id"],
+                "comparison_id": binding["comparison_id"],
+                "comparison_sha256": binding["comparison_sha256"],
+                "display_order": len(rows),
+                "display_text": _canonical_json_bytes(reference).decode("ascii"),
+                "label": "selected counterfactual branch",
+                "raw_value_kind": "CANONICAL_JSON_REFERENCE",
+                "semantic_role": PresentationSemanticRole.NEUTRAL.value,
+                "source_event_ids": [],
+                "unit": "content_addressed_reference",
             }
         )
     explanation = (
@@ -1507,9 +1625,19 @@ class PortableReplayReportV1:
 def build_portable_replay_report(
     frames: tuple[ReplayPresentationFrameV1, ...],
     *,
+    bookmarks: tuple[ReplayBookmarkV1, ...] | None = None,
+    annotations: tuple[ReplayAnnotationV1, ...] | None = None,
+    branch_comparison: BranchComparisonV1 | None = None,
+    timing_review_packet: TimingLieReviewPacketV1 | None = None,
+    timing_review_result: TimingLieReviewResultV1 | None = None,
     display_generated_at: str | None = None,
 ) -> PortableReplayReportV1:
-    """Build all reserved V1 report sections without creating WO36-E sidecars."""
+    """Build reserved V1 sections around optional immutable WO36-E sidecars.
+
+    ``None`` means that a WO36-E producer was not invoked and retains the exact
+    WO36-D deferred representation.  An explicitly supplied empty tuple records
+    a completed producer with no bookmark or annotation rows.
+    """
 
     if type(frames) is not tuple or not frames or any(
         type(item) is not ReplayPresentationFrameV1 for item in frames
@@ -1524,7 +1652,30 @@ def build_portable_replay_report(
             ),
         )
     )
-    sections = _build_report_sections(canonical_frames)
+    _validate_frame_wo36e_capabilities(
+        canonical_frames,
+        bookmarks_supplied=bookmarks is not None,
+        annotations_supplied=(
+            annotations is not None or timing_review_packet is not None
+        ),
+        comparison_supplied=branch_comparison is not None,
+    )
+    canonical_bookmarks, canonical_annotations = _validate_annotation_sidecars(
+        canonical_frames,
+        bookmarks,
+        annotations,
+        timing_review_packet,
+        timing_review_result,
+    )
+    _validate_branch_comparison(canonical_frames, branch_comparison)
+    sections = _build_report_sections(
+        canonical_frames,
+        bookmarks=canonical_bookmarks,
+        annotations=canonical_annotations,
+        branch_comparison=branch_comparison,
+        timing_review_packet=timing_review_packet,
+        timing_review_result=timing_review_result,
+    )
     return PortableReplayReportV1(
         frames=canonical_frames,
         sections=sections,
@@ -1534,13 +1685,266 @@ def build_portable_replay_report(
     )
 
 
+def _validate_frame_wo36e_capabilities(
+    frames: tuple[ReplayPresentationFrameV1, ...],
+    *,
+    bookmarks_supplied: bool,
+    annotations_supplied: bool,
+    comparison_supplied: bool,
+) -> None:
+    expected_available = {
+        DeferredCapabilityKind.BOOKMARK: bookmarks_supplied,
+        DeferredCapabilityKind.ANNOTATION: annotations_supplied,
+        DeferredCapabilityKind.COUNTERFACTUAL_SELECTION: comparison_supplied,
+        DeferredCapabilityKind.COMPARISON: comparison_supplied,
+    }
+    expected = [
+        {
+            "capability": capability.value,
+            "reason": (
+                None
+                if expected_available[capability]
+                else DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value
+            ),
+            "status": (
+                DeferredCapabilityStatus.AVAILABLE.value
+                if expected_available[capability]
+                else DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value
+            ),
+        }
+        for capability in DeferredCapabilityKind
+    ]
+    if any(
+        frame.presentation.as_dict()["deferred_capabilities"] != expected
+        for frame in frames
+    ):
+        raise ValueError(
+            "WO36-E frame capability declarations differ from supplied producers"
+        )
+
+
+def _validate_annotation_sidecars(
+    frames: tuple[ReplayPresentationFrameV1, ...],
+    bookmarks: tuple[ReplayBookmarkV1, ...] | None,
+    annotations: tuple[ReplayAnnotationV1, ...] | None,
+    timing_review_packet: TimingLieReviewPacketV1 | None,
+    timing_review_result: TimingLieReviewResultV1 | None,
+) -> tuple[
+    tuple[ReplayBookmarkV1, ...] | None,
+    tuple[ReplayAnnotationV1, ...] | None,
+]:
+    if bookmarks is not None and (
+        type(bookmarks) is not tuple
+        or any(type(item) is not ReplayBookmarkV1 for item in bookmarks)
+    ):
+        raise TypeError("portable report bookmarks must be an exact tuple")
+    if annotations is not None and (
+        type(annotations) is not tuple
+        or any(type(item) is not ReplayAnnotationV1 for item in annotations)
+    ):
+        raise TypeError("portable report annotations must be an exact tuple")
+    if timing_review_packet is not None and type(
+        timing_review_packet
+    ) is not TimingLieReviewPacketV1:
+        raise TypeError("portable report timing review packet is invalid")
+    if timing_review_result is not None and type(
+        timing_review_result
+    ) is not TimingLieReviewResultV1:
+        raise TypeError("portable report timing review result is invalid")
+    if (timing_review_packet is None) != (timing_review_result is None):
+        raise ValueError("timing review packet and result must travel together")
+
+    canonical_bookmarks = (
+        None
+        if bookmarks is None
+        else tuple(sorted(bookmarks, key=lambda item: item.bookmark_id))
+    )
+    canonical_annotations = (
+        None
+        if annotations is None
+        else tuple(sorted(annotations, key=lambda item: item.annotation_id))
+    )
+    if canonical_bookmarks is not None and len(
+        {item.bookmark_id for item in canonical_bookmarks}
+    ) != len(canonical_bookmarks):
+        raise ValueError("portable report contains duplicate bookmarks")
+    if canonical_annotations is not None and len(
+        {item.annotation_id for item in canonical_annotations}
+    ) != len(canonical_annotations):
+        raise ValueError("portable report contains duplicate annotations")
+
+    targets = [
+        item.target
+        for collection in (canonical_bookmarks, canonical_annotations)
+        if collection is not None
+        for item in collection
+    ]
+    if timing_review_packet is not None:
+        targets.extend(
+            target
+            for search in timing_review_packet.searches
+            for target in search.targets
+        )
+        if (
+            timing_review_result.packet_id != timing_review_packet.packet_id
+            or timing_review_result.packet_sha256
+            != timing_review_packet.packet_sha256
+            or timing_review_result.source_run_id
+            != timing_review_packet.source_run_id
+            or timing_review_result.source_event_sha256
+            != timing_review_packet.source_event_sha256
+        ):
+            raise ValueError("timing review result is not bound to its packet")
+    for target in targets:
+        _validate_sidecar_target_against_frames(target, frames)
+    return canonical_bookmarks, canonical_annotations
+
+
+def _validate_branch_comparison(
+    frames: tuple[ReplayPresentationFrameV1, ...],
+    branch_comparison: BranchComparisonV1 | None,
+) -> None:
+    serialized_frames = [item.as_dict() for item in frames]
+    if branch_comparison is None:
+        for frame in serialized_frames:
+            _validate_serialized_unavailable_comparison_pane(frame)
+        return
+    if type(branch_comparison) is not BranchComparisonV1:
+        raise TypeError("portable report branch comparison is invalid")
+    identity = thaw_json(frames[0].identity)
+    expected = (
+        identity["source_run_id"],
+        identity["source_event_sha256"],
+        identity["observation_mode"],
+        identity["policy_id"],
+    )
+    actual = (
+        branch_comparison.source_run_id,
+        branch_comparison.source_event_sha256,
+        branch_comparison.observation_mode.value,
+        branch_comparison.policy_id,
+    )
+    if actual != expected:
+        raise ValueError("branch comparison differs from report frame authority")
+    required = {
+        DeferredCapabilityKind.COUNTERFACTUAL_SELECTION.value,
+        DeferredCapabilityKind.COMPARISON.value,
+    }
+    for frame in frames:
+        statuses = {
+            item["capability"]: item["status"]
+            for item in frame.presentation.as_dict()["deferred_capabilities"]
+        }
+        if any(
+            statuses.get(capability)
+            != DeferredCapabilityStatus.AVAILABLE.value
+            for capability in required
+        ):
+            raise ValueError(
+                "WO36-E report frames do not declare comparison capabilities"
+            )
+    _validate_serialized_comparison_pane_bindings(
+        serialized_frames,
+        branch_comparison.as_dict(),
+    )
+
+
+def _validate_sidecar_target_against_frames(
+    target: ReplaySidecarTargetV1,
+    frames: tuple[ReplayPresentationFrameV1, ...],
+) -> None:
+    if type(target) is not ReplaySidecarTargetV1:
+        raise TypeError("portable report sidecar target is invalid")
+    matches = [
+        frame
+        for frame in frames
+        if thaw_json(frame.identity)["cursor_id"] == target.cursor_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("sidecar target cursor is absent or ambiguous in report")
+    frame = matches[0]
+    identity = thaw_json(frame.identity)
+    snapshot = thaw_json(frame.pane_snapshot)
+    cursor = thaw_json(frame.cursor)
+    pane = next(
+        (
+            item
+            for item in snapshot["panes"]
+            if item["pane_kind"] == target.pane_kind.value
+        ),
+        None,
+    )
+    if pane is None:
+        raise ValueError("sidecar target pane is absent from its snapshot")
+    expected = (
+        target.source_run_id,
+        target.source_event_sha256,
+        target.timeline_id,
+        target.cursor_id,
+        target.query_id,
+        target.observed_projection_sha256,
+        target.observation_mode.value,
+        target.policy_id,
+        target.render_cursor_time_us,
+        target.snapshot_id,
+        target.pane_availability.value,
+        target.pane_sha256,
+    )
+    actual = (
+        identity["source_run_id"],
+        identity["source_event_sha256"],
+        identity["timeline_id"],
+        cursor["cursor_id"],
+        snapshot["query_id"],
+        identity["observed_projection_sha256"],
+        identity["observation_mode"],
+        identity["policy_id"],
+        identity["render_cursor_time_us"],
+        snapshot["snapshot_id"],
+        pane["availability"],
+        _canonical_sha256(pane),
+    )
+    if actual != expected:
+        raise ValueError("sidecar target differs from its exact report frame")
+
+
 def _build_report_sections(
     frames: tuple[ReplayPresentationFrameV1, ...],
+    *,
+    bookmarks: tuple[ReplayBookmarkV1, ...] | None = None,
+    annotations: tuple[ReplayAnnotationV1, ...] | None = None,
+    branch_comparison: BranchComparisonV1 | None = None,
+    timing_review_packet: TimingLieReviewPacketV1 | None = None,
+    timing_review_result: TimingLieReviewResultV1 | None = None,
 ) -> tuple[PortableReportSection, ...]:
     first = frames[0]
     first_identity = thaw_json(first.identity)
     first_presentation = first.presentation.as_dict()
     deferred_payload = {"reason": "NOT_AVAILABLE_UNTIL_WO36_E", "records": []}
+    bookmark_availability = (
+        ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+        if bookmarks is None
+        else (
+            ReportSectionAvailability.AVAILABLE
+            if bookmarks
+            else ReportSectionAvailability.RECORDED_EMPTY
+        )
+    )
+    annotation_available = bool(annotations) or timing_review_packet is not None
+    annotation_availability = (
+        ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+        if annotations is None and timing_review_packet is None
+        else (
+            ReportSectionAvailability.AVAILABLE
+            if annotation_available
+            else ReportSectionAvailability.RECORDED_EMPTY
+        )
+    )
+    comparison_availability = (
+        ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+        if branch_comparison is None
+        else ReportSectionAvailability.AVAILABLE
+    )
     trace_rows: list[object] = []
     metric_rows: list[object] = []
     provenance_rows: list[object] = []
@@ -1594,16 +1998,46 @@ def _build_report_sections(
         (
             ReportSectionKind.BOOKMARKS,
             "Bookmarks",
-            ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E,
-            "Immutable bookmark producers are intentionally deferred.",
-            deferred_payload,
+            bookmark_availability,
+            (
+                "Immutable bookmarks bound to exact pane, cursor, and snapshot IDs."
+                if bookmarks is not None
+                else "Immutable bookmark producers are intentionally deferred."
+            ),
+            (
+                deferred_payload
+                if bookmarks is None
+                else {"records": [item.as_dict() for item in bookmarks]}
+            ),
         ),
         (
             ReportSectionKind.ANNOTATIONS,
             "Annotations",
-            ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E,
-            "Immutable annotation sidecars are intentionally deferred.",
-            deferred_payload,
+            annotation_availability,
+            (
+                "Immutable analysis revisions and the separate timing-lie review state."
+                if annotations is not None or timing_review_packet is not None
+                else "Immutable annotation sidecars are intentionally deferred."
+            ),
+            (
+                deferred_payload
+                if annotations is None and timing_review_packet is None
+                else {
+                    "records": [
+                        item.as_dict() for item in (annotations or ())
+                    ],
+                    "timing_lie_review_packet": (
+                        None
+                        if timing_review_packet is None
+                        else timing_review_packet.as_dict()
+                    ),
+                    "timing_lie_review_result": (
+                        None
+                        if timing_review_result is None
+                        else timing_review_result.as_dict()
+                    ),
+                }
+            ),
         ),
         (
             ReportSectionKind.SELECTED_SNAPSHOTS,
@@ -1632,9 +2066,20 @@ def _build_report_sections(
         (
             ReportSectionKind.BRANCH_COMPARISON,
             "Branch comparison",
-            ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E,
-            "Counterfactual selection and branch comparison are intentionally deferred.",
-            deferred_payload,
+            comparison_availability,
+            (
+                "Exact parent/branch prefix, divergence, suffix, and outcome comparison."
+                if branch_comparison is not None
+                else (
+                    "Counterfactual selection and branch comparison are intentionally "
+                    "deferred."
+                )
+            ),
+            (
+                deferred_payload
+                if branch_comparison is None
+                else branch_comparison.as_dict()
+            ),
         ),
         (
             ReportSectionKind.METRIC_SUMMARY,
@@ -1908,6 +2353,14 @@ def _validated_report_payload(
         for item in sections
     ] != [item.value for item in REPORT_SECTION_ORDER]:
         raise ValueError("portable report section inventory changed")
+    if any(
+        set(item) != {"availability", "kind", "payload", "summary", "title"}
+        or item["availability"] not in {value.value for value in ReportSectionAvailability}
+        or type(item["summary"]) is not str
+        or type(item["title"]) is not str
+        for item in sections
+    ):
+        raise ValueError("portable report section fields are invalid")
     frames = report["frames"]
     if not isinstance(frames, list) or not frames:
         raise ValueError("portable report payload lacks frames")
@@ -1989,6 +2442,7 @@ def _validated_report_payload(
         raise ValueError("portable report frame order is noncanonical")
     if len(roots) != 1:
         raise ValueError("portable report payload spans multiple authorities")
+    _validate_serialized_wo36e_sections(sections, frames)
     identity = {key: report[key] for key in sorted(identity_fields)}
     expected_report_id = (
         "portable-replay-report-" + _canonical_sha256(identity)[:24]
@@ -2045,6 +2499,2321 @@ def _serialized_frame_authority(frame: Mapping[str, object]) -> dict[str, object
     except KeyError as error:
         raise ValueError("portable report frame authority field is missing") from error
     return authority
+
+
+def _serialized_object(
+    value: object,
+    fields: set[str],
+    label: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{label} fields are invalid")
+    return value
+
+
+def _serialized_list(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    return value
+
+
+def _serialized_text(
+    value: object,
+    label: str,
+    *,
+    maximum: int = 4096,
+    empty: bool = False,
+) -> str:
+    if type(value) is not str or (not empty and not value):
+        raise ValueError(f"{label} is invalid")
+    if len(value) > maximum or unicodedata.normalize("NFC", value) != value:
+        raise ValueError(f"{label} is not bounded NFC text")
+    if any(ord(character) < 32 and character not in "\n\t" for character in value):
+        raise ValueError(f"{label} contains a control character")
+    return value
+
+
+def _serialized_run_id(value: object, label: str) -> str:
+    if type(value) is not str or _RUN_ID.fullmatch(value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _serialized_content_id(
+    value: dict[str, object],
+    id_field: str,
+    prefix: str,
+    label: str,
+) -> None:
+    identity = dict(value)
+    actual = identity.pop(id_field)
+    expected = prefix + _canonical_sha256(identity)[:24]
+    if actual != expected:
+        raise ValueError(f"{label} content-derived ID is invalid")
+
+
+def _validate_serialized_wo36e_sections(
+    sections: list[object],
+    frames: list[object],
+) -> None:
+    by_kind = {
+        section["kind"]: section
+        for section in sections
+        if isinstance(section, dict)
+    }
+    bookmarks = by_kind[ReportSectionKind.BOOKMARKS.value]
+    annotations = by_kind[ReportSectionKind.ANNOTATIONS.value]
+    comparison = by_kind[ReportSectionKind.BRANCH_COMPARISON.value]
+    _validate_serialized_capability_state(
+        frames,
+        bookmarks_available=(
+            bookmarks["availability"]
+            != ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value
+        ),
+        annotations_available=(
+            annotations["availability"]
+            != ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value
+        ),
+        comparison_available=(
+            comparison["availability"]
+            != ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value
+        ),
+    )
+    _validate_serialized_bookmarks_section(bookmarks, frames)
+    _validate_serialized_annotations_section(annotations, frames)
+    _validate_serialized_comparison_section(comparison, frames)
+
+
+def _validate_serialized_capability_state(
+    frames: list[object],
+    *,
+    bookmarks_available: bool,
+    annotations_available: bool,
+    comparison_available: bool,
+) -> None:
+    availability = {
+        DeferredCapabilityKind.BOOKMARK: bookmarks_available,
+        DeferredCapabilityKind.ANNOTATION: annotations_available,
+        DeferredCapabilityKind.COUNTERFACTUAL_SELECTION: comparison_available,
+        DeferredCapabilityKind.COMPARISON: comparison_available,
+    }
+    expected = [
+        {
+            "capability": capability.value,
+            "reason": (
+                None
+                if availability[capability]
+                else DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value
+            ),
+            "status": (
+                DeferredCapabilityStatus.AVAILABLE.value
+                if availability[capability]
+                else DeferredCapabilityStatus.NOT_AVAILABLE_UNTIL_WO36_E.value
+            ),
+        }
+        for capability in DeferredCapabilityKind
+    ]
+    for frame in frames:
+        frame_root = _serialized_object(
+            frame,
+            {
+                "cursor",
+                "frame_id",
+                "identity",
+                "overlay_set",
+                "pane_snapshot",
+                "presentation",
+                "schema_id",
+                "schema_version",
+                "timeline_root",
+            },
+            "portable report frame",
+        )
+        presentation = frame_root["presentation"]
+        if not isinstance(presentation, dict) or presentation.get(
+            "deferred_capabilities"
+        ) != expected:
+            raise ValueError(
+                "serialized WO36-E capability declarations differ from sections"
+            )
+        if not comparison_available:
+            _validate_serialized_unavailable_comparison_pane(frame_root)
+
+
+def _deferred_wo36e_payload() -> dict[str, object]:
+    return {"reason": "NOT_AVAILABLE_UNTIL_WO36_E", "records": []}
+
+
+def _validate_serialized_wo36e_section_declaration(
+    section: dict[str, object],
+    *,
+    kind: ReportSectionKind,
+    title: str,
+    available_summary: str,
+    deferred_summary: str,
+) -> None:
+    deferred = (
+        section["availability"]
+        == ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value
+    )
+    if (
+        section["kind"] != kind.value
+        or section["title"] != title
+        or section["summary"]
+        != (deferred_summary if deferred else available_summary)
+    ):
+        raise ValueError(f"serialized {kind.value} section declaration changed")
+
+
+def _validate_serialized_bookmarks_section(
+    section: dict[str, object],
+    frames: list[object],
+) -> None:
+    _validate_serialized_wo36e_section_declaration(
+        section,
+        kind=ReportSectionKind.BOOKMARKS,
+        title="Bookmarks",
+        available_summary=(
+            "Immutable bookmarks bound to exact pane, cursor, and snapshot IDs."
+        ),
+        deferred_summary="Immutable bookmark producers are intentionally deferred.",
+    )
+    availability = section["availability"]
+    if availability == ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value:
+        if section["payload"] != _deferred_wo36e_payload():
+            raise ValueError("deferred bookmark section payload changed")
+        return
+    if availability not in {
+        ReportSectionAvailability.AVAILABLE.value,
+        ReportSectionAvailability.RECORDED_EMPTY.value,
+    }:
+        raise ValueError("bookmark section availability is invalid")
+    payload = _serialized_object(
+        section["payload"],
+        {"records"},
+        "bookmark section payload",
+    )
+    records = _serialized_list(payload["records"], "bookmark records")
+    if (availability == ReportSectionAvailability.AVAILABLE.value) != bool(records):
+        raise ValueError("bookmark section availability differs from its records")
+    ids: list[str] = []
+    by_id: dict[str, dict[str, object]] = {}
+    for value in records:
+        record = _validate_serialized_bookmark(value, frames)
+        bookmark_id = record["bookmark_id"]
+        assert isinstance(bookmark_id, str)
+        ids.append(bookmark_id)
+        by_id[bookmark_id] = record
+    if ids != sorted(ids) or len(ids) != len(set(ids)):
+        raise ValueError("bookmark section order or identity is noncanonical")
+    _validate_serialized_predecessor_links(
+        by_id,
+        id_field="bookmark_id",
+        predecessor_id_field="predecessor_bookmark_id",
+        predecessor_digest_field="predecessor_sha256",
+        target_field="target",
+        label="bookmark",
+    )
+
+
+def _validate_serialized_bookmark(
+    value: object,
+    frames: list[object],
+) -> dict[str, object]:
+    record = _serialized_object(
+        value,
+        {
+            "author_id",
+            "bookmark_id",
+            "label",
+            "predecessor_bookmark_id",
+            "predecessor_sha256",
+            "revision",
+            "schema_id",
+            "schema_version",
+            "source_mutation_policy",
+            "tags",
+            "target",
+        },
+        "bookmark",
+    )
+    if (
+        record["schema_id"] != REPLAY_BOOKMARK_SCHEMA_ID
+        or record["schema_version"] != REPLAY_BOOKMARK_SCHEMA_VERSION
+        or record["source_mutation_policy"] != SOURCE_MUTATION_POLICY
+    ):
+        raise ValueError("bookmark schema or source policy is invalid")
+    _identifier(record["author_id"], "bookmark author ID")
+    _serialized_text(record["label"], "bookmark label", maximum=256)
+    _positive_int(record["revision"], "bookmark revision")
+    _validate_serialized_tags(record["tags"], "bookmark tags")
+    _validate_serialized_predecessor_fields(
+        record,
+        "predecessor_bookmark_id",
+        "predecessor_sha256",
+        "bookmark",
+    )
+    _validate_serialized_sidecar_target(record["target"], frames)
+    _serialized_content_id(record, "bookmark_id", "replay-bookmark-", "bookmark")
+    return record
+
+
+def _validate_serialized_annotations_section(
+    section: dict[str, object],
+    frames: list[object],
+) -> None:
+    _validate_serialized_wo36e_section_declaration(
+        section,
+        kind=ReportSectionKind.ANNOTATIONS,
+        title="Annotations",
+        available_summary=(
+            "Immutable analysis revisions and the separate timing-lie review state."
+        ),
+        deferred_summary="Immutable annotation sidecars are intentionally deferred.",
+    )
+    availability = section["availability"]
+    if availability == ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value:
+        if section["payload"] != _deferred_wo36e_payload():
+            raise ValueError("deferred annotation section payload changed")
+        return
+    if availability not in {
+        ReportSectionAvailability.AVAILABLE.value,
+        ReportSectionAvailability.RECORDED_EMPTY.value,
+    }:
+        raise ValueError("annotation section availability is invalid")
+    payload = _serialized_object(
+        section["payload"],
+        {"records", "timing_lie_review_packet", "timing_lie_review_result"},
+        "annotation section payload",
+    )
+    records = _serialized_list(payload["records"], "annotation records")
+    packet = payload["timing_lie_review_packet"]
+    result = payload["timing_lie_review_result"]
+    if (packet is None) != (result is None):
+        raise ValueError("serialized timing packet and result must travel together")
+    has_content = bool(records) or packet is not None
+    if (availability == ReportSectionAvailability.AVAILABLE.value) != has_content:
+        raise ValueError("annotation section availability differs from its records")
+    ids: list[str] = []
+    by_id: dict[str, dict[str, object]] = {}
+    for value in records:
+        record = _validate_serialized_annotation(value, frames)
+        annotation_id = record["annotation_id"]
+        assert isinstance(annotation_id, str)
+        ids.append(annotation_id)
+        by_id[annotation_id] = record
+    if ids != sorted(ids) or len(ids) != len(set(ids)):
+        raise ValueError("annotation section order or identity is noncanonical")
+    _validate_serialized_predecessor_links(
+        by_id,
+        id_field="annotation_id",
+        predecessor_id_field="predecessor_annotation_id",
+        predecessor_digest_field="predecessor_sha256",
+        target_field="target",
+        label="annotation",
+    )
+    if packet is not None:
+        packet_root = _validate_serialized_timing_packet(packet, frames)
+        _validate_serialized_timing_result(result, packet_root)
+
+
+def _validate_serialized_annotation(
+    value: object,
+    frames: list[object],
+) -> dict[str, object]:
+    record = _serialized_object(
+        value,
+        {
+            "annotation_id",
+            "author_id",
+            "body",
+            "kind",
+            "predecessor_annotation_id",
+            "predecessor_sha256",
+            "revision",
+            "schema_id",
+            "schema_version",
+            "source_mutation_policy",
+            "tags",
+            "target",
+        },
+        "annotation",
+    )
+    if (
+        record["schema_id"] != REPLAY_ANNOTATION_SCHEMA_ID
+        or record["schema_version"] != REPLAY_ANNOTATION_SCHEMA_VERSION
+        or record["source_mutation_policy"] != SOURCE_MUTATION_POLICY
+        or record["kind"]
+        not in {
+            "ANALYSIS_NOTE",
+            "QUESTION",
+            "TIMING_LIE_CANDIDATE",
+            "CAUSAL_LANGUAGE_NOTE",
+        }
+    ):
+        raise ValueError("annotation schema, kind, or source policy is invalid")
+    _identifier(record["author_id"], "annotation author ID")
+    _serialized_text(record["body"], "annotation body", maximum=8192)
+    _positive_int(record["revision"], "annotation revision")
+    _validate_serialized_tags(record["tags"], "annotation tags")
+    _validate_serialized_predecessor_fields(
+        record,
+        "predecessor_annotation_id",
+        "predecessor_sha256",
+        "annotation",
+    )
+    _validate_serialized_sidecar_target(record["target"], frames)
+    _serialized_content_id(
+        record,
+        "annotation_id",
+        "replay-annotation-",
+        "annotation",
+    )
+    return record
+
+
+def _validate_serialized_tags(value: object, label: str) -> None:
+    tags = _serialized_list(value, label)
+    if any(type(item) is not str for item in tags):
+        raise ValueError(f"{label} contains a non-text tag")
+    for item in tags:
+        _identifier(item, label)
+    if tags != sorted(tags, key=lambda item: item.encode("utf-8")) or len(tags) != len(
+        set(tags)
+    ):
+        raise ValueError(f"{label} is noncanonical")
+
+
+def _validate_serialized_predecessor_fields(
+    record: dict[str, object],
+    predecessor_id_field: str,
+    predecessor_digest_field: str,
+    label: str,
+) -> None:
+    predecessor_id = record[predecessor_id_field]
+    predecessor_digest = record[predecessor_digest_field]
+    revision = record["revision"]
+    if (predecessor_id is None) != (predecessor_digest is None):
+        raise ValueError(f"{label} predecessor ID and digest differ")
+    if revision == 1:
+        if predecessor_id is not None:
+            raise ValueError(f"first {label} revision has a predecessor")
+    else:
+        _identifier(predecessor_id, f"{label} predecessor ID")
+        _sha256(predecessor_digest, f"{label} predecessor digest")
+
+
+def _validate_serialized_predecessor_links(
+    records: dict[str, dict[str, object]],
+    *,
+    id_field: str,
+    predecessor_id_field: str,
+    predecessor_digest_field: str,
+    target_field: str,
+    label: str,
+) -> None:
+    for record in records.values():
+        predecessor_id = record[predecessor_id_field]
+        if predecessor_id not in records:
+            continue
+        predecessor = records[predecessor_id]
+        if (
+            record["revision"] != predecessor["revision"] + 1
+            or record[target_field] != predecessor[target_field]
+            or record[predecessor_digest_field]
+            != hashlib.sha256(_canonical_json_bytes(predecessor)).hexdigest()
+            or predecessor[id_field] != predecessor_id
+        ):
+            raise ValueError(f"serialized {label} predecessor chain is invalid")
+
+
+def _validate_serialized_sidecar_target(
+    value: object,
+    frames: list[object],
+) -> dict[str, object]:
+    target = _serialized_object(
+        value,
+        {
+            "cursor_id",
+            "observation_mode",
+            "observed_projection_sha256",
+            "pane_availability",
+            "pane_kind",
+            "pane_sha256",
+            "policy_id",
+            "query_id",
+            "render_cursor_time_us",
+            "schema_id",
+            "schema_version",
+            "snapshot_id",
+            "source_event_sha256",
+            "source_mutation_policy",
+            "source_run_id",
+            "target_id",
+            "timeline_id",
+        },
+        "replay sidecar target",
+    )
+    if (
+        target["schema_id"] != REPLAY_SIDECAR_TARGET_SCHEMA_ID
+        or target["schema_version"] != REPLAY_SIDECAR_TARGET_SCHEMA_VERSION
+        or target["source_mutation_policy"] != SOURCE_MUTATION_POLICY
+        or target["observation_mode"] not in {item.value for item in ObservationMode}
+        or target["pane_kind"] not in {item.value for item in PaneKind}
+        or target["pane_availability"] not in {item.value for item in PaneAvailability}
+    ):
+        raise ValueError("replay sidecar target schema or enum is invalid")
+    _serialized_run_id(target["source_run_id"], "sidecar target source run ID")
+    _sha256(target["source_event_sha256"], "sidecar target source digest")
+    _sha256(
+        target["observed_projection_sha256"],
+        "sidecar target observed projection digest",
+    )
+    _sha256(target["pane_sha256"], "sidecar target pane digest")
+    for field_name in ("cursor_id", "query_id", "snapshot_id", "timeline_id"):
+        _identifier(target[field_name], f"sidecar target {field_name}")
+    _nonnegative_int(target["render_cursor_time_us"], "sidecar target cursor")
+    mode = ObservationMode(target["observation_mode"])
+    if target["policy_id"] != ObservationPolicy(mode).policy_id:
+        raise ValueError("sidecar target mode and policy differ")
+    _serialized_content_id(
+        target,
+        "target_id",
+        "replay-sidecar-target-",
+        "replay sidecar target",
+    )
+    _validate_serialized_target_against_frames(target, frames)
+    return target
+
+
+def _validate_serialized_target_against_frames(
+    target: dict[str, object],
+    frames: list[object],
+) -> None:
+    matches = [
+        frame
+        for frame in frames
+        if isinstance(frame, dict)
+        and isinstance(frame.get("identity"), dict)
+        and frame["identity"].get("cursor_id") == target["cursor_id"]
+    ]
+    if len(matches) != 1:
+        raise ValueError("serialized sidecar target cursor is absent or ambiguous")
+    frame = matches[0]
+    identity = frame["identity"]
+    cursor = frame["cursor"]
+    snapshot = frame["pane_snapshot"]
+    if not all(isinstance(item, dict) for item in (identity, cursor, snapshot)):
+        raise ValueError("serialized sidecar target frame roots are invalid")
+    panes = snapshot.get("panes")
+    if not isinstance(panes, list):
+        raise ValueError("serialized sidecar target pane inventory is invalid")
+    pane_matches = [
+        item
+        for item in panes
+        if isinstance(item, dict) and item.get("pane_kind") == target["pane_kind"]
+    ]
+    if len(pane_matches) != 1:
+        raise ValueError("serialized sidecar target pane is absent or ambiguous")
+    pane = pane_matches[0]
+    expected = (
+        identity.get("source_run_id"),
+        identity.get("source_event_sha256"),
+        identity.get("timeline_id"),
+        cursor.get("cursor_id"),
+        snapshot.get("query_id"),
+        identity.get("observed_projection_sha256"),
+        identity.get("observation_mode"),
+        identity.get("policy_id"),
+        identity.get("render_cursor_time_us"),
+        snapshot.get("snapshot_id"),
+        pane.get("availability"),
+        _canonical_sha256(pane),
+    )
+    actual = (
+        target["source_run_id"],
+        target["source_event_sha256"],
+        target["timeline_id"],
+        target["cursor_id"],
+        target["query_id"],
+        target["observed_projection_sha256"],
+        target["observation_mode"],
+        target["policy_id"],
+        target["render_cursor_time_us"],
+        target["snapshot_id"],
+        target["pane_availability"],
+        target["pane_sha256"],
+    )
+    if actual != expected:
+        raise ValueError("serialized sidecar target differs from its exact frame")
+
+
+def _validate_serialized_timing_packet(
+    value: object,
+    frames: list[object],
+) -> dict[str, object]:
+    packet = _serialized_object(
+        value,
+        {
+            "human_result",
+            "human_review_authority",
+            "observation_mode",
+            "packet_id",
+            "policy_id",
+            "rubric_version",
+            "schema_id",
+            "schema_version",
+            "searches",
+            "source_event_sha256",
+            "source_mutation_policy",
+            "source_run_id",
+            "technical_status",
+            "timeline_id",
+        },
+        "timing-lie review packet",
+    )
+    if (
+        packet["schema_id"] != TIMING_LIE_REVIEW_PACKET_SCHEMA_ID
+        or packet["schema_version"] != TIMING_LIE_REVIEW_PACKET_SCHEMA_VERSION
+        or packet["rubric_version"] != TIMING_LIE_RUBRIC_VERSION
+        or packet["source_mutation_policy"] != SOURCE_MUTATION_POLICY
+        or packet["human_review_authority"] != HUMAN_REVIEW_AUTHORITY
+        or packet["technical_status"]
+        != TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW.value
+        or packet["human_result"] != TimingLieHumanResult.PENDING.value
+    ):
+        raise ValueError("timing-lie review packet authority or schema is invalid")
+    searches = _serialized_list(packet["searches"], "timing-lie searches")
+    if len(searches) != len(TIMING_LIE_RUBRIC_ORDER):
+        raise ValueError("timing-lie packet search inventory changed")
+    authority: tuple[object, ...] | None = None
+    for expected_search, value_search in zip(
+        TIMING_LIE_RUBRIC_ORDER,
+        searches,
+        strict=True,
+    ):
+        search = _serialized_object(
+            value_search,
+            {
+                "human_result",
+                "prompt",
+                "search",
+                "search_id",
+                "targets",
+                "technical_status",
+            },
+            "timing-lie search",
+        )
+        if (
+            search["search"] != expected_search.value
+            or search["prompt"] != TIMING_LIE_RUBRIC_PROMPTS[expected_search]
+            or search["technical_status"]
+            != TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW.value
+            or search["human_result"] != TimingLieHumanResult.PENDING.value
+        ):
+            raise ValueError("timing-lie search contract changed")
+        targets = _serialized_list(search["targets"], "timing-lie search targets")
+        validated = [
+            _validate_serialized_sidecar_target(item, frames) for item in targets
+        ]
+        target_ids = [item["target_id"] for item in validated]
+        if (
+            not validated
+            or target_ids != sorted(target_ids)
+            or len(target_ids) != len(set(target_ids))
+        ):
+            raise ValueError("timing-lie search targets are noncanonical")
+        for target in validated:
+            target_authority = (
+                target["source_run_id"],
+                target["source_event_sha256"],
+                target["timeline_id"],
+                target["observation_mode"],
+                target["policy_id"],
+            )
+            if authority is None:
+                authority = target_authority
+            elif authority != target_authority:
+                raise ValueError("timing-lie targets span multiple authorities")
+        _serialized_content_id(
+            search,
+            "search_id",
+            "timing-lie-search-",
+            "timing-lie search",
+        )
+    assert authority is not None
+    if (
+        packet["source_run_id"],
+        packet["source_event_sha256"],
+        packet["timeline_id"],
+        packet["observation_mode"],
+        packet["policy_id"],
+    ) != authority:
+        raise ValueError("timing-lie packet root differs from its targets")
+    _serialized_run_id(packet["source_run_id"], "timing packet source run ID")
+    _sha256(packet["source_event_sha256"], "timing packet source digest")
+    _identifier(packet["timeline_id"], "timing packet timeline ID")
+    _serialized_content_id(
+        packet,
+        "packet_id",
+        "timing-lie-review-packet-",
+        "timing-lie review packet",
+    )
+    return packet
+
+
+def _validate_serialized_timing_result(
+    value: object,
+    packet: dict[str, object],
+) -> None:
+    result = _serialized_object(
+        value,
+        {
+            "human_result",
+            "packet_id",
+            "packet_sha256",
+            "result_id",
+            "reviewer_sidecar_id",
+            "reviewer_sidecar_sha256",
+            "schema_id",
+            "schema_version",
+            "source_event_sha256",
+            "source_mutation_policy",
+            "source_run_id",
+            "technical_status",
+        },
+        "timing-lie review result",
+    )
+    if (
+        result["schema_id"] != TIMING_LIE_REVIEW_RESULT_SCHEMA_ID
+        or result["schema_version"] != TIMING_LIE_REVIEW_RESULT_SCHEMA_VERSION
+        or result["source_mutation_policy"] != SOURCE_MUTATION_POLICY
+        or result["technical_status"]
+        != TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW.value
+        or result["human_result"] not in {item.value for item in TimingLieHumanResult}
+    ):
+        raise ValueError("timing-lie review result schema or status is invalid")
+    if (
+        result["packet_id"] != packet["packet_id"]
+        or result["packet_sha256"]
+        != hashlib.sha256(_canonical_json_bytes(packet)).hexdigest()
+        or result["source_run_id"] != packet["source_run_id"]
+        or result["source_event_sha256"] != packet["source_event_sha256"]
+    ):
+        raise ValueError("timing-lie review result differs from its packet")
+    sidecar_id = result["reviewer_sidecar_id"]
+    sidecar_sha256 = result["reviewer_sidecar_sha256"]
+    if (sidecar_id is None) != (sidecar_sha256 is None):
+        raise ValueError("timing-lie reviewer reference is incomplete")
+    if sidecar_id is not None:
+        _identifier(sidecar_id, "timing-lie reviewer sidecar ID")
+        _sha256(sidecar_sha256, "timing-lie reviewer sidecar digest")
+        # A pointer is not reviewer authority.  Until this portable schema carries
+        # and verifies the sidecar bytes (and their authority receipt), relocation
+        # verification must fail closed instead of laundering a repinned verdict.
+        raise ValueError(
+            "portable timing-lie result cannot verify an external reviewer sidecar"
+        )
+    if result["human_result"] != TimingLieHumanResult.PENDING.value:
+        raise ValueError("portable timing-lie human result must remain pending")
+    _serialized_content_id(
+        result,
+        "result_id",
+        "timing-lie-review-result-",
+        "timing-lie review result",
+    )
+
+
+def _serialized_comparison_pane_pair(
+    frame: dict[str, object],
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    identity = frame.get("identity")
+    snapshot = frame.get("pane_snapshot")
+    presentation = frame.get("presentation")
+    if not all(isinstance(item, dict) for item in (identity, snapshot, presentation)):
+        raise ValueError("comparison pane frame roots are invalid")
+    assert isinstance(identity, dict)
+    assert isinstance(snapshot, dict)
+    assert isinstance(presentation, dict)
+    panes = snapshot.get("panes")
+    presentation_panes = presentation.get("panes")
+    if not isinstance(panes, list) or not isinstance(presentation_panes, list):
+        raise ValueError("comparison pane inventories are invalid")
+    snapshot_matches = [
+        item
+        for item in panes
+        if isinstance(item, dict)
+        and item.get("pane_kind") == PaneKind.COUNTERFACTUAL_COMPARISON.value
+    ]
+    presentation_matches = [
+        item
+        for item in presentation_panes
+        if isinstance(item, dict)
+        and item.get("pane_kind") == PaneKind.COUNTERFACTUAL_COMPARISON.value
+    ]
+    if len(snapshot_matches) != 1 or len(presentation_matches) != 1:
+        raise ValueError("comparison pane is absent or ambiguous")
+    return identity, snapshot, snapshot_matches[0], presentation_matches[0]
+
+
+def _validate_serialized_comparison_pane_root(
+    *,
+    identity: dict[str, object],
+    snapshot: dict[str, object],
+    pane: dict[str, object],
+) -> None:
+    expected = (
+        PaneKind.COUNTERFACTUAL_COMPARISON.value,
+        identity.get("observation_mode"),
+        identity.get("policy_id"),
+        snapshot.get("query_id"),
+        identity.get("render_cursor_time_us"),
+    )
+    actual = (
+        pane["pane_kind"],
+        pane["observation_mode"],
+        pane["policy_id"],
+        pane["query_id"],
+        pane["render_cursor_time_us"],
+    )
+    if actual != expected or snapshot.get("query_id") != identity.get("query_id"):
+        raise ValueError("comparison pane root differs from its exact frame")
+
+
+def _validate_serialized_comparison_presentation_root(
+    value: object,
+    *,
+    availability: PaneAvailability,
+    renderer: PaneRendererKind,
+    explanation: str | None,
+    semantic_role: PresentationSemanticRole,
+) -> dict[str, object]:
+    presentation = _serialized_object(
+        value,
+        {
+            "availability",
+            "display_order",
+            "explanation",
+            "integrity_assessment",
+            "market_classification",
+            "pane_kind",
+            "presentation_schema_id",
+            "presentation_schema_version",
+            "renderer_kind",
+            "rows",
+            "semantic_role",
+            "source_references",
+            "title",
+        },
+        "counterfactual comparison pane presentation",
+    )
+    expected = (
+        availability.value,
+        PANE_ORDER.index(PaneKind.COUNTERFACTUAL_COMPARISON),
+        explanation,
+        IntegrityAssessment.NOT_ASSESSED.value,
+        MarketClassification.NOT_APPLICABLE.value,
+        PaneKind.COUNTERFACTUAL_COMPARISON.value,
+        "KIRBY2_PANE_PRESENTATION_V1",
+        1,
+        renderer.value,
+        semantic_role.value,
+        [],
+        _PANE_PRESENTATION[PaneKind.COUNTERFACTUAL_COMPARISON][0],
+    )
+    actual = (
+        presentation["availability"],
+        presentation["display_order"],
+        presentation["explanation"],
+        presentation["integrity_assessment"],
+        presentation["market_classification"],
+        presentation["pane_kind"],
+        presentation["presentation_schema_id"],
+        presentation["presentation_schema_version"],
+        presentation["renderer_kind"],
+        presentation["semantic_role"],
+        presentation["source_references"],
+        presentation["title"],
+    )
+    if actual != expected:
+        raise ValueError("comparison pane presentation declaration changed")
+    return presentation
+
+
+def _validate_serialized_unavailable_comparison_pane(
+    frame: dict[str, object],
+) -> None:
+    identity, snapshot, value, presentation_value = (
+        _serialized_comparison_pane_pair(frame)
+    )
+    pane = _serialized_object(
+        value,
+        {
+            "availability",
+            "data",
+            "explanation",
+            "observation_mode",
+            "pane_kind",
+            "policy_id",
+            "query_id",
+            "queue_estimates",
+            "render_cursor_time_us",
+        },
+        "unavailable counterfactual comparison pane",
+    )
+    _validate_serialized_comparison_pane_root(
+        identity=identity,
+        snapshot=snapshot,
+        pane=pane,
+    )
+    expected_explanation = {
+        "detail": "no counterfactual branch comparison is selected",
+        "reason": PaneUnavailableReason.COUNTERFACTUAL_NOT_SELECTED.value,
+    }
+    if (
+        pane["availability"] != PaneAvailability.UNAVAILABLE.value
+        or pane["data"] != []
+        or pane["queue_estimates"] != []
+        or pane["explanation"] != expected_explanation
+    ):
+        raise ValueError("unavailable comparison pane payload is invalid")
+    presentation = _validate_serialized_comparison_presentation_root(
+        presentation_value,
+        availability=PaneAvailability.UNAVAILABLE,
+        renderer=PaneRendererKind.TYPED_UNAVAILABLE,
+        explanation=(
+            f"{PaneUnavailableReason.COUNTERFACTUAL_NOT_SELECTED.value}: "
+            "no counterfactual branch comparison is selected"
+        ),
+        semantic_role=PresentationSemanticRole.UNAVAILABLE,
+    )
+    if presentation["rows"] != []:
+        raise ValueError("unavailable comparison pane presentation carries rows")
+
+
+def _validate_serialized_comparison_section(
+    section: dict[str, object],
+    frames: list[object],
+) -> None:
+    _validate_serialized_wo36e_section_declaration(
+        section,
+        kind=ReportSectionKind.BRANCH_COMPARISON,
+        title="Branch comparison",
+        available_summary=(
+            "Exact parent/branch prefix, divergence, suffix, and outcome comparison."
+        ),
+        deferred_summary=(
+            "Counterfactual selection and branch comparison are intentionally "
+            "deferred."
+        ),
+    )
+    availability = section["availability"]
+    if availability == ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E.value:
+        if section["payload"] != _deferred_wo36e_payload():
+            raise ValueError("deferred comparison section payload changed")
+        return
+    if availability != ReportSectionAvailability.AVAILABLE.value:
+        raise ValueError("branch comparison section availability is invalid")
+    comparison = _validate_serialized_branch_comparison(section["payload"])
+    first = frames[0]
+    if not isinstance(first, dict) or not isinstance(first.get("identity"), dict):
+        raise ValueError("branch comparison report frame identity is invalid")
+    identity = first["identity"]
+    expected = (
+        identity.get("source_run_id"),
+        identity.get("source_event_sha256"),
+        identity.get("observation_mode"),
+        identity.get("policy_id"),
+    )
+    actual = (
+        comparison["source_run_id"],
+        comparison["source_event_sha256"],
+        comparison["observation_mode"],
+        comparison["policy_id"],
+    )
+    if actual != expected:
+        raise ValueError("serialized branch comparison differs from frame authority")
+    _validate_serialized_comparison_pane_bindings(frames, comparison)
+
+
+def _validate_serialized_comparison_pane_bindings(
+    frames: list[object],
+    comparison: dict[str, object],
+) -> None:
+    comparison_sha256 = hashlib.sha256(
+        _canonical_json_bytes(comparison)
+    ).hexdigest()
+    branch_identity = comparison["branch_identity"]
+    assert isinstance(branch_identity, dict)
+    for frame in frames:
+        if not isinstance(frame, dict):
+            raise ValueError("comparison pane frame is invalid")
+        identity, snapshot, pane_value, presentation_value = (
+            _serialized_comparison_pane_pair(frame)
+        )
+        pane = _serialized_object(
+            pane_value,
+            {
+                "availability",
+                "comparison_references",
+                "data",
+                "explanation",
+                "observation_mode",
+                "pane_kind",
+                "policy_id",
+                "query_id",
+                "queue_estimates",
+                "render_cursor_time_us",
+            },
+            "counterfactual comparison pane",
+        )
+        _validate_serialized_comparison_pane_root(
+            identity=identity,
+            snapshot=snapshot,
+            pane=pane,
+        )
+        references = _serialized_list(
+            pane["comparison_references"],
+            "counterfactual comparison pane references",
+        )
+        if (
+            pane["availability"] != PaneAvailability.AVAILABLE.value
+            or pane["data"] != []
+            or pane["queue_estimates"] != []
+            or pane["explanation"] is not None
+            or len(references) != 1
+        ):
+            raise ValueError("available comparison pane payload is invalid")
+        reference = _serialized_object(
+            references[0],
+            {
+                "binding",
+                "observed_projection_sha256",
+                "query_id",
+                "reference_id",
+                "render_cursor_time_us",
+                "schema_id",
+                "schema_version",
+            },
+            "counterfactual comparison pane reference",
+        )
+        if (
+            reference["schema_id"]
+            != COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID
+            or reference["schema_version"]
+            != COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION
+            or reference["observed_projection_sha256"]
+            != identity.get("observed_projection_sha256")
+            or reference["query_id"] != snapshot.get("query_id")
+            or reference["render_cursor_time_us"]
+            != identity.get("render_cursor_time_us")
+        ):
+            raise ValueError("comparison pane reference differs from its frame")
+        _sha256(
+            reference["observed_projection_sha256"],
+            "comparison pane observed projection digest",
+        )
+        _identifier(reference["query_id"], "comparison pane query ID")
+        _nonnegative_int(
+            reference["render_cursor_time_us"],
+            "comparison pane render cursor",
+        )
+        binding = _serialized_object(
+            reference["binding"],
+            {
+                "binding_id",
+                "branch_identity_id",
+                "branch_run_id",
+                "comparison_id",
+                "comparison_sha256",
+                "observation_mode",
+                "policy_id",
+                "report_section_kind",
+                "schema_id",
+                "schema_version",
+                "source_event_sha256",
+                "source_run_id",
+            },
+            "counterfactual comparison pane binding",
+        )
+        expected_binding = (
+            comparison["source_run_id"],
+            comparison["source_event_sha256"],
+            comparison["observation_mode"],
+            comparison["policy_id"],
+            comparison["comparison_id"],
+            comparison_sha256,
+            branch_identity["branch_identity_id"],
+            branch_identity["branch_run_id"],
+        )
+        actual_binding = (
+            binding["source_run_id"],
+            binding["source_event_sha256"],
+            binding["observation_mode"],
+            binding["policy_id"],
+            binding["comparison_id"],
+            binding["comparison_sha256"],
+            binding["branch_identity_id"],
+            binding["branch_run_id"],
+        )
+        if (
+            actual_binding != expected_binding
+            or binding["report_section_kind"]
+            != COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND
+            or binding["schema_id"]
+            != COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID
+            or binding["schema_version"]
+            != COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION
+        ):
+            raise ValueError("comparison pane binding differs from report comparison")
+        _serialized_content_id(
+            binding,
+            "binding_id",
+            "counterfactual-comparison-binding-",
+            "counterfactual comparison pane binding",
+        )
+        _serialized_content_id(
+            reference,
+            "reference_id",
+            "counterfactual-comparison-reference-",
+            "counterfactual comparison pane reference",
+        )
+        pane_presentation = _validate_serialized_comparison_presentation_root(
+            presentation_value,
+            availability=PaneAvailability.AVAILABLE,
+            renderer=PaneRendererKind.EVIDENCE_CARD,
+            explanation=None,
+            semantic_role=PresentationSemanticRole.NEUTRAL,
+        )
+        rows = _serialized_list(
+            pane_presentation["rows"],
+            "counterfactual comparison presentation rows",
+        )
+        if len(rows) != 1:
+            raise ValueError("comparison pane presentation is invalid")
+        row = _serialized_object(
+            rows[0],
+            {
+                "branch_run_id",
+                "cited_comparison_reference_id",
+                "comparison_id",
+                "comparison_sha256",
+                "display_order",
+                "display_text",
+                "label",
+                "raw_value_kind",
+                "semantic_role",
+                "source_event_ids",
+                "unit",
+            },
+            "counterfactual comparison presentation row",
+        )
+        expected_row = (
+            reference["reference_id"],
+            comparison["comparison_id"],
+            comparison_sha256,
+            branch_identity["branch_run_id"],
+            0,
+            _canonical_json_bytes(reference).decode("ascii"),
+            "selected counterfactual branch",
+            "CANONICAL_JSON_REFERENCE",
+            PresentationSemanticRole.NEUTRAL.value,
+            [],
+            "content_addressed_reference",
+        )
+        actual_row = (
+            row["cited_comparison_reference_id"],
+            row["comparison_id"],
+            row["comparison_sha256"],
+            row["branch_run_id"],
+            row["display_order"],
+            row["display_text"],
+            row["label"],
+            row["raw_value_kind"],
+            row["semantic_role"],
+            row["source_event_ids"],
+            row["unit"],
+        )
+        if actual_row != expected_row:
+            raise ValueError("comparison pane presentation row is unbound")
+
+
+def _validate_serialized_branch_comparison(
+    value: object,
+) -> dict[str, object]:
+    comparison = _serialized_object(
+        value,
+        {
+            "branch_identity",
+            "comparison_id",
+            "deltas",
+            "first_difference",
+            "interpretation",
+            "mechanistic_trace",
+            "observation_mode",
+            "overlays",
+            "policy_id",
+            "schema_id",
+            "schema_version",
+            "source_event_sha256",
+            "source_run_id",
+            "synchronization",
+        },
+        "branch comparison",
+    )
+    if (
+        comparison["schema_id"] != BRANCH_COMPARISON_SCHEMA_ID
+        or comparison["schema_version"] != BRANCH_COMPARISON_SCHEMA_VERSION
+        or comparison["interpretation"] != COMPARISON_INTERPRETATION
+        or comparison["observation_mode"] not in {item.value for item in ObservationMode}
+    ):
+        raise ValueError("branch comparison schema, interpretation, or mode is invalid")
+    source_run_id = _serialized_run_id(
+        comparison["source_run_id"],
+        "branch comparison source run ID",
+    )
+    _sha256(comparison["source_event_sha256"], "branch comparison source digest")
+    mode = ObservationMode(comparison["observation_mode"])
+    if comparison["policy_id"] != ObservationPolicy(mode).policy_id:
+        raise ValueError("branch comparison mode and policy differ")
+    synchronization = _validate_serialized_synchronization(
+        comparison["synchronization"]
+    )
+    first = _validate_serialized_first_difference(
+        comparison["first_difference"],
+        synchronization,
+    )
+    branch_identity = _validate_serialized_branch_identity(
+        comparison["branch_identity"],
+        source_run_id=source_run_id,
+        source_event_sha256=comparison["source_event_sha256"],
+        synchronization=synchronization,
+        first_difference=first,
+    )
+    known_events = _comparison_known_event_sources(synchronization)
+    _validate_serialized_comparison_deltas(
+        comparison["deltas"],
+        known_events,
+    )
+    _validate_serialized_comparison_input_ids(
+        comparison,
+        branch_identity=branch_identity,
+        synchronization=synchronization,
+    )
+    _validate_serialized_comparison_overlays(
+        comparison["overlays"],
+        branch_identity=branch_identity,
+        known_events=known_events,
+        mode=mode,
+    )
+    _validate_serialized_comparison_trace(
+        comparison["mechanistic_trace"],
+        source_run_id=source_run_id,
+    )
+    _serialized_content_id(
+        comparison,
+        "comparison_id",
+        "branch-comparison-",
+        "branch comparison",
+    )
+    return comparison
+
+
+def _validate_serialized_comparison_event(
+    value: object,
+    label: str,
+) -> dict[str, object]:
+    event = _serialized_object(
+        value,
+        {
+            "event_id",
+            "kind",
+            "payload",
+            "payload_sha256",
+            "schema_id",
+            "schema_version",
+            "sequence",
+            "simulation_time_us",
+        },
+        label,
+    )
+    if (
+        event["schema_id"] != COMPARISON_EVENT_SCHEMA_ID
+        or event["schema_version"] != COMPARISON_EVENT_SCHEMA_VERSION
+        or not isinstance(event["payload"], dict)
+    ):
+        raise ValueError(f"{label} schema or payload is invalid")
+    _identifier(event["kind"], f"{label} kind")
+    _positive_int(event["sequence"], f"{label} sequence")
+    _nonnegative_int(event["simulation_time_us"], f"{label} time")
+    if event["payload_sha256"] != _canonical_sha256(event["payload"]):
+        raise ValueError(f"{label} payload digest is invalid")
+    identity = {
+        "kind": event["kind"],
+        "payload": event["payload"],
+        "schema_id": event["schema_id"],
+        "schema_version": event["schema_version"],
+        "sequence": event["sequence"],
+        "simulation_time_us": event["simulation_time_us"],
+    }
+    expected_id = "comparison-event-" + _canonical_sha256(identity)[:24]
+    if event["event_id"] != expected_id:
+        raise ValueError(f"{label} content-derived ID is invalid")
+    return event
+
+
+def _comparison_event_semantic(event: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": event["kind"],
+        "payload": event["payload"],
+        "schema_id": event["schema_id"],
+        "schema_version": event["schema_version"],
+        "sequence": event["sequence"],
+        "simulation_time_us": event["simulation_time_us"],
+    }
+
+
+def _validate_serialized_synchronization(
+    value: object,
+) -> dict[str, object]:
+    synchronization = _serialized_object(
+        value,
+        {
+            "branch_suffix",
+            "branch_suffix_sha256",
+            "parent_suffix",
+            "parent_suffix_sha256",
+            "prefix_end_time_us",
+            "prefix_event_ids",
+            "prefix_event_sources",
+            "prefix_length",
+            "synchronized_prefix_sha256",
+        },
+        "branch synchronization",
+    )
+    prefix_ids = _serialized_list(
+        synchronization["prefix_event_ids"],
+        "synchronized prefix event IDs",
+    )
+    _positive_int(synchronization["prefix_length"], "synchronized prefix length")
+    _nonnegative_int(synchronization["prefix_end_time_us"], "prefix end time")
+    if (
+        len(prefix_ids) != synchronization["prefix_length"]
+        or len(prefix_ids) != len(set(prefix_ids))
+    ):
+        raise ValueError("synchronized prefix event inventory is invalid")
+    for event_id in prefix_ids:
+        _identifier(event_id, "synchronized prefix event ID")
+    prefix_sources = _serialized_list(
+        synchronization["prefix_event_sources"],
+        "synchronized prefix event sources",
+    )
+    if len(prefix_sources) != len(prefix_ids):
+        raise ValueError("synchronized prefix source inventory is invalid")
+    for expected_id, value_source in zip(prefix_ids, prefix_sources, strict=True):
+        source = _serialized_object(
+            value_source,
+            {"event_id", "payload_sha256"},
+            "synchronized prefix event source",
+        )
+        if source["event_id"] != expected_id:
+            raise ValueError("synchronized prefix source order or identity changed")
+        _sha256(source["payload_sha256"], "synchronized prefix payload digest")
+    _sha256(
+        synchronization["synchronized_prefix_sha256"],
+        "synchronized prefix digest",
+    )
+    parent_suffix = [
+        _validate_serialized_comparison_event(item, "parent suffix event")
+        for item in _serialized_list(
+            synchronization["parent_suffix"],
+            "parent comparison suffix",
+        )
+    ]
+    branch_suffix = [
+        _validate_serialized_comparison_event(item, "branch suffix event")
+        for item in _serialized_list(
+            synchronization["branch_suffix"],
+            "branch comparison suffix",
+        )
+    ]
+    if not parent_suffix and not branch_suffix:
+        raise ValueError("branch synchronization has no distinct suffix")
+    expected_start = synchronization["prefix_length"] + 1
+    for label, suffix in (("parent", parent_suffix), ("branch", branch_suffix)):
+        if [item["sequence"] for item in suffix] != list(
+            range(expected_start, expected_start + len(suffix))
+        ):
+            raise ValueError(f"{label} comparison suffix sequence is invalid")
+    parent_digest = _canonical_sha256(
+        [_comparison_event_semantic(item) for item in parent_suffix]
+    )
+    branch_digest = _canonical_sha256(
+        [_comparison_event_semantic(item) for item in branch_suffix]
+    )
+    if (
+        synchronization["parent_suffix_sha256"] != parent_digest
+        or synchronization["branch_suffix_sha256"] != branch_digest
+        or parent_digest == branch_digest
+    ):
+        raise ValueError("branch synchronization suffix digest is invalid")
+    return synchronization
+
+
+def _validate_serialized_first_difference(
+    value: object,
+    synchronization: dict[str, object],
+) -> dict[str, object]:
+    first = _serialized_object(
+        value,
+        {
+            "branch",
+            "divergence_event_id",
+            "divergence_time_us",
+            "index",
+            "parent",
+        },
+        "first differing event",
+    )
+    _nonnegative_int(first["index"], "first differing event index")
+    _nonnegative_int(first["divergence_time_us"], "first differing event time")
+    if first["index"] != synchronization["prefix_length"]:
+        raise ValueError("first differing event index differs from synchronized prefix")
+    parent = (
+        None
+        if first["parent"] is None
+        else _validate_serialized_comparison_event(
+            first["parent"],
+            "first differing parent event",
+        )
+    )
+    branch = (
+        None
+        if first["branch"] is None
+        else _validate_serialized_comparison_event(
+            first["branch"],
+            "first differing branch event",
+        )
+    )
+    if parent is None and branch is None:
+        raise ValueError("first differing event omits both sides")
+    parent_suffix = synchronization["parent_suffix"]
+    branch_suffix = synchronization["branch_suffix"]
+    if parent != (parent_suffix[0] if parent_suffix else None) or branch != (
+        branch_suffix[0] if branch_suffix else None
+    ):
+        raise ValueError("first differing event differs from the suffix heads")
+    expected_time = min(
+        item["simulation_time_us"] for item in (parent, branch) if item is not None
+    )
+    if (
+        first["divergence_time_us"] != expected_time
+        or first["divergence_time_us"] < synchronization["prefix_end_time_us"]
+    ):
+        raise ValueError("first differing event time is invalid")
+    _serialized_content_id(
+        first,
+        "divergence_event_id",
+        "branch-divergence-",
+        "first differing event",
+    )
+    return first
+
+
+def _validate_serialized_branch_identity(
+    value: object,
+    *,
+    source_run_id: str,
+    source_event_sha256: object,
+    synchronization: dict[str, object],
+    first_difference: dict[str, object],
+) -> dict[str, object]:
+    identity = _serialized_object(
+        value,
+        {
+            "branch_identity_id",
+            "branch_input_id",
+            "branch_mode",
+            "branch_run_id",
+            "branch_source_event_sha256",
+            "branch_suffix_sha256",
+            "branch_timeline_sha256",
+            "divergence_event_id",
+            "divergence_time_us",
+            "exogenous_reference_path_sha256",
+            "fork_time_us",
+            "intervention",
+            "mutation_manifest_sha256",
+            "parent_input_id",
+            "parent_prefix_sha256",
+            "parent_run_id",
+            "parent_source_event_sha256",
+            "parent_suffix_sha256",
+            "parent_timeline_sha256",
+            "rng_policy",
+            "snapshot_sha256",
+            "synchronized_prefix_sha256",
+        },
+        "branch identity",
+    )
+    if identity["branch_mode"] not in {item.value for item in CounterfactualMode} or identity[
+        "rng_policy"
+    ] not in {item.value for item in CounterfactualRngPolicy}:
+        raise ValueError("branch mode or RNG policy is invalid")
+    parent_run_id = _serialized_run_id(identity["parent_run_id"], "parent run ID")
+    branch_run_id = _serialized_run_id(identity["branch_run_id"], "branch run ID")
+    if parent_run_id != source_run_id or parent_run_id == branch_run_id:
+        raise ValueError("branch identity parent/branch roots are invalid")
+    digest_fields = (
+        "branch_source_event_sha256",
+        "branch_suffix_sha256",
+        "branch_timeline_sha256",
+        "mutation_manifest_sha256",
+        "parent_prefix_sha256",
+        "parent_source_event_sha256",
+        "parent_suffix_sha256",
+        "parent_timeline_sha256",
+        "snapshot_sha256",
+        "synchronized_prefix_sha256",
+    )
+    for field_name in digest_fields:
+        _sha256(identity[field_name], f"branch identity {field_name}")
+    for field_name in ("parent_input_id", "branch_input_id"):
+        _identifier(identity[field_name], f"branch identity {field_name}")
+        if not str(identity[field_name]).startswith("comparison-run-input-"):
+            raise ValueError("branch identity input ID has an invalid namespace")
+    if identity["parent_input_id"] == identity["branch_input_id"]:
+        raise ValueError("branch identity input IDs are not distinct")
+    _nonnegative_int(identity["fork_time_us"], "branch fork time")
+    _nonnegative_int(identity["divergence_time_us"], "branch divergence time")
+    if not isinstance(identity["intervention"], dict) or identity[
+        "mutation_manifest_sha256"
+    ] != _canonical_sha256(identity["intervention"]):
+        raise ValueError("branch intervention commitment is invalid")
+    if identity["parent_source_event_sha256"] != source_event_sha256:
+        raise ValueError("branch identity parent source digest differs")
+    expected_sync = (
+        synchronization["synchronized_prefix_sha256"],
+        synchronization["parent_suffix_sha256"],
+        synchronization["branch_suffix_sha256"],
+        first_difference["divergence_event_id"],
+        first_difference["divergence_time_us"],
+    )
+    actual_sync = (
+        identity["synchronized_prefix_sha256"],
+        identity["parent_suffix_sha256"],
+        identity["branch_suffix_sha256"],
+        identity["divergence_event_id"],
+        identity["divergence_time_us"],
+    )
+    if actual_sync != expected_sync or identity["parent_prefix_sha256"] != expected_sync[0]:
+        raise ValueError("branch identity differs from synchronized evidence")
+    if identity["divergence_time_us"] < identity["fork_time_us"]:
+        raise ValueError("branch divergence precedes the fork")
+    if identity["branch_mode"] == CounterfactualMode.EXOGENOUS_REPLAY.value:
+        if (
+            identity["rng_policy"]
+            != CounterfactualRngPolicy.FIXED_EXOGENOUS_PATH.value
+            or identity["exogenous_reference_path_sha256"] is None
+        ):
+            raise ValueError("exogenous branch identity has an invalid RNG contract")
+        _sha256(
+            identity["exogenous_reference_path_sha256"],
+            "exogenous reference path digest",
+        )
+    elif (
+        identity["rng_policy"]
+        != CounterfactualRngPolicy.FORK_SNAPSHOT_OWNED_RNG_STATE.value
+        or identity["exogenous_reference_path_sha256"] is not None
+    ):
+        raise ValueError("endogenous branch identity has an invalid RNG contract")
+    _serialized_content_id(
+        identity,
+        "branch_identity_id",
+        "branch-identity-",
+        "branch identity",
+    )
+    return identity
+
+
+def _comparison_known_event_sources(
+    synchronization: dict[str, object],
+) -> dict[str, dict[str, str]]:
+    prefix = {
+        source["event_id"]: source["payload_sha256"]
+        for source in synchronization["prefix_event_sources"]
+    }
+    output: dict[str, dict[str, str]] = {}
+    for side in ("parent", "branch"):
+        sources = dict(prefix)
+        for event in synchronization[f"{side}_suffix"]:
+            event_id = event["event_id"]
+            payload_sha256 = event["payload_sha256"]
+            if event_id in sources and sources[event_id] != payload_sha256:
+                raise ValueError(
+                    f"{side} comparison event ID has conflicting payload commitments"
+                )
+            sources[event_id] = payload_sha256
+        output[side] = sources
+    return output
+
+
+def _validate_serialized_comparison_input_ids(
+    comparison: dict[str, object],
+    *,
+    branch_identity: dict[str, object],
+    synchronization: dict[str, object],
+) -> None:
+    deltas = comparison["deltas"]
+    assert isinstance(deltas, list)
+    prefix_sources = synchronization["prefix_event_sources"]
+    assert isinstance(prefix_sources, list)
+    for side in ("parent", "branch"):
+        suffix = synchronization[f"{side}_suffix"]
+        assert isinstance(suffix, list)
+        event_sources = [
+            *prefix_sources,
+            *[
+                {
+                    "event_id": event["event_id"],
+                    "payload_sha256": event["payload_sha256"],
+                }
+                for event in suffix
+            ],
+        ]
+        event_ids = [source["event_id"] for source in event_sources]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError(f"{side} comparison run event IDs are duplicated")
+        series_sources = [
+            {
+                "kind": delta["kind"],
+                "series_sha256": delta[f"{side}_series_sha256"],
+            }
+            for delta in deltas
+        ]
+        commitment = {
+            "event_sources": event_sources,
+            "observation_mode": comparison["observation_mode"],
+            "policy_id": comparison["policy_id"],
+            "run_id": branch_identity[f"{side}_run_id"],
+            "schema_id": COMPARISON_RUN_INPUT_SCHEMA_ID,
+            "schema_version": COMPARISON_RUN_INPUT_SCHEMA_VERSION,
+            "series_sources": series_sources,
+            "source_event_sha256": branch_identity[
+                f"{side}_source_event_sha256"
+            ],
+            "timeline_sha256": branch_identity[f"{side}_timeline_sha256"],
+        }
+        expected = "comparison-run-input-" + _canonical_sha256(commitment)[:24]
+        if branch_identity[f"{side}_input_id"] != expected:
+            raise ValueError(
+                f"{side} comparison input ID differs from its portable commitment"
+            )
+
+
+def _validate_serialized_comparison_deltas(
+    value: object,
+    known_events: dict[str, dict[str, str]],
+) -> None:
+    deltas = _serialized_list(value, "comparison deltas")
+    if [item.get("kind") if isinstance(item, dict) else None for item in deltas] != [
+        item.value for item in COMPARISON_SERIES_ORDER
+    ]:
+        raise ValueError("comparison delta inventory or order changed")
+    for delta in deltas:
+        assert isinstance(delta, dict)
+        _validate_serialized_series_delta(delta, known_events)
+
+
+def _validate_serialized_series_delta(
+    value: object,
+    known_events: dict[str, dict[str, str]],
+) -> None:
+    delta = _serialized_object(
+        value,
+        {
+            "availability",
+            "branch_availability",
+            "branch_series_sha256",
+            "changed",
+            "delta_id",
+            "kind",
+            "parent_availability",
+            "parent_series_sha256",
+            "records",
+            "unavailable_reason",
+        },
+        "comparison series delta",
+    )
+    availabilities = {item.value for item in ComparisonAvailability}
+    if any(
+        delta[field_name] not in availabilities
+        for field_name in ("availability", "parent_availability", "branch_availability")
+    ):
+        raise ValueError("comparison series availability is invalid")
+    _sha256(delta["parent_series_sha256"], "parent comparison series digest")
+    _sha256(delta["branch_series_sha256"], "branch comparison series digest")
+    if type(delta["changed"]) is not bool or delta["changed"] != (
+        delta["parent_series_sha256"] != delta["branch_series_sha256"]
+    ):
+        raise ValueError("comparison series changed flag is invalid")
+    records = _serialized_list(delta["records"], "comparison record deltas")
+    record_keys: list[str] = []
+    parent_records: list[dict[str, object]] = []
+    branch_records: list[dict[str, object]] = []
+    for value_record in records:
+        record = _serialized_object(
+            value_record,
+            {"branch", "parent", "record_key", "status"},
+            "comparison record delta",
+        )
+        _identifier(record["record_key"], "comparison delta record key")
+        parent = (
+            None
+            if record["parent"] is None
+            else _validate_serialized_comparison_record(
+                record["parent"],
+                known_events["parent"],
+            )
+        )
+        branch = (
+            None
+            if record["branch"] is None
+            else _validate_serialized_comparison_record(
+                record["branch"],
+                known_events["branch"],
+            )
+        )
+        if parent is None and branch is None:
+            raise ValueError("comparison record delta omits both sides")
+        if any(
+            item is not None and item["record_key"] != record["record_key"]
+            for item in (parent, branch)
+        ):
+            raise ValueError("comparison record key differs from its delta")
+        expected_status = (
+            ComparisonRecordStatus.BRANCH_ONLY.value
+            if parent is None
+            else (
+                ComparisonRecordStatus.PARENT_ONLY.value
+                if branch is None
+                else (
+                    ComparisonRecordStatus.UNCHANGED.value
+                    if parent["record_sha256"] == branch["record_sha256"]
+                    else ComparisonRecordStatus.CHANGED.value
+                )
+            )
+        )
+        if record["status"] != expected_status:
+            raise ValueError("comparison record status differs from its evidence")
+        if parent is not None:
+            parent_records.append(parent)
+        if branch is not None:
+            branch_records.append(branch)
+        record_keys.append(record["record_key"])
+    if record_keys != sorted(record_keys) or len(record_keys) != len(set(record_keys)):
+        raise ValueError("comparison record delta order or identity is noncanonical")
+    parent_unavailable = (
+        delta["parent_availability"] == ComparisonAvailability.UNAVAILABLE.value
+    )
+    branch_unavailable = (
+        delta["branch_availability"] == ComparisonAvailability.UNAVAILABLE.value
+    )
+    expected_availability = (
+        ComparisonAvailability.UNAVAILABLE.value
+        if parent_unavailable or branch_unavailable
+        else (
+            ComparisonAvailability.RECORDED_EMPTY.value
+            if not parent_records and not branch_records
+            else ComparisonAvailability.AVAILABLE.value
+        )
+    )
+    if delta["availability"] != expected_availability:
+        raise ValueError("comparison series delta availability is invalid")
+    if expected_availability == ComparisonAvailability.AVAILABLE.value:
+        if not records or delta["unavailable_reason"] is not None:
+            raise ValueError("available comparison delta payload is invalid")
+    elif expected_availability == ComparisonAvailability.RECORDED_EMPTY.value:
+        if records or delta["unavailable_reason"] is not None:
+            raise ValueError("recorded-empty comparison delta payload is invalid")
+    elif records or type(delta["unavailable_reason"]) is not str or not delta[
+        "unavailable_reason"
+    ]:
+        raise ValueError("unavailable comparison delta payload is invalid")
+    if not parent_unavailable and not branch_unavailable:
+        parent_series = {
+            "availability": delta["parent_availability"],
+            "kind": delta["kind"],
+            "records": parent_records,
+            "schema_id": COMPARISON_SERIES_SCHEMA_ID,
+            "schema_version": COMPARISON_SERIES_SCHEMA_VERSION,
+            "unavailable_reason": None,
+        }
+        branch_series = {
+            "availability": delta["branch_availability"],
+            "kind": delta["kind"],
+            "records": branch_records,
+            "schema_id": COMPARISON_SERIES_SCHEMA_ID,
+            "schema_version": COMPARISON_SERIES_SCHEMA_VERSION,
+            "unavailable_reason": None,
+        }
+        if (
+            delta["parent_series_sha256"] != _canonical_sha256(parent_series)
+            or delta["branch_series_sha256"] != _canonical_sha256(branch_series)
+        ):
+            raise ValueError("comparison series digest does not verify")
+    prefix = str(delta["kind"]).lower().replace("_", "-") + "-comparison-delta-"
+    _serialized_content_id(delta, "delta_id", prefix, "comparison series delta")
+
+
+def _validate_serialized_comparison_record(
+    value: object,
+    known_events: dict[str, str],
+) -> dict[str, object]:
+    record = _serialized_object(
+        value,
+        {
+            "calculation_id",
+            "calculation_version",
+            "record_key",
+            "record_sha256",
+            "simulation_time_us",
+            "source_event_ids",
+            "value",
+        },
+        "comparison record",
+    )
+    _identifier(record["record_key"], "comparison record key")
+    _nonnegative_int(record["simulation_time_us"], "comparison record time")
+    if (record["calculation_id"] is None) != (record["calculation_version"] is None):
+        raise ValueError("comparison record calculation reference is incomplete")
+    if record["calculation_id"] is not None:
+        _identifier(record["calculation_id"], "comparison calculation ID")
+        _positive_int(record["calculation_version"], "comparison calculation version")
+    source_ids = _serialized_list(
+        record["source_event_ids"],
+        "comparison record source event IDs",
+    )
+    if (
+        not source_ids
+        or any(type(item) is not str or item not in known_events for item in source_ids)
+        or source_ids != sorted(source_ids)
+        or len(source_ids) != len(set(source_ids))
+    ):
+        raise ValueError("comparison record source event inventory is invalid")
+    identity = dict(record)
+    actual = identity.pop("record_sha256")
+    if actual != _canonical_sha256(identity):
+        raise ValueError("comparison record digest is invalid")
+    return record
+
+
+def _validate_serialized_comparison_overlays(
+    value: object,
+    *,
+    branch_identity: dict[str, object],
+    known_events: dict[str, dict[str, str]],
+    mode: ObservationMode,
+) -> None:
+    overlays = _serialized_list(value, "comparison overlays")
+    if [item.get("kind") if isinstance(item, dict) else None for item in overlays] != [
+        item.value for item in COMPARISON_OVERLAY_ORDER
+    ]:
+        raise ValueError("comparison overlay inventory or order changed")
+    for overlay in overlays:
+        _validate_serialized_comparison_overlay(
+            overlay,
+            branch_identity=branch_identity,
+            known_events=known_events,
+            mode=mode,
+        )
+
+
+def _validate_serialized_comparison_overlay(
+    value: object,
+    *,
+    branch_identity: dict[str, object],
+    known_events: dict[str, dict[str, str]],
+    mode: ObservationMode,
+) -> None:
+    overlay = _serialized_object(
+        value,
+        {
+            "availability",
+            "branch_run_id",
+            "branch_source_event_ids",
+            "branch_source_payload_sha256",
+            "branch_value",
+            "calculation_id",
+            "calculation_version",
+            "changed",
+            "evidence_scope",
+            "kind",
+            "overlay_delta_id",
+            "parent_run_id",
+            "parent_source_event_ids",
+            "parent_source_payload_sha256",
+            "parent_value",
+            "policy_grant_verified",
+            "schema_id",
+            "schema_version",
+            "unavailable_reason",
+            "unit",
+        },
+        "comparison overlay",
+    )
+    if (
+        overlay["schema_id"] != COMPARISON_OVERLAY_SCHEMA_ID
+        or overlay["schema_version"] != COMPARISON_OVERLAY_SCHEMA_VERSION
+        or overlay["availability"] not in {item.value for item in ComparisonAvailability}
+        or overlay["evidence_scope"]
+        not in {item.value for item in ComparisonEvidenceScope}
+        or type(overlay["changed"]) is not bool
+        or type(overlay["policy_grant_verified"]) is not bool
+    ):
+        raise ValueError("comparison overlay schema or enum is invalid")
+    reveal = overlay["evidence_scope"] in {
+        ComparisonEvidenceScope.POSTMORTEM_TRUTH.value,
+        ComparisonEvidenceScope.POSTMORTEM_HIDDEN_STATE.value,
+    }
+    if overlay["policy_grant_verified"] != reveal or (
+        reveal and mode is not ObservationMode.POSTMORTEM
+    ):
+        raise ValueError("comparison overlay reveal boundary is invalid")
+    if (
+        overlay["kind"] == "AGENT_TRUTH"
+        and overlay["availability"] == ComparisonAvailability.AVAILABLE.value
+        and overlay["evidence_scope"]
+        != ComparisonEvidenceScope.POSTMORTEM_HIDDEN_STATE.value
+    ):
+        raise ValueError("available agent truth lacks hidden-state authorization")
+    if (overlay["calculation_id"] is None) != (overlay["calculation_version"] is None):
+        raise ValueError("comparison overlay calculation reference is incomplete")
+    if overlay["calculation_id"] is not None:
+        _identifier(overlay["calculation_id"], "comparison overlay calculation ID")
+        _positive_int(
+            overlay["calculation_version"],
+            "comparison overlay calculation version",
+        )
+    if overlay["unit"] is not None:
+        _identifier(overlay["unit"], "comparison overlay unit")
+    available = overlay["availability"] == ComparisonAvailability.AVAILABLE.value
+    source_pairs: dict[str, tuple[list[object], list[object]]] = {}
+    for side in ("parent", "branch"):
+        ids = _serialized_list(
+            overlay[f"{side}_source_event_ids"],
+            f"{side} comparison overlay source IDs",
+        )
+        digests = _serialized_list(
+            overlay[f"{side}_source_payload_sha256"],
+            f"{side} comparison overlay source digests",
+        )
+        if len(ids) != len(digests) or len(ids) != len(set(ids)):
+            raise ValueError("comparison overlay source pair inventory is invalid")
+        pairs = list(zip(ids, digests, strict=True))
+        if pairs != sorted(pairs):
+            raise ValueError("comparison overlay source pairs are noncanonical")
+        for event_id, digest in pairs:
+            _identifier(event_id, "comparison overlay source event ID")
+            _sha256(digest, "comparison overlay source payload digest")
+            if (
+                event_id not in known_events[side]
+                or known_events[side][event_id] != digest
+            ):
+                raise ValueError("comparison overlay source binding is invalid")
+        source_pairs[side] = (ids, digests)
+    if available:
+        if (
+            overlay["parent_value"] is None
+            or overlay["branch_value"] is None
+            or overlay["unit"] is None
+            or overlay["calculation_id"] is None
+            or overlay["parent_run_id"] != branch_identity["parent_run_id"]
+            or overlay["branch_run_id"] != branch_identity["branch_run_id"]
+            or not source_pairs["parent"][0]
+            or not source_pairs["branch"][0]
+            or overlay["unavailable_reason"] is not None
+        ):
+            raise ValueError("available comparison overlay payload is invalid")
+    elif (
+        overlay["parent_value"] is not None
+        or overlay["branch_value"] is not None
+        or overlay["parent_run_id"] is not None
+        or overlay["branch_run_id"] is not None
+        or source_pairs["parent"][0]
+        or source_pairs["branch"][0]
+    ):
+        raise ValueError("non-available comparison overlay carries evidence")
+    elif overlay["availability"] == ComparisonAvailability.UNAVAILABLE.value:
+        if type(overlay["unavailable_reason"]) is not str or not overlay[
+            "unavailable_reason"
+        ]:
+            raise ValueError("unavailable comparison overlay lacks a reason")
+    elif overlay["unavailable_reason"] is not None:
+        raise ValueError("recorded-empty comparison overlay carries a reason")
+    if overlay["changed"] != (overlay["parent_value"] != overlay["branch_value"]):
+        raise ValueError("comparison overlay changed flag is invalid")
+    prefix = str(overlay["kind"]).lower().replace("_", "-") + "-comparison-overlay-"
+    _serialized_content_id(
+        overlay,
+        "overlay_delta_id",
+        prefix,
+        "comparison overlay",
+    )
+
+
+def _validate_serialized_comparison_trace(
+    value: object,
+    *,
+    source_run_id: str,
+) -> None:
+    trace = _serialized_object(
+        value,
+        {
+            "availability",
+            "complete_required",
+            "schema_id",
+            "schema_version",
+            "source_event_sha256",
+            "source_run_id",
+            "trace_payload",
+            "unavailable_reason",
+        },
+        "comparison trace",
+    )
+    if (
+        trace["schema_id"] != COMPARISON_TRACE_SCHEMA_ID
+        or trace["schema_version"] != COMPARISON_TRACE_SCHEMA_VERSION
+        or trace["availability"]
+        not in {item.value for item in ComparisonTraceAvailability}
+        or type(trace["complete_required"]) is not bool
+        or trace["source_run_id"] != source_run_id
+    ):
+        raise ValueError("comparison trace schema, availability, or root is invalid")
+    _sha256(trace["source_event_sha256"], "comparison trace source digest")
+    if trace["availability"] == ComparisonTraceAvailability.UNAVAILABLE.value:
+        if trace["trace_payload"] is not None or type(
+            trace["unavailable_reason"]
+        ) is not str or not trace["unavailable_reason"]:
+            raise ValueError("unavailable comparison trace payload is invalid")
+        return
+    if trace["unavailable_reason"] is not None:
+        raise ValueError("available comparison trace carries an unavailable reason")
+    payload = _serialized_object(
+        trace["trace_payload"],
+        {
+            "all_actions_complete",
+            "complete_action_ids",
+            "incomplete_action_ids",
+            "index_id",
+            "interpretation",
+            "lineage_sha256",
+            "traces",
+        },
+        "comparison trace payload",
+    )
+    if payload["interpretation"] != MECHANISTIC_INTERPRETATION:
+        raise ValueError("comparison trace interpretation is invalid")
+    traces = _serialized_list(payload["traces"], "player action traces")
+    if not traces:
+        raise ValueError("comparison trace payload has no player actions")
+    action_ids: list[str] = []
+    complete_ids: list[str] = []
+    incomplete_ids: list[str] = []
+    for player_trace in traces:
+        action_id, complete = _validate_serialized_player_action_trace(
+            player_trace,
+            source_run_id=source_run_id,
+        )
+        action_ids.append(action_id)
+        (complete_ids if complete else incomplete_ids).append(action_id)
+    if len(action_ids) != len(set(action_ids)):
+        raise ValueError("comparison trace action IDs are duplicated")
+    if (
+        payload["complete_action_ids"] != complete_ids
+        or payload["incomplete_action_ids"] != incomplete_ids
+        or payload["all_actions_complete"] != (not incomplete_ids)
+        or type(payload["all_actions_complete"]) is not bool
+        or (trace["complete_required"] and incomplete_ids)
+    ):
+        raise ValueError("comparison trace completeness summary is invalid")
+    lineage_sha256 = _canonical_sha256(traces)
+    if payload["lineage_sha256"] != lineage_sha256:
+        raise ValueError("comparison trace lineage digest is invalid")
+    index_identity = {
+        "interpretation": payload["interpretation"],
+        "lineage_sha256": lineage_sha256,
+        "schema_id": TRACE_INDEX_SCHEMA_ID,
+        "schema_version": TRACE_INDEX_SCHEMA_VERSION,
+        "source_event_sha256": trace["source_event_sha256"],
+        "source_run_id": source_run_id,
+    }
+    if payload["index_id"] != "trace-index-" + _canonical_sha256(index_identity)[:24]:
+        raise ValueError("comparison trace index ID is invalid")
+
+
+def _validate_serialized_player_action_trace(
+    value: object,
+    *,
+    source_run_id: str,
+) -> tuple[str, bool]:
+    trace = _serialized_object(
+        value,
+        {
+            "action_id",
+            "complete",
+            "edges",
+            "nodes",
+            "player_input_event_id",
+            "unavailable_edge_count",
+            "unavailable_node_count",
+        },
+        "player action trace",
+    )
+    action_id = trace["action_id"]
+    _identifier(action_id, "player action trace ID")
+    _identifier(trace["player_input_event_id"], "player action input event ID")
+    nodes = _serialized_list(trace["nodes"], "player action trace nodes")
+    edges = _serialized_list(trace["edges"], "player action trace edges")
+    if len(nodes) != len(TRACE_STAGE_ORDER) or len(edges) != len(TRACE_EDGE_ORDER):
+        raise ValueError("player action trace node or edge inventory changed")
+    node_availability: list[str] = []
+    node_event_ids: list[object] = []
+    node_provenance: list[object] = []
+    for expected_stage, node in zip(TRACE_STAGE_ORDER, nodes, strict=True):
+        availability, event_id, provenance = _validate_serialized_trace_node(
+            node,
+            expected_stage=expected_stage.value,
+            source_run_id=source_run_id,
+        )
+        node_availability.append(availability)
+        node_event_ids.append(event_id)
+        node_provenance.append(provenance)
+    edge_statuses: list[str] = []
+    for index, (expected_kind, edge) in enumerate(
+        zip(TRACE_EDGE_ORDER, edges, strict=True)
+    ):
+        edge_statuses.append(
+            _validate_serialized_trace_edge(
+                edge,
+                expected_kind=expected_kind.value,
+                expected_from_stage=TRACE_STAGE_ORDER[index].value,
+                expected_to_stage=TRACE_STAGE_ORDER[index + 1].value,
+                expected_from_event_id=node_event_ids[index],
+                expected_to_event_id=node_event_ids[index + 1],
+                expected_provenance=[
+                    item
+                    for item in (
+                        node_provenance[index],
+                        node_provenance[index + 1],
+                    )
+                    if item is not None
+                ],
+                endpoints_recorded=(
+                    node_availability[index] == TraceAvailability.RECORDED.value
+                    and node_availability[index + 1]
+                    == TraceAvailability.RECORDED.value
+                ),
+                source_run_id=source_run_id,
+            )
+        )
+    player_index = [item.value for item in TRACE_STAGE_ORDER].index("PLAYER_INPUT")
+    if (
+        node_availability[player_index] != TraceAvailability.RECORDED.value
+        or node_event_ids[player_index] != trace["player_input_event_id"]
+    ):
+        raise ValueError("player action trace does not bind its input event")
+    unavailable_nodes = sum(
+        item == TraceAvailability.UNAVAILABLE.value for item in node_availability
+    )
+    unavailable_edges = sum(
+        item == TraceLinkStatus.UNAVAILABLE.value for item in edge_statuses
+    )
+    complete = unavailable_nodes == 0 and unavailable_edges == 0
+    if (
+        trace["unavailable_node_count"] != unavailable_nodes
+        or trace["unavailable_edge_count"] != unavailable_edges
+        or trace["complete"] != complete
+        or type(trace["complete"]) is not bool
+    ):
+        raise ValueError("player action trace completeness fields are invalid")
+    return action_id, complete
+
+
+def _validate_serialized_trace_node(
+    value: object,
+    *,
+    expected_stage: str,
+    source_run_id: str,
+) -> tuple[str, object, object]:
+    node = _serialized_object(
+        value,
+        {"availability", "provenance", "source_event_id", "stage", "unavailable_reason"},
+        "mechanistic trace node",
+    )
+    if (
+        node["stage"] != expected_stage
+        or node["availability"] not in {item.value for item in TraceAvailability}
+    ):
+        raise ValueError("mechanistic trace node stage or availability is invalid")
+    if node["availability"] == TraceAvailability.RECORDED.value:
+        if (
+            node["source_event_id"] is None
+            or node["provenance"] is None
+            or node["unavailable_reason"] is not None
+        ):
+            raise ValueError("recorded mechanistic trace node payload is invalid")
+        _identifier(node["source_event_id"], "mechanistic trace node event ID")
+        _validate_serialized_trace_provenance(
+            node["provenance"],
+            source_run_id=source_run_id,
+        )
+    else:
+        if node["unavailable_reason"] not in {
+            item.value for item in TraceUnavailableReason
+        }:
+            raise ValueError("unavailable trace node lacks a typed reason")
+        if node["provenance"] is not None:
+            _validate_serialized_trace_provenance(
+                node["provenance"],
+                source_run_id=source_run_id,
+            )
+        if node["source_event_id"] is not None:
+            _identifier(node["source_event_id"], "mechanistic trace node event ID")
+        missing = node["unavailable_reason"] in {
+            TraceUnavailableReason.SOURCE_EVENT_MISSING.value,
+            TraceUnavailableReason.AMBIGUOUS_SOURCE_EVENTS.value,
+        }
+        if missing != (
+            node["source_event_id"] is None and node["provenance"] is None
+        ):
+            raise ValueError("unavailable trace node source shape is invalid")
+        if (
+            node["unavailable_reason"]
+            == TraceUnavailableReason.RECORDED_ARTIFACT_KIND_MISMATCH.value
+            and (node["source_event_id"] is None or node["provenance"] is None)
+        ):
+            raise ValueError("mismatched trace node lacks its recorded source")
+    return node["availability"], node["source_event_id"], node["provenance"]
+
+
+def _validate_serialized_trace_edge(
+    value: object,
+    *,
+    expected_kind: str,
+    expected_from_stage: str,
+    expected_to_stage: str,
+    expected_from_event_id: object,
+    expected_to_event_id: object,
+    expected_provenance: list[object],
+    endpoints_recorded: bool,
+    source_run_id: str,
+) -> str:
+    edge = _serialized_object(
+        value,
+        {
+            "correlation_ids",
+            "from_event_id",
+            "from_stage",
+            "kind",
+            "provenance",
+            "status",
+            "to_event_id",
+            "to_stage",
+            "unavailable_reason",
+        },
+        "mechanistic trace edge",
+    )
+    if (
+        edge["kind"] != expected_kind
+        or edge["from_stage"] != expected_from_stage
+        or edge["to_stage"] != expected_to_stage
+        or edge["status"] not in {item.value for item in TraceLinkStatus}
+    ):
+        raise ValueError("mechanistic trace edge identity or status is invalid")
+    correlations = _serialized_list(
+        edge["correlation_ids"],
+        "mechanistic trace edge correlations",
+    )
+    if correlations != sorted(correlations) or len(correlations) != len(
+        set(correlations)
+    ):
+        raise ValueError("mechanistic trace edge correlations are noncanonical")
+    for correlation in correlations:
+        _identifier(correlation, "mechanistic trace edge correlation ID")
+    provenance = _serialized_list(
+        edge["provenance"],
+        "mechanistic trace edge provenance",
+    )
+    for item in provenance:
+        _validate_serialized_trace_provenance(item, source_run_id=source_run_id)
+    for endpoint in (edge["from_event_id"], edge["to_event_id"]):
+        if endpoint is not None:
+            _identifier(endpoint, "mechanistic trace edge endpoint")
+    if (
+        edge["from_event_id"] != expected_from_event_id
+        or edge["to_event_id"] != expected_to_event_id
+        or provenance != expected_provenance
+    ):
+        raise ValueError("mechanistic trace edge differs from its adjacent nodes")
+    if edge["status"] == TraceLinkStatus.LINKED.value:
+        if (
+            not endpoints_recorded
+            or edge["from_event_id"] is None
+            or edge["to_event_id"] is None
+            or not correlations
+            or len(provenance) != 2
+            or edge["unavailable_reason"] is not None
+        ):
+            raise ValueError("linked mechanistic trace edge payload is invalid")
+        left_sequence = provenance[0]["event_sequence"]
+        right_sequence = provenance[1]["event_sequence"]
+        if right_sequence <= left_sequence:
+            raise ValueError("linked trace edge reverses recorded source order")
+    else:
+        if edge["unavailable_reason"] not in {
+            item.value for item in TraceUnavailableReason
+        }:
+            raise ValueError("unavailable trace edge lacks a typed reason")
+        endpoint_unavailable = not endpoints_recorded
+        if endpoint_unavailable != (
+            edge["unavailable_reason"]
+            == TraceUnavailableReason.ENDPOINT_UNAVAILABLE.value
+        ):
+            raise ValueError("unavailable trace edge reason differs from its nodes")
+    return edge["status"]
+
+
+def _validate_serialized_trace_provenance(
+    value: object,
+    *,
+    source_run_id: str,
+) -> None:
+    provenance = _serialized_object(
+        value,
+        {
+            "artifact_name",
+            "artifact_sha256",
+            "event_sequence",
+            "run_id",
+            "schema_id",
+            "schema_version",
+        },
+        "mechanistic trace provenance",
+    )
+    if provenance["run_id"] != source_run_id:
+        raise ValueError("mechanistic trace provenance belongs to another run")
+    _serialized_run_id(provenance["run_id"], "mechanistic trace provenance run ID")
+    _identifier(provenance["artifact_name"], "trace provenance artifact name")
+    _identifier(provenance["schema_id"], "trace provenance schema ID")
+    _sha256(provenance["artifact_sha256"], "trace provenance artifact digest")
+    _positive_int(provenance["schema_version"], "trace provenance schema version")
+    _positive_int(provenance["event_sequence"], "trace provenance event sequence")
 
 
 def _validate_bundle_members(
@@ -2187,7 +4956,13 @@ def write_portable_report_bundle(
 
 
 def verify_portable_report_bundle(root: Path) -> dict[str, object]:
-    """Verify a materialized or relocated report without executing JavaScript."""
+    """Verify a relocated report's internal commitments without running JavaScript.
+
+    Content-derived IDs detect inconsistent or partially rewritten artifacts; they
+    do not authenticate a publisher.  Provenance that must distinguish an authorized
+    artifact from a coherently reauthored one needs an externally pinned report ID,
+    signature, or trusted issuance receipt.
+    """
 
     if not isinstance(root, Path) or not root.is_absolute():
         raise ValueError("portable report verification root must be absolute")

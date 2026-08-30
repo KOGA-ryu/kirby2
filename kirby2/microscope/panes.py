@@ -7,7 +7,8 @@ the observation policy has already admitted at one integer render cursor.
 
 The contracts distinguish three states that presentation code must not collapse:
 
-* ``AVAILABLE`` contains at least one source-linked datum;
+* ``AVAILABLE`` contains at least one source-linked datum, queue estimate, or
+  content-addressed counterfactual-comparison reference;
 * ``RECORDED_EMPTY`` is an independently pinned backend source capability with no
   visible event at the cursor; and
 * ``UNAVAILABLE`` carries a typed explanation of the missing capability/read
@@ -54,6 +55,15 @@ PANE_CAPABILITY_SCHEMA_ID = "KIRBY2_REPLAY_PANE_CAPABILITY_READ_V1"
 PANE_CAPABILITY_SCHEMA_VERSION = 1
 PANE_DATUM_SCHEMA_ID = "KIRBY2_REPLAY_PANE_DATUM_V1"
 PANE_DATUM_SCHEMA_VERSION = 1
+COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID = (
+    "KIRBY2_COUNTERFACTUAL_COMPARISON_PANE_BINDING_V1"
+)
+COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION = 1
+COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID = (
+    "KIRBY2_COUNTERFACTUAL_COMPARISON_PANE_REFERENCE_V1"
+)
+COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION = 1
+COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND = "BRANCH_COMPARISON"
 QUEUE_ESTIMATOR_SCHEMA_ID = "KIRBY2_REPLAY_QUEUE_ESTIMATE_V1"
 QUEUE_ESTIMATOR_SCHEMA_VERSION = 1
 PANE_CAPABILITY_MANIFEST_SCOPE = "SYNCHRONIZED_REPLAY_PANES"
@@ -566,6 +576,164 @@ class PaneExplanation:
         return {"detail": self.detail, "reason": self.reason.value}
 
 
+_COMPARISON_BINDING_TOKEN = object()
+_COMPARISON_REFERENCE_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class CounterfactualComparisonBindingV1:
+    """Content-addressed authority for one selected branch comparison.
+
+    The binding deliberately contains IDs and digests only.  Full parent/branch
+    suffixes, outcome rows, overlays, and traces remain in the governed comparison
+    report section rather than being copied into every cursor-bound pane snapshot.
+    """
+
+    source_run_id: str
+    source_event_sha256: str
+    observation_mode: ObservationMode
+    policy_id: str
+    comparison_id: str
+    comparison_sha256: str
+    branch_identity_id: str
+    branch_run_id: str
+    _construction_token: InitVar[object]
+    report_section_kind: str = COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND
+    schema_id: str = COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID
+    schema_version: int = COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION
+    binding_id: str = field(init=False)
+
+    def __post_init__(self, _construction_token: object) -> None:
+        if _construction_token is not _COMPARISON_BINDING_TOKEN:
+            raise TypeError(
+                "counterfactual comparison bindings require the governed factory"
+            )
+        _require_run_id(self.source_run_id)
+        _require_sha256(
+            self.source_event_sha256,
+            "counterfactual comparison source digest",
+        )
+        if type(self.observation_mode) is not ObservationMode:
+            raise TypeError("counterfactual comparison observation mode is invalid")
+        if self.policy_id != ObservationPolicy(self.observation_mode).policy_id:
+            raise ValueError("counterfactual comparison mode and policy differ")
+        _require_identifier(self.comparison_id, "counterfactual comparison ID")
+        _require_sha256(
+            self.comparison_sha256,
+            "counterfactual comparison digest",
+        )
+        _require_identifier(
+            self.branch_identity_id,
+            "counterfactual comparison branch identity ID",
+        )
+        _require_run_id(self.branch_run_id)
+        if self.branch_run_id == self.source_run_id:
+            raise ValueError("counterfactual branch run must differ from its parent")
+        if self.report_section_kind != COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND:
+            raise ValueError("counterfactual comparison report section changed")
+        if (
+            self.schema_id != COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID
+            or self.schema_version
+            != COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported counterfactual comparison binding schema")
+        object.__setattr__(
+            self,
+            "binding_id",
+            "counterfactual-comparison-binding-"
+            + _canonical_sha256(self.identity_dict())[:24],
+        )
+
+    def identity_dict(self) -> dict[str, object]:
+        return {
+            "branch_identity_id": self.branch_identity_id,
+            "branch_run_id": self.branch_run_id,
+            "comparison_id": self.comparison_id,
+            "comparison_sha256": self.comparison_sha256,
+            "observation_mode": self.observation_mode.value,
+            "policy_id": self.policy_id,
+            "report_section_kind": self.report_section_kind,
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+            "source_event_sha256": self.source_event_sha256,
+            "source_run_id": self.source_run_id,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.identity_dict(), "binding_id": self.binding_id}
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.as_dict())
+
+    @property
+    def binding_sha256(self) -> str:
+        return _sha256_bytes(self.canonical_bytes())
+
+
+@dataclass(frozen=True, slots=True)
+class CounterfactualComparisonPaneReferenceV1:
+    """One cursor/query-bound reference to a selected comparison report section."""
+
+    binding: CounterfactualComparisonBindingV1
+    observed_projection_sha256: str
+    query_id: str
+    render_cursor_time_us: int
+    _construction_token: InitVar[object]
+    schema_id: str = COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID
+    schema_version: int = COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION
+    reference_id: str = field(init=False)
+
+    def __post_init__(self, _construction_token: object) -> None:
+        if _construction_token is not _COMPARISON_REFERENCE_TOKEN:
+            raise TypeError(
+                "counterfactual comparison references require the pane attacher"
+            )
+        if type(self.binding) is not CounterfactualComparisonBindingV1:
+            raise TypeError("counterfactual comparison reference binding is invalid")
+        _require_sha256(
+            self.observed_projection_sha256,
+            "counterfactual comparison observed projection digest",
+        )
+        _require_identifier(self.query_id, "counterfactual comparison query ID")
+        if (
+            type(self.render_cursor_time_us) is not int
+            or self.render_cursor_time_us < 0
+        ):
+            raise ValueError("counterfactual comparison cursor must be nonnegative")
+        if (
+            self.schema_id != COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID
+            or self.schema_version
+            != COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported counterfactual comparison reference schema")
+        object.__setattr__(
+            self,
+            "reference_id",
+            "counterfactual-comparison-reference-"
+            + _canonical_sha256(self.identity_dict())[:24],
+        )
+
+    def identity_dict(self) -> dict[str, object]:
+        return {
+            "binding": self.binding.as_dict(),
+            "observed_projection_sha256": self.observed_projection_sha256,
+            "query_id": self.query_id,
+            "render_cursor_time_us": self.render_cursor_time_us,
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.identity_dict(), "reference_id": self.reference_id}
+
+    def canonical_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.as_dict())
+
+    @property
+    def reference_sha256(self) -> str:
+        return _sha256_bytes(self.canonical_bytes())
+
+
 @dataclass(frozen=True, slots=True)
 class QueueEstimate:
     """One queue estimate with capability, uncertainty, and guarded truth."""
@@ -954,6 +1122,7 @@ class ReplayPane:
     data: tuple[PaneDatum, ...] = ()
     queue_estimates: tuple[QueueEstimate, ...] = ()
     explanation: PaneExplanation | None = None
+    comparison_references: tuple[CounterfactualComparisonPaneReferenceV1, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.pane_kind) is not PaneKind:
@@ -969,12 +1138,48 @@ class ReplayPane:
         _require_identifier(self.query_id, "replay pane query ID")
         data = _canonical_pane_data(self.data)
         queue_estimates = _canonical_queue_estimates(self.queue_estimates)
+        if type(self.comparison_references) is not tuple or any(
+            type(item) is not CounterfactualComparisonPaneReferenceV1
+            for item in self.comparison_references
+        ):
+            raise TypeError("counterfactual comparison pane references are invalid")
+        if len(self.comparison_references) > 1:
+            raise ValueError(
+                "counterfactual comparison pane accepts one selected branch"
+            )
         if queue_estimates and self.pane_kind is not PaneKind.INDIVIDUAL_QUEUE:
             raise ValueError("queue estimates belong only to the individual queue pane")
-        has_content = bool(data or queue_estimates)
+        if self.pane_kind is PaneKind.COUNTERFACTUAL_COMPARISON:
+            if data or queue_estimates:
+                raise ValueError(
+                    "counterfactual comparison pane accepts reference rows only"
+                )
+            if self.comparison_references:
+                reference = self.comparison_references[0]
+                if (
+                    reference.binding.observation_mode is not self.observation_mode
+                    or reference.binding.policy_id != self.policy_id
+                    or reference.query_id != self.query_id
+                    or reference.render_cursor_time_us != self.render_cursor_time_us
+                ):
+                    raise ValueError(
+                        "counterfactual comparison pane reference is split-brain"
+                    )
+        elif self.comparison_references:
+            raise ValueError(
+                "counterfactual comparison references belong only to their fixed pane"
+            )
+        has_content = bool(data or queue_estimates or self.comparison_references)
         if self.availability is PaneAvailability.AVAILABLE:
             if not has_content:
                 raise ValueError("available replay pane cannot be empty")
+            if (
+                self.pane_kind is PaneKind.COUNTERFACTUAL_COMPARISON
+                and len(self.comparison_references) != 1
+            ):
+                raise ValueError(
+                    "available counterfactual comparison pane requires one reference"
+                )
             if self.explanation is not None:
                 raise ValueError("available replay pane cannot carry an explanation")
         else:
@@ -998,7 +1203,7 @@ class ReplayPane:
         object.__setattr__(self, "queue_estimates", queue_estimates)
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "availability": self.availability.value,
             "data": [item.as_dict() for item in self.data],
             "explanation": (
@@ -1011,6 +1216,13 @@ class ReplayPane:
             "queue_estimates": [item.as_dict() for item in self.queue_estimates],
             "render_cursor_time_us": self.render_cursor_time_us,
         }
+        # Preserve the exact WO36-C/WO36-D serialization when no WO36-E
+        # comparison producer was selected.
+        if self.comparison_references:
+            payload["comparison_references"] = [
+                item.as_dict() for item in self.comparison_references
+            ]
+        return payload
 
 
 _SNAPSHOT_CONSTRUCTION_TOKEN = object()
@@ -1127,6 +1339,21 @@ class SynchronizedPaneSnapshot:
                     self.reveal_availability,
                     self.reveal_evidence_sha256,
                 )
+            for reference in pane.comparison_references:
+                binding = reference.binding
+                if (
+                    binding.source_run_id != self.source_run_id
+                    or binding.source_event_sha256 != self.source_event_sha256
+                    or binding.observation_mode is not self.observation_mode
+                    or binding.policy_id != self.policy_id
+                    or reference.observed_projection_sha256
+                    != self.observed_projection_sha256
+                    or reference.query_id != self.query_id
+                    or reference.render_cursor_time_us != self.render_cursor_time_us
+                ):
+                    raise ValueError(
+                        "counterfactual comparison reference differs from its snapshot"
+                    )
             for estimate in pane.queue_estimates:
                 for source in estimate.source_events:
                     _validate_source_at_snapshot(
@@ -1386,6 +1613,125 @@ def build_synchronized_panes(
             if effective_capabilities is None
             else effective_capabilities.manifest_sha256
         ),
+        _construction_token=_SNAPSHOT_CONSTRUCTION_TOKEN,
+    )
+
+
+def build_counterfactual_comparison_binding(
+    comparison: object,
+) -> CounterfactualComparisonBindingV1:
+    """Bind the safe identity of one governed branch comparison.
+
+    The import is deliberately local: :mod:`comparison` may consume this pane
+    contract without creating a module-import cycle.  Exact-type validation keeps
+    arbitrary duck-typed objects from minting comparison-pane authority.
+    """
+
+    from .comparison import BranchComparisonV1
+
+    if type(comparison) is not BranchComparisonV1:
+        raise TypeError(
+            "counterfactual comparison binding requires BranchComparisonV1"
+        )
+    canonical = comparison.canonical_bytes()
+    if type(canonical) is not bytes or not canonical:
+        raise TypeError("counterfactual comparison canonical bytes are invalid")
+    branch_identity = comparison.branch_identity
+    return CounterfactualComparisonBindingV1(
+        source_run_id=comparison.source_run_id,
+        source_event_sha256=comparison.source_event_sha256,
+        observation_mode=comparison.observation_mode,
+        policy_id=comparison.policy_id,
+        comparison_id=comparison.comparison_id,
+        comparison_sha256=_sha256_bytes(canonical),
+        branch_identity_id=branch_identity.branch_identity_id,
+        branch_run_id=branch_identity.selection.branch_run_id,
+        _construction_token=_COMPARISON_BINDING_TOKEN,
+    )
+
+
+def attach_counterfactual_comparison(
+    snapshot: SynchronizedPaneSnapshot,
+    binding_or_comparison: object,
+) -> SynchronizedPaneSnapshot:
+    """Return a snapshot whose fixed comparison slot references one branch.
+
+    Only the comparison pane is replaced.  Its row is a content-addressed pointer
+    to the report-level comparison, so cursor snapshots never duplicate suffix
+    events, future outcomes, overlays, or trace payloads.
+    """
+
+    if type(snapshot) is not SynchronizedPaneSnapshot:
+        raise TypeError(
+            "counterfactual comparison attachment requires SynchronizedPaneSnapshot"
+        )
+    binding = (
+        binding_or_comparison
+        if type(binding_or_comparison) is CounterfactualComparisonBindingV1
+        else build_counterfactual_comparison_binding(binding_or_comparison)
+    )
+    if (
+        binding.source_run_id != snapshot.source_run_id
+        or binding.source_event_sha256 != snapshot.source_event_sha256
+        or binding.observation_mode is not snapshot.observation_mode
+        or binding.policy_id != snapshot.policy_id
+    ):
+        raise ValueError(
+            "counterfactual comparison binding differs from its pane snapshot"
+        )
+
+    reference = CounterfactualComparisonPaneReferenceV1(
+        binding=binding,
+        observed_projection_sha256=snapshot.observed_projection_sha256,
+        query_id=snapshot.query_id,
+        render_cursor_time_us=snapshot.render_cursor_time_us,
+        _construction_token=_COMPARISON_REFERENCE_TOKEN,
+    )
+    pane_index = PANE_ORDER.index(PaneKind.COUNTERFACTUAL_COMPARISON)
+    current = snapshot.panes[pane_index]
+    if current.availability is PaneAvailability.AVAILABLE:
+        if current.comparison_references == (reference,):
+            return snapshot
+        raise ValueError("pane snapshot already selects another comparison")
+    if (
+        current.availability is not PaneAvailability.UNAVAILABLE
+        or current.data
+        or current.queue_estimates
+        or current.comparison_references
+        or current.explanation is None
+        or current.explanation.reason
+        is not PaneUnavailableReason.COUNTERFACTUAL_NOT_SELECTED
+    ):
+        raise ValueError(
+            "counterfactual comparison can replace only its unselected fixed slot"
+        )
+
+    replacement = ReplayPane(
+        pane_kind=PaneKind.COUNTERFACTUAL_COMPARISON,
+        availability=PaneAvailability.AVAILABLE,
+        render_cursor_time_us=current.render_cursor_time_us,
+        observation_mode=current.observation_mode,
+        policy_id=current.policy_id,
+        query_id=current.query_id,
+        comparison_references=(reference,),
+    )
+    panes = list(snapshot.panes)
+    panes[pane_index] = replacement
+    return SynchronizedPaneSnapshot(
+        source_run_id=snapshot.source_run_id,
+        source_event_sha256=snapshot.source_event_sha256,
+        observed_projection_sha256=snapshot.observed_projection_sha256,
+        query_id=snapshot.query_id,
+        observation_mode=snapshot.observation_mode,
+        policy_id=snapshot.policy_id,
+        reveal_availability=snapshot.reveal_availability,
+        reveal_evidence_sha256=snapshot.reveal_evidence_sha256,
+        render_cursor_time_us=snapshot.render_cursor_time_us,
+        action_time_us=snapshot.action_time_us,
+        panes=tuple(panes),
+        capability_read_id=snapshot.capability_read_id,
+        capability_authority=snapshot.capability_authority,
+        capability_manifest_sha256=snapshot.capability_manifest_sha256,
         _construction_token=_SNAPSHOT_CONSTRUCTION_TOKEN,
     )
 
@@ -1832,16 +2178,17 @@ def _reject_protected_namespace_laundering(
     result: ObservationQueryResult,
     values: tuple[QueriedValue, ...],
 ) -> None:
-    deferred_comparison = tuple(
+    direct_comparison_inputs = tuple(
         item
         for item in values
         if item.series_id.startswith(
             ("comparison.counterfactual.", "counterfactual.comparison.")
         )
     )
-    if deferred_comparison:
+    if direct_comparison_inputs:
         raise ValueError(
-            "counterfactual comparison pane inputs are unavailable until WO36-E"
+            "counterfactual comparison panes reject raw query inputs; use the "
+            "governed comparison attachment"
         )
     protected_sources = (
         ("agent.", EvidenceSourceKind.REVEALED_HIDDEN_STATE),
@@ -2438,6 +2785,11 @@ def _canonical_json_bytes(payload: object) -> bytes:
 # absent from the UI-safe star-import surface.  Backend integration imports those
 # exact names explicitly and passes only the resulting snapshot downstream.
 __all__ = [
+    "COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_ID",
+    "COUNTERFACTUAL_COMPARISON_BINDING_SCHEMA_VERSION",
+    "COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_ID",
+    "COUNTERFACTUAL_COMPARISON_REFERENCE_SCHEMA_VERSION",
+    "COUNTERFACTUAL_COMPARISON_REPORT_SECTION_KIND",
     "PANE_DATUM_SCHEMA_ID",
     "PANE_DATUM_SCHEMA_VERSION",
     "PANE_ORDER",
@@ -2446,6 +2798,8 @@ __all__ = [
     "QUEUE_ESTIMATOR_SCHEMA_ID",
     "QUEUE_ESTIMATOR_SCHEMA_VERSION",
     "CalculationKind",
+    "CounterfactualComparisonBindingV1",
+    "CounterfactualComparisonPaneReferenceV1",
     "DeclaredCalculation",
     "PaneAvailability",
     "PaneCapabilityAuthority",
@@ -2459,5 +2813,7 @@ __all__ = [
     "QueueTruthAvailability",
     "ReplayPane",
     "SynchronizedPaneSnapshot",
+    "attach_counterfactual_comparison",
+    "build_counterfactual_comparison_binding",
     "build_synchronized_panes",
 ]

@@ -148,6 +148,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0006",
     "WO36-C",
     "WO36-D",
+    "WO36-E",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4218,6 +4219,84 @@ def _audit_wo36d() -> ExpansionGateReport:
     )
 
 
+def _audit_wo36e() -> ExpansionGateReport:
+    """Verify branch comparison, immutable sidecars, and timing-lie review."""
+
+    from kirby2.audit.replay_microscope import (
+        WO36E_AUDIT_CASE_COUNT,
+        audit_counterfactual_replay_comparison,
+    )
+    from kirby2.microscope.annotations import (
+        REPLAY_ANNOTATION_SCHEMA_ID,
+        REPLAY_ANNOTATION_SCHEMA_VERSION,
+        REPLAY_BOOKMARK_SCHEMA_ID,
+        REPLAY_BOOKMARK_SCHEMA_VERSION,
+        SOURCE_MUTATION_POLICY,
+        TIMING_LIE_REVIEW_PACKET_SCHEMA_ID,
+        TIMING_LIE_REVIEW_PACKET_SCHEMA_VERSION,
+        TIMING_LIE_RUBRIC_ORDER,
+        TIMING_LIE_RUBRIC_VERSION,
+        TimingLieHumanResult,
+        TimingLieTechnicalStatus,
+    )
+    from kirby2.microscope.comparison import (
+        BRANCH_COMPARISON_SCHEMA_ID,
+        BRANCH_COMPARISON_SCHEMA_VERSION,
+        COMPARISON_OVERLAY_ORDER,
+        COMPARISON_SERIES_ORDER,
+    )
+
+    cases = audit_counterfactual_replay_comparison()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO36-E",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("annotation_schema_id", REPLAY_ANNOTATION_SCHEMA_ID),
+            ("annotation_schema_version", str(REPLAY_ANNOTATION_SCHEMA_VERSION)),
+            ("audit_case_count", str(WO36E_AUDIT_CASE_COUNT)),
+            ("bookmark_schema_id", REPLAY_BOOKMARK_SCHEMA_ID),
+            ("bookmark_schema_version", str(REPLAY_BOOKMARK_SCHEMA_VERSION)),
+            ("comparison_overlay_count", str(len(COMPARISON_OVERLAY_ORDER))),
+            ("comparison_schema_id", BRANCH_COMPARISON_SCHEMA_ID),
+            ("comparison_schema_version", str(BRANCH_COMPARISON_SCHEMA_VERSION)),
+            ("comparison_series_count", str(len(COMPARISON_SERIES_ORDER))),
+            ("human_timing_lie_status", TimingLieHumanResult.PENDING.value),
+            ("sidecar_source_mutation_policy", SOURCE_MUTATION_POLICY),
+            ("timing_lie_review_schema_id", TIMING_LIE_REVIEW_PACKET_SCHEMA_ID),
+            (
+                "timing_lie_review_schema_version",
+                str(TIMING_LIE_REVIEW_PACKET_SCHEMA_VERSION),
+            ),
+            ("timing_lie_rubric_count", str(len(TIMING_LIE_RUBRIC_ORDER))),
+            ("timing_lie_rubric_version", TIMING_LIE_RUBRIC_VERSION),
+            (
+                "timing_lie_technical_status",
+                TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW.value,
+            ),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4268,6 +4347,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0006", _audit_dev0006),
     ("WO36-C", _audit_wo36c),
     ("WO36-D", _audit_wo36d),
+    ("WO36-E", _audit_wo36e),
 )
 
 

@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from kirby2.immutable import thaw_json
+import kirby2.microscope.annotations as replay_annotations_module
 from kirby2.microscope import (
     MECHANISTIC_INTERPRETATION,
     TRACE_EDGE_ORDER,
@@ -32,7 +33,37 @@ from kirby2.microscope import (
 from kirby2.microscope.commands import (
     MICROSCOPE_COMMAND_MODULE,
     STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+    _assemble_demo_frames,
     build_microscope_demo_artifact,
+    build_stale_partial_cancel_race_fixture,
+)
+from kirby2.microscope.annotations import (
+    TIMING_LIE_RUBRIC_ORDER,
+    ReplayAnnotationV1,
+    ReplayBookmarkV1,
+    TimingLieReviewResultV1,
+    TimingLieHumanResult,
+    TimingLieRubricOutcome,
+    TimingLieTechnicalStatus,
+    create_replay_bookmark,
+    create_timing_lie_reviewer_sidecar,
+    resolve_timing_lie_review,
+)
+from kirby2.microscope.comparison import (
+    BRANCH_COMPARISON_SCHEMA_ID,
+    BRANCH_COMPARISON_SCHEMA_VERSION,
+    COMPARISON_OVERLAY_ORDER,
+    COMPARISON_SERIES_ORDER,
+    BranchComparisonV1,
+    ComparisonAvailability,
+    ComparisonEvidenceScope,
+    ComparisonOverlayKind,
+    ComparisonRecordStatus,
+    ComparisonRunInput,
+    ComparisonSeriesInput,
+    ComparisonTraceAvailability,
+    CounterfactualRngPolicy,
+    build_branch_comparison,
 )
 from kirby2.microscope.data_age import (
     NOT_OBSERVED_AS_OF_CLIENT_KNOWLEDGE,
@@ -115,6 +146,7 @@ from kirby2.microscope.query import (
     reveal_artifact_sha256,
 )
 from kirby2.microscope.report import (
+    DeferredCapabilityKind,
     OVERLAY_FORMATTERS,
     REPORT_ASSET_SHA256,
     REPORT_SECTION_ORDER,
@@ -123,7 +155,9 @@ from kirby2.microscope.report import (
     ReplayPresentationFrameV1,
     ReportSectionAvailability,
     ReportSectionKind,
+    _render_index_bytes,
     build_portable_replay_report,
+    load_installed_renderer_assets,
     verify_portable_report_bundle,
     write_portable_report_bundle,
 )
@@ -162,6 +196,7 @@ WO36B_AUDIT_CASE_COUNT = 6
 DEV0006_AUDIT_CASE_COUNT = 4
 WO36C_AUDIT_CASE_COUNT = 6
 WO36D_AUDIT_CASE_COUNT = 6
+WO36E_AUDIT_CASE_COUNT = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,6 +653,35 @@ def audit_portable_replay_reports() -> tuple[ReplayMicroscopeAuditCase, ...]:
     )
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO36-D audit case order or identity changed")
+    return cases
+
+
+def audit_counterfactual_replay_comparison() -> tuple[
+    ReplayMicroscopeAuditCase,
+    ...,
+]:
+    """Run the fixed WO36-E comparison, sidecar, and timing-lie inventory."""
+
+    cases = (
+        _counterfactual_prefix_case(),
+        _counterfactual_series_and_overlay_case(),
+        _counterfactual_annotation_sidecar_case(),
+        _counterfactual_complete_chain_case(),
+        _counterfactual_timing_lie_case(),
+        _counterfactual_report_boundary_case(),
+    )
+    if len(cases) != WO36E_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO36-E audit case inventory changed")
+    expected_names = (
+        "counterfactual_prefix_and_first_divergence_are_exact",
+        "orders_queues_fills_metrics_and_market_path_are_compared",
+        "bookmark_and_annotation_sidecars_are_immutable_and_source_bound",
+        "every_player_action_has_a_complete_recorded_chain",
+        "timing_lie_packet_is_ready_while_human_judgment_is_pending",
+        "comparison_report_is_deterministic_safe_and_non_laundering",
+    )
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO36-E audit case order or identity changed")
     return cases
 
 
@@ -1444,6 +1508,1552 @@ def _wo36d_rejected(operation: object) -> bool:
     try:
         operation()
     except (OSError, TypeError, ValueError):
+        return True
+    return False
+
+
+def _counterfactual_prefix_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    comparison = artifact.branch_comparison
+    if type(comparison) is not BranchComparisonV1:  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted its branch comparison")
+    synchronization = comparison.synchronization
+    first = comparison.first_difference
+    identity = comparison.branch_identity
+    selection = identity.selection
+    if first.parent is None or first.branch is None:  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted one side of its first difference")
+    parent_payload = thaw_json(first.parent.payload)
+    branch_payload = thaw_json(first.branch.payload)
+    checks = {
+        "branch_mode_exact": selection.branch_mode.value == "ENDOGENOUS_FORK",
+        "branch_parent_bound": selection.parent_run_id == comparison.source_run_id,
+        "branch_run_distinct": selection.branch_run_id != selection.parent_run_id,
+        "divergence_after_fork": first.divergence_time_us >= selection.fork_time_us,
+        "divergence_event_bound": (
+            first.divergence_event_id == identity.divergence_event_id
+        ),
+        "divergence_index_exact": first.index == synchronization.prefix_length,
+        "divergence_time_exact": first.divergence_time_us == 59_752_000,
+        "first_branch_route_exact": (
+            first.branch.kind == "ROUTE_DECISION"
+            and branch_payload.get("venue_id") == "BETA"
+        ),
+        "first_parent_route_exact": (
+            first.parent.kind == "ROUTE_DECISION"
+            and parent_payload.get("venue_id") == "ALPHA"
+        ),
+        "fork_time_exact": selection.fork_time_us == 59_750_000,
+        "intervention_exact": thaw_json(selection.intervention) == {
+            "action": "ROUTE_TO_BETA",
+            "target_action_id": "player-action-0001",
+            "timing_delta_us": 0,
+        },
+        "prefix_digest_bound": (
+            synchronization.synchronized_prefix_sha256
+            == identity.synchronized_prefix_sha256
+            == selection.parent_prefix_sha256
+        ),
+        "prefix_is_nonempty": synchronization.prefix_length == 4,
+        "prefix_precedes_divergence": (
+            synchronization.prefix_events[-1].simulation_time_us
+            <= selection.fork_time_us
+            < first.divergence_time_us
+        ),
+        "rng_policy_exact": (
+            selection.rng_policy
+            is CounterfactualRngPolicy.FORK_SNAPSHOT_OWNED_RNG_STATE
+            and selection.exogenous_reference_path_sha256 is None
+        ),
+        "schema_exact": (
+            comparison.schema_id == BRANCH_COMPARISON_SCHEMA_ID
+            and comparison.schema_version == BRANCH_COMPARISON_SCHEMA_VERSION
+        ),
+        "suffix_digests_bound": (
+            synchronization.parent_suffix_sha256
+            == identity.parent_suffix_sha256
+            and synchronization.branch_suffix_sha256
+            == identity.branch_suffix_sha256
+        ),
+        "suffixes_distinct": (
+            synchronization.parent_suffix_sha256
+            != synchronization.branch_suffix_sha256
+        ),
+        "timeline_digests_distinct": (
+            identity.parent_timeline_sha256 != identity.branch_timeline_sha256
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "counterfactual_prefix_and_first_divergence_are_exact",
+        (
+            f"prefix={synchronization.prefix_length} "
+            f"fork={selection.fork_time_us} divergence={first.divergence_time_us} "
+            f"rng={selection.rng_policy.value}"
+        ),
+        {
+            **checks,
+            "branch_run_id": selection.branch_run_id,
+            "comparison_id": comparison.comparison_id,
+            "divergence_event_id": first.divergence_event_id,
+            "parent_run_id": selection.parent_run_id,
+            "synchronized_prefix_sha256": (
+                synchronization.synchronized_prefix_sha256
+            ),
+        },
+        failures,
+    )
+
+
+def _counterfactual_series_and_overlay_case() -> ReplayMicroscopeAuditCase:
+    observed = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    postmortem = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.POSTMORTEM,
+        compare_counterfactual=True,
+    )
+    comparison = observed.branch_comparison
+    postmortem_comparison = postmortem.branch_comparison
+    if type(comparison) is not BranchComparisonV1 or type(
+        postmortem_comparison
+    ) is not BranchComparisonV1:  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted a mode-specific comparison")
+    series_by_kind = {item.kind: item for item in comparison.deltas}
+    declared_metric_keys = tuple(
+        item.record_key
+        for item in series_by_kind[COMPARISON_SERIES_ORDER[3]].records
+    )
+    expected_metric_keys = (
+        "adverse-selection-ticks",
+        "filled-quantity",
+        "implementation-shortfall-x2",
+        "latency-us",
+        "stale-quote-age-us",
+    )
+    observed_agent_truth = comparison.overlays[-1]
+    postmortem_agent_truth = postmortem_comparison.overlays[-1]
+    non_agent_overlays = comparison.overlays[:-1]
+    postmortem_series_by_kind = {
+        item.kind: item for item in postmortem_comparison.deltas
+    }
+    observed_queue_value = thaw_json(
+        series_by_kind[COMPARISON_SERIES_ORDER[1]].records[0].branch.value
+    )
+    postmortem_queue_value = thaw_json(
+        postmortem_series_by_kind[
+            COMPARISON_SERIES_ORDER[1]
+        ].records[0].branch.value
+    )
+    parent_events = (
+        *comparison.synchronization.prefix_events,
+        *comparison.synchronization.parent_suffix,
+    )
+    branch_events = (
+        *comparison.synchronization.prefix_events,
+        *comparison.synchronization.branch_suffix,
+    )
+    parent_input = ComparisonRunInput(
+        run_id=comparison.source_run_id,
+        source_event_sha256=comparison.source_event_sha256,
+        timeline_sha256=comparison.branch_identity.parent_timeline_sha256,
+        observation_mode=comparison.observation_mode,
+        events=parent_events,
+        series=tuple(
+            ComparisonSeriesInput(
+                item.kind,
+                item.parent_availability,
+                tuple(
+                    record.parent
+                    for record in item.records
+                    if record.parent is not None
+                ),
+                item.unavailable_reason,
+            )
+            for item in comparison.deltas
+        ),
+    )
+    branch_input = ComparisonRunInput(
+        run_id=comparison.branch_identity.selection.branch_run_id,
+        source_event_sha256=_audit_sha256(
+            [item.semantic_dict() for item in branch_events]
+        ),
+        timeline_sha256=comparison.branch_identity.branch_timeline_sha256,
+        observation_mode=comparison.observation_mode,
+        events=branch_events,
+        series=tuple(
+            ComparisonSeriesInput(
+                item.kind,
+                item.branch_availability,
+                tuple(
+                    record.branch
+                    for record in item.records
+                    if record.branch is not None
+                ),
+                item.unavailable_reason,
+            )
+            for item in comparison.deltas
+        ),
+    )
+    postmortem_parent_events = (
+        *postmortem_comparison.synchronization.prefix_events,
+        *postmortem_comparison.synchronization.parent_suffix,
+    )
+    postmortem_branch_events = (
+        *postmortem_comparison.synchronization.prefix_events,
+        *postmortem_comparison.synchronization.branch_suffix,
+    )
+    postmortem_parent_input = ComparisonRunInput(
+        run_id=postmortem_comparison.source_run_id,
+        source_event_sha256=postmortem_comparison.source_event_sha256,
+        timeline_sha256=(
+            postmortem_comparison.branch_identity.parent_timeline_sha256
+        ),
+        observation_mode=postmortem_comparison.observation_mode,
+        events=postmortem_parent_events,
+        series=tuple(
+            ComparisonSeriesInput(
+                item.kind,
+                item.parent_availability,
+                tuple(
+                    record.parent
+                    for record in item.records
+                    if record.parent is not None
+                ),
+                item.unavailable_reason,
+            )
+            for item in postmortem_comparison.deltas
+        ),
+    )
+    postmortem_branch_input = ComparisonRunInput(
+        run_id=postmortem_comparison.branch_identity.selection.branch_run_id,
+        source_event_sha256=_audit_sha256(
+            [item.semantic_dict() for item in postmortem_branch_events]
+        ),
+        timeline_sha256=(
+            postmortem_comparison.branch_identity.branch_timeline_sha256
+        ),
+        observation_mode=postmortem_comparison.observation_mode,
+        events=postmortem_branch_events,
+        series=tuple(
+            ComparisonSeriesInput(
+                item.kind,
+                item.branch_availability,
+                tuple(
+                    record.branch
+                    for record in item.records
+                    if record.branch is not None
+                ),
+                item.unavailable_reason,
+            )
+            for item in postmortem_comparison.deltas
+        ),
+    )
+    postmortem_inputs_as_observed_rejected = _wo36e_rejected(
+        lambda: build_branch_comparison(
+            postmortem_parent_input,
+            postmortem_branch_input,
+            postmortem_comparison.branch_identity.selection,
+            ObservationMode.AS_OBSERVED,
+        )
+    )
+    observed_agent_truth_relabel_rejected = _wo36e_rejected(
+        lambda: replace(
+            postmortem_agent_truth.overlay,
+            evidence_scope=ComparisonEvidenceScope.DECLARED_CALCULATION,
+            required_capability=None,
+        )
+    )
+    malicious_overlay = replace(
+        comparison.overlays[0].overlay,
+        parent_source_event_ids=("nonexistent-overlay-event",),
+        parent_source_payload_sha256=("0" * 64,),
+    )
+    unknown_overlay_source_rejected = _wo36e_rejected(
+        lambda: build_branch_comparison(
+            parent_input,
+            branch_input,
+            comparison.branch_identity.selection,
+            ObservationMode.AS_OBSERVED,
+            overlays=(
+                malicious_overlay,
+                *(item.overlay for item in comparison.overlays[1:]),
+            ),
+            mechanistic_trace=observed.trace_index,
+            require_complete_trace=True,
+        )
+    )
+    checks = {
+        "all_declared_series_available": all(
+            item.availability is ComparisonAvailability.AVAILABLE
+            for item in comparison.deltas
+        ),
+        "all_declared_series_changed": all(
+            item.changed for item in comparison.deltas
+        ),
+        "all_series_records_source_paired": all(
+            record.parent is not None
+            and record.branch is not None
+            and record.status is ComparisonRecordStatus.CHANGED
+            for item in comparison.deltas
+            for record in item.records
+        ),
+        "declared_metric_inventory_exact": (
+            declared_metric_keys == expected_metric_keys
+        ),
+        "later_market_path_compared": (
+            series_by_kind[COMPARISON_SERIES_ORDER[-1]].availability
+            is ComparisonAvailability.AVAILABLE
+            and series_by_kind[COMPARISON_SERIES_ORDER[-1]].changed
+        ),
+        "orders_queues_and_fills_compared": all(
+            series_by_kind[kind].availability
+            is ComparisonAvailability.AVAILABLE
+            and series_by_kind[kind].changed
+            for kind in COMPARISON_SERIES_ORDER[:3]
+        ),
+        "overlay_inventory_exact": (
+            tuple(item.overlay.kind for item in comparison.overlays)
+            == COMPARISON_OVERLAY_ORDER
+        ),
+        "series_inventory_exact": (
+            tuple(item.kind for item in comparison.deltas)
+            == COMPARISON_SERIES_ORDER
+        ),
+        "wo36c_overlay_prefix_exact": (
+            tuple(item.overlay.kind.value for item in comparison.overlays[:9])
+            == tuple(item.value for item in OVERLAY_KIND_ORDER)
+        ),
+        "extended_overlays_available": all(
+            item.overlay.availability is ComparisonAvailability.AVAILABLE
+            for item in non_agent_overlays
+        ),
+        "observed_agent_truth_unavailable": (
+            observed_agent_truth.overlay.kind is ComparisonOverlayKind.AGENT_TRUTH
+            and observed_agent_truth.overlay.availability
+            is ComparisonAvailability.UNAVAILABLE
+            and not observed_agent_truth.policy_grant_verified
+        ),
+        "observed_agent_truth_relabel_rejected": (
+            observed_agent_truth_relabel_rejected
+        ),
+        "postmortem_agent_truth_authorized": (
+            postmortem_agent_truth.overlay.kind
+            is ComparisonOverlayKind.AGENT_TRUTH
+            and postmortem_agent_truth.overlay.availability
+            is ComparisonAvailability.AVAILABLE
+            and postmortem_agent_truth.policy_grant_verified
+        ),
+        "postmortem_inputs_cannot_be_reused_as_observed": (
+            postmortem_inputs_as_observed_rejected
+        ),
+        "non_queue_series_values_mode_independent": all(
+            tuple(
+                (
+                    record.record_key,
+                    record.status,
+                    None
+                    if record.parent is None
+                    else thaw_json(record.parent.value),
+                    None
+                    if record.branch is None
+                    else thaw_json(record.branch.value),
+                )
+                for record in series_by_kind[kind].records
+            )
+            == tuple(
+                (
+                    record.record_key,
+                    record.status,
+                    None
+                    if record.parent is None
+                    else thaw_json(record.parent.value),
+                    None
+                    if record.branch is None
+                    else thaw_json(record.branch.value),
+                )
+                for record in postmortem_series_by_kind[kind].records
+            )
+            for kind in COMPARISON_SERIES_ORDER
+            if kind is not COMPARISON_SERIES_ORDER[1]
+        ),
+        "observed_queue_truth_redacted_to_estimate": (
+            observed_queue_value
+            == {
+                "estimate_kind": "MODEL_ESTIMATE",
+                "estimated_quantity_ahead": 4,
+            }
+            and postmortem_queue_value
+            == {
+                "estimate_kind": "SOURCE_RECORDED_QUEUE",
+                "liquidity": "HIDDEN_ICEBERG",
+                "quantity_ahead": 4,
+            }
+        ),
+        "unknown_overlay_source_rejected": unknown_overlay_source_rejected,
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "orders_queues_fills_metrics_and_market_path_are_compared",
+        (
+            f"series={len(comparison.deltas)} overlays={len(comparison.overlays)} "
+            f"changed_records={sum(len(item.records) for item in comparison.deltas)}"
+        ),
+        {
+            **checks,
+            "declared_metric_keys": list(declared_metric_keys),
+            "overlay_inventory": [
+                item.overlay.kind.value for item in comparison.overlays
+            ],
+            "series_inventory": [item.kind.value for item in comparison.deltas],
+        },
+        failures,
+    )
+
+
+def _counterfactual_annotation_sidecar_case() -> ReplayMicroscopeAuditCase:
+    source_fixture = build_stale_partial_cancel_race_fixture()
+    source_before = source_fixture.observed.canonical_bytes()
+    observed = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    repeated = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    postmortem = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.POSTMORTEM,
+        compare_counterfactual=True,
+    )
+    if len(observed.bookmarks) != 2 or len(observed.annotations) != 2:
+        raise RuntimeError("WO36-E fixture sidecar revision inventory changed")
+    bookmark_v1, bookmark_v2 = observed.bookmarks
+    annotation_v1, annotation_v2 = observed.annotations
+    bookmark_before = bookmark_v2.canonical_bytes()
+    annotation_before = annotation_v2.canonical_bytes()
+    bookmark_export = bookmark_v2.as_dict()
+    annotation_export = annotation_v2.as_dict()
+    bookmark_export["label"] = "forged label"
+    annotation_export["body"] = "forged body"
+    bookmark_export["target"]["source_run_id"] = "run-000000000000000000000000"
+    annotation_export["target"]["snapshot_id"] = "forged-snapshot"
+    frozen_bookmark_rejected = False
+    frozen_annotation_rejected = False
+    try:
+        bookmark_v2.label = "forged label"  # type: ignore[misc]
+    except (AttributeError, TypeError):
+        frozen_bookmark_rejected = True
+    try:
+        annotation_v2.body = "forged body"  # type: ignore[misc]
+    except (AttributeError, TypeError):
+        frozen_annotation_rejected = True
+
+    moved_revision_rejected = _wo36e_rejected(
+        lambda: create_replay_bookmark(
+            postmortem.bookmarks[0].target,
+            label="cross-mode move",
+            author_id="kirby2-acceptance-reviewer",
+            predecessor=bookmark_v1,
+        )
+    )
+    cross_report_rejected = _wo36e_rejected(
+        lambda: build_portable_replay_report(
+            observed.report.frames,
+            bookmarks=postmortem.bookmarks,
+            annotations=observed.annotations,
+            branch_comparison=observed.branch_comparison,
+            timing_review_packet=observed.timing_review_packet,
+            timing_review_result=observed.timing_review_result,
+        )
+    )
+    direct_bookmark_rejected = _wo36e_rejected(
+        lambda: ReplayBookmarkV1(
+            target=bookmark_v1.target,
+            label=bookmark_v1.label,
+            author_id=bookmark_v1.author_id,
+            tags=bookmark_v1.tags,
+            revision=bookmark_v1.revision,
+            predecessor_bookmark_id=bookmark_v1.predecessor_bookmark_id,
+            predecessor_sha256=bookmark_v1.predecessor_sha256,
+            _construction_token=None,
+        )
+    )
+    direct_annotation_rejected = _wo36e_rejected(
+        lambda: ReplayAnnotationV1(
+            target=annotation_v1.target,
+            kind=annotation_v1.kind,
+            body=annotation_v1.body,
+            author_id=annotation_v1.author_id,
+            tags=annotation_v1.tags,
+            revision=annotation_v1.revision,
+            predecessor_annotation_id=annotation_v1.predecessor_annotation_id,
+            predecessor_sha256=annotation_v1.predecessor_sha256,
+            _construction_token=None,
+        )
+    )
+    frame_bindings = {
+        (
+            thaw_json(frame.identity)["source_run_id"],
+            thaw_json(frame.identity)["source_event_sha256"],
+            thaw_json(frame.identity)["render_cursor_time_us"],
+            thaw_json(frame.pane_snapshot)["snapshot_id"],
+        )
+        for frame in observed.report.frames
+    }
+    sidecar_bindings = {
+        (
+            item.source_run_id,
+            item.source_event_sha256,
+            item.render_cursor_time_us,
+            item.snapshot_id,
+        )
+        for item in (*observed.bookmarks, *observed.annotations)
+    }
+    checks = {
+        "annotation_export_detached": (
+            annotation_v2.canonical_bytes() == annotation_before
+        ),
+        "annotation_revision_chain_exact": (
+            annotation_v1.revision == 1
+            and annotation_v1.predecessor_annotation_id is None
+            and annotation_v2.revision == 2
+            and annotation_v2.predecessor_annotation_id
+            == annotation_v1.annotation_id
+            and annotation_v2.predecessor_sha256
+            == annotation_v1.sidecar_sha256
+            and annotation_v2.target.target_id == annotation_v1.target.target_id
+        ),
+        "bookmark_export_detached": bookmark_v2.canonical_bytes() == bookmark_before,
+        "bookmark_revision_chain_exact": (
+            bookmark_v1.revision == 1
+            and bookmark_v1.predecessor_bookmark_id is None
+            and bookmark_v2.revision == 2
+            and bookmark_v2.predecessor_bookmark_id == bookmark_v1.bookmark_id
+            and bookmark_v2.predecessor_sha256 == bookmark_v1.sidecar_sha256
+            and bookmark_v2.target.target_id == bookmark_v1.target.target_id
+        ),
+        "content_ids_deterministic": (
+            tuple(item.bookmark_id for item in observed.bookmarks)
+            == tuple(item.bookmark_id for item in repeated.bookmarks)
+            and tuple(item.annotation_id for item in observed.annotations)
+            == tuple(item.annotation_id for item in repeated.annotations)
+        ),
+        "cross_report_rejected": cross_report_rejected,
+        "direct_annotation_rejected": direct_annotation_rejected,
+        "direct_bookmark_rejected": direct_bookmark_rejected,
+        "frozen_annotation_rejected": frozen_annotation_rejected,
+        "frozen_bookmark_rejected": frozen_bookmark_rejected,
+        "moved_revision_rejected": moved_revision_rejected,
+        "sidecars_bind_exact_report_frames": sidecar_bindings <= frame_bindings,
+        "source_bytes_unchanged": (
+            source_fixture.observed.canonical_bytes() == source_before
+        ),
+        "source_identity_preserved": all(
+            item.source_run_id == source_fixture.observed.source_run_id
+            and item.source_event_sha256
+            == source_fixture.observed.source_event_sha256
+            for item in (*observed.bookmarks, *observed.annotations)
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "bookmark_and_annotation_sidecars_are_immutable_and_source_bound",
+        (
+            f"bookmarks={len(observed.bookmarks)} "
+            f"annotations={len(observed.annotations)} "
+            f"boundary_checks={sum(checks.values())}/{len(checks)}"
+        ),
+        {
+            **checks,
+            "annotation_ids": [
+                item.annotation_id for item in observed.annotations
+            ],
+            "bookmark_ids": [item.bookmark_id for item in observed.bookmarks],
+            "target_ids": sorted(
+                {item.target.target_id for item in observed.annotations}
+                | {item.target.target_id for item in observed.bookmarks}
+            ),
+        },
+        failures,
+    )
+
+
+def _counterfactual_complete_chain_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    index = artifact.trace_index
+    comparison = artifact.branch_comparison
+    if index is None or type(comparison) is not BranchComparisonV1:  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted its complete trace")
+    traces = index.traces
+    trace = traces[0]
+    node_sequences = tuple(
+        -1 if item.provenance is None else item.provenance.event_sequence
+        for item in trace.nodes
+    )
+    adjacent_endpoints = tuple(
+        (left, right)
+        for left, right in zip(TRACE_STAGE_ORDER, TRACE_STAGE_ORDER[1:])
+    )
+    trace_payload = comparison.mechanistic_trace.as_dict()["trace_payload"]
+    if not isinstance(trace_payload, dict):  # pragma: no cover
+        raise RuntimeError("comparison trace payload is not an object")
+    missing_node_rejected = _wo36e_rejected(
+        lambda: replace(trace, nodes=trace.nodes[:-1])
+    )
+    missing_edge_rejected = _wo36e_rejected(
+        lambda: replace(trace, edges=trace.edges[:-1])
+    )
+    reordered_nodes_rejected = _wo36e_rejected(
+        lambda: replace(trace, nodes=tuple(reversed(trace.nodes)))
+    )
+    checks = {
+        "all_actions_complete": (
+            index.complete_action_count == len(traces) == 1
+            and all(item.complete for item in traces)
+        ),
+        "all_edges_linked": all(
+            item.status is TraceLinkStatus.LINKED for item in trace.edges
+        ),
+        "all_nodes_recorded": all(
+            item.availability is TraceAvailability.RECORDED for item in trace.nodes
+        ),
+        "comparison_requires_complete_trace": (
+            comparison.mechanistic_trace.availability
+            is ComparisonTraceAvailability.AVAILABLE
+            and comparison.mechanistic_trace.complete_required
+            and trace_payload.get("all_actions_complete") is True
+            and trace_payload.get("incomplete_action_ids") == []
+        ),
+        "correlation_chain_present": all(
+            item.correlation_ids == ("corr-1", "player-order-1")
+            for item in trace.edges
+        ),
+        "edge_endpoints_exact": (
+            tuple((item.from_stage, item.to_stage) for item in trace.edges)
+            == adjacent_endpoints
+        ),
+        "edge_inventory_exact": (
+            tuple(item.kind for item in trace.edges) == TRACE_EDGE_ORDER
+        ),
+        "missing_edge_rejected": missing_edge_rejected,
+        "missing_node_rejected": missing_node_rejected,
+        "node_inventory_exact": (
+            tuple(item.stage for item in trace.nodes) == TRACE_STAGE_ORDER
+        ),
+        "node_sequence_monotonic": node_sequences
+        == tuple(range(1, len(TRACE_STAGE_ORDER) + 1)),
+        "no_required_unavailable": (
+            trace.unavailable_node_count == 0
+            and trace.unavailable_edge_count == 0
+            and b'"UNAVAILABLE"' not in _audit_canonical_json_bytes(trace.as_dict())
+        ),
+        "reordered_nodes_rejected": reordered_nodes_rejected,
+        "source_identity_exact": (
+            index.source_run_id == comparison.source_run_id
+            and comparison.mechanistic_trace.source_run_id == index.source_run_id
+            and comparison.mechanistic_trace.source_event_sha256
+            == index.source_event_sha256
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "every_player_action_has_a_complete_recorded_chain",
+        (
+            f"actions={len(traces)} nodes={len(trace.nodes)} "
+            f"edges={len(trace.edges)} unavailable=0"
+        ),
+        {
+            **checks,
+            "action_ids": [item.action_id for item in traces],
+            "edge_inventory": [item.value for item in TRACE_EDGE_ORDER],
+            "node_inventory": [item.value for item in TRACE_STAGE_ORDER],
+            "trace_index_id": index.index_id,
+        },
+        failures,
+    )
+
+
+def _counterfactual_timing_lie_case() -> ReplayMicroscopeAuditCase:
+    artifact = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    packet = artifact.timing_review_packet
+    result = artifact.timing_review_result
+    comparison = artifact.branch_comparison
+    if (
+        packet is None
+        or result is None
+        or type(comparison) is not BranchComparisonV1
+    ):  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted timing-lie review state")
+    expected_targets = (
+        (PaneKind.PLAYER_ORDERS, 59_750_000),
+        (PaneKind.FILLS, 59_830_000),
+        (PaneKind.FEATURE_PROVENANCE, 59_750_000),
+        (PaneKind.AGENT_ACTIVITY, 60_000_000),
+        (PaneKind.MECHANISTIC_TRACE, 60_000_000),
+        (PaneKind.COUNTERFACTUAL_COMPARISON, 60_000_000),
+    )
+    actual_targets = tuple(
+        (search.targets[0].pane_kind, search.targets[0].render_cursor_time_us)
+        for search in packet.searches
+    )
+    frame_snapshot_ids = {
+        thaw_json(frame.pane_snapshot)["snapshot_id"]
+        for frame in artifact.report.frames
+    }
+    comparison_search = packet.searches[-1]
+    comparison_target = comparison_search.targets[0]
+    comparison_frame = next(
+        frame
+        for frame in artifact.report.frames
+        if thaw_json(frame.identity)["cursor_id"] == comparison_target.cursor_id
+    )
+    comparison_snapshot = thaw_json(comparison_frame.pane_snapshot)
+    comparison_pane = next(
+        pane
+        for pane in comparison_snapshot["panes"]
+        if pane["pane_kind"] == PaneKind.COUNTERFACTUAL_COMPARISON.value
+    )
+    comparison_references = comparison_pane.get("comparison_references", [])
+    comparison_reference = (
+        comparison_references[0] if len(comparison_references) == 1 else {}
+    )
+    comparison_binding = comparison_reference.get("binding", {})
+    comparison_digest = hashlib.sha256(comparison.canonical_bytes()).hexdigest()
+    outcomes = {
+        item: TimingLieRubricOutcome.NO_TIMING_LIE_FOUND
+        for item in TIMING_LIE_RUBRIC_ORDER
+    }
+    notes = {
+        item: "Human inspected the exact bound pane, time, and snapshot."
+        for item in TIMING_LIE_RUBRIC_ORDER
+    }
+    automation_rejected = _wo36e_rejected(
+        lambda: create_timing_lie_reviewer_sidecar(
+            packet,
+            reviewer_id="automation-reviewer",
+            reviewer_reference="automation:wo36e",
+            outcomes=outcomes,
+            notes=notes,
+        )
+    )
+    local_spoof_rejected = _wo36e_rejected(
+        lambda: create_timing_lie_reviewer_sidecar(
+            packet,
+            reviewer_id="caller-controlled-local-reviewer",
+            reviewer_reference="local:spoofed-reviewer",
+            outcomes=outcomes,
+            notes=notes,
+        )
+    )
+    auth_spoof_rejected = _wo36e_rejected(
+        lambda: create_timing_lie_reviewer_sidecar(
+            packet,
+            reviewer_id="caller-controlled-auth-reviewer",
+            reviewer_reference="auth:anything",
+            outcomes=outcomes,
+            notes=notes,
+        )
+    )
+    token_bypass_judgments = tuple(
+        replay_annotations_module.TimingLieRubricJudgmentV1(
+            search=search,
+            outcome=TimingLieRubricOutcome.NO_TIMING_LIE_FOUND,
+            note="Caller forged a complete no-timing-lie judgment.",
+            _construction_token=(
+                replay_annotations_module._RUBRIC_JUDGMENT_TOKEN
+            ),
+        )
+        for search in TIMING_LIE_RUBRIC_ORDER
+    )
+    token_bypass_sidecar = replay_annotations_module.TimingLieReviewerSidecarV1(
+        packet_id=packet.packet_id,
+        packet_sha256=packet.packet_sha256,
+        source_run_id=packet.source_run_id,
+        source_event_sha256=packet.source_event_sha256,
+        rubric_version=packet.rubric_version,
+        reviewer_id="caller-controlled-token-reviewer",
+        reviewer_reference="auth:caller-imported-module-token",
+        judgments=token_bypass_judgments,
+        revision=1,
+        predecessor_sidecar_id=None,
+        predecessor_sha256=None,
+        _construction_token=replay_annotations_module._REVIEWER_SIDECAR_TOKEN,
+    )
+    token_bypass_rejected = _wo36e_rejected(
+        lambda: resolve_timing_lie_review(packet, token_bypass_sidecar)
+    )
+    unresolved_again = resolve_timing_lie_review(packet)
+    direct_result_rejected = _wo36e_rejected(
+        lambda: TimingLieReviewResultV1(
+            packet_id=packet.packet_id,
+            packet_sha256=packet.packet_sha256,
+            source_run_id=packet.source_run_id,
+            source_event_sha256=packet.source_event_sha256,
+            technical_status=TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW,
+            human_result=TimingLieHumanResult.PASS,
+            reviewer_sidecar_id=None,
+            reviewer_sidecar_sha256=None,
+            _construction_token=None,
+        )
+    )
+    checks = {
+        "all_searches_have_exact_targets": all(
+            len(search.targets) == 1
+            and search.targets[0].snapshot_id in frame_snapshot_ids
+            and search.targets[0].source_run_id == packet.source_run_id
+            and search.targets[0].source_event_sha256
+            == packet.source_event_sha256
+            for search in packet.searches
+        ),
+        "auth_string_spoof_rejected": auth_spoof_rejected,
+        "automation_reviewer_rejected": automation_rejected,
+        "direct_result_rejected": direct_result_rejected,
+        "human_status_pending_without_sidecar": (
+            result.human_result is TimingLieHumanResult.PENDING
+            and result.reviewer_sidecar_id is None
+            and result.reviewer_sidecar_sha256 is None
+            and unresolved_again.canonical_bytes() == result.canonical_bytes()
+        ),
+        "misleading_causal_wording_binds_available_comparison": (
+            comparison_search.search is TIMING_LIE_RUBRIC_ORDER[-1]
+            and comparison_target.pane_kind
+            is PaneKind.COUNTERFACTUAL_COMPARISON
+            and comparison_target.pane_availability
+            is PaneAvailability.AVAILABLE
+            and comparison_pane["availability"]
+            == PaneAvailability.AVAILABLE.value
+            and comparison_target.pane_sha256
+            == _audit_sha256(comparison_pane)
+            and comparison_target.snapshot_id
+            == comparison_snapshot["snapshot_id"]
+            and comparison_target.render_cursor_time_us
+            == comparison_reference.get("render_cursor_time_us")
+            == 60_000_000
+            and comparison_binding.get("comparison_id")
+            == comparison.comparison_id
+            and comparison_binding.get("comparison_sha256")
+            == comparison_digest
+        ),
+        "local_string_spoof_rejected": local_spoof_rejected,
+        "no_public_caller_can_create_human_result": (
+            automation_rejected
+            and local_spoof_rejected
+            and auth_spoof_rejected
+            and token_bypass_rejected
+        ),
+        "packet_status_exact": (
+            packet.technical_status
+            is TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW
+            and packet.human_result is TimingLieHumanResult.PENDING
+            and result.technical_status
+            is TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW
+        ),
+        "rubric_inventory_exact": (
+            tuple(item.search for item in packet.searches)
+            == TIMING_LIE_RUBRIC_ORDER
+            and len(packet.searches) == 6
+        ),
+        "search_statuses_exact": all(
+            item.technical_status
+            is TimingLieTechnicalStatus.READY_FOR_HUMAN_REVIEW
+            and item.human_result is TimingLieHumanResult.PENDING
+            for item in packet.searches
+        ),
+        "target_inventory_exact": actual_targets == expected_targets,
+        "token_bypass_pass_sidecar_rejected": (
+            token_bypass_sidecar.human_result is TimingLieHumanResult.PASS
+            and token_bypass_rejected
+            and unresolved_again.human_result is TimingLieHumanResult.PENDING
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "timing_lie_packet_is_ready_while_human_judgment_is_pending",
+        (
+            f"rubric_searches={len(packet.searches)} "
+            f"technical={packet.technical_status.value} "
+            f"human={result.human_result.value}"
+        ),
+        {
+            **checks,
+            "packet_id": packet.packet_id,
+            "reviewer_adapter_status": "NOT_AVAILABLE_IN_WO36_E",
+            "rubric_searches": [item.value for item in TIMING_LIE_RUBRIC_ORDER],
+            "target_references": [
+                {
+                    "pane_kind": search.targets[0].pane_kind.value,
+                    "render_cursor_time_us": (
+                        search.targets[0].render_cursor_time_us
+                    ),
+                    "snapshot_id": search.targets[0].snapshot_id,
+                    "target_id": search.targets[0].target_id,
+                }
+                for search in packet.searches
+            ],
+        },
+        failures,
+    )
+
+
+def _counterfactual_pane_payload(
+    frame: ReplayPresentationFrameV1,
+) -> tuple[dict[str, object], dict[str, object]]:
+    snapshot = thaw_json(frame.pane_snapshot)
+    if not isinstance(snapshot, dict):  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E frame pane snapshot is not an object")
+    panes = snapshot.get("panes")
+    if not isinstance(panes, list):  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E frame pane inventory is not a list")
+    matches = [
+        item
+        for item in panes
+        if isinstance(item, dict)
+        and item.get("pane_kind") == PaneKind.COUNTERFACTUAL_COMPARISON.value
+    ]
+    if len(matches) != 1:  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E frame lacks its fixed comparison pane")
+    return snapshot, matches[0]
+
+
+def _repin_serialized_content_id(
+    value: dict[str, object],
+    *,
+    id_field: str,
+    prefix: str,
+) -> str:
+    identity = dict(value)
+    identity.pop(id_field)
+    content_id = prefix + _audit_sha256(identity)[:24]
+    value[id_field] = content_id
+    return content_id
+
+
+def _fully_repinned_comparison_semantic_forgery(
+    report: PortableReplayReportV1,
+    root: Path,
+) -> dict[str, object]:
+    """Forge comparison semantics while re-pinning every outer bundle identity."""
+
+    report_payload = report.as_dict()
+    sections = report_payload.get("sections")
+    if not isinstance(sections, list):  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E forged report section inventory is invalid")
+    section = next(
+        item
+        for item in sections
+        if isinstance(item, dict)
+        and item.get("kind") == ReportSectionKind.BRANCH_COMPARISON.value
+    )
+    if (
+        section.get("availability") != ReportSectionAvailability.AVAILABLE.value
+        or not isinstance(section.get("payload"), dict)
+    ):  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E forgery requires an available comparison payload")
+    comparison = section["payload"]
+    assert isinstance(comparison, dict)
+    first_difference = comparison.get("first_difference")
+    branch_identity = comparison.get("branch_identity")
+    if not isinstance(first_difference, dict) or not isinstance(
+        branch_identity,
+        dict,
+    ):  # pragma: no cover - fixture invariant
+        raise RuntimeError("WO36-E comparison roots are invalid")
+
+    original_divergence_time_us = first_difference.get("divergence_time_us")
+    if type(original_divergence_time_us) is not int:  # pragma: no cover
+        raise RuntimeError("WO36-E comparison divergence time is invalid")
+    forged_divergence_time_us = original_divergence_time_us + 1
+    first_difference["divergence_time_us"] = forged_divergence_time_us
+    forged_divergence_event_id = _repin_serialized_content_id(
+        first_difference,
+        id_field="divergence_event_id",
+        prefix="branch-divergence-",
+    )
+    branch_identity["divergence_time_us"] = forged_divergence_time_us
+    branch_identity["divergence_event_id"] = forged_divergence_event_id
+    forged_branch_identity_id = _repin_serialized_content_id(
+        branch_identity,
+        id_field="branch_identity_id",
+        prefix="branch-identity-",
+    )
+    forged_comparison_id = _repin_serialized_content_id(
+        comparison,
+        id_field="comparison_id",
+        prefix="branch-comparison-",
+    )
+    forged_comparison_sha256 = _audit_sha256(comparison)
+
+    identity_fields = (
+        "frames",
+        "renderer_assets",
+        "renderer_id",
+        "renderer_version",
+        "schema_id",
+        "schema_version",
+        "sections",
+    )
+    report_identity = {
+        field_name: report_payload[field_name]
+        for field_name in identity_fields
+    }
+    report_semantic_sha256 = _audit_sha256(report_identity)
+    forged_report_id = "portable-replay-report-" + report_semantic_sha256[:24]
+    report_payload["report_id"] = forged_report_id
+    report_bytes = _audit_canonical_json_bytes(report_payload)
+
+    frames = report_payload["frames"]
+    if not isinstance(frames, list) or not frames:  # pragma: no cover
+        raise RuntimeError("WO36-E forged report lacks frames")
+    first_frame = frames[0]
+    if not isinstance(first_frame, dict):  # pragma: no cover
+        raise RuntimeError("WO36-E forged report frame is invalid")
+    presentation = first_frame.get("presentation")
+    if not isinstance(presentation, dict):  # pragma: no cover
+        raise RuntimeError("WO36-E forged report presentation is invalid")
+    watermark = presentation.get("watermark")
+    if not isinstance(watermark, dict) or type(watermark.get("label")) is not str:
+        raise RuntimeError("WO36-E forged report watermark is invalid")
+    assets = {item.name: item for item in load_installed_renderer_assets()}
+    index_bytes = _render_index_bytes(
+        report_bytes,
+        forged_report_id,
+        watermark["label"],
+        assets,
+    )
+    (root / "index.html").write_bytes(index_bytes)
+
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    if not isinstance(manifest, dict):  # pragma: no cover
+        raise RuntimeError("WO36-E forged manifest is not an object")
+    manifest["report_id"] = forged_report_id
+    manifest["report_semantic_sha256"] = report_semantic_sha256
+    member_rows = manifest.get("members")
+    if not isinstance(member_rows, list):  # pragma: no cover
+        raise RuntimeError("WO36-E forged manifest member rows are invalid")
+    for row in member_rows:
+        if not isinstance(row, dict) or type(row.get("path")) is not str:
+            raise RuntimeError("WO36-E forged manifest member row is invalid")
+        member_path = root.joinpath(*row["path"].split("/"))
+        member_bytes = member_path.read_bytes()
+        row["sha256"] = hashlib.sha256(member_bytes).hexdigest()
+        row["size_bytes"] = len(member_bytes)
+    manifest_bytes = _audit_canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+    forged_bundle_id = (
+        "portable-report-bundle-" + hashlib.sha256(manifest_bytes).hexdigest()[:24]
+    )
+
+    comparison_identity = dict(comparison)
+    comparison_identity.pop("comparison_id")
+    branch_identity_without_id = dict(branch_identity)
+    branch_identity_without_id.pop("branch_identity_id")
+    first_difference_without_id = dict(first_difference)
+    first_difference_without_id.pop("divergence_event_id")
+    member_pins_match = all(
+        isinstance(row, dict)
+        and isinstance(row.get("path"), str)
+        and row.get("sha256")
+        == hashlib.sha256(
+            root.joinpath(*row["path"].split("/")).read_bytes()
+        ).hexdigest()
+        and row.get("size_bytes")
+        == len(root.joinpath(*row["path"].split("/")).read_bytes())
+        for row in member_rows
+    )
+    fully_repinned = (
+        report_payload["report_id"]
+        == "portable-replay-report-" + _audit_sha256(report_identity)[:24]
+        and manifest["report_id"] == forged_report_id
+        and manifest["report_semantic_sha256"]
+        == _audit_sha256(report_identity)
+        and manifest_path.read_bytes() == _audit_canonical_json_bytes(manifest)
+        and member_pins_match
+        and (root / "index.html").read_bytes()
+        == _render_index_bytes(
+            report_bytes,
+            forged_report_id,
+            watermark["label"],
+            assets,
+        )
+        and forged_divergence_event_id
+        == "branch-divergence-" + _audit_sha256(first_difference_without_id)[:24]
+        and forged_branch_identity_id
+        == "branch-identity-" + _audit_sha256(branch_identity_without_id)[:24]
+        and forged_comparison_id
+        == "branch-comparison-" + _audit_sha256(comparison_identity)[:24]
+        and forged_report_id != report.report_id
+    )
+    rejection_reason = ""
+    try:
+        verify_portable_report_bundle(root)
+    except (TypeError, ValueError) as error:
+        rejection_reason = str(error)
+    semantic_rejection = (
+        "first differing event time is invalid" in rejection_reason
+    )
+    return {
+        "forged_branch_identity_id": forged_branch_identity_id,
+        "forged_bundle_id": forged_bundle_id,
+        "forged_comparison_id": forged_comparison_id,
+        "forged_comparison_sha256": forged_comparison_sha256,
+        "forged_divergence_event_id": forged_divergence_event_id,
+        "forged_divergence_time_us": forged_divergence_time_us,
+        "forged_report_id": forged_report_id,
+        "fully_repinned": fully_repinned,
+        "member_pins_match": member_pins_match,
+        "original_divergence_time_us": original_divergence_time_us,
+        "rejection_reason": rejection_reason,
+        "semantic_rejection": semantic_rejection,
+    }
+
+
+def _counterfactual_report_boundary_case() -> ReplayMicroscopeAuditCase:
+    ordinary = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+    )
+    observed = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    repeated = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.AS_OBSERVED,
+        compare_counterfactual=True,
+    )
+    postmortem = build_microscope_demo_artifact(
+        STALE_PARTIAL_CANCEL_RACE_FIXTURE,
+        ObservationMode.POSTMORTEM,
+        compare_counterfactual=True,
+    )
+    comparison = observed.branch_comparison
+    postmortem_comparison = postmortem.branch_comparison
+    if type(comparison) is not BranchComparisonV1 or type(
+        postmortem_comparison
+    ) is not BranchComparisonV1:  # pragma: no cover
+        raise RuntimeError("WO36-E fixture omitted report comparison material")
+    fixture = build_stale_partial_cancel_race_fixture()
+    _, attached_without_capability_frames, _ = _assemble_demo_frames(
+        fixture,
+        ObservationMode.AS_OBSERVED,
+        branch_comparison=comparison,
+        available_wo36e_capabilities=(),
+    )
+    attached_pane_without_section_rejected = _wo36e_rejected(
+        lambda: build_portable_replay_report(attached_without_capability_frames)
+    )
+    _, capability_without_attached_frames, _ = _assemble_demo_frames(
+        fixture,
+        ObservationMode.AS_OBSERVED,
+        available_wo36e_capabilities=(
+            DeferredCapabilityKind.COUNTERFACTUAL_SELECTION,
+            DeferredCapabilityKind.COMPARISON,
+        ),
+    )
+    comparison_section_without_pane_rejected = _wo36e_rejected(
+        lambda: build_portable_replay_report(
+            capability_without_attached_frames,
+            branch_comparison=comparison,
+        )
+    )
+    partial_producer_combinations_supported = False
+    try:
+        _, bookmark_frames, _ = _assemble_demo_frames(
+            fixture,
+            ObservationMode.AS_OBSERVED,
+            available_wo36e_capabilities=(DeferredCapabilityKind.BOOKMARK,),
+        )
+        bookmark_only = build_portable_replay_report(
+            bookmark_frames,
+            bookmarks=(),
+        )
+        _, annotation_frames, _ = _assemble_demo_frames(
+            fixture,
+            ObservationMode.AS_OBSERVED,
+            available_wo36e_capabilities=(DeferredCapabilityKind.ANNOTATION,),
+        )
+        annotation_only = build_portable_replay_report(
+            annotation_frames,
+            annotations=(),
+        )
+        _, comparison_frames, _ = _assemble_demo_frames(
+            fixture,
+            ObservationMode.AS_OBSERVED,
+            branch_comparison=comparison,
+            available_wo36e_capabilities=(
+                DeferredCapabilityKind.COUNTERFACTUAL_SELECTION,
+                DeferredCapabilityKind.COMPARISON,
+            ),
+        )
+        comparison_only = build_portable_replay_report(
+            comparison_frames,
+            branch_comparison=comparison,
+        )
+        bookmark_sections = {item.kind: item for item in bookmark_only.sections}
+        annotation_sections = {item.kind: item for item in annotation_only.sections}
+        comparison_sections = {item.kind: item for item in comparison_only.sections}
+        partial_producer_combinations_supported = (
+            bookmark_sections[ReportSectionKind.BOOKMARKS].availability
+            is ReportSectionAvailability.RECORDED_EMPTY
+            and bookmark_sections[ReportSectionKind.ANNOTATIONS].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and bookmark_sections[
+                ReportSectionKind.BRANCH_COMPARISON
+            ].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and annotation_sections[ReportSectionKind.BOOKMARKS].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and annotation_sections[ReportSectionKind.ANNOTATIONS].availability
+            is ReportSectionAvailability.RECORDED_EMPTY
+            and annotation_sections[
+                ReportSectionKind.BRANCH_COMPARISON
+            ].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and comparison_sections[ReportSectionKind.BOOKMARKS].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and comparison_sections[ReportSectionKind.ANNOTATIONS].availability
+            is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+            and comparison_sections[
+                ReportSectionKind.BRANCH_COMPARISON
+            ].availability
+            is ReportSectionAvailability.AVAILABLE
+        )
+    except (PermissionError, TypeError, ValueError):
+        partial_producer_combinations_supported = False
+    member_names = (
+        "assets/report.css",
+        "assets/report.js",
+        "index.html",
+        "manifest.json",
+    )
+    deterministic = (
+        observed.report.canonical_bytes() == repeated.report.canonical_bytes()
+        and observed.report.report_id == repeated.report.report_id
+        and observed.bundle.bundle_id == repeated.bundle.bundle_id
+        and comparison.canonical_bytes()
+        == repeated.branch_comparison.canonical_bytes()
+        and all(
+            observed.bundle.member_bytes(name)
+            == repeated.bundle.member_bytes(name)
+            for name in member_names
+        )
+    )
+    sections = {item.kind: item for item in observed.report.sections}
+    ordinary_sections = {item.kind: item for item in ordinary.report.sections}
+    populated_sections = all(
+        sections[kind].availability is ReportSectionAvailability.AVAILABLE
+        for kind in (
+            ReportSectionKind.BOOKMARKS,
+            ReportSectionKind.ANNOTATIONS,
+            ReportSectionKind.BRANCH_COMPARISON,
+        )
+    )
+    ordinary_deferred = all(
+        ordinary_sections[kind].availability
+        is ReportSectionAvailability.NOT_AVAILABLE_UNTIL_WO36_E
+        for kind in (
+            ReportSectionKind.BOOKMARKS,
+            ReportSectionKind.ANNOTATIONS,
+            ReportSectionKind.BRANCH_COMPARISON,
+        )
+    )
+    comparison_sha256 = hashlib.sha256(comparison.canonical_bytes()).hexdigest()
+    comparison_panes_available = True
+    comparison_references_content_bound = True
+    observed_pane_rows: list[list[dict[str, object]]] = []
+    ordinary_pane_rows: list[list[dict[str, object]]] = []
+    comparison_reference_ids: list[str] = []
+    for frame in observed.report.frames:
+        snapshot, pane = _counterfactual_pane_payload(frame)
+        panes = snapshot.get("panes")
+        if not isinstance(panes, list):  # pragma: no cover - helper invariant
+            raise RuntimeError("WO36-E observed pane inventory changed")
+        observed_pane_rows.append(
+            [
+                item
+                for item in panes
+                if isinstance(item, dict)
+                and item.get("pane_kind")
+                != PaneKind.COUNTERFACTUAL_COMPARISON.value
+            ]
+        )
+        references = pane.get("comparison_references")
+        identity = thaw_json(frame.identity)
+        reference = (
+            references[0]
+            if isinstance(references, list)
+            and len(references) == 1
+            and isinstance(references[0], dict)
+            else None
+        )
+        binding = (
+            reference.get("binding")
+            if isinstance(reference, dict)
+            and isinstance(reference.get("binding"), dict)
+            else None
+        )
+        comparison_panes_available = comparison_panes_available and (
+            pane.get("availability") == PaneAvailability.AVAILABLE.value
+            and pane.get("data") == []
+            and pane.get("queue_estimates") == []
+            and pane.get("explanation") is None
+            and reference is not None
+        )
+        if reference is None or binding is None or not isinstance(identity, dict):
+            comparison_references_content_bound = False
+            continue
+        binding_identity = dict(binding)
+        binding_id = binding_identity.pop("binding_id", None)
+        reference_identity = dict(reference)
+        reference_id = reference_identity.pop("reference_id", None)
+        if isinstance(reference_id, str):
+            comparison_reference_ids.append(reference_id)
+        comparison_references_content_bound = (
+            comparison_references_content_bound
+            and binding_id
+            == "counterfactual-comparison-binding-"
+            + _audit_sha256(binding_identity)[:24]
+            and reference_id
+            == "counterfactual-comparison-reference-"
+            + _audit_sha256(reference_identity)[:24]
+            and binding.get("comparison_id") == comparison.comparison_id
+            and binding.get("comparison_sha256") == comparison_sha256
+            and binding.get("branch_identity_id")
+            == comparison.branch_identity.branch_identity_id
+            and binding.get("branch_run_id")
+            == comparison.branch_identity.selection.branch_run_id
+            and binding.get("source_run_id") == comparison.source_run_id
+            and binding.get("source_event_sha256")
+            == comparison.source_event_sha256
+            and binding.get("observation_mode")
+            == comparison.observation_mode.value
+            and binding.get("policy_id") == comparison.policy_id
+            and binding.get("report_section_kind")
+            == ReportSectionKind.BRANCH_COMPARISON.value
+            and reference.get("query_id") == identity.get("query_id")
+            and reference.get("observed_projection_sha256")
+            == identity.get("observed_projection_sha256")
+            and reference.get("render_cursor_time_us")
+            == identity.get("render_cursor_time_us")
+        )
+    ordinary_comparison_pane_unchanged = True
+    for frame in ordinary.report.frames:
+        snapshot, pane = _counterfactual_pane_payload(frame)
+        panes = snapshot.get("panes")
+        if not isinstance(panes, list):  # pragma: no cover - helper invariant
+            raise RuntimeError("WO36-E ordinary pane inventory changed")
+        ordinary_pane_rows.append(
+            [
+                item
+                for item in panes
+                if isinstance(item, dict)
+                and item.get("pane_kind")
+                != PaneKind.COUNTERFACTUAL_COMPARISON.value
+            ]
+        )
+        explanation = pane.get("explanation")
+        ordinary_comparison_pane_unchanged = (
+            ordinary_comparison_pane_unchanged
+            and pane.get("availability") == PaneAvailability.UNAVAILABLE.value
+            and pane.get("data") == []
+            and pane.get("queue_estimates") == []
+            and "comparison_references" not in pane
+            and isinstance(explanation, dict)
+            and explanation.get("reason")
+            == PaneUnavailableReason.COUNTERFACTUAL_NOT_SELECTED.value
+        )
+    comparison_attachment_preserves_other_panes = (
+        ordinary_pane_rows == observed_pane_rows
+    )
+    observed_bytes = observed.report.canonical_bytes()
+    postmortem_bytes = postmortem.report.canonical_bytes()
+    forbidden_observed_material = (
+        b'"agent_state"',
+        b'"required_capability"',
+        b"AUTHORIZED_GROUND_TRUTH",
+        b"AUTHORIZED_HIDDEN_STATE",
+        b"HIDDEN_ICEBERG",
+        b"REVEALED_GROUND_TRUTH",
+        b"REVEALED_HIDDEN_STATE",
+        b"ROUTE_TO_BETA_HIDDEN_LIQUIDITY",
+        b"authorization_id",
+        b"reveal_authorization",
+    )
+    forbidden_findings = tuple(
+        item.decode("ascii")
+        for item in forbidden_observed_material
+        if item in observed_bytes
+    )
+    postmortem_truth_present = (
+        b'"agent_state"' in postmortem_bytes
+        and b"HIDDEN_ICEBERG" in postmortem_bytes
+        and b"REVEALED_HIDDEN_STATE" in postmortem_bytes
+        and postmortem_comparison.overlays[-1].policy_grant_verified
+    )
+    cross_mode_comparison_rejected = _wo36e_rejected(
+        lambda: build_portable_replay_report(
+            observed.report.frames,
+            bookmarks=observed.bookmarks,
+            annotations=observed.annotations,
+            branch_comparison=postmortem.branch_comparison,
+            timing_review_packet=observed.timing_review_packet,
+            timing_review_result=observed.timing_review_result,
+        )
+    )
+    cross_mode_sidecar_rejected = _wo36e_rejected(
+        lambda: build_portable_replay_report(
+            observed.report.frames,
+            bookmarks=postmortem.bookmarks,
+            annotations=observed.annotations,
+            branch_comparison=observed.branch_comparison,
+            timing_review_packet=observed.timing_review_packet,
+            timing_review_result=observed.timing_review_result,
+        )
+    )
+    direct_comparison_rejected = _wo36e_rejected(
+        lambda: BranchComparisonV1(
+            source_run_id=comparison.source_run_id,
+            source_event_sha256=comparison.source_event_sha256,
+            observation_mode=comparison.observation_mode,
+            policy_id=comparison.policy_id,
+            branch_identity=comparison.branch_identity,
+            synchronization=comparison.synchronization,
+            first_difference=comparison.first_difference,
+            deltas=comparison.deltas,
+            overlays=comparison.overlays,
+            mechanistic_trace=comparison.mechanistic_trace,
+            _construction_token=None,
+        )
+    )
+    relocation_passed = False
+    semantic_forgery: dict[str, object] = {}
+    with tempfile.TemporaryDirectory(prefix="kirby2-wo36e-audit-") as directory:
+        root = Path(directory).resolve()
+        first_root = root / "first" / "report"
+        relocated_root = root / "relocated" / "report"
+        forgery_root = root / "semantic-forgery" / "report"
+        first_root.parent.mkdir()
+        relocated_root.parent.mkdir()
+        forgery_root.parent.mkdir()
+        write_portable_report_bundle(observed.bundle, first_root)
+        shutil.copytree(first_root, relocated_root)
+        shutil.copytree(first_root, forgery_root)
+        first_receipt = verify_portable_report_bundle(first_root)
+        relocated_receipt = verify_portable_report_bundle(relocated_root)
+        semantic_forgery = _fully_repinned_comparison_semantic_forgery(
+            observed.report,
+            forgery_root,
+        )
+        relocation_passed = (
+            first_receipt["status"] == "PASS"
+            and relocated_receipt["status"] == "PASS"
+            and first_receipt["bundle_id"] == observed.bundle.bundle_id
+            and relocated_receipt["bundle_id"] == observed.bundle.bundle_id
+        )
+    checks = {
+        "as_observed_contains_no_reveal_or_bearer_material": not forbidden_findings,
+        "attached_comparison_pane_requires_its_report_section": (
+            attached_pane_without_section_rejected
+        ),
+        "comparison_attachment_preserves_other_panes": (
+            comparison_attachment_preserves_other_panes
+        ),
+        "comparison_panes_available": comparison_panes_available,
+        "comparison_references_are_content_bound": (
+            comparison_references_content_bound
+        ),
+        "comparison_section_requires_its_attached_pane": (
+            comparison_section_without_pane_rejected
+        ),
+        "cross_mode_comparison_rejected": cross_mode_comparison_rejected,
+        "cross_mode_sidecar_rejected": cross_mode_sidecar_rejected,
+        "deterministic_report_and_bundle": deterministic,
+        "direct_comparison_rejected": direct_comparison_rejected,
+        "fully_repinned_semantic_forgery_rejected": (
+            semantic_forgery.get("fully_repinned") is True
+            and semantic_forgery.get("semantic_rejection") is True
+        ),
+        "ordinary_comparison_pane_unchanged": ordinary_comparison_pane_unchanged,
+        "ordinary_build_remains_deferred": ordinary_deferred,
+        "partial_wo36e_producers_remain_independent": (
+            partial_producer_combinations_supported
+        ),
+        "populated_wo36e_sections_available": populated_sections,
+        "postmortem_truth_requires_verified_grant": postmortem_truth_present,
+        "relocated_bundle_verifies": relocation_passed,
+        "required_trace_has_no_unavailable_edge": (
+            observed.trace_index is not None
+            and all(
+                trace.unavailable_node_count == 0
+                and trace.unavailable_edge_count == 0
+                for trace in observed.trace_index.traces
+            )
+        ),
+        "wo36e_not_deferred_when_requested": (
+            b"NOT_AVAILABLE_UNTIL_WO36_E" not in observed_bytes
+        ),
+    }
+    failures = tuple(
+        name.replace("_", " ") for name, passed in checks.items() if not passed
+    )
+    return ReplayMicroscopeAuditCase(
+        "comparison_report_is_deterministic_safe_and_non_laundering",
+        (
+            f"report={observed.report.report_id} "
+            f"bundle={observed.bundle.bundle_id} "
+            f"boundary_checks={sum(checks.values())}/{len(checks)}"
+        ),
+        {
+            **checks,
+            "bundle_id": observed.bundle.bundle_id,
+            "comparison_id": comparison.comparison_id,
+            "comparison_reference_ids": comparison_reference_ids,
+            "comparison_sha256": comparison_sha256,
+            "forbidden_observed_findings": list(forbidden_findings),
+            "report_id": observed.report.report_id,
+            "semantic_forgery": semantic_forgery,
+        },
+        failures,
+    )
+
+
+def _wo36e_rejected(operation: object) -> bool:
+    if not callable(operation):  # pragma: no cover
+        raise RuntimeError("WO36-E rejection probe must be callable")
+    try:
+        operation()
+    except (AttributeError, OSError, PermissionError, TypeError, ValueError):
         return True
     return False
 
