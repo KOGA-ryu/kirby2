@@ -7,6 +7,7 @@ import argparse
 from kirby2.curriculum.adaptive_commands import ADAPTIVE_CURRICULUM_COMMAND_MODULE
 from kirby2.discovery.commands import STRATEGY_DISCOVERY_COMMAND_MODULE
 from kirby2.full_day.commands import FULL_DAY_COMMAND_MODULE
+from kirby2.instructor.commands import INSTRUCTOR_CONSOLE_COMMAND_MODULE
 from kirby2.microscope.commands import MICROSCOPE_COMMAND_MODULE
 from kirby2.mining.commands import MINING_COMMAND_MODULE
 from kirby2.scenario_lang.commands import SCENARIO_SOURCE_COMMAND_MODULE
@@ -53,6 +54,7 @@ EXPANSION_COMMAND_MODULES = (
     ADAPTIVE_CURRICULUM_COMMAND_MODULE,
     STRATEGY_DISCOVERY_COMMAND_MODULE,
     MICROSCOPE_COMMAND_MODULE,
+    INSTRUCTOR_CONSOLE_COMMAND_MODULE,
 )
 
 
