@@ -83,6 +83,7 @@ from kirby2.research.store import LearnerArtifactStore
 WO37A_AUDIT_CASE_COUNT = 6
 WO37B_AUDIT_CASE_COUNT = 4
 WO37C_AUDIT_CASE_COUNT = 4
+WO37D_AUDIT_CASE_COUNT = 4
 
 _LEARNER_ENTROPY = bytes(range(32))
 _INSTRUCTOR_ENTROPY = bytes(range(32, 64))
@@ -2294,12 +2295,348 @@ def _wo37c_claim_scope_case(demo: object) -> InstructorConsoleAuditCase:
     )
 
 
+def audit_instructor_research_console_queries() -> tuple[
+    InstructorConsoleAuditCase,
+    ...,
+]:
+    """Exercise WO37-D inventory, as-of isolation, and comparison queries."""
+
+    from kirby2.instructor.commands import build_instructor_demo
+
+    demo = build_instructor_demo(42)
+    cases = (
+        _wo37d_demo_inventory_case(demo),
+        _wo37d_as_of_isolation_case(demo),
+        _wo37d_comparison_matrix_case(demo),
+        _wo37d_query_refusal_case(demo),
+    )
+    expected_names = (
+        "instructor_demo_has_the_exact_local_workflow_inventory",
+        "explicit_as_of_queries_are_deterministic_and_profile_isolated",
+        "all_six_descriptive_comparison_shapes_are_queryable",
+        "one_attempt_and_cross_profile_self_queries_are_refused",
+    )
+    if len(cases) != WO37D_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO37-D audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO37-D audit case order or identity changed")
+    return cases
+
+
+def _wo37d_demo_inventory_case(demo: object) -> InstructorConsoleAuditCase:
+    counts = demo.counts
+    checks = {
+        "two_pseudonymous_learners": counts["learner_profiles"] == 2,
+        "one_assignment_and_rubric": (
+            counts["assignments"] == 1 and counts["rubrics"] == 1
+        ),
+        "three_attempts_per_learner": (
+            counts["attempts"] == 6 and counts["attempts_per_learner"] == 3
+        ),
+        "every_attempt_is_reviewed_and_annotated": (
+            counts["completed_reviews"] == 6
+            and counts["annotated_reviews"] == 6
+        ),
+        "one_cohort_study_and_comparison": (
+            counts["cohorts"] == 1
+            and counts["studies"] == 1
+            and counts["cohort_comparisons"] == 1
+        ),
+        "workflow_claim_is_bounded": (
+            demo.claim_scope == "WORKFLOW_AND_PSEUDONYMOUS_PROFILE_ISOLATION_ONLY"
+            and not demo.learner_difference_claim
+            and not demo.cohort_difference_claim
+            and not demo.causal_claim
+        ),
+        "external_services_are_absent": (
+            demo.external_service_policy == "LOCAL_ONLY_NO_EXTERNAL_SERVICES_V1"
+        ),
+    }
+    return _case_from_checks(
+        "instructor_demo_has_the_exact_local_workflow_inventory",
+        (
+            f"learners={counts['learner_profiles']} attempts={counts['attempts']} "
+            f"reviews={counts['completed_reviews']}"
+        ),
+        checks,
+        {"counts": counts, "demo_id": demo.demo_id},
+    )
+
+
+def _wo37d_as_of_isolation_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.query import (
+        InstructorQueryScopeKindV1,
+        InstructorQueryScopeV1,
+        query_console_artifacts,
+    )
+
+    as_of = demo.cohort_comparison.as_of_sequence
+    learner_views = []
+    visible_learner_ids = []
+    for learner in demo.learner_profiles:
+        scope = InstructorQueryScopeV1(
+            scope_kind=InstructorQueryScopeKindV1.LEARNER_SELF,
+            principal_profile_id=learner.profile_id,
+            learner_profile_id=learner.profile_id,
+        )
+        first = query_console_artifacts(
+            demo.console_ledger,
+            scope=scope,
+            as_of=as_of,
+        )
+        repeated = query_console_artifacts(
+            demo.console_ledger,
+            scope=scope,
+            as_of=as_of,
+        )
+        learner_views.append((first, repeated))
+        visible_learner_ids.append(
+            {
+                source.source_id
+                for row in first.rows
+                for source in row.reference.source_identities
+                if source.source_id.startswith("learner-profile-")
+            }
+        )
+    first_view, first_repeat = learner_views[0]
+    second_view, second_repeat = learner_views[1]
+    checks = {
+        "same_as_of_is_byte_identical": (
+            first_view.canonical_bytes() == first_repeat.canonical_bytes()
+            and second_view.canonical_bytes() == second_repeat.canonical_bytes()
+        ),
+        "each_scope_exposes_only_its_learner": (
+            visible_learner_ids[0] == {demo.learner_profiles[0].profile_id}
+            and visible_learner_ids[1] == {demo.learner_profiles[1].profile_id}
+        ),
+        "scopes_have_distinct_rows": (
+            first_view.canonical_bytes() != second_view.canonical_bytes()
+        ),
+        "ledger_point_is_exact": (
+            first_view.as_of_sequence == as_of
+            and second_view.as_of_sequence == as_of
+            and first_view.ledger_sha256
+            == demo.console_ledger.as_of(as_of).head_sha256
+            and second_view.ledger_sha256 == first_view.ledger_sha256
+        ),
+        "every_row_discloses_source_and_versions": all(
+            row.reference.source_identities
+            and row.reference.content_version
+            and row.reference.capability.value
+            for view, _ in learner_views
+            for row in view.rows
+        ),
+    }
+    return _case_from_checks(
+        "explicit_as_of_queries_are_deterministic_and_profile_isolated",
+        (
+            f"as_of={as_of} learner_rows="
+            f"{len(first_view.rows)},{len(second_view.rows)}"
+        ),
+        checks,
+        {
+            "learner_view_sha256": [
+                hashlib.sha256(view.canonical_bytes()).hexdigest()
+                for view in (first_view, second_view)
+            ]
+        },
+    )
+
+
+def _wo37d_comparison_matrix_case(demo: object) -> InstructorConsoleAuditCase:
+    from dataclasses import replace
+
+    from kirby2.instructor.query import (
+        ComparisonExecutionModeV1,
+        ComparisonViewKindV1,
+        ComparisonViewV1,
+        InstructorQueryScopeKindV1,
+        InstructorQueryScopeV1,
+        build_comparison_view,
+    )
+
+    sources = demo.cohort_comparison.sources
+    learner_id = demo.learner_profiles[0].profile_id
+    same_learner = tuple(
+        item for item in sources if item.learner_profile_id == learner_id
+    )
+    local_scope = InstructorQueryScopeV1(
+        scope_kind=InstructorQueryScopeKindV1.INSTRUCTOR_LOCAL,
+        principal_profile_id=demo.reviewer_profile.profile_id,
+    )
+    research_scope = demo.cohort_comparison.scope
+    manual_algorithm = (
+        same_learner[0],
+        replace(
+            same_learner[1],
+            execution_mode=ComparisonExecutionModeV1.BENCHMARK_ALGORITHM,
+        ),
+    )
+    source_matrix = (
+        (
+            ComparisonViewKindV1.SAME_LEARNER_ACROSS_ATTEMPTS,
+            local_scope,
+            same_learner,
+        ),
+        (
+            ComparisonViewKindV1.SAME_LESSON_ACROSS_LEARNERS,
+            research_scope,
+            sources,
+        ),
+        (
+            ComparisonViewKindV1.SAME_SKILL_ACROSS_SCENARIOS,
+            local_scope,
+            same_learner,
+        ),
+        (
+            ComparisonViewKindV1.SAME_HOTKEY_LAYOUT_ACROSS_SESSIONS,
+            local_scope,
+            same_learner,
+        ),
+        (
+            ComparisonViewKindV1.SAME_STRATEGY_ACROSS_VOLUME_REGIMES,
+            local_scope,
+            same_learner,
+        ),
+        (
+            ComparisonViewKindV1.MANUAL_EXECUTION_VS_BENCHMARK_ALGORITHM,
+            local_scope,
+            manual_algorithm,
+        ),
+    )
+    views = tuple(
+        build_comparison_view(
+            demo.console_ledger,
+            view_kind=kind,
+            scope=scope,
+            sources=tuple(
+                sorted(
+                    selected_sources,
+                    key=lambda item: (
+                        item.attempt_id,
+                        item.attempt_sha256,
+                        item.source_sha256,
+                    ),
+                )
+            ),
+            as_of=demo.cohort_comparison.as_of_sequence,
+        )
+        for kind, scope, selected_sources in source_matrix
+    )
+    restored = tuple(
+        ComparisonViewV1.from_canonical_bytes(item.canonical_bytes())
+        for item in views
+    )
+    checks = {
+        "all_six_kinds_are_present": (
+            tuple(item.view_kind for item in views) == tuple(ComparisonViewKindV1)
+        ),
+        "every_view_round_trips": all(
+            left.canonical_bytes() == right.canonical_bytes()
+            for left, right in zip(views, restored, strict=True)
+        ),
+        "every_view_is_descriptive": all(
+            item.capability.value == "DESCRIPTIVE" for item in views
+        ),
+        "every_view_has_multiple_exact_sources": all(
+            len(item.sources) >= 2 and item.sample_count >= 2 for item in views
+        ),
+        "every_view_uses_the_requested_ledger_point": all(
+            item.as_of_sequence == demo.cohort_comparison.as_of_sequence
+            for item in views
+        ),
+    }
+    return _case_from_checks(
+        "all_six_descriptive_comparison_shapes_are_queryable",
+        f"views={len(views)} kinds={','.join(item.view_kind.value for item in views)}",
+        checks,
+        {"comparison_ids": [item.comparison_id for item in views]},
+    )
+
+
+def _wo37d_query_refusal_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.query import (
+        ComparisonViewKindV1,
+        InstructorQueryScopeKindV1,
+        InstructorQueryScopeV1,
+        build_comparison_view,
+    )
+
+    sources = demo.cohort_comparison.sources
+    as_of = demo.cohort_comparison.as_of_sequence
+    learner = demo.learner_profiles[0]
+    learner_scope = InstructorQueryScopeV1(
+        scope_kind=InstructorQueryScopeKindV1.LEARNER_SELF,
+        principal_profile_id=learner.profile_id,
+        learner_profile_id=learner.profile_id,
+    )
+    one_attempt_refused = _raises(
+        lambda: build_comparison_view(
+            demo.console_ledger,
+            view_kind=ComparisonViewKindV1.SAME_LEARNER_ACROSS_ATTEMPTS,
+            scope=learner_scope,
+            sources=(
+                next(item for item in sources if item.learner_profile_id == learner.profile_id),
+            ),
+            as_of=as_of,
+        )
+    )
+    cross_profile = tuple(
+        next(
+            item
+            for item in sources
+            if item.learner_profile_id == profile.profile_id
+        )
+        for profile in demo.learner_profiles
+    )
+    cross_profile_refused = _raises(
+        lambda: build_comparison_view(
+            demo.console_ledger,
+            view_kind=ComparisonViewKindV1.SAME_LESSON_ACROSS_LEARNERS,
+            scope=learner_scope,
+            sources=tuple(
+                sorted(
+                    cross_profile,
+                    key=lambda item: (
+                        item.attempt_id,
+                        item.attempt_sha256,
+                        item.source_sha256,
+                    ),
+                )
+            ),
+            as_of=as_of,
+        )
+    )
+    future_as_of_refused = _raises(
+        lambda: demo.console_ledger.as_of(demo.console_ledger.head_sequence + 1)
+    )
+    checks = {
+        "one_attempt_ranking_is_refused": one_attempt_refused,
+        "learner_self_cross_profile_query_is_refused": cross_profile_refused,
+        "future_ledger_point_is_refused": future_as_of_refused,
+        "source_ledger_is_unchanged": (
+            demo.console_ledger.head_sequence == demo.counts["console_entries"]
+        ),
+    }
+    return _case_from_checks(
+        "one_attempt_and_cross_profile_self_queries_are_refused",
+        (
+            f"one_attempt={one_attempt_refused} cross_profile={cross_profile_refused} "
+            f"future_as_of={future_as_of_refused}"
+        ),
+        checks,
+        {"ledger_id": demo.console_ledger.ledger_id},
+    )
+
+
 __all__ = [
     "WO37A_AUDIT_CASE_COUNT",
     "WO37B_AUDIT_CASE_COUNT",
     "WO37C_AUDIT_CASE_COUNT",
+    "WO37D_AUDIT_CASE_COUNT",
     "InstructorConsoleAuditCase",
     "audit_pseudonymous_profiles_and_consent",
     "audit_reproducible_local_studies",
+    "audit_instructor_research_console_queries",
     "audit_versioned_assignments_rubrics_reviews",
 ]
