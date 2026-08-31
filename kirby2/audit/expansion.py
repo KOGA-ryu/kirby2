@@ -161,6 +161,7 @@ REGISTERABLE_GATE_IDS = (
     "WO39-C",
     "WO38-A",
     "WO38-B",
+    "WO38-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4778,6 +4779,60 @@ def _audit_wo38b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo38c() -> ExpansionGateReport:
+    from kirby2.audit.orchestration import (
+        WO38C_ORCHESTRATION_AUDIT_CASE_COUNT,
+        audit_verified_content_exchange,
+    )
+    from kirby2.audit.packs import (
+        WO38C_PACK_AUDIT_CASE_COUNT,
+        audit_clean_root_pack_transfer,
+    )
+
+    cases = (
+        *audit_verified_content_exchange(),
+        *audit_clean_root_pack_transfer(),
+    )
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    audit_case_count = (
+        WO38C_ORCHESTRATION_AUDIT_CASE_COUNT
+        + WO38C_PACK_AUDIT_CASE_COUNT
+    )
+    return ExpansionGateReport(
+        card_id="WO38-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(audit_case_count)),
+            ("request_policy", "DIGEST_ONLY_PATH_FREE_V1"),
+            (
+                "receiver_policy",
+                "PREFLIGHT_COMPATIBILITY_THEN_ATOMIC_INSTALL_V1",
+            ),
+            ("result_policy", "COORDINATOR_VERIFIED_IMMUTABLE_CAS_V1"),
+            ("license_policy", "REDISTRIBUTION_FAIL_CLOSED_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4840,6 +4895,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO39-C", _audit_wo39c),
     ("WO38-A", _audit_wo38a),
     ("WO38-B", _audit_wo38b),
+    ("WO38-C", _audit_wo38c),
 )
 
 

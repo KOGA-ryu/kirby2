@@ -4,14 +4,36 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from kirby2.orchestration.artifacts import (
+    ContentRequestV1,
+    ResultBundleManifestV1,
+)
+from kirby2.orchestration.compatibility import (
+    ConditionalTransferAuthorizationV1,
+    OrchestrationCompatibilityRefused,
+    build_content_request,
+    pack_redistribution_decision_identity,
+    validate_pack_transfer_authorization,
+    validate_pack_transfer_completeness,
+    validate_required_content_references,
+)
+from kirby2.orchestration.content_store import (
+    ContentStoreRefused,
+    OrchestrationContentStoreV1,
+    ResultAttemptStageV1,
+)
 from kirby2.orchestration.coordinator import (
     CoordinatorRunResultV1,
     OrchestrationCoordinatorV1,
     VerifiedWorkResultV1,
+    build_verified_result_manifest,
 )
 from kirby2.orchestration.local import (
     LOCAL_WORKER_MODULE_V1,
@@ -60,10 +82,17 @@ from kirby2.orchestration.worker import (
     measure_local_worker_compatibility,
     run_data_only_stdio_worker,
 )
+from kirby2.packs.formats import canonical_manifest_bytes
+from kirby2.packs.models import (
+    PackContentModeV1,
+    PackRedistributionPolicyV1,
+)
+from kirby2.research.paths import DataPaths
 
 
 WO38A_AUDIT_CASE_COUNT = 5
 WO38B_AUDIT_CASE_COUNT = 5
+WO38C_ORCHESTRATION_AUDIT_CASE_COUNT = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +171,488 @@ def audit_local_orchestration() -> tuple[OrchestrationAuditCase, ...]:
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO38-B audit case order or identity changed")
     return cases
+
+
+def audit_verified_content_exchange() -> tuple[OrchestrationAuditCase, ...]:
+    """Exercise the fixed WO38-C path-free transfer and immutable CAS boundary."""
+
+    compatibility = measure_local_worker_compatibility()
+    complete_plan = _local_execution_plan(compatibility)
+    plan = ExperimentWorkPlanV1(
+        master_seed_identity=complete_plan.master_seed_identity,
+        experiment_identity=complete_plan.experiment_identity,
+        logical_units=(complete_plan.logical_units[0],),
+    )
+    run = OrchestrationCoordinatorV1().execute(
+        plan,
+        SingleProcessBackendV1(compatibility=compatibility),
+    )
+    logical_unit = plan.logical_units[0]
+    verified_result = run.verified_results[0]
+    cases = (
+        _path_free_content_request_case(logical_unit),
+        _immutable_result_registration_case(logical_unit, verified_result),
+        _result_attempt_lifecycle_case(logical_unit, verified_result),
+        _pack_redistribution_policy_case(),
+    )
+    expected_names = (
+        "content_requests_are_exact_digest_only_and_path_free",
+        "coordinator_results_register_as_immutable_verified_cas_objects",
+        "result_attempts_are_private_discardable_and_never_delete_registered_data",
+        "pack_redistribution_and_clean_root_completeness_fail_closed",
+    )
+    if len(cases) != WO38C_ORCHESTRATION_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO38-C orchestration audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO38-C orchestration audit case order or identity changed")
+    return cases
+
+
+def _path_free_content_request_case(
+    logical_unit: LogicalWorkUnit,
+) -> OrchestrationAuditCase:
+    request = build_content_request(logical_unit)
+    expected = request.content_references
+    extra = tuple(
+        sorted(
+            (
+                *expected,
+                DigestReferenceV1(
+                    name="dataset.unrequested",
+                    sha256=_digest("WO38-C unrequested content"),
+                ),
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    mismatched = tuple(
+        replace(
+            item,
+            sha256=_digest("WO38-C mismatched requested digest"),
+        )
+        if item == expected[0]
+        else item
+        for item in expected
+    )
+    missing_code = _capture_compatibility_refusal_code(
+        lambda: validate_required_content_references(
+            logical_unit,
+            expected[:-1],
+        )
+    )
+    extra_code = _capture_compatibility_refusal_code(
+        lambda: validate_required_content_references(logical_unit, extra)
+    )
+    digest_code = _capture_compatibility_refusal_code(
+        lambda: validate_required_content_references(logical_unit, mismatched)
+    )
+    noncanonical_code = _capture_compatibility_refusal_code(
+        lambda: validate_required_content_references(
+            logical_unit,
+            tuple(reversed(expected)),
+        )
+    )
+    path_refusal = _capture_exception_text(
+        lambda: ContentRequestV1(
+            content_references=(
+                DigestReferenceV1(
+                    name="escape/path",
+                    sha256=_digest("WO38-C path-like content reference"),
+                ),
+            )
+        )
+    )
+    checks = {
+        "request_is_the_exact_required_content_projection": (
+            expected
+            == validate_required_content_references(logical_unit, expected)
+        ),
+        "request_has_only_digest_contract_fields_and_no_path_selector": (
+            frozenset(request.as_dict())
+            == {
+                "content_references",
+                "content_request_id",
+                "schema_id",
+                "schema_version",
+            }
+            and all(
+                "/" not in item.name
+                and "\\" not in item.name
+                and not item.name.casefold().startswith("file:")
+                for item in expected
+            )
+        ),
+        "request_round_trips_as_exact_canonical_bytes": (
+            ContentRequestV1.from_canonical_bytes(request.canonical_bytes())
+            == request
+        ),
+        "missing_extra_and_digest_substitution_are_typed_refusals": (
+            missing_code == "REQUIRED_CONTENT_MISSING"
+            and extra_code == "REQUIRED_CONTENT_EXTRA"
+            and digest_code == "REQUIRED_CONTENT_DIGEST_MISMATCH"
+        ),
+        "noncanonical_order_and_path_like_names_are_refused": (
+            noncanonical_code == "REQUIRED_CONTENT_NONCANONICAL"
+            and path_refusal is not None
+            and "canonical non-path identifier" in path_refusal
+        ),
+    }
+    return _case(
+        "content_requests_are_exact_digest_only_and_path_free",
+        f"request={request.content_request_id} references={len(expected)}",
+        checks,
+        {
+            "content_request": request.as_dict(),
+            "digest_refusal": digest_code,
+            "extra_refusal": extra_code,
+            "missing_refusal": missing_code,
+            "noncanonical_refusal": noncanonical_code,
+            "path_refusal": path_refusal,
+        },
+    )
+
+
+def _immutable_result_registration_case(
+    logical_unit: LogicalWorkUnit,
+    verified_result: VerifiedWorkResultV1,
+) -> OrchestrationAuditCase:
+    attempt_id = "wo38c-coordinator-registration"
+    with TemporaryDirectory(prefix="kirby2-wo38c-result-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        paths = DataPaths(root)
+        store = OrchestrationContentStoreV1(paths=paths)
+        registered = OrchestrationCoordinatorV1().register_verified_result(
+            logical_work_unit=logical_unit,
+            verified_result=verified_result,
+            content_store=store,
+            attempt_id=attempt_id,
+        )
+        restored_manifest = store.read_result_manifest(
+            registered.manifest_sha256
+        )
+        expected_bytes = {
+            item.artifact_id: item.payload_bytes
+            for item in verified_result.artifacts
+        }
+        restored_bytes = {
+            descriptor.artifact_id: store.read_result_artifact(
+                registered.manifest_sha256,
+                descriptor,
+            )
+            for descriptor in restored_manifest.artifacts
+        }
+        immutable_files = tuple(
+            path
+            for path in paths.runs.rglob("*")
+            if path.is_file() and path.name != ".content-store.lock"
+        )
+        relative_objects = tuple(
+            sorted(str(path.relative_to(paths.runs)) for path in immutable_files)
+        )
+        manifest_raw = restored_manifest.canonical_bytes()
+        checks = {
+            "registration_binds_exact_independent_coordinator_verification": (
+                restored_manifest.coordinator_verification_sha256
+                == verified_result.scientific_result_sha256
+                and restored_manifest.worker_compatibility_sha256
+                == verified_result.worker_compatibility_sha256
+            ),
+            "registered_manifest_and_every_artifact_read_back_exactly": (
+                restored_manifest == registered.manifest
+                and restored_bytes == expected_bytes
+                and ResultBundleManifestV1.from_canonical_bytes(manifest_raw)
+                == restored_manifest
+            ),
+            "result_objects_are_digest_named_and_read_only": (
+                bool(immutable_files)
+                and all(_is_sha256(path.name) for path in immutable_files)
+                and all(
+                    not path.is_symlink()
+                    and (stat.S_IMODE(path.stat().st_mode) & 0o222) == 0
+                    for path in immutable_files
+                )
+            ),
+            "manifest_is_the_registration_point_and_attempt_is_not_scientific": (
+                registered.manifest_sha256
+                == registered.manifest.manifest_sha256
+                and registered.artifact_count == len(verified_result.artifacts)
+                and attempt_id.encode("ascii") not in manifest_raw
+                and not _attempt_stage_leaves(paths)
+            ),
+            "result_registration_uses_runs_not_the_source_transport_cache": (
+                paths.runs.exists() and not paths.cache.exists()
+            ),
+        }
+    return _case(
+        "coordinator_results_register_as_immutable_verified_cas_objects",
+        (
+            f"manifest={registered.manifest_sha256} "
+            f"artifacts={registered.artifact_count}"
+        ),
+        checks,
+        {
+            "coordinator_verification_sha256": (
+                verified_result.scientific_result_sha256
+            ),
+            "manifest_sha256": registered.manifest_sha256,
+            "relative_cas_objects": list(relative_objects),
+        },
+    )
+
+
+def _result_attempt_lifecycle_case(
+    logical_unit: LogicalWorkUnit,
+    verified_result: VerifiedWorkResultV1,
+) -> OrchestrationAuditCase:
+    manifest = build_verified_result_manifest(logical_unit, verified_result)
+    artifacts_by_id = {
+        item.artifact_id: item for item in verified_result.artifacts
+    }
+    with TemporaryDirectory(prefix="kirby2-wo38c-attempt-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        paths = DataPaths(root)
+        store = OrchestrationContentStoreV1(paths=paths)
+
+        published_attempt = store.begin_result_attempt(
+            attempt_id="wo38c-published-attempt",
+            work_request_id=manifest.work_request_id,
+            logical_work_unit_id=manifest.logical_work_unit_id,
+        )
+        for descriptor in manifest.artifacts:
+            store.stage_result_artifact(
+                published_attempt,
+                descriptor,
+                artifacts_by_id[descriptor.artifact_id].payload_bytes,
+            )
+        registered = store.register_result_bundle(
+            published_attempt,
+            manifest,
+            logical_work_unit=logical_unit,
+            coordinator_verification=verified_result,
+        )
+        published_bytes = tuple(
+            store.read_result_artifact(registered.manifest_sha256, descriptor)
+            for descriptor in manifest.artifacts
+        )
+        published_discard_code = _capture_content_store_refusal_code(
+            lambda: store.discard_result_attempt(published_attempt)
+        )
+
+        disposable_attempt = store.begin_result_attempt(
+            attempt_id="wo38c-disposable-attempt",
+            work_request_id=manifest.work_request_id,
+            logical_work_unit_id=manifest.logical_work_unit_id,
+        )
+        first_descriptor = manifest.artifacts[0]
+        first_payload = artifacts_by_id[
+            first_descriptor.artifact_id
+        ].payload_bytes
+        corrupted = bytearray(first_payload)
+        corrupted[len(corrupted) // 2] ^= 0x01
+        corruption_refusal = _capture_exception_text(
+            lambda: store.stage_result_artifact(
+                disposable_attempt,
+                first_descriptor,
+                bytes(corrupted),
+            )
+        )
+        attempt_objects = _attempt_object_root(paths, disposable_attempt)
+        names_after_corruption = _file_names(attempt_objects)
+        store.stage_result_artifact(
+            disposable_attempt,
+            first_descriptor,
+            first_payload,
+        )
+        staged_names = _file_names(attempt_objects)
+        store.discard_result_attempt(disposable_attempt)
+        repeated_discard_code = _capture_content_store_refusal_code(
+            lambda: store.discard_result_attempt(disposable_attempt)
+        )
+        restored_manifest = store.read_result_manifest(
+            registered.manifest_sha256
+        )
+        restored_bytes = tuple(
+            store.read_result_artifact(registered.manifest_sha256, descriptor)
+            for descriptor in restored_manifest.artifacts
+        )
+        checks = {
+            "corrupted_bytes_are_refused_before_the_first_stage_write": (
+                corruption_refusal is not None
+                and "differs from descriptor digest" in corruption_refusal
+                and names_after_corruption == ()
+            ),
+            "one_attempt_stages_only_its_exact_digest_named_artifact": (
+                staged_names == (first_descriptor.sha256,)
+                and disposable_attempt.stage_key_sha256
+                != published_attempt.stage_key_sha256
+            ),
+            "unregistered_attempt_is_discardable_once_then_absent": (
+                repeated_discard_code == "ATTEMPT_NOT_FOUND"
+                and not _attempt_stage_leaves(paths)
+            ),
+            "registered_attempt_capability_cannot_delete_published_content": (
+                published_discard_code == "ATTEMPT_NOT_FOUND"
+                and restored_manifest == manifest
+                and restored_bytes == published_bytes
+            ),
+            "operational_attempt_ids_never_enter_registered_scientific_bytes": (
+                published_attempt.attempt_id.encode("ascii")
+                not in restored_manifest.canonical_bytes()
+                and disposable_attempt.attempt_id.encode("ascii")
+                not in restored_manifest.canonical_bytes()
+            ),
+        }
+    return _case(
+        "result_attempts_are_private_discardable_and_never_delete_registered_data",
+        f"manifest={registered.manifest_sha256} attempt_cleanup=EXACT",
+        checks,
+        {
+            "corruption_refusal": corruption_refusal,
+            "published_discard_refusal": published_discard_code,
+            "registered_manifest_sha256": registered.manifest_sha256,
+            "repeated_discard_refusal": repeated_discard_code,
+            "staged_artifact_sha256": first_descriptor.sha256,
+        },
+    )
+
+
+def _pack_redistribution_policy_case() -> OrchestrationAuditCase:
+    from kirby2.audit.packs import build_clean_root_transfer_audit_fixture
+
+    allowed, _ = build_clean_root_transfer_audit_fixture()
+    prohibited = replace(
+        allowed,
+        license=replace(
+            allowed.license,
+            redistribution_policy=PackRedistributionPolicyV1.PROHIBITED,
+        ),
+    )
+    unknown = replace(
+        allowed,
+        license=replace(
+            allowed.license,
+            redistribution_policy=PackRedistributionPolicyV1.UNKNOWN,
+        ),
+    )
+    conditional = replace(
+        allowed,
+        license=replace(
+            allowed.license,
+            redistribution_policy=PackRedistributionPolicyV1.CONDITIONAL,
+        ),
+    )
+    reference_only = replace(
+        allowed,
+        license=replace(
+            allowed.license,
+            content_mode=PackContentModeV1.REFERENCE_ONLY,
+        ),
+    )
+    authorization = ConditionalTransferAuthorizationV1(
+        authorization_id="wo38c-transfer-authorization",
+        policy_id="wo38c-license-policy",
+        pack_id=conditional.pack_id,
+        manifest_sha256=hashlib.sha256(
+            canonical_manifest_bytes(conditional)
+        ).hexdigest(),
+        authorization_evidence_sha256=_digest(
+            "WO38-C conditional transfer evidence"
+        ),
+    )
+    mismatched_authorization = replace(
+        authorization,
+        pack_id=_digest("WO38-C foreign authorization pack"),
+    )
+    allowed_decision = pack_redistribution_decision_identity(allowed)
+    conditional_decision = pack_redistribution_decision_identity(
+        conditional,
+        authorization,
+    )
+    validated_authorization = validate_pack_transfer_authorization(
+        conditional,
+        authorization,
+    )
+    reference_only_authorization = validate_pack_transfer_authorization(
+        reference_only
+    )
+    refusal_codes = {
+        "conditional_missing": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_authorization(conditional)
+        ),
+        "conditional_mismatch": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_authorization(
+                conditional,
+                mismatched_authorization,
+            )
+        ),
+        "prohibited": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_authorization(prohibited)
+        ),
+        "reference_only": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_completeness(reference_only)
+        ),
+        "unexpected_authorization": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_authorization(
+                allowed,
+                authorization,
+            )
+        ),
+        "unknown": _capture_compatibility_refusal_code(
+            lambda: validate_pack_transfer_authorization(unknown)
+        ),
+    }
+    checks = {
+        "allowed_self_contained_pack_needs_no_extra_authorization": (
+            validate_pack_transfer_authorization(allowed) is None
+            and validate_pack_transfer_completeness(allowed) == allowed
+        ),
+        "conditional_permission_is_exact_digest_bound_evidence": (
+            validated_authorization == authorization
+            and validate_pack_transfer_completeness(conditional)
+            == conditional
+            and ConditionalTransferAuthorizationV1.from_canonical_bytes(
+                authorization.canonical_bytes()
+            )
+            == authorization
+            and conditional_decision.sha256
+            != allowed_decision.sha256
+        ),
+        "prohibited_and_unknown_redistribution_fail_closed": (
+            refusal_codes["prohibited"] == "REDISTRIBUTION_PROHIBITED"
+            and refusal_codes["unknown"] == "REDISTRIBUTION_UNKNOWN"
+        ),
+        "conditional_transfer_requires_matching_authorization_only": (
+            refusal_codes["conditional_missing"]
+            == "CONDITIONAL_AUTHORIZATION_REQUIRED"
+            and refusal_codes["conditional_mismatch"]
+            == "CONDITIONAL_AUTHORIZATION_MISMATCH"
+            and refusal_codes["unexpected_authorization"]
+            == "CONDITIONAL_AUTHORIZATION_UNEXPECTED"
+        ),
+        "reference_only_bytes_cannot_claim_clean_root_reproduction": (
+            reference_only_authorization is None
+            and refusal_codes["reference_only"]
+            == "REFERENCE_ONLY_CONTENT_INCOMPLETE"
+        ),
+    }
+    return _case(
+        "pack_redistribution_and_clean_root_completeness_fail_closed",
+        (
+            f"allowed={allowed.pack_id} "
+            f"conditional={conditional.pack_id}"
+        ),
+        checks,
+        {
+            "allowed_decision": allowed_decision.as_dict(),
+            "conditional_authorization_sha256": (
+                authorization.authorization_sha256
+            ),
+            "conditional_decision": conditional_decision.as_dict(),
+            "refusal_codes": refusal_codes,
+        },
+    )
 
 
 def _permutation_invariant_planning_case(
@@ -1296,6 +1807,65 @@ def _capture_exception_text(operation) -> str | None:
     return None
 
 
+def _capture_compatibility_refusal_code(operation) -> str | None:
+    try:
+        operation()
+    except OrchestrationCompatibilityRefused as error:
+        return error.code.value
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        return f"UNEXPECTED:{type(error).__name__}:{error}"
+    return None
+
+
+def _capture_content_store_refusal_code(operation) -> str | None:
+    try:
+        operation()
+    except ContentStoreRefused as error:
+        return error.refusal.code.value
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        return f"UNEXPECTED:{type(error).__name__}:{error}"
+    return None
+
+
+def _attempt_object_root(
+    paths: DataPaths,
+    attempt: ResultAttemptStageV1,
+) -> Path:
+    return paths.staging.joinpath(
+        "orchestration-content-v1",
+        "results",
+        "attempts",
+        attempt.stage_key_sha256,
+        "objects",
+    )
+
+
+def _attempt_stage_leaves(paths: DataPaths) -> tuple[str, ...]:
+    attempts = paths.staging.joinpath(
+        "orchestration-content-v1",
+        "results",
+        "attempts",
+    )
+    if not attempts.exists():
+        return ()
+    return tuple(
+        sorted(path.name for path in attempts.iterdir() if path.is_dir())
+    )
+
+
+def _file_names(root: Path) -> tuple[str, ...]:
+    if not root.exists():
+        return ()
+    return tuple(sorted(path.name for path in root.iterdir() if path.is_file()))
+
+
+def _is_sha256(value: str) -> bool:
+    return (
+        len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("ascii")).hexdigest()
 
@@ -1317,7 +1887,9 @@ def _case(
 __all__ = [
     "WO38A_AUDIT_CASE_COUNT",
     "WO38B_AUDIT_CASE_COUNT",
+    "WO38C_ORCHESTRATION_AUDIT_CASE_COUNT",
     "OrchestrationAuditCase",
     "audit_local_orchestration",
     "audit_logical_work_and_attempt_identity",
+    "audit_verified_content_exchange",
 ]

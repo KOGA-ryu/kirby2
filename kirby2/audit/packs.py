@@ -106,6 +106,7 @@ from kirby2.research.paths import DataAreaId, DataPaths
 WO39A_AUDIT_CASE_COUNT = 5
 WO39B_AUDIT_CASE_COUNT = 4
 WO39C_AUDIT_CASE_COUNT = 4
+WO38C_PACK_AUDIT_CASE_COUNT = 1
 
 _JSON_PATH = "data/scenario.json"
 _JSON_SCHEMA_ID = "KIRBY2_WO39A_AUDIT_SCENARIO_V1"
@@ -1125,6 +1126,372 @@ def audit_atomic_pack_installation() -> tuple[PackAuditCase, ...]:
     return cases
 
 
+def audit_clean_root_pack_transfer() -> tuple[PackAuditCase, ...]:
+    """Exercise the WO38-C bridge through the existing WO39-B/C boundaries."""
+
+    cases = (_clean_root_pack_transfer_case(),)
+    if len(cases) != WO38C_PACK_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO38-C pack audit case inventory changed")
+    if (
+        cases[0].name
+        != "clean_root_pack_transfer_is_exact_atomic_and_fail_closed"
+    ):
+        raise RuntimeError("WO38-C pack audit case identity changed")
+    return cases
+
+
+def build_clean_root_transfer_audit_fixture(
+) -> tuple[PackManifestV1, dict[str, bytes]]:
+    """Return the shared self-contained, dependency-free WO38-C audit pack."""
+
+    base, payloads = _fixture_pack()
+    return (
+        replace(
+            base,
+            name="clean-root-transfer",
+            title="Clean-root transfer audit pack",
+            dependencies=(),
+        ),
+        payloads,
+    )
+
+
+def _clean_root_pack_transfer_case() -> PackAuditCase:
+    from kirby2.orchestration.artifacts import (
+        ContentRequestV1,
+        PackTransferBundleV1,
+        build_normalized_pack_archive,
+    )
+    from kirby2.orchestration.compatibility import (
+        PackCapabilityIdentityBindingV1,
+        PackSchemaIdentityBindingV1,
+        build_content_request,
+        pack_redistribution_decision_identity,
+    )
+    from kirby2.orchestration.content_store import OrchestrationContentStoreV1
+    from kirby2.orchestration.models import (
+        DigestReferenceV1,
+        LogicalWorkCellV1,
+        WorkKindV1,
+    )
+    from kirby2.orchestration.planner import build_experiment_work_plan
+    from kirby2.orchestration.protocol import WorkerCompatibilityV1
+    from kirby2.orchestration.seeds import build_master_seed_identity
+
+    manifest, payloads = build_clean_root_transfer_audit_fixture()
+    environment = _runtime_environment(manifest)
+    installable = next(
+        item
+        for item in manifest.compatibility
+        if item.level is PackCompatibilityLevelV1.INSTALLABLE
+    )
+    schema_identities = tuple(
+        sorted(
+            (
+                DigestReferenceV1(
+                    name=requirement.schema_id,
+                    sha256=_digest(
+                        f"WO38-C worker schema {requirement.schema_id}"
+                    ),
+                )
+                for requirement in installable.schemas
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    capability_identities = tuple(
+        sorted(
+            (
+                DigestReferenceV1(
+                    name=f"capability:{label}",
+                    sha256=_digest(f"WO38-C worker capability {label}"),
+                )
+                for label in manifest.capability_labels
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    worker_compatibility = WorkerCompatibilityV1(
+        engine_identity=DigestReferenceV1(
+            name="engine.clean-root-audit",
+            sha256=_digest("WO38-C worker engine"),
+        ),
+        runtime_identity=DigestReferenceV1(
+            name="runtime.clean-root-audit",
+            sha256=_digest("WO38-C worker runtime"),
+        ),
+        dependency_identity=DigestReferenceV1(
+            name="dependencies.clean-root-audit",
+            sha256=_digest("WO38-C worker dependencies"),
+        ),
+        compiler_identity=DigestReferenceV1(
+            name="compiler.clean-root-audit",
+            sha256=_digest("WO38-C worker compiler"),
+        ),
+        schemas=schema_identities,
+        capabilities=capability_identities,
+    )
+    schema_bindings = tuple(
+        sorted(
+            (
+                PackSchemaIdentityBindingV1(
+                    schema_id=requirement.schema_id,
+                    schema_version=next(
+                        version
+                        for schema_id, version in environment.schema_versions
+                        if schema_id == requirement.schema_id
+                    ),
+                    worker_schema_identity=next(
+                        item
+                        for item in schema_identities
+                        if item.name == requirement.schema_id
+                    ),
+                )
+                for requirement in installable.schemas
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    capability_bindings = tuple(
+        sorted(
+            (
+                PackCapabilityIdentityBindingV1(
+                    capability_label=label,
+                    worker_capability_identity=next(
+                        item
+                        for item in capability_identities
+                        if item.name == f"capability:{label}"
+                    ),
+                )
+                for label in manifest.capability_labels
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    cell = LogicalWorkCellV1(
+        partition_id="clean-root-transfer",
+        cell_id="pack-install",
+        work_kind=WorkKindV1.COMPLETE_RUN,
+        configuration={"fixture_id": "WO38-C"},
+    )
+    plan = build_experiment_work_plan(
+        master_seed_identity=build_master_seed_identity(38_003),
+        experiment_identity=DigestReferenceV1(
+            name="experiment.clean-root-transfer",
+            sha256=_digest("WO38-C transfer experiment"),
+        ),
+        cells=(cell,),
+        scenario=DigestReferenceV1(
+            name="scenario.clean-root-transfer",
+            sha256=_digest("WO38-C transfer scenario"),
+        ),
+        market_profile=DigestReferenceV1(
+            name="market-profile.clean-root-transfer",
+            sha256=_digest("WO38-C transfer market profile"),
+        ),
+        datasets=(),
+        strategies=(),
+        packs=(
+            DigestReferenceV1(
+                name="pack.clean-root-transfer",
+                sha256=manifest.pack_id,
+            ),
+        ),
+        software_version="0.1.0",
+        source_version="source-v1",
+        engine_identity=worker_compatibility.engine_identity,
+        runtime_identity=worker_compatibility.runtime_identity,
+        dependency_identity=worker_compatibility.dependency_identity,
+        compiler_identity=worker_compatibility.compiler_identity,
+        schemas=worker_compatibility.schemas,
+        capabilities=worker_compatibility.capabilities,
+        expected_outputs=(
+            DigestReferenceV1(
+                name="output.clean-root-transfer",
+                sha256=_digest("WO38-C transfer output"),
+            ),
+        ),
+        resource_class="cpu-small",
+    )
+    logical_unit = plan.logical_units[0]
+    request = build_content_request(logical_unit)
+    redistribution = pack_redistribution_decision_identity(manifest)
+    bundle = build_normalized_pack_archive(
+        manifest,
+        payloads,
+        redistribution,
+    )
+
+    with TemporaryDirectory(prefix="kirby2-wo38c-source-") as source_raw:
+        with TemporaryDirectory(prefix="kirby2-wo38c-target-") as target_raw:
+            source_root = Path(source_raw).resolve()
+            target_root = Path(target_raw).resolve()
+            source_root.chmod(0o700)
+            target_root.chmod(0o700)
+            source_paths = DataPaths(source_root)
+            target_paths = DataPaths(target_root)
+            source_store = OrchestrationContentStoreV1(paths=source_paths)
+            target_store = OrchestrationContentStoreV1(paths=target_paths)
+
+            first_registration = source_store.register_source_transport(bundle)
+            repeated_registration = source_store.register_source_transport(bundle)
+            served = source_store.serve_source_transport(
+                request,
+                bundle.descriptor,
+                logical_work_unit=logical_unit,
+            )
+            installation = target_store.receive_and_install_pack(
+                request,
+                served,
+                logical_work_unit=logical_unit,
+                environment=environment,
+                worker_compatibility=worker_compatibility,
+                schema_bindings=schema_bindings,
+                capability_bindings=capability_bindings,
+            )
+            registry = read_pack_registry(paths=target_paths)
+            installed_object = target_paths.packs.joinpath(
+                *installation.receipt.object_path.split("/")
+            )
+
+            corrupted_raw = bytearray(bundle.archive_bytes)
+            corrupted_raw[len(corrupted_raw) // 2] ^= 0x01
+            corrupted_bytes = bytes(corrupted_raw)
+            corrupted_descriptor = replace(
+                bundle.descriptor,
+                transport_sha256=hashlib.sha256(corrupted_bytes).hexdigest(),
+            )
+            corrupted_bundle = PackTransferBundleV1(
+                descriptor=corrupted_descriptor,
+                archive_bytes=corrupted_bytes,
+            )
+            corrupted_refusal = _capture_exception_text(
+                lambda: target_store.receive_and_install_pack(
+                    request,
+                    corrupted_bundle,
+                    logical_work_unit=logical_unit,
+                    environment=environment,
+                    worker_compatibility=worker_compatibility,
+                    schema_bindings=schema_bindings,
+                    capability_bindings=capability_bindings,
+                )
+            )
+            policy_bundle = PackTransferBundleV1(
+                descriptor=replace(
+                    bundle.descriptor,
+                    validation_policy_id=_digest(
+                        "WO38-C wrong validation policy"
+                    ),
+                ),
+                archive_bytes=bundle.archive_bytes,
+            )
+            policy_refusal = _capture_exception_text(
+                lambda: target_store.receive_and_install_pack(
+                    request,
+                    policy_bundle,
+                    logical_work_unit=logical_unit,
+                    environment=environment,
+                    worker_compatibility=worker_compatibility,
+                    schema_bindings=schema_bindings,
+                    capability_bindings=capability_bindings,
+                )
+            )
+            bad_capability_bindings = (
+                replace(
+                    capability_bindings[0],
+                    worker_capability_identity=replace(
+                        capability_bindings[0].worker_capability_identity,
+                        sha256=_digest("WO38-C unavailable capability"),
+                    ),
+                ),
+                *capability_bindings[1:],
+            )
+            capability_refusal = _capture_exception_text(
+                lambda: target_store.receive_and_install_pack(
+                    request,
+                    bundle,
+                    logical_work_unit=logical_unit,
+                    environment=environment,
+                    worker_compatibility=worker_compatibility,
+                    schema_bindings=schema_bindings,
+                    capability_bindings=bad_capability_bindings,
+                )
+            )
+            path_refusal = _capture_exception_text(
+                lambda: ContentRequestV1(
+                    content_references=(
+                        DigestReferenceV1(
+                            name="escape/path",
+                            sha256=_digest("WO38-C path request"),
+                        ),
+                    )
+                )
+            )
+            registry_after_refusals = read_pack_registry(paths=target_paths)
+            checks = {
+                "content_request_and_descriptor_are_path_free": (
+                    str(source_root) not in repr(request.as_dict())
+                    and str(target_root) not in repr(request.as_dict())
+                    and frozenset(bundle.descriptor.identity_dict())
+                    == {
+                        "byte_count",
+                        "inventory_sha256",
+                        "manifest_sha256",
+                        "pack_id",
+                        "redistribution_decision_identity",
+                        "schema_id",
+                        "schema_version",
+                        "transport_sha256",
+                        "validation_policy_id",
+                    }
+                ),
+                "source_registration_is_immutable_and_idempotent": (
+                    not first_registration.already_registered
+                    and repeated_registration.already_registered
+                    and served == bundle
+                ),
+                "bundle_round_trips_exact_canonical_bytes": (
+                    PackTransferBundleV1.from_canonical_bytes(
+                        bundle.canonical_bytes()
+                    )
+                    == bundle
+                ),
+                "clean_root_installs_exact_read_only_content_address": (
+                    installation.receipt.pack_id == manifest.pack_id
+                    and registry.require(manifest.registry_key).pack_id
+                    == manifest.pack_id
+                    and _installed_tree_is_read_only(installed_object)
+                    and not target_paths.cache.exists()
+                ),
+                "corruption_policy_capability_and_path_attacks_are_refused": (
+                    corrupted_refusal is not None
+                    and policy_refusal is not None
+                    and capability_refusal is not None
+                    and path_refusal is not None
+                ),
+                "refusals_leave_no_partial_stage_or_registry_change": (
+                    registry_after_refusals == registry
+                    and not any(target_paths.staging.iterdir())
+                ),
+            }
+            evidence = {
+                "bundle_sha256": bundle.bundle_sha256,
+                "capability_refusal": capability_refusal,
+                "corrupted_refusal": corrupted_refusal,
+                "installed_pack_id": installation.receipt.pack_id,
+                "path_refusal": path_refusal,
+                "policy_refusal": policy_refusal,
+                "request_id": request.content_request_id,
+                "target_registry_sha256": registry.sha256,
+            }
+    return _case(
+        "clean_root_pack_transfer_is_exact_atomic_and_fail_closed",
+        f"pack={manifest.pack_id} request={request.content_request_id}",
+        checks,
+        evidence,
+    )
+
+
 def _installation_manifests(
     base: PackManifestV1,
 ) -> tuple[PackManifestV1, PackManifestV1]:
@@ -1866,11 +2233,14 @@ def _case(
 
 
 __all__ = [
+    "WO38C_PACK_AUDIT_CASE_COUNT",
     "WO39A_AUDIT_CASE_COUNT",
     "WO39B_AUDIT_CASE_COUNT",
     "WO39C_AUDIT_CASE_COUNT",
     "PackAuditCase",
+    "audit_clean_root_pack_transfer",
     "audit_atomic_pack_installation",
     "audit_canonical_pack_identity",
     "audit_hostile_archive_validation_and_staging",
+    "build_clean_root_transfer_audit_fixture",
 ]
