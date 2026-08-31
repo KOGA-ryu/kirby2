@@ -10,6 +10,7 @@ import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -36,6 +37,7 @@ MAX_LIVE_RECORD_BYTES_V1 = 4 * 1024 * 1024
 MAX_LIVE_CHECKPOINT_BYTES_V1 = 32 * 1024 * 1024
 
 _ZERO_SHA256 = hashlib.sha256(canonical_json_bytes([])).hexdigest()
+_RELEASE_SCALAR_RESERVED_V1 = "__kirby2_release_scalar_v1__"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,22 +100,23 @@ class LiveSessionSourceV1:
             "source_run_id",
             "substreams_sha256",
         }
-        if type(value) is not dict or set(value) != expected:
+        if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("live-session source fields differ")
-        lesson = value["active_lesson_id"]
+        row = dict(value)
+        lesson = row["active_lesson_id"]
         if lesson is not None and type(lesson) is not str:
             raise TypeError("live-session lesson ID must be text or null")
         return cls(
-            source_run_id=_text(value, "source_run_id"),
-            configuration_sha256=_text(value, "configuration_sha256"),
-            compiled_scenario_sha256=_text(value, "compiled_scenario_sha256"),
-            seed=_integer(value, "seed"),
-            substreams_sha256=_text(value, "substreams_sha256"),
+            source_run_id=_text(row, "source_run_id"),
+            configuration_sha256=_text(row, "configuration_sha256"),
+            compiled_scenario_sha256=_text(row, "compiled_scenario_sha256"),
+            seed=_integer(row, "seed"),
+            substreams_sha256=_text(row, "substreams_sha256"),
             active_lesson_id=lesson,
-            layout_sha256=_text(value, "layout_sha256"),
-            observation_policy_id=_text(value, "observation_policy_id"),
-            pack_activation_sha256=_text(value, "pack_activation_sha256"),
-            profile_sha256=_text(value, "profile_sha256"),
+            layout_sha256=_text(row, "layout_sha256"),
+            observation_policy_id=_text(row, "observation_policy_id"),
+            pack_activation_sha256=_text(row, "pack_activation_sha256"),
+            profile_sha256=_text(row, "profile_sha256"),
         )
 
     @classmethod
@@ -756,7 +759,7 @@ class LiveSessionJournalV1:
             session_id=self.session_id,
             source=self.source,
             journal_sequence=self._records[-1].sequence,
-            recording=recording.as_dict(),
+            recording=recovery_checkpoint_value_v1(recording.as_dict()),
             recovery_state=self._state(session),
         )
         path = self.checkpoints_directory / f"{checkpoint.checkpoint_id}.json"
@@ -1441,7 +1444,69 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _digest(value: object) -> str:
-    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+    # Built-in scenario definitions retain legacy binary-float fields in their
+    # behavioral envelopes.  Recovery identity must preserve those exact values
+    # without admitting JSON floats into canonical evidence, so reuse the frozen
+    # release semantic projection that represents each float as its exact rational.
+    from kirby2.release.performance import release_float_free_semantic
+
+    projected = release_float_free_semantic(value)
+    return hashlib.sha256(canonical_json_bytes(projected)).hexdigest()
+
+
+def recovery_checkpoint_value_v1(value: object) -> object:
+    """Project legacy recording floats into canonical, exact scalar records."""
+
+    from kirby2.release.performance import release_float_free_semantic
+
+    return release_float_free_semantic(value)
+
+
+def restore_recovery_checkpoint_value_v1(value: object) -> object:
+    """Restore exact scalar records for the legacy session-recording constructors."""
+
+    if type(value) is list:
+        return [restore_recovery_checkpoint_value_v1(item) for item in value]
+    if type(value) is dict:
+        marker = value.get(_RELEASE_SCALAR_RESERVED_V1)
+        if marker == "EXACT_RATIONAL":
+            if set(value) != {
+                _RELEASE_SCALAR_RESERVED_V1,
+                "denominator",
+                "numerator",
+            }:
+                raise ValueError("recovery rational scalar fields differ")
+            numerator = value["numerator"]
+            denominator = value["denominator"]
+            if (
+                type(numerator) is not int
+                or type(denominator) is not int
+                or denominator <= 0
+            ):
+                raise ValueError("recovery rational scalar is invalid")
+            restored = numerator / denominator
+            if restored.as_integer_ratio() != (numerator, denominator):
+                raise ValueError("recovery rational scalar is not an exact binary float")
+            return restored
+        if marker == "EXACT_DECIMAL":
+            if set(value) != {
+                _RELEASE_SCALAR_RESERVED_V1,
+                "coefficient",
+                "exponent",
+            }:
+                raise ValueError("recovery decimal scalar fields differ")
+            coefficient = value["coefficient"]
+            exponent = value["exponent"]
+            if type(coefficient) is not int or type(exponent) is not int:
+                raise ValueError("recovery decimal scalar is invalid")
+            return Decimal(coefficient).scaleb(exponent)
+        if marker is not None:
+            raise ValueError("recovery scalar marker is unknown")
+        return {
+            key: restore_recovery_checkpoint_value_v1(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _identifier_tuple(
@@ -1549,5 +1614,7 @@ __all__ = [
     "LiveSessionSourceV1",
     "TERMINAL_OBSERVATION_POLICY_ID_V1",
     "recovery_state_projection",
+    "recovery_checkpoint_value_v1",
     "require_recovery_state_matches",
+    "restore_recovery_checkpoint_value_v1",
 ]

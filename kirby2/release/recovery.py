@@ -16,6 +16,7 @@ from kirby2.session.journal import (
     LiveSessionJournalV1,
     LiveSessionSourceV1,
     require_recovery_state_matches,
+    restore_recovery_checkpoint_value_v1,
 )
 from kirby2.session.layouts import HotkeyLayout
 from kirby2.session.live import LiveMarketSession
@@ -503,7 +504,9 @@ def _replay_suffix(
 def _recording_from_checkpoint(
     checkpoint: LiveSessionCheckpointV1,
 ) -> SessionRecording:
-    value = thaw_json(checkpoint.recording)
+    value = restore_recovery_checkpoint_value_v1(
+        thaw_json(checkpoint.recording)
+    )
     if type(value) is not dict:
         raise TypeError("checkpoint recording must be an object")
     expected = {

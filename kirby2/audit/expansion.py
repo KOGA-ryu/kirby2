@@ -99,6 +99,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0006", "WO36-C"),
     ("DEV-0007", "WO37-A"),
     ("DEV-0008", "WO40-E"),
+    ("DEV-0009", "WO40-E"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -168,7 +169,20 @@ REGISTERABLE_GATE_IDS = (
     "WO39-D1",
     "WO39-D2",
     "WO39-E",
+    "WO40-A",
+    "WO40-B",
+    "WO40-B1",
+    "WO40-C",
+    "WO40-D",
+    "WO40-D1",
     "DEV-0008",
+    "DEV-0009",
+    "WO40-E",
+    "WO40-F",
+    "WO40-G",
+    "WO40-H",
+    "WO40-I",
+    "WO40-J",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -641,7 +655,76 @@ class ExpansionGateRegistry:
                 registered_ids=self.registered_ids,
             )
 
-        reports = tuple(self._invoke(gate_id) for gate_id in self.registered_ids)
+        report_rows: list[ExpansionGateReport] = []
+        closeout_registered = "WO40-J" in self._gates
+        for gate_id in self.registered_ids:
+            if gate_id == "WO40-J":
+                continue
+            report_rows.append(self._invoke(gate_id))
+
+        if closeout_registered:
+            prior_statuses = tuple(report.status for report in report_rows)
+            prior_passed = bool(report_rows) and all(
+                status
+                in {
+                    ExpansionGateStatus.PASS,
+                    ExpansionGateStatus.PASS_WITH_WARNINGS,
+                }
+                for status in prior_statuses
+            )
+            if prior_passed and self.gate_set_complete:
+                try:
+                    from kirby2.audit.release import (
+                        RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1,
+                        publish_release_closeout_prerequisites,
+                    )
+                    from kirby2.packs.formats import canonical_json_bytes
+                    from kirby2.release.qualification import (
+                        WO40_J_REQUIRED_PRIOR_GATES_V1,
+                    )
+
+                    by_id = {report.card_id: report for report in report_rows}
+                    publication_ids = (
+                        *WO40_J_REQUIRED_PRIOR_GATES_V1,
+                        *RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1,
+                    )
+                    publish_release_closeout_prerequisites(
+                        Path(__file__).resolve().parents[2],
+                        tuple(
+                            (
+                                gate_id,
+                                canonical_json_bytes(by_id[gate_id].as_dict()),
+                                by_id[gate_id].status.value,
+                            )
+                            for gate_id in publication_ids
+                        ),
+                    )
+                except Exception as error:
+                    detail = (
+                        "passing aggregate could not publish immutable closeout "
+                        f"prerequisites: {type(error).__name__}"
+                    )
+                    report_rows.append(
+                        ExpansionGateReport(
+                            card_id="WO40-J",
+                            status=ExpansionGateStatus.FAIL,
+                            checks=(
+                                ExpansionGateCheck(
+                                    code="PREREQUISITE_PUBLICATION_FAILED",
+                                    status=ExpansionGateStatus.FAIL,
+                                    detail=detail,
+                                ),
+                            ),
+                            failures=(detail,),
+                            reason_code="PREREQUISITE_PUBLICATION_FAILED",
+                        )
+                    )
+                else:
+                    report_rows.append(self._invoke("WO40-J"))
+            else:
+                report_rows.append(self._invoke("WO40-J"))
+
+        reports = tuple(report_rows)
         statuses = tuple(report.status for report in reports)
         reason_code: str | None = None
         if not reports or any(
@@ -654,7 +737,7 @@ class ExpansionGateRegistry:
         else:
             aggregate = ExpansionGateStatus.PASS
 
-        if "WO40-J" in self._gates:
+        if closeout_registered:
             deviation_ids = {item[0] for item in self._deviations}
             if not self.gate_set_complete:
                 aggregate = ExpansionGateStatus.FAIL
@@ -5178,6 +5261,124 @@ def _audit_dev0008() -> ExpansionGateReport:
     )
 
 
+def _release_suite_report(
+    card_id: str,
+    suite: object,
+) -> ExpansionGateReport:
+    """Translate the independent release-audit result into the expansion contract."""
+
+    from kirby2.audit.release import ReleaseAuditSuite
+
+    if type(suite) is not ReleaseAuditSuite or suite.gate_id != card_id:
+        raise TypeError("release audit suite identity differs from its registered gate")
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=ExpansionGateStatus(case.status.value),
+            detail=case.detail,
+            required=True,
+        )
+        for case in suite.cases
+    )
+    metadata = (
+        ("audit_case_count", str(len(suite.cases))),
+        *suite.metadata,
+    )
+    return ExpansionGateReport(
+        card_id=card_id,
+        status=ExpansionGateStatus(suite.status.value),
+        checks=checks,
+        failures=suite.failures,
+        warnings=suite.warnings,
+        reason_code=suite.reason_code,
+        metadata=metadata,
+    )
+
+
+def _audit_wo40a() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_data_and_migrations
+
+    return _release_suite_report("WO40-A", audit_release_data_and_migrations())
+
+
+def _audit_wo40b() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_recovery
+
+    return _release_suite_report("WO40-B", audit_release_recovery())
+
+
+def _audit_wo40b1() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_backup_restore
+
+    return _release_suite_report("WO40-B1", audit_release_backup_restore())
+
+
+def _audit_wo40c() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_first_run
+
+    return _release_suite_report("WO40-C", audit_release_first_run())
+
+
+def _audit_wo40d() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_protocol
+
+    return _release_suite_report("WO40-D", audit_release_protocol())
+
+
+def _audit_wo40d1() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_resource_report
+
+    return _release_suite_report("WO40-D1", audit_release_resource_report())
+
+
+def _audit_dev0009() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_frontier_registration
+
+    return _release_suite_report(
+        "DEV-0009",
+        audit_release_frontier_registration(),
+    )
+
+
+def _audit_wo40e() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_candidate_source
+
+    return _release_suite_report("WO40-E", audit_release_candidate_source())
+
+
+def _audit_wo40f() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_build_evidence
+
+    return _release_suite_report("WO40-F", audit_release_build_evidence())
+
+
+def _audit_wo40g() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_macos_evidence
+
+    return _release_suite_report("WO40-G", audit_release_macos_evidence())
+
+
+def _audit_wo40h() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_linux_evidence
+
+    return _release_suite_report("WO40-H", audit_release_linux_evidence())
+
+
+def _audit_wo40i() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_performance_evidence
+
+    return _release_suite_report("WO40-I", audit_release_performance_evidence())
+
+
+def _audit_wo40j() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_closeout_prerequisites
+
+    return _release_suite_report(
+        "WO40-J",
+        audit_release_closeout_prerequisites(),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -5246,7 +5447,20 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO39-D1", _audit_wo39d1),
     ("WO39-D2", _audit_wo39d2),
     ("WO39-E", _audit_wo39e),
+    ("WO40-A", _audit_wo40a),
+    ("WO40-B", _audit_wo40b),
+    ("WO40-B1", _audit_wo40b1),
+    ("WO40-C", _audit_wo40c),
+    ("WO40-D", _audit_wo40d),
+    ("WO40-D1", _audit_wo40d1),
     ("DEV-0008", _audit_dev0008),
+    ("DEV-0009", _audit_dev0009),
+    ("WO40-E", _audit_wo40e),
+    ("WO40-F", _audit_wo40f),
+    ("WO40-G", _audit_wo40g),
+    ("WO40-H", _audit_wo40h),
+    ("WO40-I", _audit_wo40i),
+    ("WO40-J", _audit_wo40j),
 )
 
 

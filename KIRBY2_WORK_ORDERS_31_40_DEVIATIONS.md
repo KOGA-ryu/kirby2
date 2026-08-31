@@ -414,3 +414,67 @@ the release layout carries their exact manifest digests, set digest, and archive
 names; the complete release protocol parses without substituting provisional values;
 and no target, dependency, threshold, qualification matrix, or product boundary is
 changed.
+
+## DEV-0009 — Register release qualification frontier
+
+- Interrupted canonical card: `WO40-E`
+- Exact first-parent predecessor: `8730ba83b4f54beb2308d7ef710b29e06e99a9fb`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-E`
+- Observed terminal result: `NOT_REGISTERED`; the explicit expansion registry ended
+  at `DEV-0008` even though WO40-A through WO40-E production surfaces and the WO40-D
+  release commands/protocols already existed.
+- Root cause: production-card implementation had intentionally deferred tests, but
+  WO40-D's required `kirby2/audit/release.py`, WO40-A through WO40-J gate
+  registrations, frozen future-evidence validators, and aggregate-to-closeout
+  prerequisite publication were never recovered before the release-candidate source
+  work began. Executing the recovered WO40-B audit also exposed three consequences of
+  that missing frontier: legacy scenario floats entered a strict canonical recovery
+  identity, checkpoint recordings attempted to persist those floats directly, and a
+  reopened journal passed a frozen mapping to a decoder that required a mutable dict.
+- Repair: add one release audit module that exercises public production APIs for
+  paths/migrations, exact recovery, backup/restore, first run/diagnostics, and the
+  frozen release protocol; preregister strict canonical immutable-evidence envelopes
+  for WO40-F through WO40-I; register the non-self-referential WO40-J prerequisite
+  validator; and make a fully passing aggregate publish the exact prior gate-report
+  bytes consumed by the existing closeout command. Project legacy recovery floats
+  through the already frozen exact-rational release semantic policy and reverse that
+  representation only when reconstructing the legacy session recording. Accept
+  immutable mappings at the journal source decoder.
+- Owned repair paths: `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `kirby2/session/journal.py`,
+  `kirby2/release/recovery.py`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: WO40-A, WO40-B, WO40-B1, WO40-C, WO40-D, WO40-D1,
+  `DEV-0009`, and WO40-E through WO40-J through the existing K2X-02 seam;
+  `DEV-0008` and `DEV-0009` remain immediately before resumed WO40-E in numeric
+  deviation order.
+- Inherited gates: WO39-E and DEV-0008 remain unchanged. WO40-D1 is expected to fail
+  until its one owned Markdown report is mechanically refreshed from this clean
+  protocol revision. WO40-E is expected to fail until its one mechanically derived
+  runner-source lock is regenerated after all candidate source changes are staged.
+  WO40-F through WO40-J remain `NOT_EXERCISED`; registration never fabricates or runs
+  their one-time release evidence.
+- Exact commit subject: `Register release qualification frontier`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0009
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-A
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-B
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-B1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-C
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-D
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-E
+git diff --check
+```
+
+Acceptance: the first six requested gates pass and exercise real production APIs;
+the D1 and E gates name only their expected stale mechanical bindings; F-J resolve as
+registered `NOT_EXERCISED` gates rather than unknown selectors; exact recovery
+restores the same complete state digest and pending/corrupt boundaries fail closed;
+future evidence is strict, digest-bound, and read-only; no qualification workload,
+release artifact, target, threshold, retry policy, product boundary, brokerage,
+network, telemetry, updater, or background service is added or executed.
