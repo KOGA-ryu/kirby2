@@ -2,8 +2,8 @@
 
 Status: `PASS`
 
-Protocol set SHA-256: `b6387fe0c15834b8f78ab496db1a36da7537f42a3b9e6ecd297a64eec4cc2e42`
-WO40-D protocol commit: `4a328723ffe8881f2358f1a72576f8ed905f2687`
+Protocol set SHA-256: `94f0050a592e3279a4b38b3d2e55b0ccfdc784202e67dca13e21a91fb631f9e8`
+WO40-D protocol commit: `93d0746f93ebefcf270eeff3f8836b88d9825abb`
 
 This inspection was read-only and no-network. It did not download, install, build, connect to a provider, or alter credentials.
 
