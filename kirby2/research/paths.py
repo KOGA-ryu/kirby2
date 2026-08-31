@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 
 
-DATA_PATHS_SCHEMA_VERSION = 1
+DATA_PATHS_SCHEMA_VERSION = 2
 
 _OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", ())
 _MKDIR_SUPPORTS_DIR_FD = os.mkdir in getattr(os, "supports_dir_fd", ())
@@ -40,12 +40,18 @@ class DataAreaId(str, Enum):
     BACKUPS = "backups"
     DIAGNOSTICS = "diagnostics"
     RELEASE = "release"
+    DATASETS = "datasets"
+    LOGS = "logs"
+    CRASH_REPORTS = "crash_reports"
+    TEMPORARY = "temporary"
+    EXPORTS = "exports"
 
     # Descriptive source-code aliases keep the semantic meaning visible without
     # changing the short, stable on-disk IDs used by WO31-40.
     INSTALLED_PACKS = "packs"
     CONFIGURATION = "config"
     RELEASE_ARTIFACTS = "release"
+    USER_EXPORTS = "exports"
 
 
 PACK_INSTALLATION_AREA_IDS = (DataAreaId.PACKS, DataAreaId.STAGING)
@@ -188,6 +194,30 @@ class DataPaths:
     @property
     def release_artifacts(self) -> Path:
         return self.release
+
+    @property
+    def datasets(self) -> Path:
+        return self.area(DataAreaId.DATASETS)
+
+    @property
+    def logs(self) -> Path:
+        return self.area(DataAreaId.LOGS)
+
+    @property
+    def crash_reports(self) -> Path:
+        return self.area(DataAreaId.CRASH_REPORTS)
+
+    @property
+    def temporary(self) -> Path:
+        return self.area(DataAreaId.TEMPORARY)
+
+    @property
+    def exports(self) -> Path:
+        return self.area(DataAreaId.EXPORTS)
+
+    @property
+    def user_exports(self) -> Path:
+        return self.exports
 
     def area(self, area_id: DataAreaId | str) -> Path:
         """Return one declared area path without touching the filesystem."""
