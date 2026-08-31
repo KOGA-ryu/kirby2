@@ -368,3 +368,49 @@ passive entry, aggressive entry, and liquidity withdrawal respectively, and the 
 learner retains its distinct broad cold-start route; no identity mapping, brokerage,
 order-routing, anonymity, educational-effectiveness, or real-trading capability is
 claimed.
+
+## DEV-0008 — Rebind final release starter identities
+
+- Interrupted canonical card: `WO40-E`
+- Exact first-parent predecessor: `18ae41d24503a46f1ee5641b64565075859dacc3`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 release-resource-preflight --platforms release/platforms.toml --lock release/requirements.lock --qualification release/qualification.toml --no-network --output KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`
+- Observed terminal result: `ReleaseBuildRefused: PROTOCOL_INVALID`, caused by
+  `ValueError: artifact layout starter literals differ from committed resources`.
+- Root cause: WO40-D and its original D1 preflight were committed before the final
+  WO39-E portability card standardized the required starter scenario identity to
+  `KIRBY2_STARTER_PLACE_CANCEL_SCENARIO_V1`. That canonical manifest change altered
+  the scenario manifest digest, both content-derived starter pack IDs, the starter-set
+  digest, and both content-addressed archive names while the frozen artifact layout
+  retained the provisional literals.
+- Repair: mechanically bind the final two starter manifests, content-derived pack
+  IDs, set digest, and archive names into `release/artifact_layout.toml`; add a focused
+  gate that pins those exact identities and requires the complete release protocol to
+  parse against the real starter builder. Rebind the same exact identities in the
+  preregistered interactive-ack input template without changing its workload or
+  thresholds.
+- Owned repair paths: `release/artifact_layout.toml`,
+  `release/performance_thresholds.toml`,
+  `kirby2/audit/expansion.py`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0008` through K2X-02 immediately before resumed `WO40-E`.
+- Inherited gates: `WO39-E`, the WO40-D protocol invariants, and the
+  resource/provider requirements of `WO40-D1` remain unchanged. The missing WO40-D
+  audit registration is a separate pre-freeze defect, and the original D1 report
+  must be regenerated from the amended clean protocol commit before candidate freeze.
+- Exact commit subject: `Rebind final release starter identities`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0008
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO39-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -c 'from pathlib import Path; from kirby2.release.build import load_release_protocol_bundle; print(load_release_protocol_bundle(Path.cwd()).protocol_set_sha256)'
+git diff --check
+```
+
+Acceptance: the final WO39-E starter manifests produce the two pinned content IDs;
+the release layout carries their exact manifest digests, set digest, and archive
+names; the complete release protocol parses without substituting provisional values;
+and no target, dependency, threshold, qualification matrix, or product boundary is
+changed.

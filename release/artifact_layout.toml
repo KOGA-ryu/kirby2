@@ -23,19 +23,19 @@ archive_encoder = ["KIRBY2_STDLIB_USTAR_GZIP_V1"]
 [starter_set]
 schema_version = 1
 set_id = "RELEASE_STARTER_SET_V1"
-entries_sha256 = "3ca089d9cf9d9ce601b7d811ed8ac8871df9e6bf419708e9f5e6c0847c86115d"
+entries_sha256 = "637a7c17fa5343eefebf167ed7f0bcb78746fa35d3715bc28624f902d3c83223"
 
 [[starter_set.entries]]
 role = "SCENARIO"
 manifest_path = "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
-manifest_sha256 = "4c3d8d845ab5e65ac00b4bf5ccf4dc85c5724348a70131d560c49b908904522c"
-pack_id = "f9400185db16772ccf7ae6ad336ce951720a9a289c35c7815877230fb85614b1"
+manifest_sha256 = "d461beff0be99750f074154be4eac8c20f292354f5357b4789bad133c727d898"
+pack_id = "303bcf354eea3b952bcc194c380a976ddbd67a6d59950960f2ee81562dbe7405"
 
 [[starter_set.entries]]
 role = "CURRICULUM"
 manifest_path = "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
 manifest_sha256 = "66b3f8942bd96267a7ac8dcc9a7b070cce73e5ba7f9d4166740afe0a6499273e"
-pack_id = "ef1cbe28be877d8db0dddb54f288ba06ea033f99f8d496d14aa1a6f706125a32"
+pack_id = "ec4df68073f2bd8cd174825f289f22d9430fb7ad731d8dac096db6cb0d806864"
 
 [[artifacts]]
 artifact_id = "linux-x86_64-desktop-bundle"
@@ -154,7 +154,7 @@ availability = "WO40_E"
 [[members]]
 member_id = "starter-scenario-pack"
 artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
-archive_path = "starter-packs/f9400185db16772ccf7ae6ad336ce951720a9a289c35c7815877230fb85614b1.k2pack"
+archive_path = "starter-packs/303bcf354eea3b952bcc194c380a976ddbd67a6d59950960f2ee81562dbe7405.k2pack"
 source_path = "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
 source_class = "CANDIDATE_STARTER_PACK"
 availability = "WO40_D"
@@ -162,7 +162,7 @@ availability = "WO40_D"
 [[members]]
 member_id = "starter-curriculum-pack"
 artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
-archive_path = "starter-packs/ef1cbe28be877d8db0dddb54f288ba06ea033f99f8d496d14aa1a6f706125a32.k2pack"
+archive_path = "starter-packs/ec4df68073f2bd8cd174825f289f22d9430fb7ad731d8dac096db6cb0d806864.k2pack"
 source_path = "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
 source_class = "CANDIDATE_STARTER_PACK"
 availability = "WO40_D"

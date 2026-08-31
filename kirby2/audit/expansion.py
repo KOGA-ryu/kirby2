@@ -98,6 +98,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0005", "WO36-C"),
     ("DEV-0006", "WO36-C"),
     ("DEV-0007", "WO37-A"),
+    ("DEV-0008", "WO40-E"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -167,6 +168,7 @@ REGISTERABLE_GATE_IDS = (
     "WO39-D1",
     "WO39-D2",
     "WO39-E",
+    "DEV-0008",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -5067,6 +5069,115 @@ def _audit_wo39e() -> ExpansionGateReport:
     )
 
 
+def _audit_dev0008() -> ExpansionGateReport:
+    """Bind the final WO39-E starter identities into the release protocol."""
+
+    from kirby2.release.build import load_release_protocol_bundle
+    from kirby2.release.first_run import build_release_starter_set
+
+    repository = Path(__file__).resolve().parents[2]
+    expected_starter_set = {
+        "entries": [
+            {
+                "manifest_path": (
+                    "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
+                ),
+                "manifest_sha256": (
+                    "d461beff0be99750f074154be4eac8c20f292354f5357b4789bad133c727d898"
+                ),
+                "pack_id": (
+                    "303bcf354eea3b952bcc194c380a976ddbd67a6d59950960f2ee81562dbe7405"
+                ),
+                "role": "SCENARIO",
+            },
+            {
+                "manifest_path": (
+                    "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
+                ),
+                "manifest_sha256": (
+                    "66b3f8942bd96267a7ac8dcc9a7b070cce73e5ba7f9d4166740afe0a6499273e"
+                ),
+                "pack_id": (
+                    "ec4df68073f2bd8cd174825f289f22d9430fb7ad731d8dac096db6cb0d806864"
+                ),
+                "role": "CURRICULUM",
+            },
+        ],
+        "entries_sha256": (
+            "637a7c17fa5343eefebf167ed7f0bcb78746fa35d3715bc28624f902d3c83223"
+        ),
+        "schema_version": 1,
+        "set_id": "RELEASE_STARTER_SET_V1",
+    }
+    starter_set = build_release_starter_set()
+    bundle = load_release_protocol_bundle(repository)
+    members = {item.member_id: item for item in bundle.artifact_layout.members}
+    expected_archive_paths = {
+        "starter-scenario-pack": (
+            "starter-packs/"
+            "303bcf354eea3b952bcc194c380a976ddbd67a6d59950960f2ee81562dbe7405"
+            ".k2pack"
+        ),
+        "starter-curriculum-pack": (
+            "starter-packs/"
+            "ec4df68073f2bd8cd174825f289f22d9430fb7ad731d8dac096db6cb0d806864"
+            ".k2pack"
+        ),
+    }
+    checks = (
+        ExpansionGateCheck(
+            code="canonical_starter_build_has_final_content_identities",
+            status=(
+                ExpansionGateStatus.PASS
+                if starter_set.layout_dict() == expected_starter_set
+                else ExpansionGateStatus.FAIL
+            ),
+            detail=(
+                "scenario=303bcf354eea curriculum=ec4df68073f2 "
+                "set=637a7c17fa53"
+            ),
+        ),
+        ExpansionGateCheck(
+            code="release_layout_binds_exact_final_starter_set",
+            status=(
+                ExpansionGateStatus.PASS
+                if bundle.artifact_layout.starter_set == expected_starter_set
+                else ExpansionGateStatus.FAIL
+            ),
+            detail="release artifact layout matches both committed starter manifests",
+        ),
+        ExpansionGateCheck(
+            code="release_archive_members_use_content_addressed_pack_names",
+            status=(
+                ExpansionGateStatus.PASS
+                if all(
+                    member_id in members
+                    and members[member_id].archive_path == archive_path
+                    for member_id, archive_path in expected_archive_paths.items()
+                )
+                else ExpansionGateStatus.FAIL
+            ),
+            detail="both starter archive paths equal their final content-derived IDs",
+        ),
+    )
+    failures = tuple(
+        f"{check.code}: {check.detail}"
+        for check in checks
+        if check.status is ExpansionGateStatus.FAIL
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0008",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("interrupted_card", "WO40-E"),
+            ("release_starter_set_id", "RELEASE_STARTER_SET_V1"),
+            ("starter_member_count", "2"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -5135,6 +5246,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO39-D1", _audit_wo39d1),
     ("WO39-D2", _audit_wo39d2),
     ("WO39-E", _audit_wo39e),
+    ("DEV-0008", _audit_dev0008),
 )
 
 
