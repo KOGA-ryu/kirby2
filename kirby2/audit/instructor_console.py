@@ -84,6 +84,7 @@ WO37A_AUDIT_CASE_COUNT = 6
 WO37B_AUDIT_CASE_COUNT = 4
 WO37C_AUDIT_CASE_COUNT = 4
 WO37D_AUDIT_CASE_COUNT = 4
+WO37E_AUDIT_CASE_COUNT = 4
 
 _LEARNER_ENTROPY = bytes(range(32))
 _INSTRUCTOR_ENTROPY = bytes(range(32, 64))
@@ -2629,14 +2630,235 @@ def _wo37d_query_refusal_case(demo: object) -> InstructorConsoleAuditCase:
     )
 
 
+def audit_redacted_export_and_profile_deletion() -> tuple[
+    InstructorConsoleAuditCase,
+    ...,
+]:
+    """Exercise WO37-E export, clean import, and identity-only deletion."""
+
+    from kirby2.instructor.commands import (
+        load_privacy_export_fixture,
+        run_instructor_export_demo,
+    )
+    from kirby2.instructor.deletion import ProfileDeletionResultV1
+    from kirby2.instructor.export import (
+        EvidenceExportManifestV1,
+        ExportConsentDecisionV1,
+        ExportInventoryV1,
+        ImportedExportV1,
+    )
+    from kirby2.instructor.redaction import RedactionManifestV1
+
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "instructor"
+        / "fixtures"
+        / "privacy_export.toml"
+    )
+    fixture = load_privacy_export_fixture(fixture_path)
+    result = run_instructor_export_demo(fixture, seed=42)
+    manifest = EvidenceExportManifestV1.from_dict(result["export_manifest"])
+    inventory = ExportInventoryV1.from_dict(result["inventory"])
+    redaction = RedactionManifestV1.from_dict(result["redaction_manifest"])
+    consent = ExportConsentDecisionV1.from_dict(result["consent_decision"])
+    imported = ImportedExportV1.from_dict(result["import_receipt"])
+    deletion = ProfileDeletionResultV1.from_dict(result["deletion_result"])
+    cases = (
+        _wo37e_export_binding_case(manifest, inventory, redaction, consent, result),
+        _wo37e_redaction_case(fixture, manifest, redaction, consent),
+        _wo37e_clean_import_case(manifest, inventory, imported),
+        _wo37e_deletion_case(manifest, deletion, result),
+    )
+    expected_names = (
+        "export_manifest_inventory_redaction_and_consent_bind_exactly",
+        "allowlist_and_omission_manifests_exclude_prohibited_content",
+        "clean_root_import_binds_every_verified_export_digest",
+        "profile_deletion_removes_identity_without_mutating_retained_evidence",
+    )
+    if len(cases) != WO37E_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO37-E audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO37-E audit case order or identity changed")
+    return cases
+
+
+def _wo37e_export_binding_case(
+    manifest: object,
+    inventory: object,
+    redaction: object,
+    consent: object,
+    result: dict[str, object],
+) -> InstructorConsoleAuditCase:
+    checks = {
+        "result_schema_is_exact": (
+            result["schema_id"] == "KIRBY2_INSTRUCTOR_EXPORT_DEMO_V1"
+            and result["schema_version"] == 1
+            and result["seed"] == 42
+        ),
+        "manifest_binds_inventory": (
+            manifest.inventory_id == inventory.inventory_id
+            and manifest.inventory_sha256 == inventory.sha256
+        ),
+        "manifest_binds_redaction": (
+            manifest.redaction_document_id == redaction.document_id
+            and manifest.redaction_manifest_sha256 == redaction.sha256
+            and manifest.redaction_policy_id == redaction.policy_id
+        ),
+        "manifest_binds_consent": (
+            manifest.consent_decision_id == consent.decision_id
+            and manifest.consent_decision_sha256 == consent.sha256
+        ),
+        "three_payload_artifacts_are_inventoried": len(inventory.artifacts) == 3,
+        "software_and_limitations_are_explicit": (
+            manifest.software_version == "0.1.0" and bool(manifest.limitations)
+        ),
+    }
+    return _case_from_checks(
+        "export_manifest_inventory_redaction_and_consent_bind_exactly",
+        (
+            f"export={manifest.export_id} artifacts={len(inventory.artifacts)} "
+            f"redactions={len(redaction.entries)}"
+        ),
+        checks,
+        {
+            "export_id": manifest.export_id,
+            "inventory_id": inventory.inventory_id,
+        },
+    )
+
+
+def _wo37e_redaction_case(
+    fixture: object,
+    manifest: object,
+    redaction: object,
+    consent: object,
+) -> InstructorConsoleAuditCase:
+    omission_kinds = tuple(sorted(item.item_kind for item in manifest.omissions))
+    checks = {
+        "consent_explicitly_authorizes_redacted_export": (
+            consent.allowed
+            and consent.status.value == "AUTHORIZED"
+            and consent.requested_export.value
+            == "PSEUDONYMOUS_REDACTED_EVIDENCE"
+        ),
+        "policy_uses_exact_allowlist": (
+            manifest.redaction_policy.allowlisted_paths == fixture.allowlisted_paths
+        ),
+        "no_hidden_path_is_authorized": (
+            manifest.redaction_policy.authorized_hidden_paths == ()
+            and fixture.authorized_hidden_paths == ()
+        ),
+        "all_prohibited_categories_are_explicit_omissions": (
+            omission_kinds == fixture.omitted_categories
+        ),
+        "field_manifest_is_complete_and_nonempty": (
+            redaction.retained_count > 0
+            and redaction.omitted_count > 0
+            and redaction.retained_count + redaction.omitted_count
+            == len(redaction.entries)
+        ),
+        "prohibited_content_policy_is_closed": (
+            manifest.prohibited_content_policy
+            == "NO_DIRECT_IDENTITY_IDENTITY_MAPPING_SECRETS_LOCAL_PATHS_OR_"
+            "UNAUTHORIZED_HIDDEN_REVEAL_DATA_V1"
+        ),
+    }
+    return _case_from_checks(
+        "allowlist_and_omission_manifests_exclude_prohibited_content",
+        (
+            f"retained={redaction.retained_count} omitted={redaction.omitted_count} "
+            f"categories={len(omission_kinds)}"
+        ),
+        checks,
+        {"omission_kinds": list(omission_kinds)},
+    )
+
+
+def _wo37e_clean_import_case(
+    manifest: object,
+    inventory: object,
+    imported: object,
+) -> InstructorConsoleAuditCase:
+    checks = {
+        "import_binds_export_id": imported.export_id == manifest.export_id,
+        "import_binds_manifest_digest": (
+            imported.manifest_sha256 == manifest.sha256
+        ),
+        "import_binds_inventory_digest": (
+            imported.inventory_sha256 == inventory.sha256
+        ),
+        "import_uses_clean_evidence_slot": (
+            imported.relative_directory == f"evidence/{manifest.export_id}"
+        ),
+        "import_receipt_round_trips": (
+            type(imported).from_canonical_bytes(imported.canonical_bytes()) == imported
+        ),
+    }
+    return _case_from_checks(
+        "clean_root_import_binds_every_verified_export_digest",
+        f"export={imported.export_id} slot={imported.relative_directory}",
+        checks,
+        {"manifest_sha256": imported.manifest_sha256},
+    )
+
+
+def _wo37e_deletion_case(
+    manifest: object,
+    deletion: object,
+    result: dict[str, object],
+) -> InstructorConsoleAuditCase:
+    plan = deletion.plan
+    sidecar = deletion.receipt_sidecar
+    checks = {
+        "deletion_completed": deletion.execution_status == "COMPLETED",
+        "identity_mapping_only_is_deleted": (
+            plan.direct_identity_action
+            == "DELETE_SEPARATELY_ERASABLE_IDENTITY_MAPPING_ONLY"
+            and sidecar.direct_identity_action == plan.direct_identity_action
+        ),
+        "retained_evidence_bytes_are_never_mutated": (
+            plan.evidence_bytes_action
+            == "NEVER_MUTATE_RETAINED_RUN_OR_EVIDENCE_BYTES"
+            and sidecar.evidence_bytes_action == plan.evidence_bytes_action
+            and result["retained_export_unchanged"] is True
+        ),
+        "retention_is_explicitly_authorized": (
+            plan.requested_pseudonymous_evidence_retention
+            and sidecar.pseudonymous_evidence_retained
+            and sidecar.evidence_disposition == "AUTHORIZED_RETAINED_UNCHANGED"
+        ),
+        "retained_reference_binds_export": (
+            len(sidecar.retained_evidence_references) == 1
+            and sidecar.retained_evidence_references[0].evidence_id
+            == manifest.export_id
+            and sidecar.retained_evidence_references[0].evidence_sha256
+            == manifest.sha256
+        ),
+        "deletion_result_round_trips": (
+            type(deletion).from_canonical_bytes(deletion.canonical_bytes()) == deletion
+        ),
+    }
+    return _case_from_checks(
+        "profile_deletion_removes_identity_without_mutating_retained_evidence",
+        (
+            f"result={deletion.result_id} retained="
+            f"{sidecar.pseudonymous_evidence_retained}"
+        ),
+        checks,
+        {"deletion_result_id": deletion.result_id},
+    )
+
+
 __all__ = [
     "WO37A_AUDIT_CASE_COUNT",
     "WO37B_AUDIT_CASE_COUNT",
     "WO37C_AUDIT_CASE_COUNT",
     "WO37D_AUDIT_CASE_COUNT",
+    "WO37E_AUDIT_CASE_COUNT",
     "InstructorConsoleAuditCase",
     "audit_pseudonymous_profiles_and_consent",
     "audit_reproducible_local_studies",
     "audit_instructor_research_console_queries",
+    "audit_redacted_export_and_profile_deletion",
     "audit_versioned_assignments_rubrics_reviews",
 ]
