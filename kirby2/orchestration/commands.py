@@ -1,9 +1,10 @@
-"""Modular planning, coordinator, worker, and parity-demo commands for WO38-B."""
+"""Planning plus local and explicit authenticated-LAN orchestration commands."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import secrets
 import tomllib
 from pathlib import Path
 
@@ -14,9 +15,27 @@ from kirby2.scenarios import get_scenario_definition
 from kirby2.simulation import LiquidityPreset, VolumePreset
 
 from .coordinator import CoordinatorRunResultV1, OrchestrationCoordinatorV1
+from .lan import (
+    DEFAULT_LAN_PORT_V1,
+    LanCoordinatorBackendV1,
+    LanWorkerServiceV1,
+)
+from .leases import LeasePolicyV1
 from .local import LocalSubprocessBackendV1, SingleProcessBackendV1
 from .models import DigestReferenceV1, LogicalWorkCellV1, WorkKindV1
 from .planner import build_experiment_work_plan
+from .resources import (
+    MAX_MESSAGE_BYTES_V1,
+    MAX_STREAM_BYTES_V1,
+    ResourceLimitsV1,
+    WorkerResourceAdvertisementV1,
+)
+from .security import (
+    DEFAULT_LAN_BIND_HOST_V1,
+    CredentialUseV1,
+    LanPeerRoleV1,
+    LanTlsConfigurationV1,
+)
 from .seeds import build_master_seed_identity
 from .worker import (
     complete_run_expected_output_identities,
@@ -27,6 +46,15 @@ from .worker import (
 
 ORCHESTRATION_EXPERIMENT_SCHEMA_ID = "KIRBY2_ORCHESTRATION_EXPERIMENT_V1"
 ORCHESTRATION_EXPERIMENT_SCHEMA_VERSION = 1
+
+DEFAULT_LAN_MEMORY_BYTES_V1 = 8 * 1024 * 1024 * 1024
+DEFAULT_LAN_DISK_BYTES_V1 = 8 * 1024 * 1024 * 1024
+DEFAULT_LAN_ELAPSED_SECONDS_V1 = 24 * 60 * 60
+DEFAULT_LAN_CLAIM_MEMORY_BYTES_V1 = 4 * 1024 * 1024 * 1024
+DEFAULT_LAN_CLAIM_DISK_BYTES_V1 = 1024 * 1024 * 1024
+DEFAULT_LAN_LEASE_SECONDS_V1 = 5 * 60
+DEFAULT_LAN_HEARTBEAT_SECONDS_V1 = 10
+DEFAULT_LAN_MISSED_HEARTBEATS_V1 = 3
 
 _MANIFEST_FIELDS = frozenset(
     {
@@ -194,9 +222,27 @@ def _build_backend(name: str, workers: int, compatibility):
     raise ValueError(f"unsupported orchestration backend {name!r}")
 
 
-def _run_coordinator(path: Path, backend_name: str, workers: int) -> CoordinatorRunResultV1:
+def _run_coordinator(
+    path: Path,
+    backend_name: str,
+    workers: int,
+    *,
+    lan_arguments: argparse.Namespace | None = None,
+) -> CoordinatorRunResultV1:
     plan, compatibility = load_orchestration_experiment(path)
-    backend = _build_backend(backend_name, workers, compatibility)
+    if backend_name == "lan":
+        if lan_arguments is None:
+            raise ValueError("LAN backend requires explicit LAN command arguments")
+        backend = _build_lan_coordinator_backend(
+            lan_arguments,
+            plan_id=plan.plan_id,
+            compatibility=compatibility,
+            workers=workers,
+        )
+    else:
+        if lan_arguments is not None and lan_arguments.enable_lan:
+            raise ValueError("--enable-lan is valid only with --backend lan")
+        backend = _build_backend(backend_name, workers, compatibility)
     return OrchestrationCoordinatorV1().execute(plan, backend)
 
 
@@ -206,12 +252,22 @@ def _configure_orchestrate(parser: argparse.ArgumentParser) -> None:
     plan.add_argument("--manifest", required=True, type=Path)
     coordinator = actions.add_parser(
         "coordinator",
-        help="run one local coordinator backend",
+        help="run one explicit coordinator backend",
     )
     coordinator.add_argument("--manifest", required=True, type=Path)
-    coordinator.add_argument("--backend", choices=("single", "local"), default="single")
+    coordinator.add_argument(
+        "--backend",
+        choices=("single", "local", "lan"),
+        default="single",
+    )
     coordinator.add_argument("--workers", type=int, default=1)
     actions.add_parser("worker", help="serve one canonical request on stdin/stdout")
+    _configure_lan_coordinator(coordinator)
+    lan_worker = actions.add_parser(
+        "lan-worker",
+        help="connect one explicit mTLS worker to a LAN coordinator",
+    )
+    _configure_lan_worker(lan_worker)
 
 
 def _handle_orchestrate(args: argparse.Namespace) -> int:
@@ -220,13 +276,315 @@ def _handle_orchestrate(args: argparse.Namespace) -> int:
         _print_json(plan.as_dict())
         return 0
     if args.orchestration_action == "coordinator":
-        result = _run_coordinator(args.manifest, args.backend, args.workers)
+        result = _run_coordinator(
+            args.manifest,
+            args.backend,
+            args.workers,
+            lan_arguments=args,
+        )
         _print_json(result.as_dict())
         return 0
     if args.orchestration_action == "worker":
         worker_main()
         return 0
+    if args.orchestration_action == "lan-worker":
+        results = _run_lan_worker(args)
+        _print_json(
+            {
+                "backend_id": "authenticated-lan-worker-v1",
+                "result_count": len(results),
+                "schema_id": "KIRBY2_LAN_WORKER_SESSION_RESULT_V1",
+                "schema_version": 1,
+                "scientific_result_sha256s": [
+                    item.scientific_result_sha256 for item in results
+                ],
+            }
+        )
+        return 0
     raise RuntimeError("orchestration action is not exhaustively handled")
+
+
+def _configure_lan_coordinator(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--enable-lan", action="store_true")
+    parser.add_argument("--lan-host", default=DEFAULT_LAN_BIND_HOST_V1)
+    parser.add_argument("--lan-port", type=int, default=DEFAULT_LAN_PORT_V1)
+    parser.add_argument("--lan-ca-certificate", type=Path)
+    parser.add_argument("--lan-certificate", type=Path)
+    parser.add_argument("--lan-private-key", type=Path)
+    parser.add_argument("--lan-identity")
+    parser.add_argument("--lan-worker-identities")
+    parser.add_argument("--lan-audit-fixture", action="store_true")
+    parser.add_argument("--lan-timeout-seconds", type=int, default=60)
+    parser.add_argument(
+        "--lan-maximum-memory-bytes",
+        type=int,
+        default=DEFAULT_LAN_MEMORY_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-disk-bytes",
+        type=int,
+        default=DEFAULT_LAN_DISK_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-elapsed-seconds",
+        type=int,
+        default=DEFAULT_LAN_ELAPSED_SECONDS_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-message-bytes",
+        type=int,
+        default=MAX_MESSAGE_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-stream-bytes",
+        type=int,
+        default=MAX_STREAM_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-claim-memory-bytes",
+        type=int,
+        default=DEFAULT_LAN_CLAIM_MEMORY_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-claim-disk-bytes",
+        type=int,
+        default=DEFAULT_LAN_CLAIM_DISK_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-claim-elapsed-seconds",
+        type=int,
+        default=DEFAULT_LAN_ELAPSED_SECONDS_V1,
+    )
+    parser.add_argument(
+        "--lan-lease-seconds",
+        type=int,
+        default=DEFAULT_LAN_LEASE_SECONDS_V1,
+    )
+    parser.add_argument(
+        "--lan-heartbeat-seconds",
+        type=int,
+        default=DEFAULT_LAN_HEARTBEAT_SECONDS_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-missed-heartbeats",
+        type=int,
+        default=DEFAULT_LAN_MISSED_HEARTBEATS_V1,
+    )
+
+
+def _configure_lan_worker(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--enable-lan", action="store_true")
+    parser.add_argument("--lan-host", default=DEFAULT_LAN_BIND_HOST_V1)
+    parser.add_argument("--lan-port", type=int, default=DEFAULT_LAN_PORT_V1)
+    parser.add_argument("--lan-ca-certificate", required=True, type=Path)
+    parser.add_argument("--lan-certificate", required=True, type=Path)
+    parser.add_argument("--lan-private-key", required=True, type=Path)
+    parser.add_argument("--lan-identity", required=True)
+    parser.add_argument("--lan-coordinator-identity", required=True)
+    parser.add_argument("--lan-server-hostname", required=True)
+    parser.add_argument(
+        "--lan-pinned-coordinator-certificate-sha256",
+        required=True,
+    )
+    parser.add_argument("--lan-resource-classes", required=True)
+    parser.add_argument("--lan-audit-fixture", action="store_true")
+    parser.add_argument("--lan-timeout-seconds", type=int, default=60)
+    parser.add_argument("--lan-maximum-concurrent-runs", type=int, default=1)
+    parser.add_argument("--lan-maximum-queue-depth", type=int, default=0)
+    parser.add_argument(
+        "--lan-maximum-memory-bytes",
+        type=int,
+        default=DEFAULT_LAN_MEMORY_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-disk-bytes",
+        type=int,
+        default=DEFAULT_LAN_DISK_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-elapsed-seconds",
+        type=int,
+        default=DEFAULT_LAN_ELAPSED_SECONDS_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-message-bytes",
+        type=int,
+        default=MAX_MESSAGE_BYTES_V1,
+    )
+    parser.add_argument(
+        "--lan-maximum-stream-bytes",
+        type=int,
+        default=MAX_STREAM_BYTES_V1,
+    )
+
+
+def _build_lan_coordinator_backend(
+    args: argparse.Namespace,
+    *,
+    plan_id: str,
+    compatibility,
+    workers: int,
+) -> LanCoordinatorBackendV1:
+    if not args.enable_lan:
+        raise ValueError("LAN backend requires the explicit --enable-lan opt-in")
+    expected_workers = _canonical_csv(
+        args.lan_worker_identities,
+        "LAN worker identities",
+    )
+    configuration = LanTlsConfigurationV1(
+        role=LanPeerRoleV1.COORDINATOR,
+        enabled=args.enable_lan,
+        host=args.lan_host,
+        port=args.lan_port,
+        ca_certificate=_required_resolved_file(
+            args.lan_ca_certificate,
+            "LAN CA certificate",
+        ),
+        certificate=_required_resolved_file(
+            args.lan_certificate,
+            "LAN coordinator certificate",
+        ),
+        private_key=_required_resolved_file(
+            args.lan_private_key,
+            "LAN coordinator private key",
+        ),
+        local_identity=_required_text(args.lan_identity, "LAN coordinator identity"),
+        expected_peer_identities=expected_workers,
+        credential_use=_credential_use(args.lan_audit_fixture),
+    )
+    limits = ResourceLimitsV1(
+        maximum_concurrent_runs=1,
+        maximum_queue_depth=0,
+        maximum_memory_bytes_per_run=args.lan_maximum_memory_bytes,
+        maximum_disk_bytes_per_run=args.lan_maximum_disk_bytes,
+        maximum_elapsed_seconds_per_run=args.lan_maximum_elapsed_seconds,
+        maximum_message_bytes=args.lan_maximum_message_bytes,
+        maximum_stream_bytes=args.lan_maximum_stream_bytes,
+    )
+    return LanCoordinatorBackendV1(
+        configuration=configuration,
+        compatibility=compatibility,
+        plan_id=plan_id,
+        worker_count=workers,
+        transport_limits=limits,
+        lease_policy=LeasePolicyV1(
+            lease_seconds=args.lan_lease_seconds,
+            heartbeat_interval_seconds=args.lan_heartbeat_seconds,
+            maximum_missed_heartbeats=args.lan_maximum_missed_heartbeats,
+        ),
+        claim_memory_bytes=args.lan_claim_memory_bytes,
+        claim_disk_bytes=args.lan_claim_disk_bytes,
+        claim_elapsed_seconds=args.lan_claim_elapsed_seconds,
+        connection_timeout_seconds=args.lan_timeout_seconds,
+        allow_audit_fixture=args.lan_audit_fixture,
+    )
+
+
+def _run_lan_worker(args: argparse.Namespace):
+    if not args.enable_lan:
+        raise ValueError("LAN worker requires the explicit --enable-lan opt-in")
+    compatibility = measure_local_worker_compatibility()
+    limits = ResourceLimitsV1(
+        maximum_concurrent_runs=args.lan_maximum_concurrent_runs,
+        maximum_queue_depth=args.lan_maximum_queue_depth,
+        maximum_memory_bytes_per_run=args.lan_maximum_memory_bytes,
+        maximum_disk_bytes_per_run=args.lan_maximum_disk_bytes,
+        maximum_elapsed_seconds_per_run=args.lan_maximum_elapsed_seconds,
+        maximum_message_bytes=args.lan_maximum_message_bytes,
+        maximum_stream_bytes=args.lan_maximum_stream_bytes,
+    )
+    identity = _required_text(args.lan_identity, "LAN worker identity")
+    configuration = LanTlsConfigurationV1(
+        role=LanPeerRoleV1.WORKER,
+        enabled=args.enable_lan,
+        host=args.lan_host,
+        port=args.lan_port,
+        ca_certificate=_required_resolved_file(
+            args.lan_ca_certificate,
+            "LAN CA certificate",
+        ),
+        certificate=_required_resolved_file(
+            args.lan_certificate,
+            "LAN worker certificate",
+        ),
+        private_key=_required_resolved_file(
+            args.lan_private_key,
+            "LAN worker private key",
+        ),
+        local_identity=identity,
+        expected_peer_identities=(
+            _required_text(
+                args.lan_coordinator_identity,
+                "LAN coordinator identity",
+            ),
+        ),
+        credential_use=_credential_use(args.lan_audit_fixture),
+        server_hostname=_required_text(
+            args.lan_server_hostname,
+            "LAN coordinator server hostname",
+        ),
+        pinned_coordinator_certificate_sha256=_sha256_text(
+            args.lan_pinned_coordinator_certificate_sha256,
+            "LAN coordinator certificate pin",
+        ),
+    )
+    resources = WorkerResourceAdvertisementV1(
+        worker_id=identity,
+        worker_compatibility_sha256=compatibility.compatibility_sha256,
+        resource_classes=_canonical_csv(
+            args.lan_resource_classes,
+            "LAN resource classes",
+        ),
+        limits=limits,
+        advertisement_nonce=hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+    )
+    return LanWorkerServiceV1(
+        configuration=configuration,
+        compatibility=compatibility,
+        resources=resources,
+        connection_timeout_seconds=args.lan_timeout_seconds,
+        allow_audit_fixture=args.lan_audit_fixture,
+    ).run()
+
+
+def _credential_use(audit_fixture: bool) -> CredentialUseV1:
+    if type(audit_fixture) is not bool:
+        raise TypeError("LAN audit-fixture flag must be boolean")
+    if audit_fixture:
+        return CredentialUseV1.AUDIT_LOOPBACK_FIXTURE
+    return CredentialUseV1.OPERATOR_PRODUCTION
+
+
+def _required_resolved_file(value: Path | None, label: str) -> Path:
+    if type(value) is not Path:
+        raise ValueError(f"{label} is required for LAN startup")
+    try:
+        return value.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{label} cannot be resolved") from error
+
+
+def _required_text(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"{label} must be nonempty canonical text")
+    return value
+
+
+def _canonical_csv(value: object, label: str) -> tuple[str, ...]:
+    text = _required_text(value, label)
+    items = tuple(item.strip() for item in text.split(","))
+    if any(not item for item in items) or len(items) != len(set(items)):
+        raise ValueError(f"{label} must be a unique nonempty comma list")
+    return tuple(sorted(items))
+
+
+def _sha256_text(value: object, label: str) -> str:
+    text = _required_text(value, label)
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
+        raise ValueError(f"{label} must be one lowercase SHA-256 digest")
+    return text
 
 
 def _configure_demo(parser: argparse.ArgumentParser) -> None:

@@ -34,11 +34,15 @@ INLINE_ARTIFACT_SCHEMA_ID = "KIRBY2_INLINE_ARTIFACT_V1"
 RUNTIME_AUDIT_RESULT_SCHEMA_ID = "KIRBY2_RUNTIME_AUDIT_RESULT_V1"
 WORKER_RESULT_MANIFEST_SCHEMA_ID = "KIRBY2_WORKER_RESULT_MANIFEST_V1"
 WORKER_RESULT_SCHEMA_ID = "KIRBY2_WORKER_RESULT_V1"
+LAN_PROTOCOL_ENVELOPE_SCHEMA_ID = "KIRBY2_LAN_PROTOCOL_ENVELOPE_V1"
 
 MAX_INLINE_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_DIAGNOSTIC_DETAILS_BYTES = 1024 * 1024
 MAX_PROTOCOL_JSON_DEPTH = 64
 MAX_PROTOCOL_JSON_ITEMS = 100_000
+MAX_LAN_ENVELOPE_BYTES_V1 = 64 * 1024 * 1024
+MAX_LAN_PAYLOAD_BYTES_V1 = 47 * 1024 * 1024
+MAX_LAN_SESSION_SEQUENCE_V1 = (1 << 63) - 1
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DIAGNOSTIC_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
@@ -102,6 +106,25 @@ class WorkerResultStatusV1(str, Enum):
     COMPATIBILITY_REFUSED = "COMPATIBILITY_REFUSED"
     WORK_KIND_REFUSED = "WORK_KIND_REFUSED"
     RUNTIME_AUDIT_FAILED = "RUNTIME_AUDIT_FAILED"
+
+
+class LanMessageKindV1(str, Enum):
+    """Closed data record kinds accepted by the authenticated LAN transport."""
+
+    SESSION_HELLO = "SESSION_HELLO"
+    WORKER_COMPATIBILITY = "WORKER_COMPATIBILITY"
+    RESOURCE_ADVERTISEMENT = "RESOURCE_ADVERTISEMENT"
+    RESOURCE_CLAIM = "RESOURCE_CLAIM"
+    RESOURCE_DECISION = "RESOURCE_DECISION"
+    LEASE_POLICY = "LEASE_POLICY"
+    LEASE_GRANT = "LEASE_GRANT"
+    LEASE_HEARTBEAT = "LEASE_HEARTBEAT"
+    WORK_REQUEST = "WORK_REQUEST"
+    WORK_RESULT = "WORK_RESULT"
+    EXPERIMENT_CANCELLATION = "EXPERIMENT_CANCELLATION"
+    ARTIFACT_ACCESS_SCOPE = "ARTIFACT_ACCESS_SCOPE"
+    CONTENT_REQUEST = "CONTENT_REQUEST"
+    SESSION_CLOSE = "SESSION_CLOSE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,6 +1047,144 @@ class WorkerResultV1:
         return restored
 
 
+@dataclass(frozen=True, slots=True)
+class LanProtocolEnvelopeV1:
+    """Canonical authenticated-LAN message without executable dispatch data.
+
+    The bootstrap hello is the sole message without a session identity and uses
+    sequence zero.  Every later message carries the authenticated session digest,
+    a strictly positive sequence, and a unique correlation nonce.  TLS supplies
+    confidentiality and authentication; these fields provide protocol binding and
+    replay detection rather than a second, invented cryptographic construction.
+    """
+
+    message_kind: LanMessageKindV1
+    session_id: str | None
+    sequence: int
+    nonce: str
+    payload_bytes: bytes
+
+    schema_id: ClassVar[str] = LAN_PROTOCOL_ENVELOPE_SCHEMA_ID
+    schema_version: ClassVar[int] = ORCHESTRATION_PROTOCOL_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if type(self.message_kind) is not LanMessageKindV1:
+            raise TypeError("LAN message kind must be LanMessageKindV1")
+        if type(self.sequence) is not int:
+            raise TypeError("LAN message sequence must be an exact integer")
+        bootstrap = self.message_kind is LanMessageKindV1.SESSION_HELLO
+        if bootstrap:
+            if self.session_id is not None or self.sequence != 0:
+                raise ValueError("LAN session hello must use null session and sequence zero")
+        else:
+            _require_sha256(self.session_id, "LAN envelope session ID")
+            if not 1 <= self.sequence <= MAX_LAN_SESSION_SEQUENCE_V1:
+                raise ValueError("LAN message sequence is outside the V1 range")
+        _require_sha256(self.nonce, "LAN envelope nonce")
+        raw = _require_exact_bytes(self.payload_bytes, "LAN envelope payload")
+        if not raw or len(raw) > MAX_LAN_PAYLOAD_BYTES_V1:
+            raise ValueError("LAN envelope payload is empty or exceeds its V1 limit")
+        _load_canonical_json_object(
+            raw,
+            "LAN envelope payload",
+            maximum_bytes=MAX_LAN_PAYLOAD_BYTES_V1,
+        )
+
+    @property
+    def payload_sha256(self) -> str:
+        return hashlib.sha256(self.payload_bytes).hexdigest()
+
+    def identity_dict(self) -> dict[str, object]:
+        return {
+            "message_kind": self.message_kind.value,
+            "nonce": self.nonce,
+            "payload_base64": base64.b64encode(self.payload_bytes).decode("ascii"),
+            "payload_sha256": self.payload_sha256,
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+            "sequence": self.sequence,
+            "session_id": self.session_id,
+        }
+
+    @property
+    def envelope_sha256(self) -> str:
+        return _canonical_sha256(self.identity_dict())
+
+    def as_dict(self) -> dict[str, object]:
+        return {**self.identity_dict(), "envelope_sha256": self.envelope_sha256}
+
+    def canonical_bytes(self) -> bytes:
+        raw = _canonical_json_bytes(self.as_dict())
+        if len(raw) > MAX_LAN_ENVELOPE_BYTES_V1:
+            raise ValueError("LAN envelope exceeds its V1 encoded byte limit")
+        return raw
+
+    @classmethod
+    def from_dict(cls, value: object) -> LanProtocolEnvelopeV1:
+        payload = _exact_object(
+            value,
+            frozenset(
+                {
+                    "envelope_sha256",
+                    "message_kind",
+                    "nonce",
+                    "payload_base64",
+                    "payload_sha256",
+                    "schema_id",
+                    "schema_version",
+                    "sequence",
+                    "session_id",
+                }
+            ),
+            "LAN protocol envelope",
+        )
+        _require_schema(payload, cls.schema_id, "LAN protocol envelope")
+        declared_envelope = _require_sha256(
+            payload["envelope_sha256"],
+            "declared LAN envelope digest",
+        )
+        declared_payload = _require_sha256(
+            payload["payload_sha256"],
+            "declared LAN payload digest",
+        )
+        session_id = payload["session_id"]
+        if session_id is not None and type(session_id) is not str:
+            raise TypeError("serialized LAN session ID must be exact text or null")
+        restored = cls(
+            message_kind=_enum_value(
+                LanMessageKindV1,
+                payload["message_kind"],
+                "LAN message kind",
+            ),
+            session_id=session_id,
+            sequence=_exact_integer(payload, "sequence"),
+            nonce=_exact_text(payload, "nonce"),
+            payload_bytes=_strict_base64(
+                _exact_text(payload, "payload_base64"),
+                "LAN envelope payload",
+                maximum_bytes=MAX_LAN_PAYLOAD_BYTES_V1,
+            ),
+        )
+        if not hmac.compare_digest(declared_payload, restored.payload_sha256):
+            raise ValueError("declared LAN payload digest differs from exact bytes")
+        if not hmac.compare_digest(declared_envelope, restored.envelope_sha256):
+            raise ValueError("declared LAN envelope digest differs from exact content")
+        _require_exact_round_trip(restored, payload, "LAN protocol envelope")
+        return restored
+
+    @classmethod
+    def from_canonical_bytes(cls, raw: object) -> LanProtocolEnvelopeV1:
+        payload = _load_canonical_json_object(
+            raw,
+            "LAN protocol envelope bytes",
+            maximum_bytes=MAX_LAN_ENVELOPE_BYTES_V1,
+        )
+        restored = cls.from_dict(payload)
+        if restored.canonical_bytes() != raw:
+            raise ValueError("LAN protocol envelope bytes are not canonical")
+        return restored
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -1451,8 +1612,14 @@ __all__ = [
     "INLINE_ARTIFACT_SCHEMA_ID",
     "InlineArtifactMediaTypeV1",
     "InlineArtifactV1",
+    "LAN_PROTOCOL_ENVELOPE_SCHEMA_ID",
+    "LanMessageKindV1",
+    "LanProtocolEnvelopeV1",
     "MAX_DIAGNOSTIC_DETAILS_BYTES",
     "MAX_INLINE_ARTIFACT_BYTES",
+    "MAX_LAN_ENVELOPE_BYTES_V1",
+    "MAX_LAN_PAYLOAD_BYTES_V1",
+    "MAX_LAN_SESSION_SEQUENCE_V1",
     "MAX_PROTOCOL_JSON_DEPTH",
     "MAX_PROTOCOL_JSON_ITEMS",
     "ORCHESTRATION_PROTOCOL_SCHEMA_VERSION",
