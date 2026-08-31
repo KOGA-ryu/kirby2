@@ -11,6 +11,7 @@ from kirby2.instructor.commands import INSTRUCTOR_CONSOLE_COMMAND_MODULE
 from kirby2.microscope.commands import MICROSCOPE_COMMAND_MODULE
 from kirby2.mining.commands import MINING_COMMAND_MODULE
 from kirby2.orchestration.commands import ORCHESTRATION_COMMAND_MODULE
+from kirby2.packs.commands import PACK_COMMAND_MODULE
 from kirby2.scenario_lang.commands import SCENARIO_SOURCE_COMMAND_MODULE
 
 from .registry import (
@@ -57,6 +58,7 @@ EXPANSION_COMMAND_MODULES = (
     MICROSCOPE_COMMAND_MODULE,
     INSTRUCTOR_CONSOLE_COMMAND_MODULE,
     ORCHESTRATION_COMMAND_MODULE,
+    PACK_COMMAND_MODULE,
 )
 
 

@@ -2,8 +2,9 @@
 
 WO39-A defines logical identity and byte-format declarations.  WO39-B adds hostile
 archive preflight plus private activation-eligible staging.  WO39-C adds deterministic
-local dependency resolution and the immutable registry/CAS contract.  Domain-specific
-builders remain owned by later work orders.
+local dependency resolution and the immutable registry/CAS contract.  WO39-D1 adds
+exact scenario, lesson, curriculum, strategy, and market-profile adapters without
+replacing the identities owned by those domains.
 """
 
 from .formats import (
