@@ -2,15 +2,34 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
 import io
+import json
 import stat
 import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from kirby2.calibration.profiles import MarketProfile
+from kirby2.discovery.identity import (
+    canonical_strategy_ast_bytes,
+    legacy_strategy_source_sha256,
+    lineage_payload_sha256,
+    strategy_semantic_sha256,
+)
 from kirby2.packs.archive import preflight_pack_archive_bytes
+from kirby2.packs.builders import (
+    DomainPackBuildV1,
+    DomainPackVerificationV1,
+    build_domain_pack,
+    runtime_environment_for_verified_pack_v1,
+    supported_domain_pack_types_v1,
+    verify_domain_pack_archive_bytes,
+)
+from kirby2.packs.commands import PACK_COMMAND_MODULE
 from kirby2.packs.formats import (
     K2PACK_MANIFEST_PATH,
     K2PACK_ZIP_COMPRESSION,
@@ -20,6 +39,7 @@ from kirby2.packs.formats import (
     canonical_manifest_bytes,
     canonical_toml_bytes,
     inspect_payload_format_claim,
+    load_canonical_json_bytes,
     load_manifest_bytes,
     normalized_archive_paths,
     normalized_zip_info,
@@ -87,6 +107,15 @@ from kirby2.packs.registry import (
     load_pack_registry_bytes,
     pack_object_relative_path,
 )
+from kirby2.packs.scenario_pack import build_scenario_demo_inputs
+from kirby2.packs.types import (
+    DomainPackRefusalCodeV1,
+    DomainPackRefused,
+    PackArtifactRoleV1,
+    PackArtifactStorageModeV1,
+    PackBuildSpecificationV1,
+    PackSourceArtifactV1,
+)
 from kirby2.packs.validation import (
     DEFAULT_PACK_VALIDATION_LIMITS_V1,
     PackRefusalCodeV1,
@@ -101,11 +130,13 @@ from kirby2.packs.validation import (
     validation_policy_id,
 )
 from kirby2.research.paths import DataAreaId, DataPaths
+from kirby2.strategy.language import parse_strategy_semantic_ast
 
 
 WO39A_AUDIT_CASE_COUNT = 5
 WO39B_AUDIT_CASE_COUNT = 4
 WO39C_AUDIT_CASE_COUNT = 4
+WO39D1_AUDIT_CASE_COUNT = 5
 WO38C_PACK_AUDIT_CASE_COUNT = 1
 
 _JSON_PATH = "data/scenario.json"
@@ -2125,6 +2156,827 @@ def _capture_install_refusal(
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class _DomainPackAuditFixture:
+    specification: PackBuildSpecificationV1
+    originals: dict[str, bytes]
+    build: DomainPackBuildV1
+    verification: DomainPackVerificationV1
+
+
+def audit_training_domain_packs() -> tuple[PackAuditCase, ...]:
+    """Exercise every WO39-D1 adapter and its fail-closed public boundary."""
+
+    fixtures = _training_domain_pack_fixtures()
+    by_type = {item.specification.pack_type: item for item in fixtures}
+    cases = (
+        _scenario_domain_pack_case(by_type[PackTypeV1.SCENARIO]),
+        _lesson_and_curriculum_domain_pack_case(
+            by_type[PackTypeV1.LESSON],
+            by_type[PackTypeV1.CURRICULUM],
+        ),
+        _strategy_domain_pack_case(by_type[PackTypeV1.STRATEGY]),
+        _profile_domain_pack_case(by_type[PackTypeV1.MARKET_PROFILE]),
+        _generic_domain_pack_lifecycle_case(fixtures),
+    )
+    expected_names = (
+        "scenario_pack_preserves_compiled_validation_source_and_capability_identity",
+        "lesson_and_curriculum_preserve_training_and_review_boundaries",
+        "strategy_pack_preserves_legacy_semantic_ast_and_experiment_lineage",
+        "profile_pack_preserves_profile_preregistration_and_review_status",
+        "generic_domain_pack_lifecycle_is_declared_and_all_five_types_round_trip",
+    )
+    if len(cases) != WO39D1_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO39-D1 audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO39-D1 audit case order or identity changed")
+    return cases
+
+
+def _training_domain_pack_fixtures() -> tuple[_DomainPackAuditFixture, ...]:
+    scenario_source = (
+        Path(__file__).resolve().parents[1]
+        / "scenario_lang"
+        / "examples"
+        / "full_day.toml"
+    )
+    inputs = (
+        build_scenario_demo_inputs(scenario_source),
+        _training_policy_pack_inputs(PackTypeV1.LESSON),
+        _training_policy_pack_inputs(PackTypeV1.CURRICULUM),
+        _strategy_pack_inputs(),
+        _profile_pack_inputs(),
+    )
+    return tuple(_verified_domain_fixture(*item) for item in inputs)
+
+
+def _verified_domain_fixture(
+    specification: PackBuildSpecificationV1,
+    originals: dict[str, bytes],
+) -> _DomainPackAuditFixture:
+    build = build_domain_pack(specification, originals)
+    verification = verify_domain_pack_archive_bytes(
+        build.archive_bytes,
+        expected_pack_id=build.manifest.pack_id,
+    )
+    return _DomainPackAuditFixture(
+        specification=specification,
+        originals=originals,
+        build=build,
+        verification=verification,
+    )
+
+
+def _training_policy_pack_inputs(
+    pack_type: PackTypeV1,
+) -> tuple[PackBuildSpecificationV1, dict[str, bytes]]:
+    if pack_type is PackTypeV1.LESSON:
+        prefix = "lesson"
+        role_pairs = (
+            ("lesson-source", PackArtifactRoleV1.LESSON_SOURCE),
+            ("lesson-detector", PackArtifactRoleV1.LESSON_DETECTOR),
+            ("lesson-capabilities", PackArtifactRoleV1.LESSON_CAPABILITIES),
+            (
+                "lesson-observable-policy",
+                PackArtifactRoleV1.LESSON_OBSERVABLE_POLICY,
+            ),
+            ("lesson-reveal-policy", PackArtifactRoleV1.LESSON_REVEAL_POLICY),
+            ("lesson-skills", PackArtifactRoleV1.LESSON_SKILLS),
+            ("lesson-scoring", PackArtifactRoleV1.LESSON_SCORING),
+            (
+                "lesson-review-sidecar",
+                PackArtifactRoleV1.LESSON_REVIEW_SIDECAR,
+            ),
+            ("lesson-embedded-run", PackArtifactRoleV1.EMBEDDED_RUN),
+            ("lesson-embedded-audit", PackArtifactRoleV1.EMBEDDED_AUDIT),
+        )
+    elif pack_type is PackTypeV1.CURRICULUM:
+        prefix = "curriculum"
+        role_pairs = (
+            ("curriculum-source", PackArtifactRoleV1.CURRICULUM_SOURCE),
+            ("curriculum-detector", PackArtifactRoleV1.CURRICULUM_DETECTOR),
+            (
+                "curriculum-capabilities",
+                PackArtifactRoleV1.CURRICULUM_CAPABILITIES,
+            ),
+            (
+                "curriculum-observable-policy",
+                PackArtifactRoleV1.CURRICULUM_OBSERVABLE_POLICY,
+            ),
+            (
+                "curriculum-reveal-policy",
+                PackArtifactRoleV1.CURRICULUM_REVEAL_POLICY,
+            ),
+            ("curriculum-skills", PackArtifactRoleV1.CURRICULUM_SKILLS),
+            ("curriculum-scoring", PackArtifactRoleV1.CURRICULUM_SCORING),
+            (
+                "curriculum-review-sidecar",
+                PackArtifactRoleV1.CURRICULUM_REVIEW_SIDECAR,
+            ),
+        )
+    else:
+        raise TypeError("training policy fixture requires lesson or curriculum")
+
+    originals: dict[str, bytes] = {}
+    artifacts: list[PackSourceArtifactV1] = []
+    for artifact_id, role in role_pairs:
+        schema_id = f"KIRBY2_WO39D1_{role.value}_V1"
+        raw = canonical_json_bytes(
+            {
+                "fixture_id": "WO39D1_ADAPTER_AUDIT_V1",
+                "role": role.value,
+                "schema_id": schema_id,
+                "schema_version": 1,
+            }
+        )
+        originals[artifact_id] = raw
+        artifacts.append(
+            _direct_json_source_artifact(
+                artifact_id=artifact_id,
+                role=role,
+                schema_id=schema_id,
+            )
+        )
+    return (
+        _domain_pack_specification(
+            pack_type=pack_type,
+            name=f"wo39d1-{prefix}-audit",
+            title=f"WO39-D1 {prefix} adapter audit",
+            primary_artifact_id=f"{prefix}-source",
+            artifacts=tuple(sorted(artifacts, key=lambda item: item.artifact_id)),
+        ),
+        originals,
+    )
+
+
+def _strategy_pack_inputs() -> tuple[PackBuildSpecificationV1, dict[str, bytes]]:
+    source = (
+        "setup momentum_long\n"
+        "window 5s\n\n"
+        "GREEN when\n"
+        "    book_imbalance > 0.20\n"
+        "    buy_sell_ratio > 1.10\n"
+        "    ask_depletion_rate > 20\n"
+        "    spread_ticks <= 3\n\n"
+        "WAIT when\n"
+        "    book_imbalance > -0.20\n"
+        "    spread_ticks <= 5\n\n"
+        "RED otherwise\n"
+    )
+    source_raw = source.encode("utf-8")
+    ast = parse_strategy_semantic_ast(source)
+    ast_raw = canonical_strategy_ast_bytes(ast)
+    semantic_identity = strategy_semantic_sha256(ast)
+    lineage = {
+        "experiment_id": "WO39D1_STRATEGY_PACK_AUDIT_V1",
+        "schema_id": "KIRBY2_WO39D1_STRATEGY_LINEAGE_V1",
+        "schema_version": 1,
+        "strategy_semantic_sha256": semantic_identity,
+    }
+    lineage_raw = canonical_json_bytes(lineage)
+    originals = {
+        "strategy-legacy-source": source_raw,
+        "strategy-canonical-ast": ast_raw,
+        "strategy-experiment-lineage": lineage_raw,
+    }
+    artifacts = (
+        PackSourceArtifactV1(
+            artifact_id="strategy-canonical-ast",
+            role=PackArtifactRoleV1.STRATEGY_CANONICAL_AST,
+            source_path="generated/strategy-canonical-ast.json",
+            original_schema_id="KIRBY2_WO39D1_STRATEGY_AST_V1",
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="STRATEGY_SEMANTIC_AST_SHA256_V1",
+            logical_identity_sha256=semantic_identity,
+            direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+        ),
+        PackSourceArtifactV1(
+            artifact_id="strategy-experiment-lineage",
+            role=PackArtifactRoleV1.STRATEGY_EXPERIMENT_LINEAGE,
+            source_path="generated/strategy-experiment-lineage.json",
+            original_schema_id="KIRBY2_WO39D1_STRATEGY_LINEAGE_V1",
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="STRATEGY_LINEAGE_SHA256_V1",
+            logical_identity_sha256=lineage_payload_sha256(lineage),
+            direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+        ),
+        PackSourceArtifactV1(
+            artifact_id="strategy-legacy-source",
+            role=PackArtifactRoleV1.STRATEGY_LEGACY_SOURCE,
+            source_path="strategy/momentum-long.txt",
+            original_schema_id="KIRBY2_WO39D1_LEGACY_STRATEGY_SOURCE_V1",
+            original_schema_version=1,
+            original_media_type="text/plain",
+            storage_mode=PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE,
+            logical_identity_kind="LEGACY_STRATEGY_SOURCE_SHA256_V1",
+            logical_identity_sha256=legacy_strategy_source_sha256(source),
+        ),
+    )
+    return (
+        _domain_pack_specification(
+            pack_type=PackTypeV1.STRATEGY,
+            name="wo39d1-strategy-audit",
+            title="WO39-D1 strategy adapter audit",
+            primary_artifact_id="strategy-canonical-ast",
+            artifacts=tuple(sorted(artifacts, key=lambda item: item.artifact_id)),
+        ),
+        originals,
+    )
+
+
+def _profile_pack_inputs() -> tuple[PackBuildSpecificationV1, dict[str, bytes]]:
+    profile = MarketProfile(
+        profile_id="WO39D1_MARKET_PROFILE_AUDIT_V1",
+        scenario_name="WO39D1_SYNTHETIC_SCENARIO_V1",
+        regime="SYNTHETIC_AUDIT",
+        parameters={"arrival_rate": 0.25, "spread_ticks": 2.0},
+        fixed_parameters=("arrival_rate",),
+        reference_dataset_id="WO39D1_SYNTHETIC_REFERENCE_V1",
+        objective_id="WO39D1_CALIBRATION_OBJECTIVE_V1",
+    )
+    originals = {
+        "market-profile": profile.canonical_json().encode("utf-8"),
+        "profile-preregistration": canonical_json_bytes(
+            {
+                "preregistered": True,
+                "schema_id": "KIRBY2_WO39D1_PROFILE_PREREGISTRATION_V1",
+                "schema_version": 1,
+                "status": "LOCKED_BEFORE_REVIEW",
+            }
+        ),
+        "profile-review-status": canonical_json_bytes(
+            {
+                "decision": "AUDIT_FIXTURE_ONLY",
+                "review_status": "REVIEWED",
+                "schema_id": "KIRBY2_WO39D1_PROFILE_REVIEW_STATUS_V1",
+                "schema_version": 1,
+            }
+        ),
+    }
+    artifacts = (
+        PackSourceArtifactV1(
+            artifact_id="market-profile",
+            role=PackArtifactRoleV1.MARKET_PROFILE,
+            source_path="profiles/wo39d1-market-profile.json",
+            original_schema_id="KIRBY2_WO39D1_MARKET_PROFILE_V1",
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE,
+            logical_identity_kind="MARKET_PROFILE_CANONICAL_SHA256_V1",
+        ),
+        _direct_json_source_artifact(
+            artifact_id="profile-preregistration",
+            role=PackArtifactRoleV1.PROFILE_PREREGISTRATION,
+            schema_id="KIRBY2_WO39D1_PROFILE_PREREGISTRATION_V1",
+        ),
+        _direct_json_source_artifact(
+            artifact_id="profile-review-status",
+            role=PackArtifactRoleV1.PROFILE_REVIEW_STATUS,
+            schema_id="KIRBY2_WO39D1_PROFILE_REVIEW_STATUS_V1",
+        ),
+    )
+    return (
+        _domain_pack_specification(
+            pack_type=PackTypeV1.MARKET_PROFILE,
+            name="wo39d1-market-profile-audit",
+            title="WO39-D1 market-profile adapter audit",
+            primary_artifact_id="market-profile",
+            artifacts=tuple(sorted(artifacts, key=lambda item: item.artifact_id)),
+        ),
+        originals,
+    )
+
+
+def _direct_json_source_artifact(
+    *,
+    artifact_id: str,
+    role: PackArtifactRoleV1,
+    schema_id: str,
+) -> PackSourceArtifactV1:
+    return PackSourceArtifactV1(
+        artifact_id=artifact_id,
+        role=role,
+        source_path=f"generated/{artifact_id}.json",
+        original_schema_id=schema_id,
+        original_schema_version=1,
+        original_media_type="application/json",
+        storage_mode=PackArtifactStorageModeV1.DIRECT,
+        logical_identity_kind="CANONICAL_JSON_SHA256_V1",
+        direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+    )
+
+
+def _domain_pack_specification(
+    *,
+    pack_type: PackTypeV1,
+    name: str,
+    title: str,
+    primary_artifact_id: str,
+    artifacts: tuple[PackSourceArtifactV1, ...],
+) -> PackBuildSpecificationV1:
+    return PackBuildSpecificationV1(
+        namespace="kirby2.audit.wo39d1",
+        name=name,
+        title=title,
+        version="1.0.0",
+        creator=PackCreatorV1(
+            display_name="Kirby2 WO39-D1 audit",
+            identity_uri="urn:kirby2:audit:wo39d1",
+        ),
+        pack_type=pack_type,
+        primary_artifact_id=primary_artifact_id,
+        dependencies=(),
+        license=PackLicenseV1(
+            license_id="KIRBY2_WO39D1_AUDIT_LICENSE_V1",
+            license_name="Synthetic Kirby2 WO39-D1 audit data",
+            license_uri="urn:kirby2:license:wo39d1-audit-v1",
+            redistribution_policy=PackRedistributionPolicyV1.ALLOWED,
+            content_mode=PackContentModeV1.SELF_CONTAINED,
+        ),
+        capability_labels=("DETERMINISTIC_SIMULATION", "LOCAL_OFFLINE"),
+        artifacts=artifacts,
+    )
+
+
+def _scenario_domain_pack_case(
+    fixture: _DomainPackAuditFixture,
+) -> PackAuditCase:
+    index = fixture.verification.index
+    demo_command = next(
+        item for item in PACK_COMMAND_MODULE.commands if item.name == "pack-build-demo"
+    )
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "scenario_lang"
+        / "examples"
+        / "full_day.toml"
+    )
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        demo_status = demo_command.handler(
+            argparse.Namespace(
+                pack_demo_type="scenario",
+                source=source,
+                output=None,
+            )
+        )
+    demo = load_canonical_json_bytes(
+        output.getvalue().strip().encode("ascii"),
+        "WO39-D1 scenario demo result",
+    )
+    expected_roles = {
+        PackArtifactRoleV1.SCENARIO_SOURCE,
+        PackArtifactRoleV1.SCENARIO_COMPILED,
+        PackArtifactRoleV1.SCENARIO_VALIDATION,
+        PackArtifactRoleV1.SCENARIO_CAPABILITIES,
+    }
+    checks = {
+        "scenario_roles_are_complete_and_separate": (
+            expected_roles == {item.role for item in index.artifacts}
+        ),
+        "owning_adapter_reverified_every_original": (
+            _fixture_identities_are_exact(fixture)
+        ),
+        "compiled_validation_source_and_capability_identities_are_distinct": (
+            len({item.logical_identity_sha256 for item in index.artifacts})
+            == len(index.artifacts)
+        ),
+        "public_demo_rebuilds_the_same_logical_and_transport_identity": (
+            demo_status == 0
+            and type(demo) is dict
+            and demo.get("status") == "PASS"
+            and demo.get("pack_id") == fixture.build.manifest.pack_id
+            and demo.get("transport_sha256") == fixture.build.transport_sha256
+            and demo.get("domain_identity_sha256")
+            == index.domain_identity_sha256
+        ),
+    }
+    return _case(
+        "scenario_pack_preserves_compiled_validation_source_and_capability_identity",
+        f"pack={fixture.build.manifest.pack_id} artifacts={len(index.artifacts)}",
+        checks,
+        {
+            "demo_status": demo_status,
+            "domain_identity_sha256": index.domain_identity_sha256,
+            "pack_id": fixture.build.manifest.pack_id,
+            "roles": sorted(item.role.value for item in index.artifacts),
+        },
+    )
+
+
+def _lesson_and_curriculum_domain_pack_case(
+    lesson: _DomainPackAuditFixture,
+    curriculum: _DomainPackAuditFixture,
+) -> PackAuditCase:
+    lesson_required = {
+        PackArtifactRoleV1.LESSON_SOURCE,
+        PackArtifactRoleV1.LESSON_DETECTOR,
+        PackArtifactRoleV1.LESSON_CAPABILITIES,
+        PackArtifactRoleV1.LESSON_OBSERVABLE_POLICY,
+        PackArtifactRoleV1.LESSON_REVEAL_POLICY,
+        PackArtifactRoleV1.LESSON_SKILLS,
+        PackArtifactRoleV1.LESSON_SCORING,
+        PackArtifactRoleV1.LESSON_REVIEW_SIDECAR,
+    }
+    curriculum_required = {
+        PackArtifactRoleV1.CURRICULUM_SOURCE,
+        PackArtifactRoleV1.CURRICULUM_DETECTOR,
+        PackArtifactRoleV1.CURRICULUM_CAPABILITIES,
+        PackArtifactRoleV1.CURRICULUM_OBSERVABLE_POLICY,
+        PackArtifactRoleV1.CURRICULUM_REVEAL_POLICY,
+        PackArtifactRoleV1.CURRICULUM_SKILLS,
+        PackArtifactRoleV1.CURRICULUM_SCORING,
+        PackArtifactRoleV1.CURRICULUM_REVIEW_SIDECAR,
+    }
+    lesson_refusal = _reveal_policy_refusal(
+        lesson,
+        "lesson-observable-policy",
+        "lesson-reveal-policy",
+    )
+    curriculum_refusal = _reveal_policy_refusal(
+        curriculum,
+        "curriculum-observable-policy",
+        "curriculum-reveal-policy",
+    )
+    embedded = tuple(
+        item
+        for item in lesson.verification.index.artifacts
+        if item.role
+        in {PackArtifactRoleV1.EMBEDDED_RUN, PackArtifactRoleV1.EMBEDDED_AUDIT}
+    )
+    checks = {
+        "lesson_retains_all_policy_and_review_roles": (
+            lesson_required
+            <= {item.role for item in lesson.verification.index.artifacts}
+        ),
+        "curriculum_retains_all_policy_and_review_roles": (
+            curriculum_required
+            <= {item.role for item in curriculum.verification.index.artifacts}
+        ),
+        "both_adapters_reverify_exact_original_and_logical_identity": (
+            _fixture_identities_are_exact(lesson)
+            and _fixture_identities_are_exact(curriculum)
+        ),
+        "embedded_run_and_audit_keep_their_original_identities": (
+            len(embedded) == 2
+            and all(
+                item.logical_identity_sha256
+                == hashlib.sha256(lesson.originals[item.artifact_id]).hexdigest()
+                for item in embedded
+            )
+        ),
+        "observable_and_reveal_identity_cannot_collapse": (
+            lesson_refusal is DomainPackRefusalCodeV1.REVEAL_POLICY_VIOLATION
+            and curriculum_refusal
+            is DomainPackRefusalCodeV1.REVEAL_POLICY_VIOLATION
+        ),
+    }
+    return _case(
+        "lesson_and_curriculum_preserve_training_and_review_boundaries",
+        (
+            f"lesson={lesson.build.manifest.pack_id} "
+            f"curriculum={curriculum.build.manifest.pack_id}"
+        ),
+        checks,
+        {
+            "curriculum_reveal_refusal": (
+                None if curriculum_refusal is None else curriculum_refusal.value
+            ),
+            "embedded_roles": sorted(item.role.value for item in embedded),
+            "lesson_reveal_refusal": (
+                None if lesson_refusal is None else lesson_refusal.value
+            ),
+        },
+    )
+
+
+def _strategy_domain_pack_case(
+    fixture: _DomainPackAuditFixture,
+) -> PackAuditCase:
+    index = fixture.verification.index
+    source_raw = fixture.originals["strategy-legacy-source"]
+    source = source_raw.decode("utf-8")
+    ast = parse_strategy_semantic_ast(source)
+    semantic_identity = strategy_semantic_sha256(ast)
+    lineage_payload = load_canonical_json_bytes(
+        fixture.originals["strategy-experiment-lineage"],
+        "WO39-D1 strategy lineage",
+    )
+    source_row = index.artifact(PackArtifactRoleV1.STRATEGY_LEGACY_SOURCE)
+    ast_row = index.artifact(PackArtifactRoleV1.STRATEGY_CANONICAL_AST)
+    lineage_row = index.artifact(PackArtifactRoleV1.STRATEGY_EXPERIMENT_LINEAGE)
+    mismatch = _strategy_lineage_refusal(fixture)
+    checks = {
+        "legacy_source_exact_bytes_and_identity_are_preserved": (
+            source_row.original_sha256 == hashlib.sha256(source_raw).hexdigest()
+            and source_row.logical_identity_sha256
+            == legacy_strategy_source_sha256(source)
+        ),
+        "canonical_ast_is_recomputed_by_the_owning_parser": (
+            fixture.originals["strategy-canonical-ast"]
+            == canonical_strategy_ast_bytes(ast)
+            and ast_row.logical_identity_sha256 == semantic_identity
+        ),
+        "lineage_binds_the_semantic_ast_and_owning_lineage_digest": (
+            type(lineage_payload) is dict
+            and lineage_payload.get("strategy_semantic_sha256")
+            == semantic_identity
+            and lineage_row.logical_identity_sha256
+            == lineage_payload_sha256(lineage_payload)
+        ),
+        "legacy_and_semantic_identities_remain_dual": (
+            source_row.logical_identity_sha256 != ast_row.logical_identity_sha256
+        ),
+        "lineage_mismatch_is_explicitly_refused": (
+            mismatch is DomainPackRefusalCodeV1.STRATEGY_IDENTITY_MISMATCH
+        ),
+    }
+    return _case(
+        "strategy_pack_preserves_legacy_semantic_ast_and_experiment_lineage",
+        f"pack={fixture.build.manifest.pack_id} semantic={semantic_identity}",
+        checks,
+        {
+            "legacy_source_sha256": source_row.logical_identity_sha256,
+            "lineage_refusal": None if mismatch is None else mismatch.value,
+            "semantic_ast_sha256": semantic_identity,
+        },
+    )
+
+
+def _profile_domain_pack_case(
+    fixture: _DomainPackAuditFixture,
+) -> PackAuditCase:
+    index = fixture.verification.index
+    profile_raw = fixture.originals["market-profile"]
+    profile_payload = json.loads(profile_raw.decode("utf-8"))
+    profile = MarketProfile.from_dict(profile_payload)
+    preregistration = load_canonical_json_bytes(
+        fixture.originals["profile-preregistration"],
+        "WO39-D1 profile preregistration",
+    )
+    review = load_canonical_json_bytes(
+        fixture.originals["profile-review-status"],
+        "WO39-D1 profile review status",
+    )
+    invalid_status = _profile_status_refusal(fixture)
+    profile_row = index.artifact(PackArtifactRoleV1.MARKET_PROFILE)
+    checks = {
+        "profile_round_trips_through_the_owning_calibration_schema": (
+            profile.canonical_json().encode("utf-8") == profile_raw
+            and profile_row.logical_identity_sha256
+            == hashlib.sha256(profile_raw).hexdigest()
+        ),
+        "profile_native_float_bytes_use_an_exact_data_envelope": (
+            profile_row.storage_mode
+            is PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE
+        ),
+        "preregistration_and_review_status_are_explicit_and_separate": (
+            type(preregistration) is dict
+            and preregistration.get("preregistered") is True
+            and type(review) is dict
+            and review.get("review_status") == "REVIEWED"
+            and hashlib.sha256(
+                fixture.originals["profile-preregistration"]
+            ).hexdigest()
+            != hashlib.sha256(
+                fixture.originals["profile-review-status"]
+            ).hexdigest()
+        ),
+        "owning_adapter_reverified_every_original": (
+            _fixture_identities_are_exact(fixture)
+        ),
+        "missing_review_status_is_explicitly_refused": (
+            invalid_status is DomainPackRefusalCodeV1.PROFILE_STATUS_INVALID
+        ),
+    }
+    return _case(
+        "profile_pack_preserves_profile_preregistration_and_review_status",
+        f"pack={fixture.build.manifest.pack_id} profile={profile.profile_id}",
+        checks,
+        {
+            "profile_id": profile.profile_id,
+            "status_refusal": (
+                None if invalid_status is None else invalid_status.value
+            ),
+            "storage_mode": profile_row.storage_mode.value,
+        },
+    )
+
+
+def _generic_domain_pack_lifecycle_case(
+    fixtures: tuple[_DomainPackAuditFixture, ...],
+) -> PackAuditCase:
+    rebuilt = tuple(
+        build_domain_pack(item.specification, item.originals) for item in fixtures
+    )
+    pack_command = next(
+        item for item in PACK_COMMAND_MODULE.commands if item.name == "pack"
+    )
+    if pack_command.configure is None:
+        raise RuntimeError("WO39-D1 pack command lost its parser declaration")
+    parser = argparse.ArgumentParser(add_help=False)
+    pack_command.configure(parser)
+    action = next(
+        item
+        for item in parser._actions
+        if isinstance(item, argparse._SubParsersAction)
+    )
+    lifecycle_actions = tuple(action.choices)
+    required_actions = {"build", "inspect", "verify", "install", "list", "remove"}
+    demo_command = next(
+        item for item in PACK_COMMAND_MODULE.commands if item.name == "pack-build-demo"
+    )
+    unsupported = _capture_domain_refusal_code(
+        lambda: demo_command.handler(
+            argparse.Namespace(
+                pack_demo_type="lesson",
+                source=Path("unused-for-unsupported-type"),
+                output=None,
+            )
+        )
+    )
+    scenario = fixtures[0]
+    dependency = PackDependencyV1(
+        creator_id=_digest("WO39-D1 missing creator"),
+        namespace="kirby2.audit.wo39d1",
+        name="missing-provider",
+        version_constraint="1.0.0",
+        expected_pack_id=_digest("WO39-D1 missing provider"),
+    )
+    dependent_specification = replace(
+        scenario.specification,
+        name="wo39d1-missing-dependency",
+        dependencies=(dependency,),
+    )
+    dependent_build = build_domain_pack(
+        dependent_specification,
+        scenario.originals,
+    )
+    dependent_verification = verify_domain_pack_archive_bytes(
+        dependent_build.archive_bytes,
+        expected_pack_id=dependent_build.manifest.pack_id,
+    )
+    missing_dependency = _capture_exception_text(
+        lambda: resolve_pack_dependencies(
+            dependent_build.manifest,
+            PackRegistryV1.empty(),
+            runtime_environment_for_verified_pack_v1(dependent_verification),
+        )
+    )
+    required_pack_types = {
+        PackTypeV1.SCENARIO,
+        PackTypeV1.LESSON,
+        PackTypeV1.CURRICULUM,
+        PackTypeV1.STRATEGY,
+        PackTypeV1.MARKET_PROFILE,
+    }
+    checks = {
+        "all_five_domain_adapters_are_declared": (
+            required_pack_types <= set(supported_domain_pack_types_v1())
+            and {item.specification.pack_type for item in fixtures}
+            == required_pack_types
+        ),
+        "all_five_rebuilds_are_byte_and_identity_identical": all(
+            first.build.archive_bytes == second.archive_bytes
+            and first.build.manifest.pack_id == second.manifest.pack_id
+            and first.build.transport_sha256 == second.transport_sha256
+            and first.build.index == second.index
+            for first, second in zip(fixtures, rebuilt, strict=True)
+        ),
+        "all_five_round_trip_original_identity_and_provenance": all(
+            _fixture_identities_are_exact(item)
+            and _manifest_provenance_covers_domain_index(item)
+            for item in fixtures
+        ),
+        "generic_lifecycle_and_demo_commands_are_declared": (
+            tuple(item.name for item in PACK_COMMAND_MODULE.commands)
+            == ("pack", "pack-build-demo")
+            and required_actions <= set(lifecycle_actions)
+        ),
+        "unsupported_type_is_explicitly_refused": (
+            unsupported is DomainPackRefusalCodeV1.UNSUPPORTED_PACK_TYPE
+        ),
+        "missing_dependency_is_local_only_and_explicit": (
+            missing_dependency is not None
+            and "MISSING_PACK_DEPENDENCY" in missing_dependency
+        ),
+    }
+    return _case(
+        "generic_domain_pack_lifecycle_is_declared_and_all_five_types_round_trip",
+        f"types={len(fixtures)} actions={len(lifecycle_actions)}",
+        checks,
+        {
+            "lifecycle_actions": list(lifecycle_actions),
+            "missing_dependency": missing_dependency,
+            "pack_ids": {
+                item.specification.pack_type.value: item.build.manifest.pack_id
+                for item in fixtures
+            },
+            "unsupported_type_refusal": (
+                None if unsupported is None else unsupported.value
+            ),
+        },
+    )
+
+
+def _fixture_identities_are_exact(fixture: _DomainPackAuditFixture) -> bool:
+    return (
+        fixture.verification.index == fixture.build.index
+        and fixture.verification.original_artifact_count
+        == len(fixture.originals)
+        and all(
+            item.original_byte_count == len(fixture.originals[item.artifact_id])
+            and item.original_sha256
+            == hashlib.sha256(fixture.originals[item.artifact_id]).hexdigest()
+            for item in fixture.verification.index.artifacts
+        )
+    )
+
+
+def _manifest_provenance_covers_domain_index(
+    fixture: _DomainPackAuditFixture,
+) -> bool:
+    provenance = {
+        (item.source_kind, item.source_id, item.source_sha256)
+        for item in fixture.build.manifest.provenance
+    }
+    return all(
+        (item.role.value, item.artifact_id, item.original_sha256) in provenance
+        for item in fixture.build.index.artifacts
+    )
+
+
+def _reveal_policy_refusal(
+    fixture: _DomainPackAuditFixture,
+    observable_artifact_id: str,
+    reveal_artifact_id: str,
+) -> DomainPackRefusalCodeV1 | None:
+    originals = dict(fixture.originals)
+    originals[reveal_artifact_id] = originals[observable_artifact_id]
+    return _capture_domain_refusal_code(
+        lambda: build_domain_pack(fixture.specification, originals)
+    )
+
+
+def _strategy_lineage_refusal(
+    fixture: _DomainPackAuditFixture,
+) -> DomainPackRefusalCodeV1 | None:
+    invalid_lineage = {
+        "experiment_id": "WO39D1_STRATEGY_PACK_MISMATCH_V1",
+        "schema_id": "KIRBY2_WO39D1_STRATEGY_LINEAGE_V1",
+        "schema_version": 1,
+        "strategy_semantic_sha256": _digest("WO39-D1 wrong semantic AST"),
+    }
+    invalid_raw = canonical_json_bytes(invalid_lineage)
+    invalid_artifacts = tuple(
+        replace(
+            item,
+            logical_identity_sha256=lineage_payload_sha256(invalid_lineage),
+        )
+        if item.artifact_id == "strategy-experiment-lineage"
+        else item
+        for item in fixture.specification.artifacts
+    )
+    originals = dict(fixture.originals)
+    originals["strategy-experiment-lineage"] = invalid_raw
+    return _capture_domain_refusal_code(
+        lambda: build_domain_pack(
+            replace(fixture.specification, artifacts=invalid_artifacts),
+            originals,
+        )
+    )
+
+
+def _profile_status_refusal(
+    fixture: _DomainPackAuditFixture,
+) -> DomainPackRefusalCodeV1 | None:
+    originals = dict(fixture.originals)
+    originals["profile-review-status"] = canonical_json_bytes(
+        {
+            "note": "deliberately missing an explicit review status",
+            "schema_id": "KIRBY2_WO39D1_PROFILE_REVIEW_STATUS_V1",
+            "schema_version": 1,
+        }
+    )
+    return _capture_domain_refusal_code(
+        lambda: build_domain_pack(fixture.specification, originals)
+    )
+
+
+def _capture_domain_refusal_code(
+    operation,
+) -> DomainPackRefusalCodeV1 | None:
+    try:
+        operation()
+    except DomainPackRefused as error:
+        return error.code
+    return None
+
+
 def _capture_exception_text(operation) -> str | None:
     try:
         operation()
@@ -2237,10 +3089,12 @@ __all__ = [
     "WO39A_AUDIT_CASE_COUNT",
     "WO39B_AUDIT_CASE_COUNT",
     "WO39C_AUDIT_CASE_COUNT",
+    "WO39D1_AUDIT_CASE_COUNT",
     "PackAuditCase",
     "audit_clean_root_pack_transfer",
     "audit_atomic_pack_installation",
     "audit_canonical_pack_identity",
     "audit_hostile_archive_validation_and_staging",
+    "audit_training_domain_packs",
     "build_clean_root_transfer_audit_fixture",
 ]

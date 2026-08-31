@@ -164,6 +164,7 @@ REGISTERABLE_GATE_IDS = (
     "WO38-C",
     "WO38-D",
     "WO38-E",
+    "WO39-D1",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4918,6 +4919,55 @@ def _audit_wo38e() -> ExpansionGateReport:
     )
 
 
+def _audit_wo39d1() -> ExpansionGateReport:
+    from kirby2.audit.packs import (
+        WO39D1_AUDIT_CASE_COUNT,
+        audit_training_domain_packs,
+    )
+
+    cases = audit_training_domain_packs()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO39-D1",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO39D1_AUDIT_CASE_COUNT)),
+            (
+                "pack_types",
+                "SCENARIO_LESSON_CURRICULUM_STRATEGY_MARKET_PROFILE_V1",
+            ),
+            (
+                "identity_policy",
+                "ORIGINAL_BYTES_AND_OWNING_LOGICAL_IDENTITY_V1",
+            ),
+            (
+                "training_boundary",
+                "SOURCE_DETECTOR_CAPABILITY_OBSERVABLE_REVEAL_SKILLS_SCORING_REVIEW_V1",
+            ),
+            ("lifecycle", "BUILD_INSPECT_VERIFY_INSTALL_LIST_REMOVE_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4983,6 +5033,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO38-C", _audit_wo38c),
     ("WO38-D", _audit_wo38d),
     ("WO38-E", _audit_wo38e),
+    ("WO39-D1", _audit_wo39d1),
 )
 
 
