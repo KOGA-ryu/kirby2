@@ -1,0 +1,93 @@
+schema_id = "KIRBY2_HOSTILE_PACK_SOURCE_SET_V1"
+schema_version = 1
+
+[[cases]]
+case_id = "path_traversal"
+attack_kind = "PATH_TRAVERSAL"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[cases]]
+case_id = "digest_mismatch"
+attack_kind = "DIGEST_MISMATCH"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[cases]]
+case_id = "undeclared_file"
+attack_kind = "UNDECLARED_FILE"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[cases]]
+case_id = "oversized_expansion"
+attack_kind = "OVERSIZED_EXPANSION"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[cases]]
+case_id = "unsupported_schema"
+attack_kind = "UNSUPPORTED_SCHEMA"
+expected_boundary = "DOMAIN_ADAPTER"
+
+[[cases]]
+case_id = "missing_dependency"
+attack_kind = "MISSING_DEPENDENCY"
+expected_boundary = "ATOMIC_INSTALL"
+
+[[cases]]
+case_id = "capability_lie"
+attack_kind = "CAPABILITY_LIE"
+expected_boundary = "DOMAIN_ADAPTER"
+
+[[cases]]
+case_id = "embedded_executable"
+attack_kind = "EMBEDDED_EXECUTABLE"
+expected_boundary = "DOMAIN_ADAPTER"
+
+[[cases]]
+case_id = "wo39b_archive_classes"
+attack_kind = "WO39B_ARCHIVE_CLASSES"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[cases]]
+case_id = "dependency_cycle"
+attack_kind = "DEPENDENCY_CYCLE"
+expected_boundary = "ATOMIC_INSTALL"
+
+[[cases]]
+case_id = "malformed_toml"
+attack_kind = "MALFORMED_TOML"
+expected_boundary = "CONTENT_FORMAT"
+
+[[cases]]
+case_id = "malformed_parquet"
+attack_kind = "MALFORMED_PARQUET"
+expected_boundary = "CONTENT_FORMAT"
+
+[[cases]]
+case_id = "canonicalization_mismatch"
+attack_kind = "CANONICALIZATION_MISMATCH"
+expected_boundary = "CONTENT_FORMAT"
+
+[[cases]]
+case_id = "spoofed_extension"
+attack_kind = "SPOOFED_EXTENSION"
+expected_boundary = "CONTENT_FORMAT"
+
+[[cases]]
+case_id = "signed_hostile_content"
+attack_kind = "SIGNED_HOSTILE_CONTENT"
+expected_boundary = "ARCHIVE_PREFLIGHT"
+
+[[payloads]]
+path = "embedded.js"
+sha256 = "972326efa3fcf10ebd4af0cec72abdb15efabc12c369768b5817465579921e46"
+
+[[payloads]]
+path = "malformed.parquet"
+sha256 = "afe8c460f08dd1fafa5a24912932eae294a8d885a4c09eeefdf85024ca1f9d65"
+
+[[payloads]]
+path = "malformed.toml"
+sha256 = "ed7b1a3866a53aa152749dcd1c493c75a126d6cc83f0e9a4c0a95995c64e20af"
+
+[[payloads]]
+path = "spoofed.png"
+sha256 = "450e902bada829c9086bce40be0f468448be2f63c9811fed4766d8bd8ca69a82"

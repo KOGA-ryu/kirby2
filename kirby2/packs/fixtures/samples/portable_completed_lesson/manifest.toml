@@ -1,0 +1,24 @@
+schema_id = "KIRBY2_PACK_SAMPLE_GROUP_V1"
+schema_version = 1
+group_id = "PORTABLE_COMPLETED_LESSON_V1"
+title = "Portable completed lesson with replay and analysis"
+pack_types = ["LESSON"]
+capability_labels = ["DATA_ONLY", "DETERMINISTIC_REPLAY", "LOCAL_OFFLINE"]
+lesson_id = "KIRBY2_STARTER_PLACE_CANCEL_V1"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+expected_replay_sha256 = "6addbac9e70687a4996585f89e173cee4d1089591dc605dd1858c720edcae5eb"
+
+[[payloads]]
+path = "analysis.json"
+media_type = "application/json"
+sha256 = "f5d970f011b89df6cdd8985b2d685a47f4d7483519c24f9bd9935fdce571537e"
+
+[[payloads]]
+path = "lesson.json"
+media_type = "application/json"
+sha256 = "91f8372920cf3331f44095a7d8746a86dd94eb1fef7136dffe14bb21f13e8662"
+
+[[payloads]]
+path = "replay.jsonl"
+media_type = "application/x-ndjson"
+sha256 = "6addbac9e70687a4996585f89e173cee4d1089591dc605dd1858c720edcae5eb"

@@ -166,6 +166,7 @@ REGISTERABLE_GATE_IDS = (
     "WO38-E",
     "WO39-D1",
     "WO39-D2",
+    "WO39-E",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -5019,6 +5020,53 @@ def _audit_wo39d2() -> ExpansionGateReport:
     )
 
 
+def _audit_wo39e() -> ExpansionGateReport:
+    from kirby2.audit.packs import WO39E_AUDIT_CASE_COUNT, audit_pack_portability
+
+    cases = audit_pack_portability()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO39-E",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO39E_AUDIT_CASE_COUNT)),
+            ("sample_group_count", "5"),
+            ("hostile_source_case_count", "15"),
+            (
+                "portability_policy",
+                "OFFLINE_CLEAN_ROOT_CONTENT_ADDRESSED_REPLAY_EQUIVALENCE_V1",
+            ),
+            (
+                "signature_policy",
+                "OPTIONAL_PROVIDER_AUTHENTICITY_NEVER_OVERRIDES_SAFETY_V1",
+            ),
+            (
+                "removal_policy",
+                "DEPENDENCY_SAFE_RECOVERABLE_RUN_EVIDENCE_PRESERVING_V1",
+            ),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -5086,6 +5134,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO38-E", _audit_wo38e),
     ("WO39-D1", _audit_wo39d1),
     ("WO39-D2", _audit_wo39d2),
+    ("WO39-E", _audit_wo39e),
 )
 
 

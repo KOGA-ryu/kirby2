@@ -38,7 +38,7 @@
 "adapter_version" = 1
 "capability_digest" = "3b3e0e876d2dc52e8260e3fffe5cc97a2955faaa05da1d7c05fc11dbae0f8e1d"
 "description" = "A short deterministic simulated-market drill for placing and cancelling one resting order."
-"scenario_id" = "kirby2_starter_place_cancel_v1"
+"scenario_id" = "KIRBY2_STARTER_PLACE_CANCEL_SCENARIO_V1"
 "scenario_version" = 1
 "target_kind" = "MARKET_SCENARIO_V1"
 "target_version" = 1

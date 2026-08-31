@@ -1,0 +1,14 @@
+schema_id = "KIRBY2_PACK_SAMPLE_GROUP_V1"
+schema_version = 1
+group_id = "HISTORICAL_RECONSTRUCTION_V1"
+title = "Synthetic historical reconstruction"
+pack_types = ["HISTORICAL"]
+capability_labels = ["DATA_ONLY", "LOCAL_OFFLINE", "OBSERVED_TRADES", "RECONSTRUCTED_BOOK"]
+content_mode = "SELF_CONTAINED"
+license_id = "KIRBY2-PROJECT"
+redistribution_policy = "ALLOWED"
+
+[[payloads]]
+path = "observed_trades.csv"
+media_type = "text/csv"
+sha256 = "053c60f14c61438f5b68f1942fb5ab0392db1c1a93a1a8e6bdb8d20d108a6017"

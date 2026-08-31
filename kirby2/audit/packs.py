@@ -137,6 +137,7 @@ WO39A_AUDIT_CASE_COUNT = 5
 WO39B_AUDIT_CASE_COUNT = 4
 WO39C_AUDIT_CASE_COUNT = 4
 WO39D1_AUDIT_CASE_COUNT = 5
+WO39E_AUDIT_CASE_COUNT = 5
 WO38C_PACK_AUDIT_CASE_COUNT = 1
 
 _JSON_PATH = "data/scenario.json"
@@ -2193,6 +2194,30 @@ def audit_training_domain_packs() -> tuple[PackAuditCase, ...]:
     return cases
 
 
+def audit_pack_portability(
+    sample_set: Path | None = None,
+    hostile_set: Path | None = None,
+    *,
+    seed: int = 42,
+) -> tuple[PackAuditCase, ...]:
+    """Run the focused WO39-E module through the established pack-audit surface."""
+
+    from kirby2.audit.pack_portability import audit_pack_portability as execute
+
+    cases = execute(sample_set, hostile_set, seed=seed)
+    if len(cases) != WO39E_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO39-E pack audit case inventory changed")
+    return tuple(
+        PackAuditCase(
+            name=item.name,
+            detail=item.detail,
+            evidence=item.evidence,
+            failures=item.failures,
+        )
+        for item in cases
+    )
+
+
 def _training_domain_pack_fixtures() -> tuple[_DomainPackAuditFixture, ...]:
     scenario_source = (
         Path(__file__).resolve().parents[1]
@@ -3090,11 +3115,13 @@ __all__ = [
     "WO39B_AUDIT_CASE_COUNT",
     "WO39C_AUDIT_CASE_COUNT",
     "WO39D1_AUDIT_CASE_COUNT",
+    "WO39E_AUDIT_CASE_COUNT",
     "PackAuditCase",
     "audit_clean_root_pack_transfer",
     "audit_atomic_pack_installation",
     "audit_canonical_pack_identity",
     "audit_hostile_archive_validation_and_staging",
+    "audit_pack_portability",
     "audit_training_domain_packs",
     "build_clean_root_transfer_audit_fixture",
 ]

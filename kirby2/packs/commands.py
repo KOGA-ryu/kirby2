@@ -285,6 +285,24 @@ def _handle_pack_build_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_pack_portability_demo(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--sample-set", required=True, type=Path)
+    parser.add_argument("--hostile-set", required=True, type=Path)
+    parser.add_argument("--seed", required=True, type=int)
+
+
+def _handle_pack_portability_demo(args: argparse.Namespace) -> int:
+    from kirby2.audit.pack_portability import run_pack_portability_demo
+
+    report = run_pack_portability_demo(
+        args.sample_set,
+        args.hostile_set,
+        seed=args.seed,
+    )
+    _print_json(report)
+    return 0 if report["status"] == "PASS" else 1
+
+
 def _default_output(build: DomainPackBuildV1) -> Path:
     return Path.cwd() / f"{build.manifest.name}-{build.manifest.version}.k2pack"
 
@@ -335,6 +353,13 @@ PACK_COMMAND_MODULE = CommandModule(
             help="build and verify one canonical domain-pack demonstration",
             handler=_handle_pack_build_demo,
             configure=_configure_pack_build_demo,
+        ),
+        CommandSpec(
+            command_id="PACK_PORTABILITY_DEMO",
+            name="pack-portability-demo",
+            help="qualify governed sample packs across offline clean roots",
+            handler=_handle_pack_portability_demo,
+            configure=_configure_pack_portability_demo,
         ),
     ),
 )

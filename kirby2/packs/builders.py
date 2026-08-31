@@ -107,6 +107,91 @@ DOMAIN_PACK_INDEX_PATH_V1 = "domain/index.json"
 PACK_BUILD_MAX_SOURCE_DEFINITION_BYTES_V1 = 2 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 
+# Pack capability labels describe what the installed data enables.  These labels are
+# outside Kirby2's offline mathematical-simulator boundary and are refused even when
+# every byte and detached signature is otherwise valid.
+PROHIBITED_PACK_CAPABILITY_LABELS_V1 = frozenset(
+    {
+        "BROKERAGE",
+        "INTERNET_ACCESS",
+        "LIVE_BROKERAGE",
+        "LIVE_ORDER_SUBMISSION",
+        "NETWORK_ACCESS",
+        "REAL_MARKET_EXECUTION",
+        "TELEMETRY",
+    }
+)
+PROHIBITED_PACK_EXECUTABLE_MEDIA_TYPES_V1 = frozenset(
+    {
+        "application/javascript",
+        "application/wasm",
+        "application/x-executable",
+        "application/x-javascript",
+        "application/x-python-code",
+        "application/x-sh",
+        "text/css",
+        "text/html",
+        "text/javascript",
+        "text/x-python",
+        "text/x-shellscript",
+    }
+)
+PROHIBITED_PACK_EXECUTABLE_SUFFIXES_V1 = frozenset(
+    {
+        ".app",
+        ".7z",
+        ".bash",
+        ".bat",
+        ".cjs",
+        ".class",
+        ".cmd",
+        ".com",
+        ".deb",
+        ".bz2",
+        ".css",
+        ".dll",
+        ".dylib",
+        ".exe",
+        ".fish",
+        ".gz",
+        ".htm",
+        ".html",
+        ".jar",
+        ".js",
+        ".mjs",
+        ".msi",
+        ".pdf",
+        ".ps1",
+        ".py",
+        ".pyc",
+        ".pyd",
+        ".rpm",
+        ".rar",
+        ".sh",
+        ".so",
+        ".svg",
+        ".tar",
+        ".wasm",
+        ".whl",
+        ".xlsm",
+        ".xz",
+        ".zsh",
+        ".zip",
+    }
+)
+_PROHIBITED_PACK_PAYLOAD_MAGICS_V1 = (
+    b"#!",
+    b"MZ",
+    b"PK\x03\x04",
+    b"\x00asm",
+    b"\x7fELF",
+    b"\xca\xfe\xba\xbe",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+)
+
 
 _DIRECT_DECLARATIONS: dict[PackContentFormatV1, tuple[str, str]] = {
     PackContentFormatV1.TOML: (".toml", "application/toml"),
@@ -701,12 +786,20 @@ def build_domain_pack(
             DomainPackRefusalCodeV1.SOURCE_TOO_LARGE,
             "original artifacts exceed the total V1 byte limit",
         )
+    _validate_no_executable_artifact_bytes(tuple(originals.items()))
     if source_definition_sha256 is not None:
         from .formats import require_sha256
 
         require_sha256(source_definition_sha256, "pack source-definition digest")
 
     contract = domain_pack_adapter_v1(specification.pack_type)
+    _validate_pack_capability_boundary(specification.capability_labels)
+    _validate_no_executable_artifact_claims(
+        tuple(
+            (item.source_path, item.original_media_type)
+            for item in specification.artifacts
+        )
+    )
     _validate_content_license(specification, contract)
     validate_adapter_inventory(
         contract,
@@ -735,13 +828,20 @@ def build_domain_pack(
                 logical_identity,
             )
         )
-        inspect_payload_format_claim(
-            payload,
-            path=payload_path,
-            content_format=content_format.value,
-            media_type=media_type,
-            schema_id=schema_id,
-        )
+        try:
+            inspect_payload_format_claim(
+                payload,
+                path=payload_path,
+                content_format=content_format.value,
+                media_type=media_type,
+                schema_id=schema_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.ARTIFACT_FORMAT_INVALID,
+                "direct artifact bytes differ from their declared content format: "
+                + declaration.artifact_id,
+            ) from error
         payloads[payload_path] = payload
         inventory_rows.append(
             PackFileV1(
@@ -864,6 +964,7 @@ def verify_domain_pack_archive_bytes(
     )
     manifest = preflight.manifest
     contract = domain_pack_adapter_v1(manifest.pack_type)
+    _validate_pack_capability_boundary(manifest.capability_labels)
     inventory_by_path = {item.path: item for item in manifest.inventory}
     index_declaration = inventory_by_path.get(DOMAIN_PACK_INDEX_PATH_V1)
     if (
@@ -889,6 +990,9 @@ def verify_domain_pack_archive_bytes(
             DomainPackRefusalCodeV1.DOMAIN_INDEX_INVALID,
             "domain index failed exact canonical reconstruction",
         ) from error
+    _validate_no_executable_artifact_claims(
+        tuple((item.original_path, item.original_media_type) for item in index.artifacts)
+    )
     if (
         index.pack_type is not manifest.pack_type
         or index.adapter_id != contract.adapter_id
@@ -928,6 +1032,7 @@ def verify_domain_pack_archive_bytes(
                 f"restored original bytes differ: {row.artifact_id}",
             )
         originals[row.artifact_id] = original
+    _validate_no_executable_artifact_bytes(tuple(originals.items()))
     _validate_domain(index, originals, license=manifest.license)
     return DomainPackVerificationV1(
         preflight=preflight,
@@ -1136,6 +1241,44 @@ def _all_text_values(value: object) -> frozenset[str]:
 
     visit(value)
     return frozenset(found)
+
+
+def _validate_pack_capability_boundary(labels: tuple[str, ...]) -> None:
+    prohibited = tuple(sorted(set(labels) & PROHIBITED_PACK_CAPABILITY_LABELS_V1))
+    if prohibited:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.ARTIFACT_INVENTORY_INVALID,
+            "pack claims capabilities outside the offline simulator boundary: "
+            + ", ".join(prohibited),
+        )
+
+
+def _validate_no_executable_artifact_claims(
+    claims: tuple[tuple[str, str], ...],
+) -> None:
+    for path, media_type in claims:
+        suffix = PurePosixPath(path).suffix.casefold()
+        if (
+            media_type.casefold() in PROHIBITED_PACK_EXECUTABLE_MEDIA_TYPES_V1
+            or suffix in PROHIBITED_PACK_EXECUTABLE_SUFFIXES_V1
+        ):
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.RENDERER_INJECTION_REFUSED,
+                "data-only pack artifact claims executable or renderer content: "
+                + path,
+            )
+
+
+def _validate_no_executable_artifact_bytes(
+    artifacts: tuple[tuple[str, bytes], ...],
+) -> None:
+    for artifact_id, raw in artifacts:
+        if any(raw.startswith(magic) for magic in _PROHIBITED_PACK_PAYLOAD_MAGICS_V1):
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.RENDERER_INJECTION_REFUSED,
+                "data-only pack artifact carries executable or nested-container magic: "
+                + artifact_id,
+            )
 
 
 def _validate_content_license(
@@ -1626,6 +1769,9 @@ __all__ = [
     "DOMAIN_PACK_INDEX_PATH_V1",
     "PACK_BUILD_MAX_SOURCE_DEFINITION_BYTES_V1",
     "PACK_SOURCE_FILENAME_V1",
+    "PROHIBITED_PACK_CAPABILITY_LABELS_V1",
+    "PROHIBITED_PACK_EXECUTABLE_MEDIA_TYPES_V1",
+    "PROHIBITED_PACK_EXECUTABLE_SUFFIXES_V1",
     "DomainPackBuildV1",
     "DomainPackVerificationV1",
     "build_domain_pack",
