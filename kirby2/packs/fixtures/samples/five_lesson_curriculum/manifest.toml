@@ -1,0 +1,43 @@
+schema_id = "KIRBY2_STARTER_CURRICULUM_SOURCE_V1"
+schema_version = 1
+curriculum_id = "KIRBY2_STARTER_CURRICULUM_V1"
+curriculum_version = 1
+title = "Kirby2 five-lesson simulator starter"
+description = "Five offline mathematical-simulator lessons with no real-world trading connection."
+scenario_role = "SCENARIO"
+lesson_count = 5
+
+[[lessons]]
+lesson_id = "KIRBY2_STARTER_PLACE_CANCEL_V1"
+ordinal = 1
+title = "Place and cancel"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+objective = "Place one resting simulated order, observe its acknowledgement, then cancel it."
+
+[[lessons]]
+lesson_id = "KIRBY2_STARTER_QUEUE_V1"
+ordinal = 2
+title = "Queue position"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+objective = "Observe deterministic price-time priority in a simulated order queue."
+
+[[lessons]]
+lesson_id = "KIRBY2_STARTER_SPREAD_V1"
+ordinal = 3
+title = "Spread and displayed depth"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+objective = "Read the simulated best bid, best ask, spread, and displayed depth."
+
+[[lessons]]
+lesson_id = "KIRBY2_STARTER_PARTIAL_FILL_V1"
+ordinal = 4
+title = "Partial fills"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+objective = "Observe conservation across deterministic simulated partial fills."
+
+[[lessons]]
+lesson_id = "KIRBY2_STARTER_REPLAY_V1"
+ordinal = 5
+title = "Replay the evidence"
+checkpoint_selector = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+objective = "Review the immutable event stream without revealing future simulated events early."

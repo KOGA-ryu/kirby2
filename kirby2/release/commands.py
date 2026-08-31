@@ -1,4 +1,4 @@
-"""Registered release backup and restore commands."""
+"""Registered offline release data, first-run, and diagnostic commands."""
 
 from __future__ import annotations
 
@@ -18,6 +18,10 @@ from .backup import (
     verify_backup,
 )
 from .restore import RestoreConflictPolicyV1, restore_backup
+from .diagnostics import export_release_diagnostics
+from .doctor import HealthStatusV1, release_identity, run_doctor, verify_installation
+from .first_run import run_first_run
+from .platform_paths import select_release_paths
 
 
 def _absolute_path(value: str) -> Path:
@@ -179,6 +183,88 @@ def _handle_backup_restore_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_data_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--data-root",
+        type=_absolute_path,
+        help="explicit resolved data root; platform release path is the default",
+    )
+
+
+def _paths_from_args(args: argparse.Namespace) -> DataPaths:
+    return select_release_paths(explicit_root=args.data_root).paths
+
+
+def _handle_version(_args: argparse.Namespace) -> int:
+    _print_json(release_identity().as_dict())
+    return 0
+
+
+def _handle_data_paths(args: argparse.Namespace) -> int:
+    selection = select_release_paths(explicit_root=args.data_root)
+    _print_json(selection.as_dict())
+    return 0
+
+
+def _handle_doctor(args: argparse.Namespace) -> int:
+    report = run_doctor(_paths_from_args(args), strict=False)
+    _print_json(report.as_dict())
+    return 1 if report.status is HealthStatusV1.FAIL else 0
+
+
+def _handle_verify_installation(args: argparse.Namespace) -> int:
+    report = verify_installation(_paths_from_args(args))
+    _print_json(report.as_dict())
+    return 0 if report.status is HealthStatusV1.PASS else 1
+
+
+def _configure_export_diagnostics(parser: argparse.ArgumentParser) -> None:
+    _configure_data_root(parser)
+    parser.add_argument("--output", required=True, type=_absolute_path)
+    parser.add_argument(
+        "--authorize-hidden-lesson-truth",
+        action="store_true",
+        help=(
+            "record explicit authorization; V1 support diagnostics still do not "
+            "collect hidden lesson truth"
+        ),
+    )
+
+
+def _handle_export_diagnostics(args: argparse.Namespace) -> int:
+    receipt = export_release_diagnostics(
+        _paths_from_args(args),
+        args.output,
+        authorize_hidden_lesson_truth=args.authorize_hidden_lesson_truth,
+    )
+    _print_json(receipt.as_dict())
+    return 0
+
+
+def _configure_first_run_demo(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--seed", required=True, type=int)
+    parser.add_argument(
+        "--data-root",
+        type=_absolute_path,
+        help=(
+            "explicit persistent data root; when omitted the complete flow runs "
+            "inside a clean temporary root"
+        ),
+    )
+
+
+def _handle_first_run_demo(args: argparse.Namespace) -> int:
+    if args.data_root is not None:
+        report = run_first_run(DataPaths(args.data_root), seed=args.seed)
+        _print_json(report.as_dict())
+        return 0 if report.complete else 1
+    with tempfile.TemporaryDirectory(prefix="kirby2-first-run-") as temporary:
+        root = Path(temporary).resolve()
+        report = run_first_run(DataPaths(root), seed=args.seed)
+        _print_json(report.as_dict())
+        return 0 if report.complete else 1
+
+
 def _print_json(value: object) -> None:
     print(canonical_json_bytes(value).decode("ascii"))
 
@@ -206,6 +292,47 @@ RELEASE_DATA_COMMAND_MODULE = CommandModule(
             help="exercise the deterministic release user-data backup flow",
             handler=_handle_backup_restore_demo,
             configure=_configure_backup_restore_demo,
+        ),
+        CommandSpec(
+            command_id="RELEASE_DOCTOR",
+            name="doctor",
+            help="inspect paths, packs, schemas, manifests, dependencies, and recovery",
+            handler=_handle_doctor,
+            configure=_configure_data_root,
+        ),
+        CommandSpec(
+            command_id="RELEASE_VERSION",
+            name="version",
+            help="show engine, source, runtime, and schema identity",
+            handler=_handle_version,
+        ),
+        CommandSpec(
+            command_id="RELEASE_DATA_PATHS",
+            name="data-paths",
+            help="show every governed release data path without creating it",
+            handler=_handle_data_paths,
+            configure=_configure_data_root,
+        ),
+        CommandSpec(
+            command_id="VERIFY_RELEASE_INSTALLATION",
+            name="verify-installation",
+            help="strictly verify a complete first-run release installation",
+            handler=_handle_verify_installation,
+            configure=_configure_data_root,
+        ),
+        CommandSpec(
+            command_id="EXPORT_RELEASE_DIAGNOSTICS",
+            name="export-diagnostics",
+            help="export one new explicitly redacted local diagnostic JSON file",
+            handler=_handle_export_diagnostics,
+            configure=_configure_export_diagnostics,
+        ),
+        CommandSpec(
+            command_id="RELEASE_FIRST_RUN_DEMO",
+            name="release-first-run-demo",
+            help="run the complete offline first-run and place/cancel demonstration",
+            handler=_handle_first_run_demo,
+            configure=_configure_first_run_demo,
         ),
     ),
 )
