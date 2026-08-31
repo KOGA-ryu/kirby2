@@ -38,6 +38,7 @@ from .runtime import (
     strategy_id,
 )
 from .tables import (
+    LEGACY_OPTIONAL_TABLE_NAMES_V1,
     RUN_ARTIFACT_REGISTRY_COLUMNS,
     TABLE_SPECS,
     artifact_registry_rows,
@@ -51,7 +52,13 @@ from .tables import (
     strategy_discovery_artifact_registry_rows,
     write_parquet_tables,
 )
-from .toml_codec import canonical_digest, canonical_toml, file_sha256, load_toml
+from .toml_codec import (
+    canonical_digest,
+    canonical_toml,
+    encode_payload,
+    file_sha256,
+    load_toml,
+)
 
 if TYPE_CHECKING:
     from kirby2.discovery.access import PartitionAccessRecordV1
@@ -576,6 +583,25 @@ class RunStore:
         configuration = configuration_toml(recording, session)
         configuration_digest = _sha256_text(configuration)
         raw_tables = extract_session_tables(recording, session)
+        for recovery in session.recovery_records:
+            raw_tables["session_recovery"].append(
+                {
+                    "boundary": recovery.boundary.value,
+                    "checkpoint_id": recovery.checkpoint_id,
+                    "details_toml": encode_payload(recovery.details),
+                    "disposition": recovery.disposition,
+                    "event_prefix_count": recovery.event_prefix_count,
+                    "event_prefix_sha256": recovery.event_prefix_sha256,
+                    "ledger_prefix_count": recovery.ledger_prefix_count,
+                    "ledger_prefix_sha256": recovery.ledger_prefix_sha256,
+                    "reason_code": recovery.reason_code,
+                    "record_sha256": recovery.record_sha256,
+                    "recovery_sequence": recovery.sequence,
+                    "session_id": recovery.session_id,
+                    "simulation_time_us": recovery.simulation_time_us,
+                    "transaction_id": recovery.transaction_id,
+                }
+            )
         facts_digest = evidence_digest(raw_tables)
         schema_versions = dict(SUPPORTED_SCHEMA_VERSIONS)
         objective = (
@@ -806,9 +832,23 @@ class RunStore:
         }:
             return InstructorArtifactStore(self.root).verify_run(run_id)
         directory = self.run_directory(run_id)
+        legacy_schema_versions = {
+            key: value
+            for key, value in SUPPORTED_SCHEMA_VERSIONS.items()
+            if key.removeprefix("table.") not in LEGACY_OPTIONAL_TABLE_NAMES_V1
+        }
+        has_recovery_table = (
+            "table.session_recovery" in manifest.schema_versions
+        )
+        active_table_specs = tuple(
+            spec
+            for spec in TABLE_SPECS
+            if has_recovery_table
+            or spec.name not in LEGACY_OPTIONAL_TABLE_NAMES_V1
+        )
         expected_artifact_schemas = {
             "configuration": RUN_CONFIGURATION_SCHEMA_VERSION,
-            **{spec.name: spec.schema_version for spec in TABLE_SPECS},
+            **{spec.name: spec.schema_version for spec in active_table_specs},
         }
         actual_artifact_schemas = {
             item.name: item.schema_version for item in manifest.artifacts
@@ -818,7 +858,18 @@ class RunStore:
             "run_manifest": manifest.schema_version,
         }
         schema_versions_supported = (
-            manifest.schema_versions == expected_schema_versions
+            tuple(sorted(manifest.schema_versions.items()))
+            in {
+                tuple(sorted(expected_schema_versions.items())),
+                tuple(
+                    sorted(
+                        {
+                            **legacy_schema_versions,
+                            "run_manifest": manifest.schema_version,
+                        }.items()
+                    )
+                ),
+            }
             and actual_artifact_schemas == expected_artifact_schemas
         )
         if not schema_versions_supported:
@@ -854,7 +905,7 @@ class RunStore:
             failures.append("replay configuration is missing")
         table_payload: dict[str, list[dict[str, Any]]] = {}
         try:
-            for spec in TABLE_SPECS:
+            for spec in active_table_specs:
                 rows = read_parquet_table(directory / "tables" / f"{spec.name}.parquet")
                 if any(row.get("run_id") != run_id for row in rows):
                     raise ValueError(f"{spec.name} contains a foreign run ID")

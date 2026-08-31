@@ -7,9 +7,15 @@ import math
 import sys
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from kirby2.session.bindings import BindingMap, SessionCommand
 from kirby2.session.live import LevelView, LiveMarketSession, SessionSnapshot
+
+if TYPE_CHECKING:
+    from kirby2.release.recovery import RecoveryActionV1, RecoveryOfferV1
+    from kirby2.research.paths import DataPaths
+    from kirby2.session.layouts import HotkeyLayout
 
 
 MINIMUM_WIDTH = 116
@@ -24,6 +30,7 @@ class TerminalUiConfig:
     tape_rows: int = 12
     working_order_rows: int = 5
     layout_name: str = "layout_default"
+    recovery_checkpoint_frames: int = 20
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.speed) or self.speed <= 0:
@@ -38,6 +45,11 @@ class TerminalUiConfig:
             raise ValueError("working-order row count must be positive")
         if not self.layout_name:
             raise ValueError("hotkey layout name must not be empty")
+        if (
+            type(self.recovery_checkpoint_frames) is not int
+            or self.recovery_checkpoint_frames <= 0
+        ):
+            raise ValueError("recovery checkpoint cadence must be positive")
 
     @property
     def simulation_step_us(self) -> int:
@@ -121,14 +133,65 @@ def run_terminal_ui(
     session: LiveMarketSession,
     bindings: BindingMap | None = None,
     config: TerminalUiConfig | None = None,
+    *,
+    recovery_paths: DataPaths | None = None,
+    recovery_action: RecoveryActionV1 | None = None,
 ) -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("Kirby2 UI requires an interactive terminal")
     actual_bindings = bindings or BindingMap.default()
     actual_config = config or TerminalUiConfig()
 
+    from kirby2.release.platform_paths import platform_data_paths
+    from kirby2.release.recovery import InteractiveRecoveryCoordinatorV1
+    from kirby2.session.journal import LiveSessionSourceV1
+    from kirby2.session.layouts import HotkeyLayout
+
+    actual_paths = recovery_paths or platform_data_paths()
+    layout = HotkeyLayout(actual_config.layout_name, actual_bindings)
+    source = LiveSessionSourceV1.from_session(
+        session,
+        actual_bindings,
+        layout_name=actual_config.layout_name,
+    )
+    recovery = InteractiveRecoveryCoordinatorV1(actual_paths)
+    offer = recovery.inspect(source)
+
     def wrapped(screen: curses.window) -> None:
-        _run(screen, session, actual_bindings, actual_config)
+        selected = recovery_action or _choose_recovery_action(screen, offer)
+        if selected not in offer.actions:
+            raise RuntimeError("selected recovery action was not offered")
+        if selected.value == "ABANDON":
+            recovery.abandon(
+                source=source,
+                simulation_time_us=session.simulation_time_us,
+            )
+            return
+        if selected.value == "CONTINUE_EXACT":
+            recovery.continue_exact(
+                session=session,
+                source=source,
+                bindings=actual_bindings,
+            )
+        elif selected.value == "REPLAY_SAFE":
+            recovery.select_safe_replay(
+                session=session,
+                source=source,
+                layout=layout,
+            )
+        else:
+            recovery.start_new(
+                session=session,
+                source=source,
+                layout=layout,
+            )
+        _run(
+            screen,
+            session,
+            actual_bindings,
+            actual_config,
+            layout=layout,
+        )
 
     curses.wrapper(wrapped)
 
@@ -138,26 +201,39 @@ def _run(
     session: LiveMarketSession,
     bindings: BindingMap,
     config: TerminalUiConfig,
+    *,
+    layout: HotkeyLayout,
 ) -> None:
     try:
         curses.curs_set(0)
     except curses.error:
         pass
     screen.keypad(True)
-    session.start()
     frame_seconds = config.frame_milliseconds / 1_000.0
     next_tick = time.monotonic() + frame_seconds
     should_quit = False
+    frames_since_checkpoint = 0
 
     while not should_quit:
         now = time.monotonic()
         if now >= next_tick:
             elapsed_ticks = int((now - next_tick) // frame_seconds) + 1
+            advanced_frames = 0
             for _ in range(elapsed_ticks):
+                before_time_us = session.simulation_time_us
                 session.advance_by(config.simulation_step_us)
+                if session.simulation_time_us != before_time_us:
+                    advanced_frames += 1
             next_tick += elapsed_ticks * frame_seconds
+            frames_since_checkpoint += advanced_frames
+            if frames_since_checkpoint >= config.recovery_checkpoint_frames:
+                session.commit_recovery_checkpoint(layout, auto_start=True)
+                frames_since_checkpoint = 0
 
-        _draw(screen, session.snapshot(), bindings, config)
+        snapshot = session.snapshot()
+        client_transaction_id = session.begin_recovery_client_message(snapshot)
+        _draw(screen, snapshot, bindings, config)
+        session.acknowledge_recovery_client_message(client_transaction_id)
         timeout_ms = max(0, round((next_tick - time.monotonic()) * 1_000))
         screen.timeout(min(config.frame_milliseconds, timeout_ms))
         try:
@@ -170,8 +246,52 @@ def _run(
             else curses.keyname(key).decode("ascii", errors="replace")
         )
         record = session.handle_input(input_key, bindings)
+        session.commit_recovery_checkpoint(layout, auto_start=True)
+        frames_since_checkpoint = 0
         if record.resolved_command == SessionCommand.QUIT.value:
             should_quit = True
+    session.close_recovery_journal()
+
+
+def _choose_recovery_action(
+    screen: curses.window,
+    offer: RecoveryOfferV1,
+) -> RecoveryActionV1:
+    from kirby2.release.recovery import (
+        RecoveryActionV1,
+        RecoveryDispositionV1,
+    )
+
+    if offer.disposition is RecoveryDispositionV1.NO_RECOVERY:
+        return RecoveryActionV1.START_NEW
+    screen.erase()
+    height, width = screen.getmaxyx()
+    lines = [
+        "KIRBY2 RECOVERY",
+        offer.detail,
+        f"Reason: {offer.reason_code.value}",
+        "",
+    ]
+    choices: dict[str, RecoveryActionV1] = {}
+    if RecoveryActionV1.CONTINUE_EXACT in offer.actions:
+        lines.append("[E] Continue exactly from the verified durable cut")
+        choices["e"] = RecoveryActionV1.CONTINUE_EXACT
+    if RecoveryActionV1.REPLAY_SAFE in offer.actions:
+        lines.append("[R] Start a safe replay from the beginning")
+        choices["r"] = RecoveryActionV1.REPLAY_SAFE
+    if RecoveryActionV1.ABANDON in offer.actions:
+        lines.append("[A] Abandon this unfinished session and exit")
+        choices["a"] = RecoveryActionV1.ABANDON
+    lines.append("")
+    lines.append("Kirby2 will not infer whether an unacknowledged action was applied.")
+    for row, line in enumerate(lines[:height]):
+        _safe_write(screen, row, 0, line, width)
+    screen.refresh()
+    screen.timeout(-1)
+    while True:
+        key = screen.get_wch()
+        if isinstance(key, str) and key.casefold() in choices:
+            return choices[key.casefold()]
 
 
 def _draw(

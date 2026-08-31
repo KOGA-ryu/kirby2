@@ -33,6 +33,13 @@ from .platform_paths import (
     platform_data_paths,
     select_release_paths,
 )
+from .recovery import (
+    InteractiveRecoveryCoordinatorV1,
+    RecoveryActionV1,
+    RecoveryDispositionV1,
+    RecoveryOfferV1,
+    RecoveryReasonCodeV1,
+)
 
 
 __all__ = [
@@ -59,6 +66,11 @@ __all__ = [
     "ReleaseSchemaKindV1",
     "ReleaseSchemaUseV1",
     "ReleaseVersionRangeV1",
+    "InteractiveRecoveryCoordinatorV1",
+    "RecoveryActionV1",
+    "RecoveryDispositionV1",
+    "RecoveryOfferV1",
+    "RecoveryReasonCodeV1",
     "apply_release_migration",
     "builtin_release_schema_inventory",
     "platform_data_paths",

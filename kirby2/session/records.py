@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +25,95 @@ class TimelineKind(str, Enum):
     CURRICULUM = "CURRICULUM"
     MID = "MID"
     BOOK = "BOOK"
+
+
+class RecoveryBoundaryKindV1(str, Enum):
+    SESSION_OPENED = "SESSION_OPENED"
+    SESSION_STARTED = "SESSION_STARTED"
+    SESSION_PAUSED = "SESSION_PAUSED"
+    ADVANCE_COMMITTED = "ADVANCE_COMMITTED"
+    ACTION_PENDING = "ACTION_PENDING"
+    ACTION_ACKNOWLEDGED = "ACTION_ACKNOWLEDGED"
+    CLIENT_MESSAGE_PENDING = "CLIENT_MESSAGE_PENDING"
+    CLIENT_MESSAGE_ACKNOWLEDGED = "CLIENT_MESSAGE_ACKNOWLEDGED"
+    CHECKPOINT_COMMITTED = "CHECKPOINT_COMMITTED"
+    PACK_ACTIVATION_PENDING = "PACK_ACTIVATION_PENDING"
+    PACK_ACTIVATION_COMMITTED = "PACK_ACTIVATION_COMMITTED"
+    PROFILE_UPDATE_PENDING = "PROFILE_UPDATE_PENDING"
+    PROFILE_UPDATE_COMMITTED = "PROFILE_UPDATE_COMMITTED"
+    RECOVERY_COMPLETED = "RECOVERY_COMPLETED"
+    SESSION_CLOSED = "SESSION_CLOSED"
+    SESSION_ABANDONED = "SESSION_ABANDONED"
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEvidenceRecordV1:
+    """One durable recovery boundary projected into immutable run evidence."""
+
+    sequence: int
+    session_id: str
+    boundary: RecoveryBoundaryKindV1
+    simulation_time_us: int
+    transaction_id: str | None
+    checkpoint_id: str | None
+    event_prefix_count: int
+    event_prefix_sha256: str
+    ledger_prefix_count: int
+    ledger_prefix_sha256: str
+    disposition: str | None
+    reason_code: str | None
+    details: Mapping[str, object]
+    record_sha256: str
+
+    def __post_init__(self) -> None:
+        frozen = freeze_json(self.details)
+        if not isinstance(frozen, Mapping):
+            raise TypeError("recovery evidence details must be a JSON object")
+        object.__setattr__(self, "details", frozen)
+        if self.sequence <= 0 or self.simulation_time_us < 0:
+            raise ValueError("recovery evidence sequence or timestamp is invalid")
+        if not self.session_id.startswith("live-session-"):
+            raise ValueError("recovery evidence session ID is invalid")
+        if type(self.boundary) is not RecoveryBoundaryKindV1:
+            raise TypeError("recovery evidence boundary is invalid")
+        if self.event_prefix_count < 0 or self.ledger_prefix_count < 0:
+            raise ValueError("recovery evidence prefix counts must be nonnegative")
+        for value, label in (
+            (self.event_prefix_sha256, "event-prefix"),
+            (self.ledger_prefix_sha256, "ledger-prefix"),
+            (self.record_sha256, "record"),
+        ):
+            if type(value) is not str or _SHA256.fullmatch(value) is None:
+                raise ValueError(f"recovery evidence {label} digest is invalid")
+        for value, label in (
+            (self.transaction_id, "transaction ID"),
+            (self.checkpoint_id, "checkpoint ID"),
+            (self.disposition, "disposition"),
+            (self.reason_code, "reason code"),
+        ):
+            if value is not None and (type(value) is not str or not value):
+                raise ValueError(f"recovery evidence {label} is invalid")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "boundary": self.boundary.value,
+            "checkpoint_id": self.checkpoint_id,
+            "details": thaw_json(self.details),
+            "disposition": self.disposition,
+            "event_prefix_count": self.event_prefix_count,
+            "event_prefix_sha256": self.event_prefix_sha256,
+            "ledger_prefix_count": self.ledger_prefix_count,
+            "ledger_prefix_sha256": self.ledger_prefix_sha256,
+            "reason_code": self.reason_code,
+            "record_sha256": self.record_sha256,
+            "sequence": self.sequence,
+            "session_id": self.session_id,
+            "simulation_time_us": self.simulation_time_us,
+            "transaction_id": self.transaction_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)

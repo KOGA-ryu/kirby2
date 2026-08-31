@@ -38,6 +38,10 @@ from .scoring import ExecutionTracker
 if TYPE_CHECKING:
     from kirby2.curriculum import CurriculumDrill
 
+    from .journal import LiveSessionJournalV1
+    from .layouts import HotkeyLayout
+    from .records import RecoveryEvidenceRecordV1
+
 
 DEFAULT_QUANTITIES = (25, 50, 100, 200, 500, 1_000, 2_000)
 
@@ -167,6 +171,7 @@ class LiveMarketSession:
         self._cancel_sequence = 0
         self._tape: list[TapePrint] = []
         self._seen_trade_ids: set[str] = set()
+        self._recovery_journal: LiveSessionJournalV1 | None = None
         self.running = False
         self.complete = False
         self.status_message = "READY - SPACE starts simulated flow"
@@ -219,16 +224,67 @@ class LiveMarketSession:
     def execution_tracker(self) -> ExecutionTracker | None:
         return self._execution_tracker
 
+    @property
+    def recovery_journal(self) -> LiveSessionJournalV1 | None:
+        return self._recovery_journal
+
+    @property
+    def recovery_records(self) -> tuple[RecoveryEvidenceRecordV1, ...]:
+        if self._recovery_journal is None:
+            return ()
+        return self._recovery_journal.evidence_records()
+
+    def bind_recovery_journal(self, journal: LiveSessionJournalV1) -> None:
+        from .journal import LiveSessionJournalV1
+
+        if type(journal) is not LiveSessionJournalV1:
+            raise TypeError("live session requires LiveSessionJournalV1")
+        if self._recovery_journal is not None and self._recovery_journal is not journal:
+            raise RuntimeError("live session already has another recovery journal")
+        self._recovery_journal = journal
+
+    def adopt_recovered_session(self, recovered: LiveMarketSession) -> None:
+        """Adopt a separately replay-verified state without replacing this object."""
+
+        if type(recovered) is not LiveMarketSession:
+            raise TypeError("recovered session must be LiveMarketSession")
+        if (
+            recovered.definition.as_dict() != self.definition.as_dict()
+            or recovered.seed != self.seed
+            or recovered.duration_us != self.duration_us
+            or recovered.quantity_options != self.quantity_options
+            or recovered.initial_quantity != self.initial_quantity
+        ):
+            raise ValueError("recovered session configuration differs from startup")
+        journal = self._recovery_journal
+        self.__dict__.clear()
+        self.__dict__.update(recovered.__dict__)
+        self._recovery_journal = journal
+
     def start(self) -> None:
         if self.complete:
             self.status_message = "SESSION COMPLETE - reset to run again"
             return
         self.running = True
         self.status_message = "RUNNING"
+        if self._recovery_journal is not None:
+            from .records import RecoveryBoundaryKindV1
+
+            self._recovery_journal.append_lifecycle(
+                RecoveryBoundaryKindV1.SESSION_STARTED,
+                self,
+            )
 
     def pause(self) -> None:
         self.running = False
         self.status_message = "PAUSED"
+        if self._recovery_journal is not None:
+            from .records import RecoveryBoundaryKindV1
+
+            self._recovery_journal.append_lifecycle(
+                RecoveryBoundaryKindV1.SESSION_PAUSED,
+                self,
+            )
 
     def reset(self, start: bool = False) -> None:
         self.engine, self.dimensions = create_market_engine(
@@ -317,6 +373,7 @@ class LiveMarketSession:
             raise ValueError("simulation delta must be a nonnegative integer")
         if not self.running or self.complete or delta_us == 0:
             return ()
+        recovery_start_time_us = self.simulation_time_us
         target = min(self.duration_us, self.simulation_time_us + delta_us)
         flow_events: list[FlowEvent] = []
         if self._traffic_runtime is None:
@@ -352,12 +409,27 @@ class LiveMarketSession:
                     ),
                 )
         self._finish_if_due()
+        if self._recovery_journal is not None:
+            self._recovery_journal.commit_advance(
+                session=self,
+                from_time_us=recovery_start_time_us,
+                requested_delta_us=delta_us,
+            )
         return tuple(flow_events)
 
     def handle_input(self, key: str, bindings: BindingMap) -> InputRecord:
         if not isinstance(key, str) or not key:
             raise ValueError("input key must be a nonempty string")
         command = bindings.resolve(key)
+        recovery_transaction_id = (
+            None
+            if self._recovery_journal is None
+            else self._recovery_journal.begin_action(
+                session=self,
+                key=key,
+                command=command,
+            )
+        )
         if command is SessionCommand.RESET:
             self.reset()
         state = self._capture_market_state()
@@ -416,7 +488,57 @@ class LiveMarketSession:
             resulting_order_ids=outcome.order_ids,
         )
         self._input_records.append(record)
+        if self._recovery_journal is not None:
+            if recovery_transaction_id is None:
+                raise RuntimeError("recovery action transaction was not created")
+            self._recovery_journal.acknowledge_action(
+                session=self,
+                transaction_id=recovery_transaction_id,
+                record=record,
+            )
         return record
+
+    def begin_recovery_client_message(self, snapshot: SessionSnapshot) -> str | None:
+        if self._recovery_journal is None:
+            return None
+        return self._recovery_journal.begin_client_message(
+            session=self,
+            snapshot=snapshot,
+        )
+
+    def acknowledge_recovery_client_message(
+        self,
+        transaction_id: str | None,
+    ) -> None:
+        if self._recovery_journal is None:
+            if transaction_id is not None:
+                raise RuntimeError("client recovery transaction has no journal")
+            return
+        if transaction_id is None:
+            raise RuntimeError("client recovery acknowledgement lacks its transaction")
+        self._recovery_journal.acknowledge_client_message(
+            session=self,
+            transaction_id=transaction_id,
+        )
+
+    def commit_recovery_checkpoint(
+        self,
+        layout: HotkeyLayout,
+        *,
+        auto_start: bool = True,
+    ) -> str | None:
+        if self._recovery_journal is None:
+            return None
+        checkpoint = self._recovery_journal.commit_checkpoint(
+            session=self,
+            layout=layout,
+            auto_start=auto_start,
+        )
+        return checkpoint.checkpoint_id
+
+    def close_recovery_journal(self) -> None:
+        if self._recovery_journal is not None and not self._recovery_journal.terminal:
+            self._recovery_journal.close(session=self)
 
     def execute(
         self,

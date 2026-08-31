@@ -161,6 +161,27 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         ("message_sequence",),
     ),
     TableSpec(
+        "session_recovery",
+        (
+            ("run_id", "VARCHAR"),
+            ("recovery_sequence", "BIGINT"),
+            ("session_id", "VARCHAR"),
+            ("boundary", "VARCHAR"),
+            ("simulation_time_us", "BIGINT"),
+            ("transaction_id", "VARCHAR"),
+            ("checkpoint_id", "VARCHAR"),
+            ("event_prefix_count", "BIGINT"),
+            ("event_prefix_sha256", "VARCHAR"),
+            ("ledger_prefix_count", "BIGINT"),
+            ("ledger_prefix_sha256", "VARCHAR"),
+            ("disposition", "VARCHAR"),
+            ("reason_code", "VARCHAR"),
+            ("details_toml", "VARCHAR"),
+            ("record_sha256", "VARCHAR"),
+        ),
+        ("recovery_sequence",),
+    ),
+    TableSpec(
         "scores",
         (
             ("run_id", "VARCHAR"),
@@ -211,6 +232,7 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
 )
 
 TABLE_SPEC_BY_NAME = {spec.name: spec for spec in TABLE_SPECS}
+LEGACY_OPTIONAL_TABLE_NAMES_V1 = frozenset({"session_recovery"})
 
 
 RUN_ARTIFACT_REGISTRY_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -401,7 +423,8 @@ def write_parquet_tables(
     counts: dict[str, int] = {}
     connection = duckdb.connect(":memory:")
     try:
-        for spec in TABLE_SPECS:
+        active_specs = tuple(spec for spec in TABLE_SPECS if spec.name in tables)
+        for spec in active_specs:
             rows = _sorted_rows(spec, tables[spec.name])
             column_names = tuple(name for name, _sql_type in spec.columns)
             columns_sql = ", ".join(
@@ -461,7 +484,9 @@ def _sort_value(value: Any) -> tuple[int, Any]:
 
 def _validate_table_inventory(tables: dict[str, list[dict[str, Any]]]) -> None:
     expected = set(TABLE_SPEC_BY_NAME)
-    if set(tables) != expected:
+    supplied = set(tables)
+    legacy = expected - LEGACY_OPTIONAL_TABLE_NAMES_V1
+    if frozenset(supplied) not in {frozenset(expected), frozenset(legacy)}:
         missing = sorted(expected - set(tables))
         extra = sorted(set(tables) - expected)
         raise ValueError(f"canonical table inventory mismatch missing={missing} extra={extra}")
