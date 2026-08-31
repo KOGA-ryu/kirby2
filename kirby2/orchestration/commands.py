@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import secrets
+import subprocess
+import sys
+import tempfile
 import tomllib
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from kirby2 import __version__
 from kirby2.cli.registry import CommandModule, CommandSpec
 from kirby2.packs.formats import canonical_json_bytes
+from kirby2.research.paths import DataPaths
 from kirby2.scenarios import get_scenario_definition
 from kirby2.simulation import LiquidityPreset, VolumePreset
 
@@ -21,9 +27,28 @@ from .lan import (
     LanWorkerServiceV1,
 )
 from .leases import LeasePolicyV1
-from .local import LocalSubprocessBackendV1, SingleProcessBackendV1
-from .models import DigestReferenceV1, LogicalWorkCellV1, WorkKindV1
+from .local import (
+    LOCAL_WORKER_MODULE_V1,
+    LocalSubprocessBackendV1,
+    LocalWorkerProcessError,
+    SingleProcessBackendV1,
+)
+from .models import (
+    DigestReferenceV1,
+    ExperimentWorkPlanV1,
+    LogicalWorkCellV1,
+    WorkKindV1,
+)
 from .planner import build_experiment_work_plan
+from .protocol import WorkRequestV1, WorkerCompatibilityV1, WorkerResultV1
+from .recovery import (
+    RecoveryCheckpointV1,
+    RecoveryCompletionOrderV1,
+    RecoveryCoordinatorV1,
+    RecoveryEventKindV1,
+    RecoveryExperimentStatusV1,
+    RecoveryWorkStateV1,
+)
 from .resources import (
     MAX_MESSAGE_BYTES_V1,
     MAX_STREAM_BYTES_V1,
@@ -71,6 +96,29 @@ _MANIFEST_FIELDS = frozenset(
     }
 )
 _CELL_FIELDS = frozenset({"cell_id", "partition_id"})
+
+
+def _data_root(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("data root must be an explicit absolute path")
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise argparse.ArgumentTypeError("data root cannot be resolved safely") from error
+    if path != resolved:
+        raise argparse.ArgumentTypeError("data root must be supplied already resolved")
+    return resolved
+
+
+def _seed(value: str) -> int:
+    try:
+        selected = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("seed must be an integer") from error
+    if not 0 <= selected <= (1 << 63) - 1:
+        raise argparse.ArgumentTypeError("seed must be an unsigned 63-bit integer")
+    return selected
 
 
 def load_orchestration_experiment(path: Path):
@@ -263,6 +311,40 @@ def _configure_orchestrate(parser: argparse.ArgumentParser) -> None:
     coordinator.add_argument("--workers", type=int, default=1)
     actions.add_parser("worker", help="serve one canonical request on stdin/stdout")
     _configure_lan_coordinator(coordinator)
+    submit = actions.add_parser(
+        "submit",
+        help="persist one canonical experiment for durable execution",
+    )
+    submit.add_argument("--manifest", required=True, type=Path)
+    submit.add_argument("--data-root", required=True, type=_data_root)
+    status = actions.add_parser(
+        "status",
+        help="read the current durable experiment checkpoint",
+    )
+    _configure_recovery_plan_target(status)
+    cancel = actions.add_parser(
+        "cancel",
+        help="cancel every not-yet-registered logical work unit",
+    )
+    _configure_recovery_plan_target(cancel)
+    cancel.add_argument("--reason-code", default="OPERATOR_CANCELLED")
+    resume = actions.add_parser(
+        "resume",
+        help="recover and execute every outstanding logical work unit",
+    )
+    _configure_recovery_plan_target(resume)
+    resume.add_argument(
+        "--backend",
+        choices=("single", "local", "lan"),
+        default="single",
+    )
+    resume.add_argument("--workers", type=int, default=1)
+    resume.add_argument(
+        "--completion-order",
+        choices=("canonical", "reverse"),
+        default="canonical",
+    )
+    _configure_lan_coordinator(resume)
     lan_worker = actions.add_parser(
         "lan-worker",
         help="connect one explicit mTLS worker to a LAN coordinator",
@@ -284,6 +366,48 @@ def _handle_orchestrate(args: argparse.Namespace) -> int:
         )
         _print_json(result.as_dict())
         return 0
+    if args.orchestration_action == "submit":
+        plan, _compatibility = load_orchestration_experiment(args.manifest)
+        checkpoint = RecoveryCoordinatorV1(DataPaths(args.data_root)).submit(plan)
+        _print_json(_checkpoint_summary(checkpoint))
+        return 0
+    if args.orchestration_action == "status":
+        checkpoint = RecoveryCoordinatorV1(DataPaths(args.data_root)).status(
+            args.plan_id
+        )
+        _print_json(_checkpoint_summary(checkpoint))
+        return 0
+    if args.orchestration_action == "cancel":
+        checkpoint = RecoveryCoordinatorV1(DataPaths(args.data_root)).cancel(
+            args.plan_id,
+            reason_code=args.reason_code,
+        )
+        _print_json(_checkpoint_summary(checkpoint))
+        return 0
+    if args.orchestration_action == "resume":
+        recovery = RecoveryCoordinatorV1(DataPaths(args.data_root))
+        checkpoint = recovery.status(args.plan_id)
+        compatibility = measure_local_worker_compatibility()
+        if args.backend == "lan":
+            backend = _build_lan_coordinator_backend(
+                args,
+                plan_id=checkpoint.plan_id,
+                compatibility=compatibility,
+                workers=args.workers,
+            )
+        else:
+            if args.enable_lan:
+                raise ValueError("--enable-lan is valid only with --backend lan")
+            backend = _build_backend(args.backend, args.workers, compatibility)
+        checkpoint = recovery.resume(
+            checkpoint.plan_id,
+            backend,
+            completion_order=RecoveryCompletionOrderV1(
+                args.completion_order.upper()
+            ),
+        )
+        _print_json(_checkpoint_summary(checkpoint))
+        return 0
     if args.orchestration_action == "worker":
         worker_main()
         return 0
@@ -302,6 +426,11 @@ def _handle_orchestrate(args: argparse.Namespace) -> int:
         )
         return 0
     raise RuntimeError("orchestration action is not exhaustively handled")
+
+
+def _configure_recovery_plan_target(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--data-root", required=True, type=_data_root)
+    parser.add_argument("--plan-id", required=True)
 
 
 def _configure_lan_coordinator(parser: argparse.ArgumentParser) -> None:
@@ -587,6 +716,235 @@ def _sha256_text(value: object, label: str) -> str:
     return text
 
 
+def _checkpoint_summary(checkpoint: RecoveryCheckpointV1) -> dict[str, object]:
+    if type(checkpoint) is not RecoveryCheckpointV1:
+        raise TypeError("checkpoint summary requires RecoveryCheckpointV1")
+    return {
+        "aggregate_sha256": (
+            None
+            if checkpoint.aggregate is None
+            else checkpoint.aggregate.aggregate_sha256
+        ),
+        "checkpoint_sha256": checkpoint.checkpoint_sha256,
+        "event_count": len(checkpoint.events),
+        "latest_event": checkpoint.events[-1].as_dict(),
+        "logical_work_unit_count": len(checkpoint.records),
+        "plan_id": checkpoint.plan_id,
+        "revision": checkpoint.revision,
+        "schema_id": "KIRBY2_RECOVERY_STATUS_SUMMARY_V1",
+        "schema_version": 1,
+        "state_counts": {
+            state.value: sum(item.state is state for item in checkpoint.records)
+            for state in RecoveryWorkStateV1
+        },
+        "status": checkpoint.status.value,
+    }
+
+
+class _SimulatedCoordinatorRestart(BaseException):
+    """Demo-only process boundary; deliberately bypasses normal failure cleanup."""
+
+
+@dataclass(frozen=True, slots=True)
+class _KilledWorkerBackendV1:
+    """Kill one fixed worker mid-frame, then simulate coordinator process loss."""
+
+    compatibility: WorkerCompatibilityV1
+
+    def __post_init__(self) -> None:
+        if type(self.compatibility) is not WorkerCompatibilityV1:
+            raise TypeError("killed-worker demo requires WorkerCompatibilityV1")
+
+    @property
+    def backend_id(self) -> str:
+        return "killed-local-worker-demo-v1"
+
+    def execute_many(
+        self,
+        requests: tuple[WorkRequestV1, ...],
+    ) -> tuple[WorkerResultV1, ...]:
+        if type(requests) is not tuple or not requests or any(
+            type(item) is not WorkRequestV1 for item in requests
+        ):
+            raise TypeError("killed-worker demo requires canonical work requests")
+        request = min(
+            requests,
+            key=lambda item: item.logical_work_unit.logical_work_unit_id,
+        )
+        environment = dict(os.environ)
+        environment["PYTHONHASHSEED"] = "0"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        process = subprocess.Popen(
+            (sys.executable, "-m", LOCAL_WORKER_MODULE_V1),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        if process.stdin is None:
+            process.kill()
+            process.wait()
+            raise LocalWorkerProcessError("killed-worker demo did not receive stdin")
+        raw = request.canonical_bytes()
+        try:
+            process.stdin.write(raw[: max(1, len(raw) // 2)])
+            process.stdin.flush()
+            process.kill()
+            process.communicate()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        if process.returncode == 0:
+            raise LocalWorkerProcessError("demo worker exited before it could be killed")
+        raise _SimulatedCoordinatorRestart()
+
+
+def _configure_distributed_demo(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--seed", type=_seed, default=42)
+    parser.add_argument("--kill-worker", action="store_true")
+    parser.add_argument("--workers", type=int, default=3)
+
+
+def _handle_distributed_demo(args: argparse.Namespace) -> int:
+    if type(args.workers) is not int or not 2 <= args.workers <= 64:
+        raise ValueError("distributed demo requires between 2 and 64 local workers")
+    template_path = Path(__file__).resolve().parent / "examples" / "small.toml"
+    template = template_path.read_text(encoding="utf-8")
+    if template.count("master_seed = 42") != 1:
+        raise RuntimeError("distributed demo manifest template is not canonical")
+    manifest_text = template.replace(
+        "master_seed = 42",
+        f"master_seed = {args.seed}",
+    )
+    with tempfile.TemporaryDirectory(prefix="kirby2-distributed-demo-") as temporary:
+        root = Path(temporary).resolve(strict=True)
+        manifest_path = root / "experiment.toml"
+        manifest_path.write_text(manifest_text, encoding="utf-8", newline="\n")
+        base_plan, compatibility = load_orchestration_experiment(manifest_path)
+        strategy_identity = DigestReferenceV1(
+            name="demo-strategy:passive-observer-v1",
+            sha256=hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "decision_policy": "PASSIVE_OBSERVER",
+                        "schema_id": "KIRBY2_DISTRIBUTED_DEMO_STRATEGY_V1",
+                        "schema_version": 1,
+                    }
+                )
+            ).hexdigest(),
+        )
+        strategy_units = tuple(
+            sorted(
+                (
+                    replace(unit, strategies=(strategy_identity,))
+                    for unit in base_plan.logical_units
+                ),
+                key=lambda item: item.logical_work_unit_id,
+            )
+        )
+        plan = ExperimentWorkPlanV1(
+            master_seed_identity=base_plan.master_seed_identity,
+            experiment_identity=base_plan.experiment_identity,
+            logical_units=strategy_units,
+        )
+
+        reference = RecoveryCoordinatorV1(DataPaths(root / "reference"))
+        reference.submit(plan)
+        reference_checkpoint = reference.resume(
+            plan.plan_id,
+            SingleProcessBackendV1(compatibility=compatibility),
+        )
+
+        recovered_root = root / "recovered"
+        recovered = RecoveryCoordinatorV1(DataPaths(recovered_root))
+        recovered.submit(plan)
+        coordinator_restarted = False
+        worker_killed = False
+        if args.kill_worker:
+            try:
+                recovered.resume(
+                    plan.plan_id,
+                    _KilledWorkerBackendV1(compatibility=compatibility),
+                )
+            except _SimulatedCoordinatorRestart:
+                worker_killed = True
+                coordinator_restarted = True
+            else:
+                raise RuntimeError("distributed demo did not interrupt its worker")
+            interrupted = RecoveryCoordinatorV1(
+                DataPaths(recovered_root)
+            ).status(plan.plan_id)
+            if not all(
+                item.state is RecoveryWorkStateV1.IN_FLIGHT
+                for item in interrupted.records
+            ):
+                raise RuntimeError("interrupted coordinator did not retain in-flight work")
+            recovered = RecoveryCoordinatorV1(DataPaths(recovered_root))
+        recovered_checkpoint = recovered.resume(
+            plan.plan_id,
+            LocalSubprocessBackendV1(
+                worker_count=args.workers,
+                compatibility=compatibility,
+            ),
+            completion_order=RecoveryCompletionOrderV1.REVERSE,
+        )
+
+        if (
+            reference_checkpoint.status is not RecoveryExperimentStatusV1.COMPLETED
+            or recovered_checkpoint.status is not RecoveryExperimentStatusV1.COMPLETED
+            or reference_checkpoint.aggregate is None
+            or recovered_checkpoint.aggregate is None
+        ):
+            raise RuntimeError("distributed demo did not complete both whole experiments")
+        if (
+            reference_checkpoint.aggregate.as_dict()
+            != recovered_checkpoint.aggregate.as_dict()
+        ):
+            raise RuntimeError("recovered experiment differs from its reference")
+        seeds = tuple(unit.seed for unit in plan.logical_units)
+        if len(seeds) != len(set(seeds)):
+            raise RuntimeError("distributed demo reused a derived seed")
+        recovered_ids = tuple(
+            item.logical_work_unit_id for item in recovered_checkpoint.records
+        )
+        planned_ids = tuple(unit.logical_work_unit_id for unit in plan.logical_units)
+        if recovered_ids != planned_ids:
+            raise RuntimeError("distributed demo lost or invented logical work")
+        event_kinds = tuple(item.kind for item in recovered_checkpoint.events)
+        if args.kill_worker and (
+            RecoveryEventKindV1.LEASE_EXPIRED not in event_kinds
+            or RecoveryEventKindV1.ATTEMPT_REISSUED not in event_kinds
+        ):
+            raise RuntimeError("distributed demo did not record expiry and reissue")
+        _print_json(
+            {
+                "aggregate_sha256": recovered_checkpoint.aggregate.aggregate_sha256,
+                "completion_order": RecoveryCompletionOrderV1.REVERSE.value,
+                "coordinator_restarted": coordinator_restarted,
+                "lan": {
+                    "reason_code": "NO_EXPLICIT_LAN_CONFIGURATION",
+                    "status": "NOT_EXERCISED",
+                },
+                "local_worker_count": args.workers,
+                "logical_work_unit_count": len(plan.logical_units),
+                "plan_id": plan.plan_id,
+                "reference_backend": "single-process-v1",
+                "recovered_backend": "local-subprocess-v1",
+                "retry_attempt_numbers": [
+                    item.attempt_number for item in recovered_checkpoint.records
+                ],
+                "schema_id": "KIRBY2_DISTRIBUTED_RECOVERY_DEMO_V1",
+                "schema_version": 1,
+                "seed_count": len(seeds),
+                "status": "PASS",
+                "strategy_identity": strategy_identity.as_dict(),
+                "worker_killed": worker_killed,
+            }
+        )
+    return 0
+
+
 def _configure_demo(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--backends", default="single,local")
@@ -689,6 +1047,13 @@ ORCHESTRATION_COMMAND_MODULE = CommandModule(
             help="compare single-process and local-process orchestration",
             handler=_handle_demo,
             configure=_configure_demo,
+        ),
+        CommandSpec(
+            command_id="DISTRIBUTED_DEMO",
+            name="distributed-demo",
+            help="demonstrate worker kill, coordinator restart, and exact recovery",
+            handler=_handle_distributed_demo,
+            configure=_configure_distributed_demo,
         ),
     ),
 )

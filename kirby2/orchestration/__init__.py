@@ -4,8 +4,21 @@ WO38-A defines immutable scientific work separately from operational attempts. W
 adds one data-only protocol shared by direct and fixed-subprocess execution. WO38-C
 adds requested, validated pack transfer and immutable coordinator-verified result CAS
 registration without exposing ambient filesystem paths. WO38-D adds explicit TLS 1.3
-LAN execution, operational leases/resources, and crash-safe restart records.
+LAN execution, operational leases/resources, and crash-safe restart records. WO38-E
+adds durable recovery, idempotent late-result reduction, and whole-run aggregation.
 """
+
+from .aggregation import (
+    EXPERIMENT_AGGREGATE_MEMBER_SCHEMA_ID,
+    EXPERIMENT_AGGREGATE_SCHEMA_ID,
+    METRIC_COLUMN_AGGREGATE_SCHEMA_ID,
+    ORCHESTRATION_AGGREGATION_SCHEMA_VERSION,
+    ExperimentAggregateMemberV1,
+    ExperimentAggregateV1,
+    MetricColumnAggregateV1,
+    MetricValueKindV1,
+    aggregate_registered_results,
+)
 
 from .coordinator import (
     COORDINATOR_RUN_RESULT_SCHEMA_ID,
@@ -213,6 +226,23 @@ from .resources import (
     WorkerResourceAdvertisementV1,
     record_from_canonical_bytes,
 )
+from .recovery import (
+    MAX_RECOVERY_CHECKPOINT_BYTES_V1,
+    ORCHESTRATION_RECOVERY_SCHEMA_VERSION,
+    RECOVERY_CHECKPOINT_SCHEMA_ID,
+    RECOVERY_OPERATIONAL_EVENT_SCHEMA_ID,
+    RECOVERY_WORK_RECORD_SCHEMA_ID,
+    RecoveryCheckpointStoreV1,
+    RecoveryCheckpointV1,
+    RecoveryCompletionOrderV1,
+    RecoveryCoordinatorV1,
+    RecoveryEventKindV1,
+    RecoveryExperimentStatusV1,
+    RecoveryOperationalEventV1,
+    RecoveryRefused,
+    RecoveryWorkRecordV1,
+    RecoveryWorkStateV1,
+)
 from .security import (
     ARTIFACT_ACCESS_SCOPE_SCHEMA_ID,
     AUTHENTICATED_SESSION_SCHEMA_ID,
@@ -291,6 +321,8 @@ __all__ = [
     "COORDINATOR_RESPONSIBILITY_SEQUENCE_V1",
     "DATA_ONLY_STDIO_MAX_BYTES_V1",
     "DETERMINISTIC_REPLAY_AUDIT_ID_V1",
+    "EXPERIMENT_AGGREGATE_MEMBER_SCHEMA_ID",
+    "EXPERIMENT_AGGREGATE_SCHEMA_ID",
     "EXPERIMENT_WORK_PLAN_SCHEMA_ID",
     "INLINE_ARTIFACT_SCHEMA_ID",
     "LOGICAL_WORK_CELL_SCHEMA_ID",
@@ -309,6 +341,9 @@ __all__ = [
     "MAX_RESULT_ARTIFACT_BYTES_V1",
     "MAX_RESULT_ARTIFACT_DESCRIPTORS_V1",
     "MAX_RUNTIME_AUDIT_REFERENCES_V1",
+    "MAX_RECOVERY_CHECKPOINT_BYTES_V1",
+    "METRIC_COLUMN_AGGREGATE_SCHEMA_ID",
+    "ORCHESTRATION_AGGREGATION_SCHEMA_VERSION",
     "ORCHESTRATION_CONTENT_STORE_SCHEMA_VERSION",
     "ORCHESTRATION_COORDINATOR_SCHEMA_VERSION",
     "ORCHESTRATION_CELL_SEED_DOMAIN_V1",
@@ -316,6 +351,7 @@ __all__ = [
     "ORCHESTRATION_MODEL_SCHEMA_VERSION",
     "ORCHESTRATION_PLANNER_SCHEMA_VERSION",
     "ORCHESTRATION_PROTOCOL_SCHEMA_VERSION",
+    "ORCHESTRATION_RECOVERY_SCHEMA_VERSION",
     "ORCHESTRATION_SEED_DERIVATION_DOMAIN_V1",
     "ORCHESTRATION_SEED_POLICY_VERSION_V1",
     "ORCHESTRATION_SEED_SCHEMA_VERSION",
@@ -327,6 +363,9 @@ __all__ = [
     "PACK_TRANSFER_DESCRIPTOR_SCHEMA_ID",
     "PROTOCOL_DIAGNOSTIC_SCHEMA_ID",
     "RECEIVED_PACK_INSTALLATION_SCHEMA_ID",
+    "RECOVERY_CHECKPOINT_SCHEMA_ID",
+    "RECOVERY_OPERATIONAL_EVENT_SCHEMA_ID",
+    "RECOVERY_WORK_RECORD_SCHEMA_ID",
     "REGISTERED_RESULT_BUNDLE_SCHEMA_ID",
     "RESULT_ARTIFACT_DESCRIPTOR_SCHEMA_ID",
     "RESULT_ATTEMPT_STAGE_SCHEMA_ID",
@@ -356,6 +395,8 @@ __all__ = [
     "CoordinatorVerificationError",
     "DigestReferenceV1",
     "ExecutionBackendV1",
+    "ExperimentAggregateMemberV1",
+    "ExperimentAggregateV1",
     "ExperimentWorkPlanV1",
     "InlineArtifactMediaTypeV1",
     "InlineArtifactV1",
@@ -364,6 +405,8 @@ __all__ = [
     "LogicalWorkCellV1",
     "LogicalWorkUnit",
     "MasterSeedIdentityV1",
+    "MetricColumnAggregateV1",
+    "MetricValueKindV1",
     "OrchestrationCompatibilityRefusalCodeV1",
     "OrchestrationCompatibilityRefusalV1",
     "OrchestrationCompatibilityRefused",
@@ -376,6 +419,16 @@ __all__ = [
     "PackTransferDescriptorV1",
     "ProtocolDiagnosticV1",
     "ReceivedPackInstallationV1",
+    "RecoveryCheckpointStoreV1",
+    "RecoveryCheckpointV1",
+    "RecoveryCompletionOrderV1",
+    "RecoveryCoordinatorV1",
+    "RecoveryEventKindV1",
+    "RecoveryExperimentStatusV1",
+    "RecoveryOperationalEventV1",
+    "RecoveryRefused",
+    "RecoveryWorkRecordV1",
+    "RecoveryWorkStateV1",
     "RegisteredResultBundleV1",
     "ResultArtifactDescriptorV1",
     "ResultAttemptStageV1",
@@ -405,6 +458,7 @@ __all__ = [
     "build_master_seed_identity",
     "build_normalized_pack_archive",
     "build_verified_result_manifest",
+    "aggregate_registered_results",
     "canonical_aggregation_order",
     "complete_run_expected_output_identities",
     "complete_run_runtime_audit_identities",
