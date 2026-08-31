@@ -6,12 +6,13 @@ import hashlib
 import hmac
 import re
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from kirby2.packs.formats import canonical_json_bytes
 
+from .artifacts import ResultArtifactDescriptorV1, ResultBundleManifestV1
 from .local import ExecutionBackendV1
-from .models import DigestReferenceV1, ExperimentWorkPlanV1
+from .models import DigestReferenceV1, ExperimentWorkPlanV1, LogicalWorkUnit
 from .protocol import (
     InlineArtifactV1,
     RuntimeAuditResultV1,
@@ -27,6 +28,12 @@ from .worker import (
     complete_run_runtime_audit_identities,
     execute_work_request,
 )
+
+if TYPE_CHECKING:
+    from .content_store import (
+        OrchestrationContentStoreV1,
+        RegisteredResultBundleV1,
+    )
 
 
 ORCHESTRATION_COORDINATOR_SCHEMA_VERSION = 1
@@ -175,6 +182,54 @@ class VerifiedWorkResultV1:
         if restored.as_dict() != payload:
             raise ValueError("serialized verified work result did not round-trip exactly")
         return restored
+
+
+def build_verified_result_manifest(
+    logical_work_unit: LogicalWorkUnit,
+    verified_result: VerifiedWorkResultV1,
+) -> ResultBundleManifestV1:
+    """Bind independently replayed bytes to the logical output schema contracts."""
+
+    if type(logical_work_unit) is not LogicalWorkUnit:
+        raise TypeError("verified result manifest requires LogicalWorkUnit")
+    if type(verified_result) is not VerifiedWorkResultV1:
+        raise TypeError("verified result manifest requires VerifiedWorkResultV1")
+    if logical_work_unit.logical_work_unit_id != verified_result.logical_work_unit_id:
+        raise CoordinatorVerificationError(
+            "verified result belongs to a different logical work unit"
+        )
+    expected_outputs = logical_work_unit.expected_outputs
+    expected_names = tuple(item.name for item in expected_outputs)
+    actual_names = tuple(item.artifact_id for item in verified_result.artifacts)
+    if actual_names != expected_names:
+        raise CoordinatorVerificationError(
+            "verified artifacts differ from the logical output inventory"
+        )
+    schemas_by_name = {item.name: item for item in expected_outputs}
+    descriptors = tuple(
+        ResultArtifactDescriptorV1(
+            artifact_id=artifact.artifact_id,
+            media_type=artifact.media_type,
+            schema_identity=schemas_by_name[artifact.artifact_id],
+            byte_count=artifact.byte_count,
+            sha256=artifact.sha256,
+        )
+        for artifact in verified_result.artifacts
+    )
+    return ResultBundleManifestV1(
+        work_request_id=verified_result.work_request_id,
+        logical_work_unit_id=verified_result.logical_work_unit_id,
+        worker_compatibility_sha256=(
+            verified_result.worker_compatibility_sha256
+        ),
+        coordinator_verification_sha256=(
+            verified_result.scientific_result_sha256
+        ),
+        artifacts=descriptors,
+        runtime_audit_results=tuple(
+            item.result_reference for item in verified_result.runtime_audit_results
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +407,57 @@ class OrchestrationCoordinatorV1:
             verified_results=verified,
         )
 
+    def register_verified_result(
+        self,
+        *,
+        logical_work_unit: LogicalWorkUnit,
+        verified_result: VerifiedWorkResultV1,
+        content_store: OrchestrationContentStoreV1,
+        attempt_id: str,
+    ) -> RegisteredResultBundleV1:
+        """Stage and publish one result through the coordinator-verification seam."""
+
+        from .content_store import OrchestrationContentStoreV1
+
+        if type(content_store) is not OrchestrationContentStoreV1:
+            raise TypeError(
+                "verified result registration requires OrchestrationContentStoreV1"
+            )
+        manifest = build_verified_result_manifest(
+            logical_work_unit,
+            verified_result,
+        )
+        attempt = content_store.begin_result_attempt(
+            attempt_id=attempt_id,
+            work_request_id=verified_result.work_request_id,
+            logical_work_unit_id=verified_result.logical_work_unit_id,
+        )
+        artifacts_by_id = {
+            item.artifact_id: item for item in verified_result.artifacts
+        }
+        try:
+            for descriptor in manifest.artifacts:
+                artifact = artifacts_by_id[descriptor.artifact_id]
+                content_store.stage_result_artifact(
+                    attempt,
+                    descriptor,
+                    artifact.payload_bytes,
+                )
+        except Exception:
+            try:
+                content_store.discard_result_attempt(attempt)
+            except Exception as cleanup_error:
+                raise CoordinatorVerificationError(
+                    "failed result staging could not discard its private attempt"
+                ) from cleanup_error
+            raise
+        return content_store.register_result_bundle(
+            attempt,
+            manifest,
+            logical_work_unit=logical_work_unit,
+            coordinator_verification=verified_result,
+        )
+
     def _verify_result(
         self,
         request: WorkRequestV1,
@@ -493,4 +599,5 @@ __all__ = [
     "CoordinatorVerificationError",
     "OrchestrationCoordinatorV1",
     "VerifiedWorkResultV1",
+    "build_verified_result_manifest",
 ]
