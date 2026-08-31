@@ -478,3 +478,53 @@ restores the same complete state digest and pending/corrupt boundaries fail clos
 future evidence is strict, digest-bound, and read-only; no qualification workload,
 release artifact, target, threshold, retry policy, product boundary, brokerage,
 network, telemetry, updater, or background service is added or executed.
+
+## DEV-0010 — Stabilize release preflight provenance
+
+- Interrupted canonical card: `WO40-E`
+- Exact first-parent predecessor: `7d58e4519b94ff07df1f947507e90b981a79d0bb`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-D1`
+  immediately after committing the exact passing D1 report.
+- Observed terminal result: `FAIL`; the live renderer changed only
+  `protocol_commit` from the report's predecessor to the report commit itself, so the
+  report became stale merely by being committed.
+- Root cause: `release_resource_preflight` resolved repository `HEAD` and called it
+  the WO40-D protocol commit. That identity included later evidence/audit commits even
+  though the protocol set is exactly the five paths in `RELEASE_PROTOCOL_PATHS_V1`.
+  A self-invalidating D1 report could pass before its commit but never remain exact
+  after it, blocking every clean WO40-E freeze.
+- Repair: resolve the newest first-parent commit touching any exact frozen protocol
+  path, independently compare all five current protocol files with that tree, and
+  bind the report to that path-owned revision. Register a focused gate proving a
+  later nonprotocol commit does not change either the resolved protocol revision or
+  the exact report rendering, then regenerate the one D1 report from the repair.
+- Owned repair paths: `kirby2/release/build.py`, `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0010` through K2X-02 immediately after `DEV-0009` and
+  before resumed `WO40-E`; the closeout prerequisite deviation inventory extends
+  monotonically through `DEV-0010`.
+- Inherited gates: WO40-D's five protocol paths and protocol-set digest, WO40-D1's
+  wheel/provider requirements, DEV-0008's final starter identities, and DEV-0009's
+  release-audit contracts remain unchanged. The repair performs no build, remote
+  connection, qualification, or performance work.
+- Exact commit subject: `Stabilize release preflight provenance`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 release-resource-preflight --platforms release/platforms.toml --lock release/requirements.lock --qualification release/qualification.toml --no-network --output KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0010
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0009
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: D1 resolves the same protocol-owning commit before and after its report is
+committed; every current protocol byte equals that revision; both exact wheelhouses,
+both clean providers, tools, and starter packs remain PASS; the report is byte-exact;
+the complete registry contains DEV-0001 through DEV-0010; and no target, dependency,
+threshold, matrix, retry rule, product boundary, network action, artifact build,
+qualification workload, or performance workload changes or runs.

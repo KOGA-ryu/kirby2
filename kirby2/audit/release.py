@@ -33,6 +33,7 @@ WO40D_AUDIT_CASE_COUNT = 4
 WO40D1_AUDIT_CASE_COUNT = 2
 WO40E_AUDIT_CASE_COUNT = 4
 DEV0009_AUDIT_CASE_COUNT = 3
+DEV0010_AUDIT_CASE_COUNT = 2
 
 RELEASE_GATE_EVIDENCE_SCHEMA_ID_V1 = "KIRBY2_RELEASE_GATE_EVIDENCE_V1"
 RELEASE_CLOSEOUT_PREREQUISITE_PACKET_SCHEMA_ID_V1 = (
@@ -53,7 +54,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 10)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 11)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1434,6 +1435,95 @@ def audit_release_resource_report() -> ReleaseAuditSuite:
     if len(cases) != WO40D1_AUDIT_CASE_COUNT:
         raise RuntimeError("WO40-D1 release audit inventory changed")
     return ReleaseAuditSuite("WO40-D1", cases)
+
+
+def audit_release_preflight_provenance() -> ReleaseAuditSuite:
+    """Prove D1 binds protocol history rather than its own evidence commit."""
+
+    from kirby2.release.build import (
+        load_release_protocol_bundle,
+        release_resource_preflight,
+    )
+    from kirby2.release.manifest import RELEASE_PROTOCOL_PATHS_V1
+
+    repository = _repository_root()
+    bundle = load_release_protocol_bundle(repository)
+    provider_inventory = repository / ".kirby2/release/clean-providers.toml"
+    preflight = release_resource_preflight(
+        bundle,
+        wheelhouse_root=repository / "release/wheelhouse",
+        provider_inventory=(
+            provider_inventory if provider_inventory.is_file() else None
+        ),
+    )
+    history = subprocess.run(
+        [
+            "git",
+            "log",
+            "-1",
+            "--first-parent",
+            "--format=%H",
+            "--",
+            *RELEASE_PROTOCOL_PATHS_V1,
+        ],
+        cwd=repository,
+        capture_output=True,
+        check=False,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=repository,
+        capture_output=True,
+        check=False,
+    )
+    history_commit = history.stdout.decode("ascii", errors="replace").strip()
+    head_commit = head.stdout.decode("ascii", errors="replace").strip()
+    provenance_failures: list[str] = []
+    if history.returncode != 0 or _COMMIT.fullmatch(history_commit) is None:
+        provenance_failures.append("protocol path history did not resolve a commit")
+    if preflight.protocol_commit != history_commit:
+        provenance_failures.append("preflight does not bind the protocol-owning revision")
+    if preflight.status != "PASS":
+        provenance_failures.append("stable protocol provenance did not pass resource preflight")
+    provenance_case = _case(
+        "protocol_revision_is_owned_by_frozen_input_history",
+        "The resolved revision is the newest first-parent commit touching an exact protocol path.",
+        {
+            "protocol_commit": preflight.protocol_commit,
+            "protocol_path_count": len(RELEASE_PROTOCOL_PATHS_V1),
+            "protocol_set_sha256": preflight.protocol_set_sha256,
+        },
+        provenance_failures,
+    )
+
+    report_path = repository / "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md"
+    expected = preflight.markdown().encode("utf-8")
+    observed = report_path.read_bytes() if report_path.is_file() else b""
+    stability_failures: list[str] = []
+    if head.returncode != 0 or _COMMIT.fullmatch(head_commit) is None:
+        stability_failures.append("repository HEAD did not resolve")
+    elif head_commit == preflight.protocol_commit:
+        stability_failures.append("audit fixture lacks a later nonprotocol evidence commit")
+    if observed != expected:
+        stability_failures.append("preflight report is not exact after a nonprotocol commit")
+    stability_case = _case(
+        "nonprotocol_commits_do_not_invalidate_resource_evidence",
+        "A later report/audit commit leaves the protocol revision and exact D1 bytes stable.",
+        {
+            "head_commit": head_commit,
+            "report_sha256": _sha256(observed),
+            "resolved_protocol_commit": preflight.protocol_commit,
+        },
+        stability_failures,
+    )
+    cases = (provenance_case, stability_case)
+    if len(cases) != DEV0010_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0010 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0010",
+        cases,
+        metadata=(("interrupted_card", "WO40-E"),),
+    )
 
 
 def _capture_release_surface(entrypoint, arguments: tuple[str, ...]) -> tuple[int, bytes]:

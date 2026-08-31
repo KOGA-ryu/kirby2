@@ -1080,6 +1080,57 @@ def load_release_protocol_bundle(
         ) from error
 
 
+def _resolve_release_protocol_commit(
+    bundle: ReleaseProtocolBundleV1,
+) -> tuple[str | None, bool]:
+    """Resolve the newest commit that changed a frozen protocol input.
+
+    Resource evidence is committed after the protocol, so binding it to repository
+    HEAD would make the evidence invalidate itself.  The owning revision is instead
+    the newest first-parent-visible commit touching any exact protocol path, with
+    every current protocol byte independently compared to that tree.
+    """
+
+    try:
+        commit_result = subprocess.run(
+            [
+                "git",
+                "log",
+                "-1",
+                "--first-parent",
+                "--format=%H",
+                "--",
+                *RELEASE_PROTOCOL_PATHS_V1,
+            ],
+            cwd=bundle.repository_root,
+            capture_output=True,
+            check=False,
+        )
+        protocol_commit = commit_result.stdout.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None, False
+    if (
+        commit_result.returncode != 0
+        or _COMMIT.fullmatch(protocol_commit) is None
+    ):
+        return None, False
+
+    for relative in RELEASE_PROTOCOL_PATHS_V1:
+        try:
+            committed = subprocess.run(
+                ["git", "show", f"{protocol_commit}:{relative}"],
+                cwd=bundle.repository_root,
+                capture_output=True,
+                check=False,
+            )
+            current = (bundle.repository_root / relative).read_bytes()
+        except OSError:
+            return protocol_commit, False
+        if committed.returncode != 0 or committed.stdout != current:
+            return protocol_commit, False
+    return protocol_commit, True
+
+
 def release_resource_preflight(
     bundle: ReleaseProtocolBundleV1,
     *,
@@ -1090,41 +1141,9 @@ def release_resource_preflight(
 
     root = _absolute(wheelhouse_root, "wheelhouse root")
     items: list[ReleaseResourceItemV1] = []
-    try:
-        commit_result = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            cwd=bundle.repository_root,
-            capture_output=True,
-            check=False,
-        )
-        protocol_commit = commit_result.stdout.decode("ascii").strip()
-        protocol_commit_value = (
-            protocol_commit
-            if commit_result.returncode == 0
-            and _COMMIT.fullmatch(protocol_commit) is not None
-            else None
-        )
-    except (OSError, UnicodeDecodeError):
-        protocol_commit_value = None
-    protocol_matches_commit = protocol_commit_value is not None
-    if protocol_commit_value is not None:
-        for relative in RELEASE_PROTOCOL_PATHS_V1:
-            try:
-                committed = subprocess.run(
-                    ["git", "show", f"{protocol_commit_value}:{relative}"],
-                    cwd=bundle.repository_root,
-                    capture_output=True,
-                    check=False,
-                )
-            except OSError:
-                protocol_matches_commit = False
-                break
-            if (
-                committed.returncode != 0
-                or committed.stdout != (bundle.repository_root / relative).read_bytes()
-            ):
-                protocol_matches_commit = False
-                break
+    protocol_commit_value, protocol_matches_commit = (
+        _resolve_release_protocol_commit(bundle)
+    )
     items.append(
         ReleaseResourceItemV1(
             resource_id="wo40-d-protocol-commit",
@@ -1142,12 +1161,12 @@ def release_resource_preflight(
             expected_sha256=None,
             observed_sha256=None,
             detail=(
-                "Repository HEAD contains every exact protocol byte bound by the report."
+                "Resolved protocol revision contains every exact byte bound by the report."
                 if protocol_matches_commit
                 else (
-                    "Repository HEAD commit could not be resolved."
+                    "Protocol-owning commit could not be resolved."
                     if protocol_commit_value is None
-                    else "Current protocol bytes differ from the resolved repository HEAD."
+                    else "Current protocol bytes differ from the resolved protocol revision."
                 )
             ),
         )

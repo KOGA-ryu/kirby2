@@ -3,13 +3,13 @@
 Status: `PASS`
 
 Protocol set SHA-256: `94f0050a592e3279a4b38b3d2e55b0ccfdc784202e67dca13e21a91fb631f9e8`
-WO40-D protocol commit: `93d0746f93ebefcf270eeff3f8836b88d9825abb`
+WO40-D protocol commit: `8730ba83b4f54beb2308d7ef710b29e06e99a9fb`
 
 This inspection was read-only and no-network. It did not download, install, build, connect to a provider, or alter credentials.
 
 | Resource | Target | Kind | Status | Detail |
 | --- | --- | --- | --- | --- |
-| `wo40-d-protocol-commit` | `all` | `PROTOCOL_COMMIT` | `PASS` | Repository HEAD contains every exact protocol byte bound by the report. |
+| `wo40-d-protocol-commit` | `all` | `PROTOCOL_COMMIT` | `PASS` | Resolved protocol revision contains every exact byte bound by the report. |
 | `duckdb-1.5.5-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl` | `linux-x86_64` | `LOCKED_DEPENDENCY_WHEEL` | `PASS` | Exact local wheel digest matched. |
 | `duckdb-1.5.5-cp314-cp314-macosx_11_0_arm64.whl` | `macos-arm64` | `LOCKED_DEPENDENCY_WHEEL` | `PASS` | Exact local wheel digest matched. |
 | `git` | `build-host` | `EXTERNAL_PACKAGING_TOOL` | `PASS` | Executable is available and its local bytes were fingerprinted. |
