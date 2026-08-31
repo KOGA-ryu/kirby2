@@ -162,6 +162,7 @@ REGISTERABLE_GATE_IDS = (
     "WO38-A",
     "WO38-B",
     "WO38-C",
+    "WO38-D",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4833,6 +4834,47 @@ def _audit_wo38c() -> ExpansionGateReport:
     )
 
 
+def _audit_wo38d() -> ExpansionGateReport:
+    from kirby2.audit.orchestration import (
+        WO38D_AUDIT_CASE_COUNT,
+        audit_authenticated_lan_orchestration,
+    )
+
+    cases = audit_authenticated_lan_orchestration()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO38-D",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO38D_AUDIT_CASE_COUNT)),
+            ("default_bind", "LOOPBACK_EXPLICIT_LAN_OPT_IN_V1"),
+            ("transport", "TLS13_MTLS_PINNED_NO_PLAINTEXT_V1"),
+            ("fixture_policy", "AUDIT_LOOPBACK_ONLY_NOT_PRODUCTION_TRUST_V1"),
+            ("operational_state", "LEASE_RESOURCE_RESTART_OUTSIDE_RESULTS_V1"),
+            ("holdout_policy", "SEALED_STAGE_ACCESS_CONTROL_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4896,6 +4938,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO38-A", _audit_wo38a),
     ("WO38-B", _audit_wo38b),
     ("WO38-C", _audit_wo38c),
+    ("WO38-D", _audit_wo38d),
 )
 
 

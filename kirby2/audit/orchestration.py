@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
+import socket
+import ssl
 import stat
+import tempfile
+import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from kirby2.discovery.access import (
+    PartitionAccessDecisionV1,
+    PartitionAccessPurposeV1,
+    PartitionAccessReasonV1,
+    PartitionAccessRecordV1,
+)
+from kirby2.discovery.experiment import ExperimentPhaseV1
+from kirby2.discovery.partitions import StrategyPartitionV1
 from kirby2.orchestration.artifacts import (
     ContentRequestV1,
     ResultBundleManifestV1,
@@ -40,6 +54,21 @@ from kirby2.orchestration.local import (
     LocalSubprocessBackendV1,
     SingleProcessBackendV1,
 )
+from kirby2.orchestration.lan import (
+    FramedTlsChannelV1,
+    LanCoordinatorBackendV1,
+    LanWorkerServiceV1,
+)
+from kirby2.orchestration.leases import (
+    CoordinatorStateSnapshotV1,
+    CoordinatorStateStoreV1,
+    CoordinatorWorkStateRecordV1,
+    CoordinatorWorkStateV1,
+    LeaseBookV1,
+    LeaseHeartbeatV1,
+    LeasePolicyV1,
+    LeaseRefused,
+)
 from kirby2.orchestration.models import (
     DigestReferenceV1,
     ExperimentWorkPlanV1,
@@ -62,6 +91,9 @@ from kirby2.orchestration.planner import (
 )
 from kirby2.orchestration.protocol import (
     InlineArtifactV1,
+    MAX_LAN_PAYLOAD_BYTES_V1,
+    LanMessageKindV1,
+    LanProtocolEnvelopeV1,
     RuntimeAuditStatusV1,
     WorkRequestV1,
     WorkerCompatibilityV1,
@@ -69,11 +101,40 @@ from kirby2.orchestration.protocol import (
     WorkerResultStatusV1,
     WorkerResultV1,
 )
+from kirby2.orchestration.resources import (
+    ExperimentCancellationV1,
+    ResourceAdmissionStatusV1,
+    ResourceClaimV1,
+    ResourceControllerV1,
+    ResourceDecisionCodeV1,
+    ResourceLimitsV1,
+    WorkerResourceAdvertisementV1,
+    record_from_canonical_bytes,
+)
 from kirby2.orchestration.seeds import (
     SeedDerivationV1,
     StableCellIdentityV1,
     build_master_seed_identity,
     derive_logical_cell_seed_batch,
+)
+from kirby2.orchestration.security import (
+    DEFAULT_LAN_BIND_HOST_V1,
+    TEST_PKI_CERTIFICATE_SHA256S_V1,
+    TEST_PKI_ROOT_V1,
+    ArtifactAccessScopeV1,
+    AuthenticatedSessionV1,
+    CredentialUseV1,
+    LanPeerRoleV1,
+    LanTlsConfigurationV1,
+    SecurityRefused,
+    SessionHelloV1,
+    SessionReplayGuardV1,
+    build_client_ssl_context,
+    build_server_ssl_context,
+    certificate_sha256,
+    derive_authenticated_session,
+    protocol_sha256,
+    validate_artifact_access,
 )
 from kirby2.orchestration.worker import (
     complete_run_expected_output_identities,
@@ -93,6 +154,7 @@ from kirby2.research.paths import DataPaths
 WO38A_AUDIT_CASE_COUNT = 5
 WO38B_AUDIT_CASE_COUNT = 5
 WO38C_ORCHESTRATION_AUDIT_CASE_COUNT = 4
+WO38D_AUDIT_CASE_COUNT = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +267,44 @@ def audit_verified_content_exchange() -> tuple[OrchestrationAuditCase, ...]:
         raise RuntimeError("WO38-C orchestration audit case inventory changed")
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO38-C orchestration audit case order or identity changed")
+    return cases
+
+
+def audit_authenticated_lan_orchestration() -> tuple[OrchestrationAuditCase, ...]:
+    """Exercise the fixed WO38-D authenticated operational LAN boundary."""
+
+    compatibility = measure_local_worker_compatibility()
+    complete_plan = _local_execution_plan(compatibility)
+    plan = ExperimentWorkPlanV1(
+        master_seed_identity=complete_plan.master_seed_identity,
+        experiment_identity=complete_plan.experiment_identity,
+        logical_units=(complete_plan.logical_units[0],),
+    )
+    reference = OrchestrationCoordinatorV1().execute(
+        plan,
+        SingleProcessBackendV1(compatibility=compatibility),
+    )
+    logical_unit = plan.logical_units[0]
+    cases = (
+        _tls_configuration_and_fixture_case(),
+        _lan_protocol_and_replay_case(compatibility),
+        _authenticated_loopback_parity_case(plan, compatibility, reference),
+        _lease_and_restart_state_case(plan, logical_unit),
+        _sealed_artifact_access_case(),
+        _resource_backpressure_and_cancellation_case(logical_unit),
+    )
+    expected_names = (
+        "lan_requires_explicit_tls13_mtls_and_rejects_fixture_production_use",
+        "lan_envelopes_are_canonical_bounded_nonexecutable_and_replay_safe",
+        "authenticated_loopback_preserves_single_process_result_identity",
+        "leases_and_restart_snapshots_are_operational_chained_and_replay_safe",
+        "active_search_workers_cannot_receive_sealed_holdout_content",
+        "resource_limits_backpressure_abort_and_cancel_without_scientific_success",
+    )
+    if len(cases) != WO38D_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO38-D audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO38-D audit case order or identity changed")
     return cases
 
 
@@ -651,6 +751,838 @@ def _pack_redistribution_policy_case() -> OrchestrationAuditCase:
             ),
             "conditional_decision": conditional_decision.as_dict(),
             "refusal_codes": refusal_codes,
+        },
+    )
+
+
+def _tls_configuration_and_fixture_case() -> OrchestrationAuditCase:
+    limits = _lan_audit_resource_limits()
+    coordinator, worker = _lan_fixture_configurations(
+        _available_loopback_port()
+    )
+    manifest_raw = TEST_PKI_ROOT_V1.joinpath(
+        "fixture_manifest.json"
+    ).read_bytes()
+    fixture = json.loads(manifest_raw.decode("ascii"))
+    canonical_fixture_raw = json.dumps(
+        fixture,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    declared_file_hashes = fixture["file_sha256"]
+    actual_file_hashes = {
+        name: hashlib.sha256(TEST_PKI_ROOT_V1.joinpath(name).read_bytes()).hexdigest()
+        for name in declared_file_hashes
+    }
+    actual_certificate_hashes = {
+        "ca.cert.pem": certificate_sha256(
+            TEST_PKI_ROOT_V1 / "ca.cert.pem"
+        ),
+        "coordinator.cert.pem": certificate_sha256(
+            TEST_PKI_ROOT_V1 / "coordinator.cert.pem"
+        ),
+        "worker.cert.pem": certificate_sha256(
+            TEST_PKI_ROOT_V1 / "worker.cert.pem"
+        ),
+    }
+    disabled_code = _capture_security_refusal_code(
+        lambda: build_server_ssl_context(
+            replace(coordinator, enabled=False),
+            allow_audit_fixture=True,
+        )
+    )
+    production_fixture_code = _capture_security_refusal_code(
+        lambda: build_server_ssl_context(
+            replace(
+                coordinator,
+                credential_use=CredentialUseV1.OPERATOR_PRODUCTION,
+            ),
+            allow_audit_fixture=False,
+        )
+    )
+    nonloopback_fixture_code = _capture_security_refusal_code(
+        lambda: build_server_ssl_context(
+            replace(coordinator, host="192.0.2.10"),
+            allow_audit_fixture=True,
+        )
+    )
+    fixture_without_opt_in_code = _capture_security_refusal_code(
+        lambda: build_server_ssl_context(
+            coordinator,
+            allow_audit_fixture=False,
+        )
+    )
+    plaintext_refusal = _capture_exception_text(
+        lambda: FramedTlsChannelV1(object(), limits)
+    )
+    server_context: ssl.SSLContext | None = None
+    client_context: ssl.SSLContext | None = None
+    context_error: str | None = None
+    try:
+        server_context = build_server_ssl_context(
+            coordinator,
+            allow_audit_fixture=True,
+        )
+        client_context = build_client_ssl_context(
+            worker,
+            allow_audit_fixture=True,
+        )
+    except SecurityRefused as error:
+        context_error = f"{error.code.value}:{error.detail}"
+    certificate_set = frozenset(actual_certificate_hashes.values())
+    configured_paths = {
+        coordinator.ca_certificate,
+        coordinator.certificate,
+        coordinator.private_key,
+        worker.ca_certificate,
+        worker.certificate,
+        worker.private_key,
+    }
+    checks = {
+        "loopback_is_the_only_default_and_lan_requires_explicit_enablement": (
+            DEFAULT_LAN_BIND_HOST_V1 == "127.0.0.1"
+            and coordinator.host == DEFAULT_LAN_BIND_HOST_V1
+            and worker.host == DEFAULT_LAN_BIND_HOST_V1
+            and disabled_code == "LAN_NOT_EXPLICITLY_ENABLED"
+        ),
+        "fixture_packet_is_exact_packaged_and_excludes_ca_key_from_runtime": (
+            manifest_raw == canonical_fixture_raw + b"\n"
+            and actual_file_hashes == declared_file_hashes
+            and actual_certificate_hashes
+            == fixture["certificate_der_sha256"]
+            and certificate_set == TEST_PKI_CERTIFICATE_SHA256S_V1
+            and TEST_PKI_ROOT_V1.joinpath("ca.key.pem")
+            not in configured_paths
+        ),
+        "fixture_credentials_are_audit_only_loopback_only_and_explicit": (
+            production_fixture_code == "TEST_CREDENTIAL_REFUSED"
+            and nonloopback_fixture_code == "NON_LOOPBACK_DEFAULT_REFUSED"
+            and fixture_without_opt_in_code == "TEST_CREDENTIAL_REFUSED"
+        ),
+        "both_contexts_pin_exact_tls13_mtls_and_hostname_validation": (
+            context_error is None
+            and server_context is not None
+            and client_context is not None
+            and server_context.minimum_version
+            is ssl.TLSVersion.TLSv1_3
+            and server_context.maximum_version
+            is ssl.TLSVersion.TLSv1_3
+            and client_context.minimum_version
+            is ssl.TLSVersion.TLSv1_3
+            and client_context.maximum_version
+            is ssl.TLSVersion.TLSv1_3
+            and server_context.verify_mode is ssl.CERT_REQUIRED
+            and client_context.verify_mode is ssl.CERT_REQUIRED
+            and not server_context.check_hostname
+            and client_context.check_hostname
+            and worker.pinned_coordinator_certificate_sha256
+            == certificate_sha256(coordinator.certificate)
+        ),
+        "framed_protocol_has_no_plaintext_socket_fallback": (
+            plaintext_refusal is not None
+            and "requires ssl.SSLSocket" in plaintext_refusal
+        ),
+    }
+    return _case(
+        "lan_requires_explicit_tls13_mtls_and_rejects_fixture_production_use",
+        (
+            f"protocol={protocol_sha256()} "
+            f"tls13={'READY' if context_error is None else 'UNSUPPORTED'}"
+        ),
+        checks,
+        {
+            "certificate_sha256s": actual_certificate_hashes,
+            "context_error": context_error,
+            "disabled_refusal": disabled_code,
+            "fixture_schema_id": fixture["schema_id"],
+            "fixture_without_opt_in_refusal": fixture_without_opt_in_code,
+            "nonloopback_fixture_refusal": nonloopback_fixture_code,
+            "plaintext_refusal": plaintext_refusal,
+            "production_fixture_refusal": production_fixture_code,
+            "protocol_sha256": protocol_sha256(),
+        },
+    )
+
+
+def _lan_protocol_and_replay_case(
+    compatibility: WorkerCompatibilityV1,
+) -> OrchestrationAuditCase:
+    protocol_digest = protocol_sha256()
+    resources = WorkerResourceAdvertisementV1(
+        worker_id="worker.test.kirby2.invalid",
+        worker_compatibility_sha256=compatibility.compatibility_sha256,
+        resource_classes=("cpu-small",),
+        limits=_lan_audit_resource_limits(),
+        advertisement_nonce=_digest("WO38-D resource advertisement nonce"),
+    )
+    coordinator_hello = SessionHelloV1(
+        role=LanPeerRoleV1.COORDINATOR,
+        peer_identity="coordinator.test.kirby2.invalid",
+        certificate_sha256=certificate_sha256(
+            TEST_PKI_ROOT_V1 / "coordinator.cert.pem"
+        ),
+        hello_nonce=_digest("WO38-D coordinator hello"),
+        protocol_sha256=protocol_digest,
+        compatibility_sha256=None,
+        resource_advertisement_sha256=None,
+    )
+    worker_hello = SessionHelloV1(
+        role=LanPeerRoleV1.WORKER,
+        peer_identity="worker.test.kirby2.invalid",
+        certificate_sha256=certificate_sha256(
+            TEST_PKI_ROOT_V1 / "worker.cert.pem"
+        ),
+        hello_nonce=_digest("WO38-D worker hello"),
+        protocol_sha256=protocol_digest,
+        compatibility_sha256=compatibility.compatibility_sha256,
+        resource_advertisement_sha256=resources.advertisement_sha256,
+    )
+    session = derive_authenticated_session(coordinator_hello, worker_hello)
+    guard = SessionReplayGuardV1(session.session_id)
+    first_nonce = _digest("WO38-D first accepted message")
+    guard.accept(
+        session_id=session.session_id,
+        sequence=1,
+        nonce=first_nonce,
+    )
+    replay_code = _capture_security_refusal_code(
+        lambda: guard.accept(
+            session_id=session.session_id,
+            sequence=2,
+            nonce=first_nonce,
+        )
+    )
+    gap_code = _capture_security_refusal_code(
+        lambda: guard.accept(
+            session_id=session.session_id,
+            sequence=3,
+            nonce=_digest("WO38-D sequence gap"),
+        )
+    )
+    foreign_session_code = _capture_security_refusal_code(
+        lambda: guard.accept(
+            session_id=_digest("WO38-D foreign session"),
+            sequence=2,
+            nonce=_digest("WO38-D foreign session nonce"),
+        )
+    )
+    envelope = LanProtocolEnvelopeV1(
+        message_kind=LanMessageKindV1.WORK_REQUEST,
+        session_id=session.session_id,
+        sequence=1,
+        nonce=_digest("WO38-D envelope nonce"),
+        payload_bytes=b'{"record_id":"wo38d-audit"}',
+    )
+    tampered = envelope.as_dict()
+    tampered["payload_sha256"] = _digest("WO38-D forged payload digest")
+    tamper_refusal = _capture_exception_text(
+        lambda: LanProtocolEnvelopeV1.from_dict(tampered)
+    )
+    executable_refusal = _capture_exception_text(
+        lambda: LanProtocolEnvelopeV1(
+            message_kind=LanMessageKindV1.WORK_REQUEST,
+            session_id=session.session_id,
+            sequence=1,
+            nonce=_digest("WO38-D executable request nonce"),
+            payload_bytes=b'{"python_module":"evil.module"}',
+        )
+    )
+    oversized_refusal = _capture_exception_text(
+        lambda: LanProtocolEnvelopeV1(
+            message_kind=LanMessageKindV1.WORK_REQUEST,
+            session_id=session.session_id,
+            sequence=1,
+            nonce=_digest("WO38-D oversized request nonce"),
+            payload_bytes=b"x" * (MAX_LAN_PAYLOAD_BYTES_V1 + 1),
+        )
+    )
+    message_kinds = frozenset(item.value for item in LanMessageKindV1)
+    checks = {
+        "hellos_bind_roles_certificates_compatibility_resources_and_protocol": (
+            session.coordinator_identity == coordinator_hello.peer_identity
+            and session.worker_identity == worker_hello.peer_identity
+            and session.protocol_sha256 == protocol_digest
+            and AuthenticatedSessionV1.from_dict(session.as_dict()) == session
+        ),
+        "every_bound_envelope_is_exact_canonical_and_digest_bound": (
+            LanProtocolEnvelopeV1.from_canonical_bytes(
+                envelope.canonical_bytes()
+            )
+            == envelope
+            and envelope.session_id == session.session_id
+            and tamper_refusal is not None
+            and "payload digest differs" in tamper_refusal
+        ),
+        "nonces_sequences_and_session_identity_reject_replay": (
+            replay_code == "SESSION_REPLAY"
+            and gap_code == "SESSION_SEQUENCE_INVALID"
+            and foreign_session_code == "SESSION_BINDING_MISMATCH"
+        ),
+        "executable_and_oversized_payloads_fail_before_dispatch": (
+            executable_refusal is not None
+            and "forbidden executable payload field" in executable_refusal
+            and oversized_refusal is not None
+            and "exceeds its V1 limit" in oversized_refusal
+        ),
+        "message_vocabulary_is_closed_data_records_without_shell_dispatch": (
+            "WORK_REQUEST" in message_kinds
+            and "CONTENT_REQUEST" in message_kinds
+            and not (
+                message_kinds
+                & {"COMMAND", "EXEC", "PYTHON", "SHELL", "SOURCE"}
+            )
+            and _is_sha256(protocol_digest)
+        ),
+    }
+    return _case(
+        "lan_envelopes_are_canonical_bounded_nonexecutable_and_replay_safe",
+        f"session={session.session_id} envelope={envelope.envelope_sha256}",
+        checks,
+        {
+            "envelope_sha256": envelope.envelope_sha256,
+            "executable_refusal": executable_refusal,
+            "foreign_session_refusal": foreign_session_code,
+            "replay_refusal": replay_code,
+            "sequence_refusal": gap_code,
+            "session_id": session.session_id,
+            "tamper_refusal": tamper_refusal,
+        },
+    )
+
+
+def _authenticated_loopback_parity_case(
+    plan: ExperimentWorkPlanV1,
+    compatibility: WorkerCompatibilityV1,
+    reference: CoordinatorRunResultV1,
+) -> OrchestrationAuditCase:
+    port = _available_loopback_port()
+    coordinator_configuration, worker_configuration = (
+        _lan_fixture_configurations(port)
+    )
+    limits = _lan_audit_resource_limits()
+    resources = WorkerResourceAdvertisementV1(
+        worker_id=worker_configuration.local_identity,
+        worker_compatibility_sha256=compatibility.compatibility_sha256,
+        resource_classes=("cpu-small",),
+        limits=limits,
+        advertisement_nonce=_digest("WO38-D loopback resource advertisement"),
+    )
+    lease_policy = LeasePolicyV1(
+        lease_seconds=30,
+        heartbeat_interval_seconds=1,
+        maximum_missed_heartbeats=3,
+    )
+    backend = LanCoordinatorBackendV1(
+        configuration=coordinator_configuration,
+        compatibility=compatibility,
+        plan_id=plan.plan_id,
+        worker_count=1,
+        transport_limits=limits,
+        lease_policy=lease_policy,
+        claim_memory_bytes=limits.maximum_memory_bytes_per_run,
+        claim_disk_bytes=limits.maximum_disk_bytes_per_run,
+        claim_elapsed_seconds=30,
+        connection_timeout_seconds=15,
+        allow_audit_fixture=True,
+    )
+    worker = LanWorkerServiceV1(
+        configuration=worker_configuration,
+        compatibility=compatibility,
+        resources=resources,
+        connection_timeout_seconds=15,
+        allow_audit_fixture=True,
+    )
+    incompatible_worker_refusal = _capture_exception_text(
+        lambda: LanWorkerServiceV1(
+            configuration=worker_configuration,
+            compatibility=compatibility,
+            resources=replace(
+                resources,
+                worker_compatibility_sha256=_digest(
+                    "WO38-D incompatible worker advertisement"
+                ),
+            ),
+            connection_timeout_seconds=15,
+            allow_audit_fixture=True,
+        )
+    )
+    temporary_before = _lan_attempt_temporary_roots()
+    lan_result: CoordinatorRunResultV1 | None = None
+    worker_results: tuple[WorkerResultV1, ...] = ()
+    execution_error: str | None = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            worker_future = executor.submit(_run_lan_worker_with_retry, worker)
+            lan_result = OrchestrationCoordinatorV1().execute(plan, backend)
+            worker_results = worker_future.result(timeout=20)
+    except (
+        FutureTimeout,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        execution_error = f"{type(error).__name__}:{error}"
+    temporary_after = _lan_attempt_temporary_roots()
+    checks = {
+        "one_explicit_outbound_worker_completes_authenticated_loopback": (
+            execution_error is None
+            and lan_result is not None
+            and lan_result.backend_id == "authenticated-lan-v1"
+            and len(worker_results) == len(plan.logical_units)
+        ),
+        "lan_and_single_have_identical_verified_scientific_results": (
+            lan_result is not None
+            and lan_result.verified_results == reference.verified_results
+            and lan_result.aggregate_sha256 == reference.aggregate_sha256
+        ),
+        "worker_results_bind_the_exact_requests_and_compatibility": (
+            len(worker_results) == len(plan.logical_units)
+            and all(
+                result.request.logical_work_unit == logical_unit
+                and result.worker_compatibility == compatibility
+                for result, logical_unit in zip(
+                    worker_results,
+                    plan.logical_units,
+                    strict=True,
+                )
+            )
+        ),
+        "incompatible_worker_advertisement_is_refused_before_connection": (
+            incompatible_worker_refusal is not None
+            and "advertisement compatibility differs"
+            in incompatible_worker_refusal
+        ),
+        "lan_operational_identity_does_not_enter_scientific_aggregate": (
+            lan_result is not None
+            and lan_result.backend_id != reference.backend_id
+            and lan_result.scientific_dict() == reference.scientific_dict()
+        ),
+        "worker_attempt_directories_are_removed_after_session_completion": (
+            temporary_after <= temporary_before
+        ),
+    }
+    return _case(
+        "authenticated_loopback_preserves_single_process_result_identity",
+        (
+            f"plan={plan.plan_id} "
+            f"aggregate={reference.aggregate_sha256}"
+        ),
+        checks,
+        {
+            "execution_error": execution_error,
+            "incompatible_worker_refusal": incompatible_worker_refusal,
+            "lan_aggregate_sha256": (
+                None if lan_result is None else lan_result.aggregate_sha256
+            ),
+            "loopback_port": port,
+            "reference_aggregate_sha256": reference.aggregate_sha256,
+            "temporary_roots_after": len(temporary_after),
+            "temporary_roots_before": len(temporary_before),
+            "worker_result_count": len(worker_results),
+        },
+    )
+
+
+def _lease_and_restart_state_case(
+    plan: ExperimentWorkPlanV1,
+    logical_unit: LogicalWorkUnit,
+) -> OrchestrationAuditCase:
+    request = WorkRequestV1(
+        logical_work_unit=logical_unit,
+        required_runtime_audits=complete_run_runtime_audit_identities(),
+    )
+    policy = LeasePolicyV1(
+        lease_seconds=60,
+        heartbeat_interval_seconds=5,
+        maximum_missed_heartbeats=3,
+    )
+    lease_book = LeaseBookV1(policy)
+    grant = lease_book.grant(
+        plan_id=plan.plan_id,
+        work_request_id=request.work_request_id,
+        logical_work_unit_id=logical_unit.logical_work_unit_id,
+        attempt_number=1,
+        worker_id="worker.wo38d.audit",
+        session_id=_digest("WO38-D lease session"),
+        issued_at_utc="2026-01-01T00:00:00Z",
+    )
+    heartbeat = LeaseHeartbeatV1(
+        lease_id=grant.lease_id,
+        attempt_id=grant.attempt_id,
+        worker_id=grant.worker_id,
+        session_id=grant.session_id,
+        heartbeat_sequence=1,
+        sent_at_utc="2026-01-01T00:00:01Z",
+        heartbeat_nonce=_digest("WO38-D heartbeat one"),
+    )
+    accepted_grant = lease_book.heartbeat(heartbeat)
+    heartbeat_replay_code = _capture_lease_refusal_code(
+        lambda: lease_book.heartbeat(heartbeat)
+    )
+    heartbeat_gap_code = _capture_lease_refusal_code(
+        lambda: lease_book.heartbeat(
+            replace(
+                heartbeat,
+                heartbeat_sequence=3,
+                heartbeat_nonce=_digest("WO38-D heartbeat gap"),
+            )
+        )
+    )
+    completed_grant = lease_book.complete(grant.lease_id)
+    duplicate_completion_code = _capture_lease_refusal_code(
+        lambda: lease_book.complete(grant.lease_id)
+    )
+
+    records = _coordinator_state_inventory()
+    first_snapshot = CoordinatorStateSnapshotV1(
+        plan_id=plan.plan_id,
+        revision=1,
+        previous_snapshot_sha256=None,
+        records=records,
+    )
+    second_snapshot = CoordinatorStateSnapshotV1(
+        plan_id=plan.plan_id,
+        revision=2,
+        previous_snapshot_sha256=first_snapshot.snapshot_sha256,
+        records=records,
+        cancellation_sha256s=(_digest("WO38-D cancellation ledger"),),
+    )
+    with TemporaryDirectory(prefix="kirby2-wo38d-state-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        paths = DataPaths(root)
+        store = CoordinatorStateStoreV1(paths)
+        first_saved = store.save(first_snapshot)
+        second_saved = store.save(second_snapshot)
+        restored = store.load(plan.plan_id)
+        stale_refusal = _capture_exception_text(
+            lambda: store.save(second_snapshot)
+        )
+        temporary_state_files = tuple(
+            path.name
+            for path in paths.checkpoints.rglob("*")
+            if path.name.startswith(".coordinator-state-tmp-")
+        )
+    logical_raw = logical_unit.canonical_bytes()
+    checks = {
+        "lease_and_heartbeat_bind_attempt_worker_session_and_exact_sequence": (
+            accepted_grant == grant
+            and completed_grant == grant
+            and heartbeat_replay_code == "HEARTBEAT_REPLAYED"
+            and heartbeat_gap_code == "HEARTBEAT_SEQUENCE_GAP"
+            and duplicate_completion_code == "UNKNOWN_LEASE"
+        ),
+        "leases_and_heartbeats_are_operational_not_scientific_identity": (
+            grant.attempt_id.encode("ascii") not in logical_raw
+            and grant.lease_id.encode("ascii") not in logical_raw
+            and heartbeat.heartbeat_nonce.encode("ascii") not in logical_raw
+        ),
+        "restart_state_distinguishes_every_required_work_state": (
+            frozenset(item.state for item in records)
+            == frozenset(CoordinatorWorkStateV1)
+        ),
+        "restart_snapshots_are_canonical_atomically_saved_and_hash_chained": (
+            first_saved == first_snapshot.snapshot_sha256
+            and second_saved == second_snapshot.snapshot_sha256
+            and restored == second_snapshot
+            and CoordinatorStateSnapshotV1.from_canonical_bytes(
+                second_snapshot.canonical_bytes()
+            )
+            == second_snapshot
+            and temporary_state_files == ()
+        ),
+        "stale_or_forked_restart_revision_is_refused": (
+            stale_refusal is not None
+            and "does not extend the stored revision" in stale_refusal
+        ),
+    }
+    return _case(
+        "leases_and_restart_snapshots_are_operational_chained_and_replay_safe",
+        f"lease={grant.lease_id} snapshot={second_snapshot.snapshot_sha256}",
+        checks,
+        {
+            "duplicate_completion_refusal": duplicate_completion_code,
+            "heartbeat_gap_refusal": heartbeat_gap_code,
+            "heartbeat_replay_refusal": heartbeat_replay_code,
+            "lease_id": grant.lease_id,
+            "snapshot_sha256": second_snapshot.snapshot_sha256,
+            "stale_snapshot_refusal": stale_refusal,
+            "work_states": [item.state.value for item in records],
+        },
+    )
+
+
+def _sealed_artifact_access_case() -> OrchestrationAuditCase:
+    sealed_reference = DigestReferenceV1(
+        name="dataset.holdout",
+        sha256=_digest("WO38-D sealed holdout content"),
+    )
+    open_reference = DigestReferenceV1(
+        name="dataset.training",
+        sha256=_digest("WO38-D open training content"),
+    )
+    sealed_request = ContentRequestV1(
+        content_references=tuple(
+            sorted(
+                (sealed_reference, open_reference),
+                key=lambda item: item.sort_key,
+            )
+        )
+    )
+    open_request = ContentRequestV1(content_references=(open_reference,))
+    search_scope = ArtifactAccessScopeV1(
+        experiment_id="wo38d-access-audit",
+        experiment_version=1,
+        phase=ExperimentPhaseV1.SEARCH_OPEN,
+        purpose=PartitionAccessPurposeV1.SEARCH_TRAIN,
+        partition=StrategyPartitionV1.HOLDOUT,
+        access_record_sha256=None,
+    )
+    search_refusal = _capture_security_refusal_code(
+        lambda: validate_artifact_access(
+            sealed_request,
+            search_scope,
+            sealed_content_sha256s=(sealed_reference.sha256,),
+        )
+    )
+    terminal_access = PartitionAccessRecordV1(
+        experiment_id=search_scope.experiment_id,
+        experiment_version=search_scope.experiment_version,
+        partition_manifest_sha256=_digest("WO38-D partition manifest"),
+        access_ordinal=1,
+        previous_access_sha256=None,
+        state_before_sha256=_digest("WO38-D terminal state before access"),
+        phase_before=ExperimentPhaseV1.TERMINAL_EVALUATION,
+        phase_after=ExperimentPhaseV1.TERMINAL_EVALUATION,
+        partition=StrategyPartitionV1.HOLDOUT,
+        purpose=PartitionAccessPurposeV1.TERMINAL_EVALUATION,
+        requested_member_ids=("holdout-member-0001",),
+        validation_schedule_id=None,
+        decision=PartitionAccessDecisionV1.GRANTED,
+        reason=PartitionAccessReasonV1.GRANTED,
+        metrics_visible=True,
+        granted_member_ids=("holdout-member-0001",),
+        candidate_freeze_sha256=_digest("WO38-D candidate freeze"),
+    )
+    terminal_scope = ArtifactAccessScopeV1.from_access_record(terminal_access)
+    terminal_result = validate_artifact_access(
+        sealed_request,
+        terminal_scope,
+        sealed_content_sha256s=(sealed_reference.sha256,),
+        access_record=terminal_access,
+    )
+    mismatched_record_refusal = _capture_security_refusal_code(
+        lambda: validate_artifact_access(
+            sealed_request,
+            terminal_scope,
+            sealed_content_sha256s=(sealed_reference.sha256,),
+            access_record=replace(
+                terminal_access,
+                experiment_id="wo38d-foreign-experiment",
+            ),
+        )
+    )
+    forged_search_scope_refusal = _capture_exception_text(
+        lambda: replace(
+            search_scope,
+            access_record_sha256=terminal_access.access_sha256,
+        )
+    )
+    open_result = validate_artifact_access(
+        open_request,
+        search_scope,
+        sealed_content_sha256s=(sealed_reference.sha256,),
+    )
+    checks = {
+        "open_search_content_remains_available_without_holdout_authority": (
+            open_result == open_request
+        ),
+        "active_search_scope_cannot_receive_any_requested_sealed_digest": (
+            search_refusal == "SEALED_ARTIFACT_REFUSED"
+        ),
+        "terminal_holdout_access_requires_one_exact_granted_wo35_record": (
+            terminal_result == sealed_request
+            and terminal_scope.access_record_sha256
+            == terminal_access.access_sha256
+            and mismatched_record_refusal == "SEALED_ARTIFACT_REFUSED"
+        ),
+        "search_open_scope_cannot_smuggle_a_terminal_access_digest": (
+            forged_search_scope_refusal is not None
+            and "cannot carry a sealed access record"
+            in forged_search_scope_refusal
+        ),
+        "artifact_scope_and_request_round_trip_as_canonical_data": (
+            ArtifactAccessScopeV1.from_canonical_bytes(
+                terminal_scope.canonical_bytes()
+            )
+            == terminal_scope
+            and ContentRequestV1.from_canonical_bytes(
+                sealed_request.canonical_bytes()
+            )
+            == sealed_request
+        ),
+    }
+    return _case(
+        "active_search_workers_cannot_receive_sealed_holdout_content",
+        (
+            f"sealed={sealed_reference.sha256} "
+            f"access={terminal_access.access_sha256}"
+        ),
+        checks,
+        {
+            "forged_search_scope_refusal": forged_search_scope_refusal,
+            "mismatched_record_refusal": mismatched_record_refusal,
+            "search_refusal": search_refusal,
+            "sealed_content_sha256": sealed_reference.sha256,
+            "terminal_access_sha256": terminal_access.access_sha256,
+        },
+    )
+
+
+def _resource_backpressure_and_cancellation_case(
+    logical_unit: LogicalWorkUnit,
+) -> OrchestrationAuditCase:
+    limits = ResourceLimitsV1(
+        maximum_concurrent_runs=1,
+        maximum_queue_depth=1,
+        maximum_memory_bytes_per_run=1024,
+        maximum_disk_bytes_per_run=2048,
+        maximum_elapsed_seconds_per_run=60,
+        maximum_message_bytes=4096,
+        maximum_stream_bytes=16 * 1024,
+    )
+    controller = ResourceControllerV1(
+        limits=limits,
+        resource_classes=(logical_unit.resource_class,),
+    )
+    experiment_id = logical_unit.experiment_identity.sha256
+    first = _resource_claim(
+        experiment_id,
+        "first",
+        logical_unit.resource_class,
+    )
+    second = _resource_claim(
+        experiment_id,
+        "second",
+        logical_unit.resource_class,
+    )
+    third = _resource_claim(
+        experiment_id,
+        "third",
+        logical_unit.resource_class,
+    )
+    oversized = replace(
+        _resource_claim(
+            experiment_id,
+            "oversized",
+            logical_unit.resource_class,
+        ),
+        memory_bytes=limits.maximum_memory_bytes_per_run + 1,
+    )
+    first_decision = controller.admit(first)
+    second_decision = controller.admit(second)
+    third_decision = controller.admit(third)
+    oversized_decision = controller.admit(oversized)
+    abort_decisions = controller.observe_usage(
+        first.claim_id,
+        memory_bytes=first.memory_bytes + 1,
+        disk_bytes=first.disk_bytes,
+        elapsed_seconds=first.elapsed_seconds,
+    )
+    cancellation = ExperimentCancellationV1(
+        experiment_id=experiment_id,
+        cancellation_id=_digest("WO38-D whole experiment cancellation"),
+        reason_code="AUDIT_OPERATOR_CANCELLED",
+        sequence=1,
+    )
+    cancellation_decisions = controller.cancel_experiment(cancellation)
+    after_cancel = _resource_claim(
+        experiment_id,
+        "after-cancel",
+        logical_unit.resource_class,
+    )
+    after_cancel_decision = controller.admit(after_cancel)
+    decision_inventory = (
+        first_decision,
+        second_decision,
+        third_decision,
+        oversized_decision,
+        *abort_decisions,
+        *cancellation_decisions,
+        after_cancel_decision,
+    )
+    scientific_before = logical_unit.logical_work_unit_id
+    round_trips = tuple(
+        record_from_canonical_bytes(
+            type(decision),
+            decision.canonical_bytes(),
+        )
+        for decision in decision_inventory
+    )
+    checks = {
+        "finite_concurrency_queues_once_then_refuses_queue_overflow": (
+            first_decision.status is ResourceAdmissionStatusV1.ADMITTED
+            and second_decision.status is ResourceAdmissionStatusV1.QUEUED
+            and third_decision.status is ResourceAdmissionStatusV1.REFUSED
+            and third_decision.code is ResourceDecisionCodeV1.QUEUE_FULL
+        ),
+        "oversized_claim_is_refused_before_admission": (
+            oversized_decision.status is ResourceAdmissionStatusV1.REFUSED
+            and oversized_decision.code
+            is ResourceDecisionCodeV1.MEMORY_LIMIT_EXCEEDED
+        ),
+        "observed_overrun_aborts_active_attempt_and_promotes_waiting_work": (
+            tuple(item.status for item in abort_decisions)
+            == (
+                ResourceAdmissionStatusV1.ABORTED,
+                ResourceAdmissionStatusV1.ADMITTED,
+            )
+            and abort_decisions[0].code
+            is ResourceDecisionCodeV1.MEMORY_LIMIT_EXCEEDED
+        ),
+        "whole_experiment_cancellation_removes_active_and_blocks_future_work": (
+            len(cancellation_decisions) == 1
+            and cancellation_decisions[0].status
+            is ResourceAdmissionStatusV1.CANCELLED
+            and after_cancel_decision.status
+            is ResourceAdmissionStatusV1.CANCELLED
+            and after_cancel_decision.cancellation_id
+            == cancellation.cancellation_id
+        ),
+        "resource_decisions_are_canonical_operational_records_not_results": (
+            tuple(round_trips) == decision_inventory
+            and logical_unit.logical_work_unit_id == scientific_before
+            and all(
+                not frozenset(decision.as_dict())
+                & {
+                    "artifacts",
+                    "manifest",
+                    "runtime_audit_results",
+                    "scientific_result_sha256",
+                    "worker_result",
+                }
+                for decision in decision_inventory
+            )
+        ),
+    }
+    return _case(
+        "resource_limits_backpressure_abort_and_cancel_without_scientific_success",
+        (
+            f"experiment={experiment_id} "
+            f"decisions={len(decision_inventory)}"
+        ),
+        checks,
+        {
+            "abort_statuses": [item.status.value for item in abort_decisions],
+            "after_cancel_status": after_cancel_decision.status.value,
+            "cancellation_id": cancellation.cancellation_id,
+            "first_status": first_decision.status.value,
+            "oversized_code": oversized_decision.code.value,
+            "second_status": second_decision.status.value,
+            "third_code": third_decision.code.value,
         },
     )
 
@@ -1827,6 +2759,189 @@ def _capture_content_store_refusal_code(operation) -> str | None:
     return None
 
 
+def _capture_security_refusal_code(operation) -> str | None:
+    try:
+        operation()
+    except SecurityRefused as error:
+        return error.code.value
+    except (
+        KeyError,
+        LookupError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        return f"UNEXPECTED:{type(error).__name__}:{error}"
+    return None
+
+
+def _capture_lease_refusal_code(operation) -> str | None:
+    try:
+        operation()
+    except LeaseRefused as error:
+        return error.code.value
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        return f"UNEXPECTED:{type(error).__name__}:{error}"
+    return None
+
+
+def _lan_audit_resource_limits() -> ResourceLimitsV1:
+    return ResourceLimitsV1(
+        maximum_concurrent_runs=1,
+        maximum_queue_depth=0,
+        maximum_memory_bytes_per_run=16 * 1024 * 1024 * 1024,
+        maximum_disk_bytes_per_run=2 * 1024 * 1024 * 1024,
+        maximum_elapsed_seconds_per_run=60,
+        maximum_message_bytes=8 * 1024 * 1024,
+        maximum_stream_bytes=64 * 1024 * 1024,
+    )
+
+
+def _lan_fixture_configurations(
+    port: int,
+) -> tuple[LanTlsConfigurationV1, LanTlsConfigurationV1]:
+    coordinator_identity = "coordinator.test.kirby2.invalid"
+    worker_identity = "worker.test.kirby2.invalid"
+    ca_certificate = TEST_PKI_ROOT_V1 / "ca.cert.pem"
+    coordinator_certificate = TEST_PKI_ROOT_V1 / "coordinator.cert.pem"
+    coordinator = LanTlsConfigurationV1(
+        role=LanPeerRoleV1.COORDINATOR,
+        enabled=True,
+        host=DEFAULT_LAN_BIND_HOST_V1,
+        port=port,
+        ca_certificate=ca_certificate,
+        certificate=coordinator_certificate,
+        private_key=TEST_PKI_ROOT_V1 / "coordinator.key.pem",
+        local_identity=coordinator_identity,
+        expected_peer_identities=(worker_identity,),
+        credential_use=CredentialUseV1.AUDIT_LOOPBACK_FIXTURE,
+    )
+    worker = LanTlsConfigurationV1(
+        role=LanPeerRoleV1.WORKER,
+        enabled=True,
+        host=DEFAULT_LAN_BIND_HOST_V1,
+        port=port,
+        ca_certificate=ca_certificate,
+        certificate=TEST_PKI_ROOT_V1 / "worker.cert.pem",
+        private_key=TEST_PKI_ROOT_V1 / "worker.key.pem",
+        local_identity=worker_identity,
+        expected_peer_identities=(coordinator_identity,),
+        credential_use=CredentialUseV1.AUDIT_LOOPBACK_FIXTURE,
+        server_hostname=coordinator_identity,
+        pinned_coordinator_certificate_sha256=certificate_sha256(
+            coordinator_certificate
+        ),
+    )
+    return coordinator, worker
+
+
+def _available_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind((DEFAULT_LAN_BIND_HOST_V1, 0))
+        port = listener.getsockname()[1]
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise RuntimeError("loopback port allocation returned an invalid port")
+    return port
+
+
+def _run_lan_worker_with_retry(
+    worker: LanWorkerServiceV1,
+) -> tuple[WorkerResultV1, ...]:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return worker.run()
+        except ConnectionRefusedError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _lan_attempt_temporary_roots() -> frozenset[Path]:
+    temporary_root = Path(tempfile.gettempdir())
+    return frozenset(
+        path.resolve()
+        for path in temporary_root.glob("kirby2-lan-attempt-*")
+        if path.is_dir()
+    )
+
+
+def _coordinator_state_inventory() -> tuple[CoordinatorWorkStateRecordV1, ...]:
+    records: list[CoordinatorWorkStateRecordV1] = []
+    leased_states = {
+        CoordinatorWorkStateV1.LEASED,
+        CoordinatorWorkStateV1.COMPLETED_UNVERIFIED,
+        CoordinatorWorkStateV1.REGISTERED,
+        CoordinatorWorkStateV1.QUARANTINED,
+    }
+    returned_states = {
+        CoordinatorWorkStateV1.COMPLETED_UNVERIFIED,
+        CoordinatorWorkStateV1.REGISTERED,
+        CoordinatorWorkStateV1.QUARANTINED,
+    }
+    failure_states = {
+        CoordinatorWorkStateV1.FAILED,
+        CoordinatorWorkStateV1.CANCELLED,
+        CoordinatorWorkStateV1.QUARANTINED,
+    }
+    for index, state in enumerate(CoordinatorWorkStateV1, start=1):
+        leased = state in leased_states
+        records.append(
+            CoordinatorWorkStateRecordV1(
+                work_request_id=_digest(
+                    f"WO38-D state work request {index}"
+                ),
+                logical_work_unit_id=_digest(
+                    f"WO38-D state logical work {index}"
+                ),
+                state=state,
+                attempt_id=(
+                    _digest(f"WO38-D state attempt {index}")
+                    if leased
+                    else None
+                ),
+                worker_id=(f"worker.wo38d.state-{index}" if leased else None),
+                lease_id=(
+                    _digest(f"WO38-D state lease {index}")
+                    if leased
+                    else None
+                ),
+                returned_result_sha256=(
+                    _digest(f"WO38-D state result {index}")
+                    if state in returned_states
+                    else None
+                ),
+                registered_manifest_sha256=(
+                    _digest(f"WO38-D state manifest {index}")
+                    if state is CoordinatorWorkStateV1.REGISTERED
+                    else None
+                ),
+                failure_code=(
+                    f"{state.value}_AUDIT"
+                    if state in failure_states
+                    else None
+                ),
+            )
+        )
+    return tuple(sorted(records, key=lambda item: item.sort_key))
+
+
+def _resource_claim(
+    experiment_id: str,
+    label: str,
+    resource_class: str,
+) -> ResourceClaimV1:
+    return ResourceClaimV1(
+        experiment_id=experiment_id,
+        work_request_id=_digest(f"WO38-D resource claim {label}"),
+        resource_class=resource_class,
+        memory_bytes=512,
+        disk_bytes=1024,
+        elapsed_seconds=30,
+    )
+
+
 def _attempt_object_root(
     paths: DataPaths,
     attempt: ResultAttemptStageV1,
@@ -1888,7 +3003,9 @@ __all__ = [
     "WO38A_AUDIT_CASE_COUNT",
     "WO38B_AUDIT_CASE_COUNT",
     "WO38C_ORCHESTRATION_AUDIT_CASE_COUNT",
+    "WO38D_AUDIT_CASE_COUNT",
     "OrchestrationAuditCase",
+    "audit_authenticated_lan_orchestration",
     "audit_local_orchestration",
     "audit_logical_work_and_attempt_identity",
     "audit_verified_content_exchange",
