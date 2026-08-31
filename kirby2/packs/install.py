@@ -661,7 +661,7 @@ def install_pack(
                     finally:
                         os.close(object_descriptor)
                 else:
-                    _make_stage_read_only(
+                    _make_stage_publishable(
                         stage_descriptor,
                         stage,
                     )
@@ -673,6 +673,7 @@ def install_pack(
                         PackInstallOperationV1.INSTALL,
                         "read-only pack stage was rebound before publication",
                     )
+                    published = False
                     try:
                         os.rename(
                             stage.stage_name,
@@ -680,12 +681,30 @@ def install_pack(
                             src_dir_fd=staging_descriptor,
                             dst_dir_fd=object_parent,
                         )
+                        published = True
+                        # macOS requires write permission on a directory whose
+                        # cross-parent rename updates its ``..`` entry.  Payloads
+                        # and nested directories are already read-only; seal the
+                        # root immediately after the atomic move and before the
+                        # registry can reference it.
+                        os.fchmod(stage_descriptor, 0o500)
+                        os.fsync(stage_descriptor)
                     except OSError as error:
-                        _restore_stage_modes(stage_descriptor, stage.manifest)
+                        if published:
+                            _rollback_pack_publication(
+                                stage_descriptor,
+                                stage.manifest,
+                                staging_descriptor=staging_descriptor,
+                                stage_name=stage.stage_name,
+                                object_parent=object_parent,
+                                object_leaf=object_leaf,
+                            )
+                        else:
+                            _restore_stage_modes(stage_descriptor, stage.manifest)
                         _refuse(
                             PackInstallRefusalCodeV1.OBJECT_PUBLISH_FAILED,
                             PackInstallOperationV1.INSTALL,
-                            "verified stage could not be atomically published",
+                            "verified stage could not be atomically published and sealed",
                             cause=error,
                         )
                     installed_new_object = True
@@ -960,12 +979,28 @@ def remove_deactivated_pack(
                         PackInstallOperationV1.REMOVE,
                         "installed object changed after registry removal",
                     )
+                    # A read-only directory cannot be moved across parents on
+                    # macOS because the filesystem updates its ``..`` entry.
+                    # Temporarily open only the root mode, move the exact inode,
+                    # and seal it again before accepting recovery publication.
+                    os.fchmod(object_descriptor, 0o700)
+                    os.fsync(object_descriptor)
+                    _require_named_identity(
+                        object_parent,
+                        object_leaf,
+                        (object_metadata.st_dev, object_metadata.st_ino),
+                        PackInstallRefusalCodeV1.OBJECT_CONFLICT,
+                        PackInstallOperationV1.REMOVE,
+                        "installed object changed before the recovery move",
+                    )
                     os.rename(
                         object_leaf,
                         recovery_leaf,
                         src_dir_fd=object_parent,
                         dst_dir_fd=recovery_parent,
                     )
+                    os.fchmod(object_descriptor, 0o500)
+                    os.fsync(object_descriptor)
                     moved = os.stat(
                         recovery_leaf,
                         dir_fd=recovery_parent,
@@ -979,6 +1014,11 @@ def remove_deactivated_pack(
                     os.fsync(object_parent)
                     os.fsync(recovery_parent)
                 except (OSError, PackInstallRefused, ValueError) as error:
+                    try:
+                        os.fchmod(object_descriptor, 0o500)
+                        os.fsync(object_descriptor)
+                    except OSError:
+                        pass
                     _refuse(
                         PackInstallRefusalCodeV1.RECOVERY_MOVE_FAILED,
                         PackInstallOperationV1.REMOVE,
@@ -1489,10 +1529,19 @@ def _open_relative_parent(
         _close_suppress(current if current >= 0 else None)
 
 
-def _make_stage_read_only(
+def _make_stage_publishable(
     stage_descriptor: int,
     stage: ActivationEligiblePackStageV1,
 ) -> None:
+    """Seal payloads while retaining the root mode needed for a portable rename.
+
+    Linux permits a mode-0500 directory to move between parents.  macOS requires
+    owner write permission because the move updates the directory's ``..`` entry.
+    The stage root therefore remains 0700 until the atomic move; all contained
+    files and directories are already read-only, and the caller seals the root to
+    0500 before any registry activation.
+    """
+
     manifest = stage.manifest
     files, directories = _expected_tree(manifest)
     root_binding, file_bindings, directory_bindings = _scan_pack_tree(
@@ -1543,9 +1592,8 @@ def _make_stage_read_only(
                 mode=0o500,
                 operation=PackInstallOperationV1.INSTALL,
             )
-        os.fchmod(stage_descriptor, 0o500)
         os.fsync(stage_descriptor)
-        _verify_read_only_pack_tree(
+        _verify_publishable_pack_tree(
             stage_descriptor,
             manifest,
             operation=PackInstallOperationV1.INSTALL,
@@ -1554,6 +1602,38 @@ def _make_stage_read_only(
     finally:
         if not converted:
             _restore_stage_modes(stage_descriptor, manifest)
+
+
+def _rollback_pack_publication(
+    stage_descriptor: int,
+    manifest: PackManifestV1,
+    *,
+    staging_descriptor: int,
+    stage_name: str,
+    object_parent: int,
+    object_leaf: str,
+) -> bool:
+    """Best-effort rollback when a moved stage cannot be sealed durably."""
+
+    try:
+        os.fchmod(stage_descriptor, 0o700)
+        os.rename(
+            object_leaf,
+            stage_name,
+            src_dir_fd=object_parent,
+            dst_dir_fd=staging_descriptor,
+        )
+        _restore_stage_modes(stage_descriptor, manifest)
+        os.fsync(object_parent)
+        os.fsync(staging_descriptor)
+        return True
+    except OSError:
+        try:
+            os.fchmod(stage_descriptor, 0o500)
+            os.fsync(stage_descriptor)
+        except OSError:
+            pass
+        return False
 
 
 def _restore_stage_modes(stage_descriptor: int, manifest: PackManifestV1) -> None:
@@ -1587,6 +1667,33 @@ def _verify_read_only_pack_tree(
         files,
         directories,
         root_mode=0o500,
+        file_mode=0o400,
+        directory_mode=0o500,
+        operation=operation,
+    )
+    _verify_tree_payloads(
+        root_descriptor,
+        manifest,
+        file_bindings,
+        expected_file_mode=0o400,
+        operation=operation,
+    )
+
+
+def _verify_publishable_pack_tree(
+    root_descriptor: int,
+    manifest: PackManifestV1,
+    *,
+    operation: PackInstallOperationV1,
+) -> None:
+    """Verify a sealed payload tree whose root awaits cross-parent movement."""
+
+    files, directories = _expected_tree(manifest)
+    _, file_bindings, _ = _scan_pack_tree(
+        root_descriptor,
+        files,
+        directories,
+        root_mode=0o700,
         file_mode=0o400,
         directory_mode=0o500,
         operation=operation,

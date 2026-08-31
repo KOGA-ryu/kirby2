@@ -3075,13 +3075,7 @@ def _provenance_and_gate_truth_case(
     if not isinstance(implementation, dict):
         raise TypeError("audit provenance implementation manifest is not an object")
     repository = Path(__file__).resolve().parents[2]
-    expected_paths = {
-        "kirby2/__init__.py",
-        "kirby2/__main__.py",
-        "kirby2/immutable.py",
-        "kirby2/runtime_state.py",
-        "pyproject.toml",
-    }
+    expected_paths = set(audit_runner._PROVENANCE_TOP_LEVEL_FILES)
     for root_name in audit_runner.PROVENANCE_PACKAGE_ROOTS:
         package_root = repository / "kirby2" / root_name
         expected_paths.update(

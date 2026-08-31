@@ -142,7 +142,7 @@ def load_hostile_archive_fixture_specs(
 ) -> tuple[HostileArchiveFixtureSpecV1, ...]:
     """Load the exact committed fixture inventory without following a symlink."""
 
-    if type(path) is not Path:
+    if not isinstance(path, Path):
         raise TypeError("hostile archive fixture manifest path must be pathlib.Path")
     if path.is_symlink() or not path.is_file():
         raise ValueError("hostile archive fixture manifest must be a regular file")

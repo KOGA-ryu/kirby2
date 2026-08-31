@@ -77,11 +77,17 @@ PROVENANCE_PACKAGE_ROOTS = (
     "research",
     "full_day",
     "mining",
+    "instructor",
+    "microscope",
+    "orchestration",
+    "packs",
+    "release",
 )
 _PROVENANCE_TOP_LEVEL_FILES = (
     "kirby2/__init__.py",
     "kirby2/__main__.py",
     "kirby2/immutable.py",
+    "kirby2/pseudonyms.py",
     "kirby2/runtime_state.py",
     "pyproject.toml",
 )

@@ -723,13 +723,40 @@ def _sample_checks(samples: _SampleBuildSetV1) -> dict[str, bool]:
             and item.manifest.license == _sample_license()
             for item in samples.builds
         ),
-        "custom_sample_capabilities_are_bound_to_their_source_manifests": (
+        "custom_sample_capabilities_are_bound_with_their_adapter_identity": (
             strategy.manifest.capability_labels
-            == tuple(groups["traffic_light_strategy"].manifest["capability_labels"])
+            == tuple(
+                sorted(
+                    (
+                        *groups["traffic_light_strategy"].manifest[
+                            "capability_labels"
+                        ],
+                        strategy.index.adapter_id,
+                    )
+                )
+            )
             and historical.manifest.capability_labels
-            == tuple(groups["historical_reconstruction"].manifest["capability_labels"])
+            == tuple(
+                sorted(
+                    (
+                        *groups["historical_reconstruction"].manifest[
+                            "capability_labels"
+                        ],
+                        historical.index.adapter_id,
+                    )
+                )
+            )
             and lesson.manifest.capability_labels
-            == tuple(groups["portable_completed_lesson"].manifest["capability_labels"])
+            == tuple(
+                sorted(
+                    (
+                        *groups["portable_completed_lesson"].manifest[
+                            "capability_labels"
+                        ],
+                        lesson.index.adapter_id,
+                    )
+                )
+            )
         ),
         "curriculum_binds_exact_content_derived_scenario_dependency": (
             len(dependency) == 1
