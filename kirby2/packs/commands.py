@@ -7,12 +7,14 @@ from pathlib import Path
 
 from kirby2.cli.registry import CommandModule, CommandSpec
 from kirby2.research.paths import DataAreaId, DataPaths
+from kirby2.research.store import DEFAULT_RESEARCH_STORE
 
 from .archive import preflight_pack_archive_bytes, read_pack_archive_bytes
 from .builders import (
     DomainPackBuildV1,
     build_domain_pack,
     build_pack_source_directory,
+    build_registered_run_pack,
     runtime_environment_for_verified_pack_v1,
     verify_domain_pack_archive_bytes,
     write_new_pack_archive,
@@ -59,6 +61,14 @@ def _configure_pack(parser: argparse.ArgumentParser) -> None:
     build.add_argument("source_directory", type=Path)
     build.add_argument("--output", type=Path)
 
+    export_run = actions.add_parser(
+        "export-run",
+        help="package only one verified run's manifest-registered artifacts",
+    )
+    export_run.add_argument("run_id")
+    export_run.add_argument("--store", type=Path, default=DEFAULT_RESEARCH_STORE)
+    export_run.add_argument("--output", type=Path)
+
     inspect = actions.add_parser(
         "inspect",
         help="inspect a fully preflighted manifest without installing",
@@ -98,6 +108,20 @@ def _handle_pack(args: argparse.Namespace) -> int:
         output = args.output or _default_output(build)
         target = write_new_pack_archive(build, output)
         _print_json(_build_result(build, target))
+        return 0
+    if args.pack_action == "export-run":
+        build = build_registered_run_pack(args.store, args.run_id)
+        output = args.output or _default_output(build)
+        target = write_new_pack_archive(build, output)
+        result = _build_result(build, target)
+        result.update(
+            {
+                "run_id": args.run_id,
+                "source_policy": "MANIFEST_REGISTERED_ARTIFACTS_ONLY",
+                "status": "EXPORTED",
+            }
+        )
+        _print_json(result)
         return 0
     if args.pack_action == "inspect":
         raw = read_pack_archive_bytes(args.archive)
@@ -248,7 +272,7 @@ PACK_COMMAND_MODULE = CommandModule(
         CommandSpec(
             command_id="PACK_LIFECYCLE",
             name="pack",
-            help="build, inspect, verify, install, list, or remove data-only packs",
+            help="build, export, inspect, verify, install, list, or remove data-only packs",
             handler=_handle_pack,
             configure=_configure_pack,
         ),

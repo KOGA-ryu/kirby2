@@ -22,6 +22,12 @@ from pathlib import Path, PurePosixPath
 
 from kirby2 import __version__
 
+from .analysis_pack import (
+    ANALYSIS_PACK_ADAPTER_V1,
+    ANALYSIS_PROVENANCE_SCHEMA_ID_V1,
+    AnalysisProvenanceRecordV1,
+    validate_analysis_pack,
+)
 from .archive import PackArchivePreflightV1, preflight_pack_archive_bytes
 from .curriculum_pack import (
     CURRICULUM_PACK_ADAPTER_V1,
@@ -34,19 +40,23 @@ from .formats import (
     K2PACK_ZIP_COMPRESSION,
     canonical_manifest_bytes,
     inspect_payload_format_claim,
+    load_canonical_json_bytes,
     normalized_archive_paths,
     normalized_zip_info,
     require_relative_pack_path,
 )
 from .identity import verify_pack_payload_identity
+from .historical_pack import HISTORICAL_PACK_ADAPTER_V1, validate_historical_pack
 from .lesson_pack import LESSON_PACK_ADAPTER_V1, validate_lesson_pack
 from .models import (
     PackCompatibilityLevelV1,
     PackCompatibilityV1,
     PackContentFormatV1,
     PackContentModeV1,
+    PackCreatorV1,
     PackEntrypointV1,
     PackFileV1,
+    PackLicenseV1,
     PackManifestV1,
     PackProvenanceV1,
     PackRedistributionPolicyV1,
@@ -55,6 +65,20 @@ from .models import (
     PackVersionRequirementV1,
 )
 from .profile_pack import PROFILE_PACK_ADAPTER_V1, validate_profile_pack
+from .replay_pack import (
+    REPLAY_COMPATIBILITY_SCHEMA_ID_V1,
+    REPLAY_ENGINE_COMPONENT_ID_V1,
+    REPLAY_PACK_ADAPTER_V1,
+    REPLAY_RENDERER_COMPONENT_ID_V1,
+    REPLAY_RESULT_BINDING_SCHEMA_ID_V1,
+    REPLAY_RUN_MANIFEST_SCHEMA_ID_V1,
+    ReplayCompatibilityRecordV1,
+    ReplayResultBindingV1,
+    replay_role_for_artifact,
+    replay_registered_schema_id,
+    validate_replay_pack,
+)
+from .research_pack import RESEARCH_PACK_ADAPTER_V1, validate_research_pack
 from .scenario_pack import SCENARIO_PACK_ADAPTER_V1, validate_scenario_pack
 from .strategy_pack import STRATEGY_PACK_ADAPTER_V1, validate_strategy_pack
 from .types import (
@@ -69,8 +93,10 @@ from .types import (
     DomainPackIndexV1,
     DomainPackRefusalCodeV1,
     DomainPackRefused,
+    PackArtifactRoleV1,
     PackArtifactStorageModeV1,
     PackBuildSpecificationV1,
+    PackSourceArtifactV1,
     PreservedExactBytesV1,
     validate_adapter_inventory,
 )
@@ -190,7 +216,7 @@ def domain_pack_adapter_v1(pack_type: PackTypeV1) -> DomainPackAdapterContractV1
     if contract is None:
         raise DomainPackRefused(
             DomainPackRefusalCodeV1.UNSUPPORTED_PACK_TYPE,
-            f"WO39-D1 does not build pack type {pack_type.value}",
+            f"WO39-D does not build pack type {pack_type.value}",
         )
     return contract
 
@@ -236,6 +262,412 @@ def build_pack_source_directory(source_directory: Path) -> DomainPackBuildV1:
     )
 
 
+def build_registered_run_pack(
+    store_root: Path,
+    run_id: str,
+) -> DomainPackBuildV1:
+    """Export one verified run from its exact registered artifact inventory.
+
+    The run directory is never enumerated.  The canonical manifest is loaded by its
+    owning store, verified, and then each declared ``ArtifactReference`` is read by
+    exact confined path with no-follow semantics and rechecked against its digest.
+    Privacy-sensitive learner and instructor runs are refused here because their
+    ordinary run manifests do not contain the governed consent/redaction bundle
+    required by ``RESEARCH_PACK_ADAPTER_V1``.
+    """
+
+    from kirby2.research.models import RunManifest, RunType
+    from kirby2.research.store import RunStore
+
+    root = _trusted_source_directory(Path(store_root))
+    store = RunStore(root)
+    try:
+        verification = store.verify_run(run_id)
+        manifest = store.load_manifest(run_id)
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_VERIFICATION_FAILED,
+            f"registered run could not be verified: {run_id}",
+        ) from error
+    if not verification.passed:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_VERIFICATION_FAILED,
+            "registered run verification failed: " + "; ".join(verification.failures),
+        )
+    if type(manifest) is not RunManifest or manifest.schema_version < 2:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_EXPORT_UNSUPPORTED,
+            "run export requires the typed artifact manifest schema",
+        )
+
+    sensitive_types = {
+        RunType.LEARNER_UPDATE,
+        RunType.INSTRUCTOR_ASSIGNMENT,
+        RunType.INSTRUCTOR_ATTEMPT,
+        RunType.INSTRUCTOR_RUBRIC,
+        RunType.INSTRUCTOR_REVIEW,
+    }
+    if manifest.run_type in sensitive_types:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RESEARCH_CONSENT_REQUIRED,
+            "privacy-sensitive runs must first become a governed consent/redaction export bundle",
+        )
+
+    run_directory = _trusted_source_directory(store.run_directory(run_id))
+    manifest_raw = _read_confined_regular_file(
+        run_directory,
+        "manifest.toml",
+        maximum_bytes=PACK_BUILD_MAX_SOURCE_DEFINITION_BYTES_V1,
+    )
+    if (
+        manifest.to_toml().encode("utf-8") != manifest_raw
+        or hashlib.sha256(manifest_raw).hexdigest()
+        != hashlib.sha256(manifest.to_toml().encode("utf-8")).hexdigest()
+    ):
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_ARTIFACT_UNSAFE,
+            "verified run manifest changed before export capture",
+        )
+
+    registered: list[tuple[object, bytes]] = []
+    total = len(manifest_raw)
+    for reference in manifest.artifacts:
+        raw = _read_confined_regular_file(
+            run_directory,
+            reference.relative_path,
+            maximum_bytes=MAX_ORIGINAL_ARTIFACT_BYTES_V1,
+        )
+        if hashlib.sha256(raw).hexdigest() != reference.sha256:
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.RUN_ARTIFACT_UNSAFE,
+                f"registered artifact changed before export capture: {reference.name}",
+            )
+        total += len(raw)
+        if total > MAX_DOMAIN_TOTAL_BYTES_V1:
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.SOURCE_TOO_LARGE,
+                "registered run artifacts exceed the domain-pack byte bound",
+            )
+        registered.append((reference, raw))
+
+    analysis_types = {
+        RunType.LESSON,
+        RunType.LESSON_MINING,
+        RunType.LESSON_REVIEW,
+        RunType.LESSON_BUILD,
+    }
+    if manifest.run_type in analysis_types:
+        specification, originals = _analysis_run_export_inputs(
+            manifest,
+            manifest_raw,
+            tuple(registered),
+        )
+    else:
+        specification, originals = _replay_run_export_inputs(
+            manifest,
+            manifest_raw,
+            tuple(registered),
+        )
+    return build_domain_pack(specification, originals)
+
+
+def _replay_run_export_inputs(
+    manifest: object,
+    manifest_raw: bytes,
+    registered: tuple[tuple[object, bytes], ...],
+) -> tuple[PackBuildSpecificationV1, dict[str, bytes]]:
+    from kirby2.research.models import ArtifactReference, RunManifest
+
+    if type(manifest) is not RunManifest or not registered:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_EXPORT_UNSUPPORTED,
+            "replay export requires a typed run with registered artifacts",
+        )
+    manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+    compatibility = ReplayCompatibilityRecordV1(
+        run_id=manifest.run_id,
+        run_manifest_sha256=manifest_sha256,
+        engine_component_id=REPLAY_ENGINE_COMPONENT_ID_V1,
+        engine_version=manifest.software_version,
+        renderer_component_id=REPLAY_RENDERER_COMPONENT_ID_V1,
+        renderer_version=__version__,
+    )
+    result = ReplayResultBindingV1.from_manifest(manifest)
+    originals: dict[str, bytes] = {
+        "replay-compatibility": compatibility.canonical_bytes(),
+        "replay-result-binding": result.canonical_bytes(),
+        "run-manifest": manifest_raw,
+    }
+    declarations: list[PackSourceArtifactV1] = [
+        PackSourceArtifactV1(
+            artifact_id="replay-compatibility",
+            role=PackArtifactRoleV1.REPLAY_COMPATIBILITY,
+            source_path="generated/replay-compatibility.json",
+            original_schema_id=REPLAY_COMPATIBILITY_SCHEMA_ID_V1,
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="REPLAY_COMPATIBILITY_SHA256",
+            logical_identity_sha256=hashlib.sha256(
+                compatibility.canonical_bytes()
+            ).hexdigest(),
+            direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+        ),
+        PackSourceArtifactV1(
+            artifact_id="replay-result-binding",
+            role=PackArtifactRoleV1.REPLAY_RESULT_BINDING,
+            source_path="generated/replay-result-binding.json",
+            original_schema_id=REPLAY_RESULT_BINDING_SCHEMA_ID_V1,
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="REPLAY_RESULT_BINDING_SHA256",
+            logical_identity_sha256=hashlib.sha256(
+                result.canonical_bytes()
+            ).hexdigest(),
+            direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+        ),
+        PackSourceArtifactV1(
+            artifact_id="run-manifest",
+            role=PackArtifactRoleV1.REPLAY_RUN_MANIFEST,
+            source_path="manifest.toml",
+            original_schema_id=REPLAY_RUN_MANIFEST_SCHEMA_ID_V1,
+            original_schema_version=manifest.schema_version,
+            original_media_type="application/toml",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="RUN_ID",
+            logical_identity_sha256=hashlib.sha256(
+                manifest.run_id.encode("ascii")
+            ).hexdigest(),
+            direct_content_format=PackContentFormatV1.TOML,
+        ),
+    ]
+    for ordinal, item in enumerate(registered):
+        reference, raw = item
+        if type(reference) is not ArtifactReference or type(raw) is not bytes:
+            raise TypeError("registered replay inputs must retain typed references")
+        artifact_id = _registered_artifact_id(ordinal, reference.sha256)
+        storage_mode, content_format = _registered_storage(reference, raw)
+        originals[artifact_id] = raw
+        declarations.append(
+            PackSourceArtifactV1(
+                artifact_id=artifact_id,
+                role=replay_role_for_artifact(reference),
+                source_path=reference.relative_path,
+                original_schema_id=replay_registered_schema_id(reference),
+                original_schema_version=reference.schema_version,
+                original_media_type=reference.media_type,
+                storage_mode=storage_mode,
+                logical_identity_kind="RUN_ARTIFACT_SHA256",
+                logical_identity_sha256=reference.sha256,
+                direct_content_format=content_format,
+            )
+        )
+    return (
+        PackBuildSpecificationV1(
+            namespace="kirby2.local",
+            name=f"{manifest.run_id}-replay",
+            title=f"Kirby2 verified replay evidence {manifest.run_id}",
+            version="1.0.0",
+            creator=_local_run_export_creator(),
+            pack_type=PackTypeV1.REPLAY,
+            primary_artifact_id="run-manifest",
+            dependencies=(),
+            license=_local_evidence_license(),
+            capability_labels=(
+                "LOCAL_EVIDENCE",
+                "REGISTERED_ARTIFACTS_ONLY",
+                "RUN_IDENTITY_PRESERVED",
+            ),
+            artifacts=tuple(sorted(declarations, key=lambda item: item.artifact_id)),
+        ),
+        originals,
+    )
+
+
+def _analysis_run_export_inputs(
+    manifest: object,
+    manifest_raw: bytes,
+    registered: tuple[tuple[object, bytes], ...],
+) -> tuple[PackBuildSpecificationV1, dict[str, bytes]]:
+    from kirby2.research.models import ArtifactReference, ArtifactType, RunManifest
+
+    if type(manifest) is not RunManifest or not registered:
+        raise DomainPackRefused(
+            DomainPackRefusalCodeV1.RUN_EXPORT_UNSUPPORTED,
+            "analysis export requires canonical registered report artifacts",
+        )
+    annotation_types = {
+        ArtifactType.FULL_DAY_REVIEW_SELECTION,
+        ArtifactType.FULL_DAY_REVIEW_PACKET,
+        ArtifactType.FULL_DAY_REVIEWER_SIDECAR,
+        ArtifactType.LESSON_REVIEW_SIDECAR,
+        ArtifactType.LESSON_TECHNICAL_REVIEW_PACKET,
+        ArtifactType.INSTRUCTOR_REVIEW_SIDECAR,
+    }
+    originals: dict[str, bytes] = {}
+    declarations: list[PackSourceArtifactV1] = []
+    report_ids: list[str] = []
+    data_digests: list[str] = []
+    for ordinal, item in enumerate(registered):
+        reference, raw = item
+        if type(reference) is not ArtifactReference or type(raw) is not bytes:
+            raise TypeError("registered analysis inputs must retain typed references")
+        if reference.media_type not in {
+            "application/json",
+            "application/vnd.kirby2.report+json",
+        }:
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.RUN_EXPORT_UNSUPPORTED,
+                f"analysis export refuses non-report artifact: {reference.name}",
+            )
+        try:
+            load_canonical_json_bytes(raw, "registered analysis artifact")
+        except (TypeError, ValueError) as error:
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.RUN_EXPORT_UNSUPPORTED,
+                f"analysis export requires canonical JSON: {reference.name}",
+            ) from error
+        artifact_id = _registered_artifact_id(ordinal, reference.sha256)
+        role = (
+            PackArtifactRoleV1.ANALYSIS_ANNOTATIONS
+            if reference.artifact_type in annotation_types
+            else PackArtifactRoleV1.ANALYSIS_REPORT_DATA
+        )
+        if role is PackArtifactRoleV1.ANALYSIS_REPORT_DATA:
+            report_ids.append(artifact_id)
+        originals[artifact_id] = raw
+        data_digests.append(reference.sha256)
+        declarations.append(
+            PackSourceArtifactV1(
+                artifact_id=artifact_id,
+                role=role,
+                source_path=reference.relative_path,
+                original_schema_id=replay_registered_schema_id(reference),
+                original_schema_version=reference.schema_version,
+                original_media_type=reference.media_type,
+                storage_mode=PackArtifactStorageModeV1.DIRECT,
+                logical_identity_kind="RUN_ARTIFACT_SHA256",
+                logical_identity_sha256=reference.sha256,
+                direct_content_format=(
+                    PackContentFormatV1.REPORT_DATA
+                    if reference.media_type == "application/vnd.kirby2.report+json"
+                    else PackContentFormatV1.CANONICAL_JSON
+                ),
+            )
+        )
+    if not report_ids:
+        first = declarations[0]
+        declarations[0] = PackSourceArtifactV1(
+            artifact_id=first.artifact_id,
+            role=PackArtifactRoleV1.ANALYSIS_REPORT_DATA,
+            source_path=first.source_path,
+            original_schema_id=first.original_schema_id,
+            original_schema_version=first.original_schema_version,
+            original_media_type=first.original_media_type,
+            storage_mode=first.storage_mode,
+            logical_identity_kind=first.logical_identity_kind,
+            logical_identity_sha256=first.logical_identity_sha256,
+            direct_content_format=first.direct_content_format,
+        )
+        report_ids.append(first.artifact_id)
+    provenance = AnalysisProvenanceRecordV1(
+        source_run_id=manifest.run_id,
+        source_run_manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        source_artifact_sha256s=tuple(sorted(data_digests)),
+    )
+    originals["analysis-provenance"] = provenance.canonical_bytes()
+    declarations.append(
+        PackSourceArtifactV1(
+            artifact_id="analysis-provenance",
+            role=PackArtifactRoleV1.ANALYSIS_PROVENANCE,
+            source_path="generated/analysis-provenance.json",
+            original_schema_id=ANALYSIS_PROVENANCE_SCHEMA_ID_V1,
+            original_schema_version=1,
+            original_media_type="application/json",
+            storage_mode=PackArtifactStorageModeV1.DIRECT,
+            logical_identity_kind="ANALYSIS_PROVENANCE_SHA256",
+            logical_identity_sha256=hashlib.sha256(
+                provenance.canonical_bytes()
+            ).hexdigest(),
+            direct_content_format=PackContentFormatV1.CANONICAL_JSON,
+        )
+    )
+    return (
+        PackBuildSpecificationV1(
+            namespace="kirby2.local",
+            name=f"{manifest.run_id}-analysis",
+            title=f"Kirby2 canonical analysis evidence {manifest.run_id}",
+            version="1.0.0",
+            creator=_local_run_export_creator(),
+            pack_type=PackTypeV1.ANALYSIS,
+            primary_artifact_id=report_ids[0],
+            dependencies=(),
+            license=_local_evidence_license(),
+            capability_labels=(
+                "CANONICAL_REPORT_DATA_ONLY",
+                "LOCAL_EVIDENCE",
+                "REGISTERED_ARTIFACTS_ONLY",
+            ),
+            artifacts=tuple(sorted(declarations, key=lambda item: item.artifact_id)),
+        ),
+        originals,
+    )
+
+
+def _registered_storage(
+    reference: object,
+    raw: bytes,
+) -> tuple[PackArtifactStorageModeV1, PackContentFormatV1 | None]:
+    from kirby2.research.models import ArtifactReference
+
+    if type(reference) is not ArtifactReference or type(raw) is not bytes:
+        raise TypeError("registered artifact storage selection requires exact inputs")
+    if reference.media_type == "application/toml":
+        return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.TOML
+    if reference.media_type == "application/vnd.apache.parquet":
+        return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.PARQUET
+    if reference.media_type == "application/x-ndjson":
+        return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.CANONICAL_EVENT_STREAM
+    if reference.media_type in {"application/json", "application/vnd.kirby2.report+json"}:
+        try:
+            load_canonical_json_bytes(raw, "registered JSON artifact")
+        except (TypeError, ValueError):
+            return PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE, None
+        return (
+            PackArtifactStorageModeV1.DIRECT,
+            (
+                PackContentFormatV1.REPORT_DATA
+                if reference.media_type == "application/vnd.kirby2.report+json"
+                else PackContentFormatV1.CANONICAL_JSON
+            ),
+        )
+    if reference.media_type in _BINARY_DIRECT_SUFFIXES:
+        return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.BINARY_EVIDENCE
+    return PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE, None
+
+
+def _registered_artifact_id(ordinal: int, digest: str) -> str:
+    return f"registered-{ordinal:04d}-{digest[:16]}"
+
+
+def _local_run_export_creator() -> PackCreatorV1:
+    return PackCreatorV1(
+        display_name="Kirby2 local run exporter",
+        identity_uri="urn:kirby2:local-run-exporter-v1",
+    )
+
+
+def _local_evidence_license() -> PackLicenseV1:
+    return PackLicenseV1(
+        license_id="KIRBY2_LOCAL_EVIDENCE_V1",
+        license_name="Kirby2 local evidence; inspect source rights before redistribution",
+        license_uri="urn:kirby2:license:local-evidence-v1",
+        redistribution_policy=PackRedistributionPolicyV1.CONDITIONAL,
+        content_mode=PackContentModeV1.SELF_CONTAINED,
+    )
+
+
 def build_domain_pack(
     specification: PackBuildSpecificationV1,
     original_artifacts: Mapping[str, bytes],
@@ -274,8 +706,8 @@ def build_domain_pack(
 
         require_sha256(source_definition_sha256, "pack source-definition digest")
 
-    _validate_content_license(specification)
     contract = domain_pack_adapter_v1(specification.pack_type)
+    _validate_content_license(specification, contract)
     validate_adapter_inventory(
         contract,
         specification.pack_type,
@@ -346,7 +778,7 @@ def build_domain_pack(
         primary_artifact_id=specification.primary_artifact_id,
         artifacts=tuple(sorted(artifact_rows, key=lambda item: item.sort_key)),
     )
-    _validate_domain(index, originals)
+    _validate_domain(index, originals, license=specification.license)
     index_bytes = index.canonical_bytes()
     payloads[DOMAIN_PACK_INDEX_PATH_V1] = index_bytes
     inventory_rows.append(
@@ -496,7 +928,7 @@ def verify_domain_pack_archive_bytes(
                 f"restored original bytes differ: {row.artifact_id}",
             )
         originals[row.artifact_id] = original
-    _validate_domain(index, originals)
+    _validate_domain(index, originals, license=manifest.license)
     return DomainPackVerificationV1(
         preflight=preflight,
         index=index,
@@ -506,7 +938,7 @@ def verify_domain_pack_archive_bytes(
 
 
 def builtin_pack_runtime_environment_v1() -> PackRuntimeEnvironmentV1:
-    """Return only the five adapter/schema capabilities compiled into this card."""
+    """Return only the nine exact adapter/schema capabilities compiled into WO39-D."""
 
     contracts = tuple(_adapter_contracts().values())
     schemas = {
@@ -608,20 +1040,33 @@ def _adapter_contracts() -> dict[PackTypeV1, DomainPackAdapterContractV1]:
         PackTypeV1.CURRICULUM: CURRICULUM_PACK_ADAPTER_V1,
         PackTypeV1.STRATEGY: STRATEGY_PACK_ADAPTER_V1,
         PackTypeV1.MARKET_PROFILE: PROFILE_PACK_ADAPTER_V1,
+        PackTypeV1.HISTORICAL: HISTORICAL_PACK_ADAPTER_V1,
+        PackTypeV1.REPLAY: REPLAY_PACK_ADAPTER_V1,
+        PackTypeV1.ANALYSIS: ANALYSIS_PACK_ADAPTER_V1,
+        PackTypeV1.RESEARCH: RESEARCH_PACK_ADAPTER_V1,
     }
 
 
 def _validate_domain(
     index: DomainPackIndexV1,
     originals: Mapping[str, bytes],
+    *,
+    license: PackLicenseV1,
 ) -> None:
+    _validate_embedded_evidence_identities(index, originals)
     validators = {
         PackTypeV1.SCENARIO: validate_scenario_pack,
         PackTypeV1.LESSON: validate_lesson_pack,
         PackTypeV1.CURRICULUM: validate_curriculum_pack,
         PackTypeV1.STRATEGY: validate_strategy_pack,
         PackTypeV1.MARKET_PROFILE: validate_profile_pack,
+        PackTypeV1.REPLAY: validate_replay_pack,
+        PackTypeV1.ANALYSIS: validate_analysis_pack,
+        PackTypeV1.RESEARCH: validate_research_pack,
     }
+    if index.pack_type is PackTypeV1.HISTORICAL:
+        validate_historical_pack(index, originals, license=license)
+        return
     validator = validators.get(index.pack_type)
     if validator is None:
         raise DomainPackRefused(
@@ -631,14 +1076,82 @@ def _validate_domain(
     validator(index, originals)
 
 
-def _validate_content_license(specification: PackBuildSpecificationV1) -> None:
+def _validate_embedded_evidence_identities(
+    index: DomainPackIndexV1,
+    originals: Mapping[str, bytes],
+) -> None:
+    """Require optional run/audit rows to retain an owning or exact-byte identity."""
+
+    from kirby2.research.models import RunManifest
+
+    for role in (PackArtifactRoleV1.EMBEDDED_RUN, PackArtifactRoleV1.EMBEDDED_AUDIT):
+        for row in index.artifacts_for(role):
+            raw = originals.get(row.artifact_id)
+            if type(raw) is not bytes:
+                raise DomainPackRefused(
+                    DomainPackRefusalCodeV1.ARTIFACT_INVENTORY_INVALID,
+                    f"embedded evidence bytes are absent: {row.artifact_id}",
+                )
+            if row.logical_identity_sha256 == hashlib.sha256(raw).hexdigest():
+                continue
+            if role is PackArtifactRoleV1.EMBEDDED_RUN:
+                try:
+                    payload = tomllib.loads(raw.decode("utf-8"))
+                    manifest = RunManifest.from_dict(payload)
+                except (UnicodeDecodeError, tomllib.TOMLDecodeError, TypeError, ValueError):
+                    manifest = None
+                if (
+                    manifest is not None
+                    and manifest.to_toml().encode("utf-8") == raw
+                    and row.logical_identity_sha256
+                    == hashlib.sha256(manifest.run_id.encode("ascii")).hexdigest()
+                ):
+                    continue
+            try:
+                payload = load_canonical_json_bytes(raw, "embedded evidence")
+            except (TypeError, ValueError):
+                payload = None
+            if payload is not None and row.logical_identity_sha256 in _all_text_values(
+                payload
+            ):
+                continue
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.ARTIFACT_IDENTITY_MISMATCH,
+                f"embedded {role.value} does not retain an authoritative identity",
+            )
+
+
+def _all_text_values(value: object) -> frozenset[str]:
+    found: set[str] = set()
+
+    def visit(item: object) -> None:
+        if type(item) is str:
+            found.add(item)
+        elif type(item) is dict:
+            for child in item.values():
+                visit(child)
+        elif type(item) in {list, tuple}:
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return frozenset(found)
+
+
+def _validate_content_license(
+    specification: PackBuildSpecificationV1,
+    contract: DomainPackAdapterContractV1,
+) -> None:
     license = specification.license
-    if license.content_mode is not PackContentModeV1.SELF_CONTAINED:
+    if license.content_mode not in contract.allowed_content_modes:
         raise DomainPackRefused(
             DomainPackRefusalCodeV1.LICENSE_CONTENT_REFUSED,
-            "WO39-D1 artifact packs contain exact bytes and require SELF_CONTAINED mode",
+            f"{contract.adapter_id} does not allow {license.content_mode.value} mode",
         )
-    if license.redistribution_policy is PackRedistributionPolicyV1.PROHIBITED:
+    if (
+        license.content_mode is PackContentModeV1.SELF_CONTAINED
+        and license.redistribution_policy is PackRedistributionPolicyV1.PROHIBITED
+    ):
         raise DomainPackRefused(
             DomainPackRefusalCodeV1.LICENSE_CONTENT_REFUSED,
             "self-contained pack construction is refused by the declared policy",
@@ -651,9 +1164,12 @@ def _validate_manifest_domain_binding(
     contract: DomainPackAdapterContractV1,
 ) -> None:
     if (
-        manifest.license.content_mode is not PackContentModeV1.SELF_CONTAINED
-        or manifest.license.redistribution_policy
-        is PackRedistributionPolicyV1.PROHIBITED
+        manifest.license.content_mode not in contract.allowed_content_modes
+        or (
+            manifest.license.content_mode is PackContentModeV1.SELF_CONTAINED
+            and manifest.license.redistribution_policy
+            is PackRedistributionPolicyV1.PROHIBITED
+        )
     ):
         raise DomainPackRefused(
             DomainPackRefusalCodeV1.LICENSE_CONTENT_REFUSED,
@@ -699,7 +1215,7 @@ def _validate_manifest_domain_binding(
     if (
         not readable.supported
         or not installable.supported
-        or not executable.supported
+        or executable.supported is not contract.supports_execution
         or replay.supported is not contract.supports_replay_equivalence
     ):
         raise DomainPackRefused(
@@ -911,12 +1427,19 @@ def _compatibility(
             compilers=(compiler,),
             schemas=schemas,
         ),
-        PackCompatibilityV1(
-            level=PackCompatibilityLevelV1.EXECUTABLE,
-            supported=True,
-            engine=engine,
-            compilers=(compiler,),
-            schemas=schemas,
+        (
+            PackCompatibilityV1(
+                level=PackCompatibilityLevelV1.EXECUTABLE,
+                supported=True,
+                engine=engine,
+                compilers=(compiler,),
+                schemas=schemas,
+            )
+            if contract.supports_execution
+            else PackCompatibilityV1(
+                level=PackCompatibilityLevelV1.EXECUTABLE,
+                supported=False,
+            )
         ),
         (
             PackCompatibilityV1(
@@ -1107,6 +1630,7 @@ __all__ = [
     "DomainPackVerificationV1",
     "build_domain_pack",
     "build_pack_source_directory",
+    "build_registered_run_pack",
     "builtin_pack_runtime_environment_v1",
     "domain_pack_adapter_v1",
     "runtime_environment_for_verified_pack_v1",

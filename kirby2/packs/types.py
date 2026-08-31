@@ -27,6 +27,7 @@ from .formats import (
 )
 from .models import (
     PackContentFormatV1,
+    PackContentModeV1,
     PackCreatorV1,
     PackDependencyV1,
     PackLicenseV1,
@@ -66,6 +67,17 @@ class DomainPackRefusalCodeV1(str, Enum):
     ARCHIVE_BUILD_FAILED = "ARCHIVE_BUILD_FAILED"
     DOMAIN_INDEX_INVALID = "DOMAIN_INDEX_INVALID"
     PACK_TYPE_MISMATCH = "PACK_TYPE_MISMATCH"
+    HISTORICAL_LICENSE_MISMATCH = "HISTORICAL_LICENSE_MISMATCH"
+    HISTORICAL_REFERENCE_VIOLATION = "HISTORICAL_REFERENCE_VIOLATION"
+    REPLAY_IDENTITY_MISMATCH = "REPLAY_IDENTITY_MISMATCH"
+    REPLAY_COMPATIBILITY_MISMATCH = "REPLAY_COMPATIBILITY_MISMATCH"
+    RENDERER_INJECTION_REFUSED = "RENDERER_INJECTION_REFUSED"
+    RESEARCH_CONSENT_REQUIRED = "RESEARCH_CONSENT_REQUIRED"
+    RESEARCH_REDACTION_VIOLATION = "RESEARCH_REDACTION_VIOLATION"
+    DIRECT_IDENTITY_REFUSED = "DIRECT_IDENTITY_REFUSED"
+    RUN_EXPORT_UNSUPPORTED = "RUN_EXPORT_UNSUPPORTED"
+    RUN_VERIFICATION_FAILED = "RUN_VERIFICATION_FAILED"
+    RUN_ARTIFACT_UNSAFE = "RUN_ARTIFACT_UNSAFE"
 
 
 class DomainPackRefused(ValueError):
@@ -88,7 +100,7 @@ class PackArtifactStorageModeV1(str, Enum):
 
 
 class PackArtifactRoleV1(str, Enum):
-    """Closed WO39-D1 artifact vocabulary.
+    """Closed WO39-D artifact vocabulary.
 
     Runs and audits are deliberately shared optional roles.  Their owning schemas
     and logical identities remain recorded by each artifact row.
@@ -124,6 +136,31 @@ class PackArtifactRoleV1(str, Enum):
     MARKET_PROFILE = "MARKET_PROFILE"
     PROFILE_PREREGISTRATION = "PROFILE_PREREGISTRATION"
     PROFILE_REVIEW_STATUS = "PROFILE_REVIEW_STATUS"
+
+    HISTORICAL_CAPABILITIES = "HISTORICAL_CAPABILITIES"
+    HISTORICAL_PROVENANCE = "HISTORICAL_PROVENANCE"
+    HISTORICAL_SOURCE_LICENSE = "HISTORICAL_SOURCE_LICENSE"
+    HISTORICAL_SOURCE_CONTENT = "HISTORICAL_SOURCE_CONTENT"
+    HISTORICAL_SOURCE_REFERENCE = "HISTORICAL_SOURCE_REFERENCE"
+    HISTORICAL_DERIVED_EVIDENCE = "HISTORICAL_DERIVED_EVIDENCE"
+
+    REPLAY_RUN_MANIFEST = "REPLAY_RUN_MANIFEST"
+    REPLAY_COMPATIBILITY = "REPLAY_COMPATIBILITY"
+    REPLAY_RESULT_BINDING = "REPLAY_RESULT_BINDING"
+    REPLAY_CHECKPOINT = "REPLAY_CHECKPOINT"
+    REPLAY_EVENT_ARTIFACT = "REPLAY_EVENT_ARTIFACT"
+    REPLAY_RESULT_ARTIFACT = "REPLAY_RESULT_ARTIFACT"
+    REPLAY_REGISTERED_ARTIFACT = "REPLAY_REGISTERED_ARTIFACT"
+
+    ANALYSIS_REPORT_DATA = "ANALYSIS_REPORT_DATA"
+    ANALYSIS_ANNOTATIONS = "ANALYSIS_ANNOTATIONS"
+    ANALYSIS_PROVENANCE = "ANALYSIS_PROVENANCE"
+
+    RESEARCH_EXPORT_MANIFEST = "RESEARCH_EXPORT_MANIFEST"
+    RESEARCH_EXPORT_INVENTORY = "RESEARCH_EXPORT_INVENTORY"
+    RESEARCH_REDACTED_EVIDENCE = "RESEARCH_REDACTED_EVIDENCE"
+    RESEARCH_REDACTION_MANIFEST = "RESEARCH_REDACTION_MANIFEST"
+    RESEARCH_CONSENT_DECISION = "RESEARCH_CONSENT_DECISION"
 
     EMBEDDED_RUN = "EMBEDDED_RUN"
     EMBEDDED_AUDIT = "EMBEDDED_AUDIT"
@@ -750,6 +787,10 @@ class DomainPackAdapterContractV1:
     multiple_roles: tuple[PackArtifactRoleV1, ...]
     primary_roles: tuple[PackArtifactRoleV1, ...]
     supports_replay_equivalence: bool
+    supports_execution: bool = True
+    allowed_content_modes: tuple[PackContentModeV1, ...] = (
+        PackContentModeV1.SELF_CONTAINED,
+    )
 
     def __post_init__(self) -> None:
         from .formats import require_semver
@@ -779,6 +820,23 @@ class DomainPackAdapterContractV1:
             raise ValueError("domain adapter primary roles must be required")
         if type(self.supports_replay_equivalence) is not bool:
             raise TypeError("domain adapter replay support must be a bool")
+        if type(self.supports_execution) is not bool:
+            raise TypeError("domain adapter execution support must be a bool")
+        if (
+            type(self.allowed_content_modes) is not tuple
+            or not self.allowed_content_modes
+            or any(
+                type(item) is not PackContentModeV1
+                for item in self.allowed_content_modes
+            )
+            or self.allowed_content_modes
+            != tuple(
+                sorted(set(self.allowed_content_modes), key=lambda item: item.value)
+            )
+        ):
+            raise ValueError(
+                "domain adapter content modes must be a canonical nonempty tuple"
+            )
 
 
 def validate_adapter_inventory(
@@ -787,7 +845,7 @@ def validate_adapter_inventory(
     primary_artifact_id: str,
     artifacts: tuple[PackSourceArtifactV1 | DomainArtifactIdentityV1, ...],
 ) -> None:
-    """Apply exact role/cardinality checks shared by all five adapters."""
+    """Apply exact role/cardinality checks shared by every WO39-D adapter."""
 
     if type(contract) is not DomainPackAdapterContractV1:
         raise TypeError("adapter inventory validation requires a contract")
