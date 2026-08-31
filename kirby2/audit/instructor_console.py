@@ -81,6 +81,7 @@ from kirby2.research.store import LearnerArtifactStore
 
 
 WO37A_AUDIT_CASE_COUNT = 6
+WO37B_AUDIT_CASE_COUNT = 4
 
 _LEARNER_ENTROPY = bytes(range(32))
 _INSTRUCTOR_ENTROPY = bytes(range(32, 64))
@@ -1818,8 +1819,240 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode("ascii")
 
 
+def audit_versioned_assignments_rubrics_reviews() -> tuple[
+    InstructorConsoleAuditCase,
+    ...,
+]:
+    """Exercise WO37-B through its public immutable instructor workflow."""
+
+    from kirby2.instructor.commands import build_instructor_demo
+
+    demo = build_instructor_demo(42)
+    cases = (
+        _wo37b_round_trip_case(demo),
+        _wo37b_assignment_lock_case(demo),
+        _wo37b_review_immutability_case(demo),
+        _wo37b_rubric_correction_case(demo),
+    )
+    expected_names = (
+        "assignment_attempt_review_artifacts_round_trip_exactly",
+        "attempt_runtime_parameters_cannot_bypass_assignment_locks",
+        "completed_reviews_preserve_attempts_and_refuse_later_operations",
+        "rubric_correction_creates_successor_sidecars_without_mutation",
+    )
+    if len(cases) != WO37B_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO37-B audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO37-B audit case order or identity changed")
+    return cases
+
+
+def _case_from_checks(
+    name: str,
+    detail: str,
+    checks: dict[str, bool],
+    evidence: dict[str, object],
+) -> InstructorConsoleAuditCase:
+    return InstructorConsoleAuditCase(
+        name=name,
+        detail=detail,
+        evidence={"checks": checks, **evidence},
+        failures=tuple(
+            key.replace("_", " ") for key, passed in checks.items() if not passed
+        ),
+    )
+
+
+def _wo37b_round_trip_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.commands import InstructorDemoV1, build_instructor_demo
+
+    raw = demo.canonical_bytes()
+    restored = InstructorDemoV1.from_json_bytes(raw)
+    repeated = build_instructor_demo(42)
+    checks = {
+        "canonical_bytes_round_trip": restored.canonical_bytes() == raw,
+        "deterministic_rebuild": repeated.canonical_bytes() == raw,
+        "one_assignment_six_attempts": (
+            restored.counts["assignments"] == 1
+            and restored.counts["attempts"] == 6
+        ),
+        "one_rubric_six_complete_reviews": (
+            restored.counts["rubrics"] == 1
+            and restored.counts["completed_reviews"] == 6
+        ),
+        "every_attempt_binds_exact_assignment": all(
+            item.assignment_revision.sha256 == restored.assignment.sha256
+            for item in restored.attempts
+        ),
+    }
+    return _case_from_checks(
+        "assignment_attempt_review_artifacts_round_trip_exactly",
+        (
+            f"demo={restored.demo_id} attempts={len(restored.attempts)} "
+            f"reviews={len(restored.review_bundle.reviews)}"
+        ),
+        checks,
+        {"demo_id": restored.demo_id, "demo_sha256": restored.sha256},
+    )
+
+
+def _wo37b_assignment_lock_case(demo: object) -> InstructorConsoleAuditCase:
+    from dataclasses import replace
+
+    from kirby2.instructor.assignments import bind_assignment_attempt
+
+    attempt = demo.attempts[0]
+    original_bytes = attempt.canonical_bytes()
+    tampered = replace(
+        attempt.runtime_parameters,
+        objective=attempt.runtime_parameters.objective + " [tampered]",
+    )
+    refused = _raises(
+        lambda: bind_assignment_attempt(
+            assignment_revision=attempt.assignment_revision,
+            learner_profile_id=attempt.learner_profile_id,
+            attempt_number=attempt.attempt_number,
+            run_id=attempt.run_id,
+            selected_lesson=attempt.selected_lesson,
+            selected_scenario_variation=attempt.selected_scenario_variation,
+            runtime_parameters=tampered,
+            consent_evidence=attempt.consent_evidence,
+            recorded_at_utc=attempt.recorded_at_utc,
+            deadline_clock_evidence=attempt.deadline_clock_evidence,
+        )
+    )
+    checks = {
+        "all_eight_lock_families_are_bound": set(
+            attempt.assignment_revision.spec.locks.as_dict()
+        )
+        == {
+            "hidden_state_reveal_policy",
+            "latency_sha256",
+            "liquidity_sha256",
+            "objective",
+            "seed_policy",
+            "strategy_sha256",
+            "venue_count",
+            "volume_sha256",
+        },
+        "runtime_snapshot_matches_assignment": (
+            attempt.runtime_parameters.lock_snapshot()
+            == attempt.assignment_revision.spec.locks
+        ),
+        "changed_objective_is_refused": refused,
+        "failed_bypass_did_not_mutate_attempt": attempt.canonical_bytes() == original_bytes,
+    }
+    return _case_from_checks(
+        "attempt_runtime_parameters_cannot_bypass_assignment_locks",
+        f"attempt={attempt.attempt_id} bypass_refused={refused}",
+        checks,
+        {
+            "assignment_id": attempt.assignment_revision.assignment_id,
+            "attempt_id": attempt.attempt_id,
+        },
+    )
+
+
+def _wo37b_review_immutability_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.reviews import ReviewOperationKindV1, mark_complete
+
+    review = demo.review_bundle.reviews[0]
+    attempt = next(
+        item for item in demo.attempts if item.attempt_id == review.attempt_id
+    )
+    review_bytes = review.canonical_bytes()
+    attempt_bytes = attempt.canonical_bytes()
+    operation_kinds = tuple(item.operation for item in review.sidecar.operations)
+    refused = _raises(lambda: mark_complete(review))
+    checks = {
+        "review_binds_exact_attempt": (
+            review.sidecar.attempt.attempt_id == attempt.attempt_id
+            and review.sidecar.attempt.attempt_sha256 == attempt.sha256
+        ),
+        "review_is_opened_replayed_traced_annotated_scored_and_completed": (
+            operation_kinds
+            == (
+                ReviewOperationKindV1.OPEN_ATTEMPT,
+                ReviewOperationKindV1.REPLAY_ATTEMPT,
+                ReviewOperationKindV1.INSPECT_CAUSAL_TRACE,
+                ReviewOperationKindV1.ANNOTATE_TIMELINE,
+                ReviewOperationKindV1.ATTACH_RUBRIC_RESULT,
+                ReviewOperationKindV1.MARK_COMPLETE,
+            )
+        ),
+        "second_completion_is_refused": refused,
+        "refusal_preserves_review": review.canonical_bytes() == review_bytes,
+        "review_workflow_preserves_source_attempt": attempt.canonical_bytes() == attempt_bytes,
+    }
+    return _case_from_checks(
+        "completed_reviews_preserve_attempts_and_refuse_later_operations",
+        f"review={review.review_id} operations={len(operation_kinds)} sealed={refused}",
+        checks,
+        {"operation_kinds": [item.value for item in operation_kinds]},
+    )
+
+
+def _wo37b_rubric_correction_case(demo: object) -> InstructorConsoleAuditCase:
+    from dataclasses import replace
+
+    from kirby2.instructor.rubrics import correct_rubric
+
+    source_rubric = demo.rubric
+    source_score = demo.review_bundle.scores[0]
+    rubric_bytes = source_rubric.canonical_bytes()
+    score_bytes = source_score.canonical_bytes()
+    corrected_content = replace(
+        source_rubric.content,
+        title=source_rubric.content.title + " corrected",
+        scoring_version=source_rubric.content.scoring_version + 1,
+    )
+    correction = correct_rubric(
+        source_rubric,
+        corrected_content,
+        source_score=source_score,
+        corrected_item_scores=source_score.item_scores,
+    )
+    checks = {
+        "rubric_revision_advances_once": (
+            correction.corrected_rubric.revision == source_rubric.revision + 1
+        ),
+        "corrected_rubric_binds_predecessor": (
+            correction.corrected_rubric.rubric.predecessor_record_id
+            == source_rubric.rubric_id
+            and correction.corrected_rubric.rubric.predecessor_sha256
+            == source_rubric.record_sha256
+        ),
+        "corrected_score_supersedes_source": (
+            correction.corrected_score.supersedes_score_id == source_score.score_id
+            and correction.corrected_score.supersedes_score_sha256 == source_score.sha256
+        ),
+        "attempt_binding_is_unchanged": (
+            correction.corrected_score.assignment_attempt_id
+            == source_score.assignment_attempt_id
+            and correction.corrected_score.assignment_attempt_sha256
+            == source_score.assignment_attempt_sha256
+        ),
+        "source_rubric_is_immutable": source_rubric.canonical_bytes() == rubric_bytes,
+        "source_score_is_immutable": source_score.canonical_bytes() == score_bytes,
+    }
+    return _case_from_checks(
+        "rubric_correction_creates_successor_sidecars_without_mutation",
+        (
+            f"source_revision={source_rubric.revision} "
+            f"corrected_revision={correction.corrected_rubric.revision}"
+        ),
+        checks,
+        {
+            "corrected_rubric_id": correction.corrected_rubric.rubric_id,
+            "corrected_score_id": correction.corrected_score.score_id,
+        },
+    )
+
+
 __all__ = [
     "WO37A_AUDIT_CASE_COUNT",
+    "WO37B_AUDIT_CASE_COUNT",
     "InstructorConsoleAuditCase",
     "audit_pseudonymous_profiles_and_consent",
+    "audit_versioned_assignments_rubrics_reviews",
 ]

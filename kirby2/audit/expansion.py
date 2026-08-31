@@ -152,6 +152,7 @@ REGISTERABLE_GATE_IDS = (
     "WO36-E",
     "DEV-0007",
     "WO37-A",
+    "WO37-B",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4410,6 +4411,45 @@ def _audit_wo37a() -> ExpansionGateReport:
     )
 
 
+def _audit_wo37b() -> ExpansionGateReport:
+    from kirby2.audit.instructor_console import (
+        WO37B_AUDIT_CASE_COUNT,
+        audit_versioned_assignments_rubrics_reviews,
+    )
+
+    cases = audit_versioned_assignments_rubrics_reviews()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO37-B",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO37B_AUDIT_CASE_COUNT)),
+            ("assignment_lock_policy", "ATTEMPT_RUNTIME_EXACT_MATCH_V1"),
+            ("review_mutation_policy", "IMMUTABLE_SUCCESSOR_SIDECARS_V1"),
+            ("rubric_correction_policy", "NEW_VERSION_AND_DERIVED_SCORE_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4463,6 +4503,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO36-E", _audit_wo36e),
     ("DEV-0007", _audit_dev0007),
     ("WO37-A", _audit_wo37a),
+    ("WO37-B", _audit_wo37b),
 )
 
 
