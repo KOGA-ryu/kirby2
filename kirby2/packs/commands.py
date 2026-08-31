@@ -1,4 +1,4 @@
-"""Generic WO39-D pack lifecycle commands over the WO39-A-C substrate."""
+"""Generic WO39 pack lifecycle commands over the secure local substrate."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ from kirby2.cli.registry import CommandModule, CommandSpec
 from kirby2.research.paths import DataAreaId, DataPaths
 from kirby2.research.store import DEFAULT_RESEARCH_STORE
 
-from .archive import preflight_pack_archive_bytes, read_pack_archive_bytes
+from .archive import (
+    PackArchivePreflightV1,
+    preflight_pack_archive_bytes,
+    read_pack_archive_bytes,
+)
 from .builders import (
     DomainPackBuildV1,
     build_domain_pack,
@@ -27,6 +31,12 @@ from .install import (
     remove_deactivated_pack,
 )
 from .scenario_pack import build_scenario_demo_inputs
+from .signatures import (
+    PackAuthenticityVerificationV1,
+    qualification_report_for_verified_pack,
+    read_pack_signature_bytes,
+    verify_pack_signature,
+)
 from .staging import discard_pack_stage, stage_pack_archive_bytes
 from .types import DomainPackRefusalCodeV1, DomainPackRefused
 
@@ -74,18 +84,33 @@ def _configure_pack(parser: argparse.ArgumentParser) -> None:
         help="inspect a fully preflighted manifest without installing",
     )
     inspect.add_argument("archive", type=Path)
+    inspect.add_argument(
+        "--signature",
+        type=Path,
+        help="report one detached signature claim without weakening preflight",
+    )
 
     verify = actions.add_parser(
         "verify",
         help="preflight and run the exact owning domain adapter",
     )
     verify.add_argument("archive", type=Path)
+    verify.add_argument(
+        "--signature",
+        type=Path,
+        help="report one detached signature claim separately from pack validity",
+    )
 
     install = actions.add_parser(
         "install",
         help="verify, stage, and atomically install one local pack",
     )
     install.add_argument("archive", type=Path)
+    install.add_argument(
+        "--signature",
+        type=Path,
+        help="retain detached authenticity status in the install result",
+    )
     install.add_argument("--data-root", required=True, type=_data_root)
 
     list_parser = actions.add_parser(
@@ -126,9 +151,11 @@ def _handle_pack(args: argparse.Namespace) -> int:
     if args.pack_action == "inspect":
         raw = read_pack_archive_bytes(args.archive)
         preflight = preflight_pack_archive_bytes(raw)
+        authenticity = _authenticity(preflight, args.signature)
         _print_json(
             {
                 "archive_byte_count": preflight.archive_byte_count,
+                "authenticity": authenticity.as_dict(),
                 "inventory_sha256": preflight.inventory_sha256,
                 "manifest": preflight.manifest.as_dict(),
                 "manifest_sha256": preflight.manifest_sha256,
@@ -140,9 +167,15 @@ def _handle_pack(args: argparse.Namespace) -> int:
     if args.pack_action == "verify":
         raw = read_pack_archive_bytes(args.archive)
         verification = verify_domain_pack_archive_bytes(raw)
+        authenticity = _authenticity(verification.preflight, args.signature)
+        qualification = qualification_report_for_verified_pack(
+            verification,
+            authenticity,
+        )
         _print_json(
             {
                 **verification.as_dict(),
+                "qualification": qualification.as_dict(),
                 "status": "VERIFIED",
             }
         )
@@ -150,6 +183,11 @@ def _handle_pack(args: argparse.Namespace) -> int:
     if args.pack_action == "install":
         raw = read_pack_archive_bytes(args.archive)
         verification = verify_domain_pack_archive_bytes(raw)
+        authenticity = _authenticity(verification.preflight, args.signature)
+        qualification = qualification_report_for_verified_pack(
+            verification,
+            authenticity,
+        )
         paths = DataPaths(args.data_root)
         paths.ensure(DataAreaId.STAGING)
         stage = stage_pack_archive_bytes(
@@ -179,6 +217,7 @@ def _handle_pack(args: argparse.Namespace) -> int:
             {
                 "domain_identity_sha256": verification.index.domain_identity_sha256,
                 "install_receipt": receipt.as_dict(),
+                "qualification": qualification.as_dict(),
                 "status": "INSTALLED",
             }
         )
@@ -260,6 +299,20 @@ def _build_result(build: DomainPackBuildV1, target: Path | None) -> dict[str, ob
         "pack_type": build.manifest.pack_type.value,
         "transport_sha256": build.transport_sha256,
     }
+
+
+def _authenticity(
+    preflight: PackArchivePreflightV1,
+    signature_path: Path | None,
+) -> PackAuthenticityVerificationV1:
+    """Report detached authenticity without loading pack-supplied provider code."""
+
+    signature = (
+        None
+        if signature_path is None
+        else read_pack_signature_bytes(signature_path)
+    )
+    return verify_pack_signature(preflight, signature, providers={})
 
 
 def _print_json(value: object) -> None:
