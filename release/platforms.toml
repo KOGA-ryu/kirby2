@@ -1,0 +1,22 @@
+schema_version = 1
+release_version = "0.1.0"
+designated_performance_target = "macos-arm64"
+windows_supported = false
+
+[[targets]]
+target_id = "macos-arm64"
+system = "Darwin"
+machine = "arm64"
+python_implementation = "CPython"
+python_version = "3.14"
+clean_provider_required = true
+functional_selectors = ["macos-arm64/desktop", "macos-arm64/headless"]
+
+[[targets]]
+target_id = "linux-x86_64"
+system = "Linux"
+machine = "x86_64"
+python_implementation = "CPython"
+python_version = "3.14"
+clean_provider_required = true
+functional_selectors = ["linux-x86_64/desktop", "linux-x86_64/headless"]

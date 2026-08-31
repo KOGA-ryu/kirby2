@@ -1,0 +1,305 @@
+[protocol]
+schema_version = 1
+benchmark_id = "RELEASE_BENCHMARK_FIXTURES_V1"
+row_count = 10000
+row_corpus_sha256 = "5a04dd7394fe80389ec5e1b24f69c258c333c15db7de9c14055284f9489ce2e6"
+row_storage = "CANONICAL_GENERATOR_AND_DIGEST_V1"
+worker_count = 4
+queue_size = 256
+designated_target = "macos-arm64"
+
+[row_generation]
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+root_start = 4000000
+root_end_inclusive = 4000999
+initial_attempt = 1
+result_schema_id = "ReleasePerformanceCellResultV1"
+cell_order = [
+  "CORE_FLOW",
+  "MARKET_MECHANICS",
+  "QUEUE_REACTIVE",
+  "LATENCY",
+  "HIDDEN_LIQUIDITY",
+  "MULTIVENUE",
+  "AGENT_ECOLOGY",
+  "ALGORITHM",
+  "HALT_REOPEN",
+  "FAULT_REPLAY",
+]
+
+[resources]
+logical_cpu_minimum = 4
+memory_bytes_minimum = 8589934592
+store_bytes_minimum = 21474836480
+per_attempt_rss_bytes = 536870912
+per_attempt_temporary_bytes = 8388608
+per_attempt_wall_ns = 120000000000
+total_wall_ns = 129600000000000
+aggregate_artifact_pass_bytes = 12884901888
+aggregate_artifact_warning_bytes = 19327352832
+retries = 1
+retryable_failure_codes = ["PROCESS_FAILURE", "RESOURCE_LIMIT"]
+
+[designated_target]
+target = "macos-arm64"
+python_implementation = "CPython"
+python_version = "3.14"
+artifact_pair = ["macos-arm64/headless", "macos-arm64/desktop"]
+
+[cross_platform_integer_core]
+policy_id = "CROSS_PLATFORM_INTEGER_CORE_V1"
+core_flow_roots = [4000000, 4000001, 4000002, 4000003, 4000004, 4000005, 4000006, 4000007, 4000008, 4000009, 4000010, 4000011, 4000012, 4000013, 4000014, 4000015]
+mechanics_roots = [4000000, 4000001, 4000002, 4000003, 4000004, 4000005, 4000006, 4000007, 4000008, 4000009, 4000010, 4000011, 4000012, 4000013, 4000014, 4000015]
+
+[[auxiliary_templates]]
+workload_id = "RELEASE_INTERACTIVE_ACK_V1"
+sample_contract_id = "RELEASE_INTERACTIVE_ACK_V1"
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+entrypoint_paths = ["kirby2/release/desktop.py", "kirby2/release/commands.py", "kirby2/ui/terminal.py"]
+artifact_selector = "macos-arm64/desktop"
+
+[auxiliary_templates.input_identity]
+schema_version = 1
+kind = "INTERACTIVE_ACK"
+
+[auxiliary_templates.input_identity.parameters]
+starter_set_id = "RELEASE_STARTER_SET_V1"
+starter_entries_sha256 = "3ca089d9cf9d9ce601b7d811ed8ac8871df9e6bf419708e9f5e6c0847c86115d"
+scenario_manifest_path = "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
+scenario_manifest_sha256 = "4c3d8d845ab5e65ac00b4bf5ccf4dc85c5724348a70131d560c49b908904522c"
+scenario_pack_id = "f9400185db16772ccf7ae6ad336ce951720a9a289c35c7815877230fb85614b1"
+curriculum_manifest_path = "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
+curriculum_manifest_sha256 = "66b3f8942bd96267a7ac8dcc9a7b070cce73e5ba7f9d4166740afe0a6499273e"
+curriculum_pack_id = "ef1cbe28be877d8db0dddb54f288ba06ea033f99f8d496d14aa1a6f706125a32"
+lesson_id = "KIRBY2_STARTER_PLACE_CANCEL_V1"
+checkpoint_selector_id = "FIRST_QUIESCENT_CONTINUOUS_TWO_SIDED_V1"
+lesson_seed_policy = "FROM_LESSON_MANIFEST"
+pairs = 550
+warmup_pairs = 50
+quantity_shares = 1
+
+[auxiliary_templates.input_identity.parameters.terminal]
+columns = 120
+rows = 40
+encoding = "UTF-8"
+term = "dumb"
+color = false
+drain_policy = "CONTINUOUS"
+
+[[auxiliary_templates]]
+workload_id = "RELEASE_TERMINAL_UPDATE_V1"
+sample_contract_id = "RELEASE_TERMINAL_UPDATE_V1"
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+entrypoint_paths = ["kirby2/release/desktop.py", "kirby2/release/commands.py", "kirby2/ui/terminal.py"]
+artifact_selector = "macos-arm64/desktop"
+
+[auxiliary_templates.input_identity]
+schema_version = 1
+kind = "TERMINAL_UPDATE"
+
+[auxiliary_templates.input_identity.parameters]
+qualification_evidence_path = "KIRBY2_FULL_DAY_QUALIFICATION_EVIDENCE.md"
+qualification_evidence_sha256 = "dc5c166b9be1e737c87cd240b90be4f387821c18cee280c36d5cbaa7d7f91857"
+profile_id = "QUIET_RANGE_PRESSURE"
+root_seed = 3102000
+artifact_selection_policy_id = "UNIQUE_VERIFIED_PROFILE_ROOT_V1"
+source_artifact_manifest_sha256 = "455935bd656aeadd417e38f57fbf00de52c16e32b96fd7565f0c5f1914c79306"
+start_selector = "CONTINUOUS_START"
+warmup_updates = 100
+measured_updates = 5000
+
+[auxiliary_templates.input_identity.parameters.terminal]
+columns = 120
+rows = 40
+encoding = "UTF-8"
+term = "dumb"
+color = false
+drain_policy = "CONTINUOUS"
+
+[[auxiliary_templates]]
+workload_id = "RELEASE_FULL_DAY_GENERATION_V1"
+sample_contract_id = "RELEASE_FULL_DAY_GENERATION_V1"
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+entrypoint_paths = ["kirby2/release/headless.py", "kirby2/full_day/commands.py", "kirby2/full_day/runtime.py", "kirby2/full_day/store.py"]
+artifact_selector = "macos-arm64/headless"
+
+[auxiliary_templates.input_identity]
+schema_version = 1
+kind = "FULL_DAY_GENERATION"
+
+[auxiliary_templates.input_identity.parameters]
+profile_manifest_path = "kirby2/full_day/profile_candidates.toml"
+profile_manifest_sha256 = "c578ca25b2c66a8be0ef88315ccf1bd17a33c9ff9a63d76635dca00338f5fe09"
+profile_id = "QUIET_RANGE_PRESSURE"
+root_seed = 3101000
+selected_plan_sha256 = "a91bea23b96731361f2569824c4acb3eb2f36ab670a463472d05cc4ecd3682bf"
+repetition_ordinals = [0, 1, 2, 3]
+warmup_ordinals = [0]
+measured_ordinals = [1, 2, 3]
+
+[[auxiliary_templates]]
+workload_id = "RELEASE_FULL_DAY_REPLAY_V1"
+sample_contract_id = "RELEASE_FULL_DAY_REPLAY_V1"
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+entrypoint_paths = ["kirby2/release/headless.py", "kirby2/full_day/commands.py", "kirby2/full_day/restore.py", "kirby2/full_day/store.py"]
+artifact_selector = "macos-arm64/headless"
+
+[auxiliary_templates.input_identity]
+schema_version = 1
+kind = "FULL_DAY_REPLAY"
+
+[auxiliary_templates.input_identity.parameters]
+producer_workload_id = "RELEASE_FULL_DAY_GENERATION_V1"
+source_artifact_policy_id = "MATCH_GENERATION_ORDINAL_V1"
+repetition_ordinals = [0, 1, 2, 3]
+warmup_ordinals = [0]
+measured_ordinals = [1, 2, 3]
+
+[[auxiliary_templates]]
+workload_id = "RELEASE_MICROSCOPE_LOAD_V1"
+sample_contract_id = "RELEASE_MICROSCOPE_LOAD_V1"
+runner_source_policy_id = "RUNNER_SOURCE_TREE_V1"
+entrypoint_paths = ["kirby2/release/desktop.py", "kirby2/microscope/commands.py", "kirby2/microscope/report.py"]
+artifact_selector = "macos-arm64/desktop"
+
+[auxiliary_templates.input_identity]
+schema_version = 1
+kind = "MICROSCOPE_LOAD"
+
+[auxiliary_templates.input_identity.parameters]
+producer_workload_id = "RELEASE_FULL_DAY_GENERATION_V1"
+source_ordinal = 1
+cursor_policy_id = "CONTINUOUS_MIDPOINT_V1"
+mode = "AS_OBSERVED"
+pane_ids = ["LEVEL2_LADDER", "TIME_AND_SALES", "DEPTH_HEATMAP", "INDIVIDUAL_QUEUE", "PLAYER_ORDERS", "ORDER_LIFECYCLE", "POSITION", "TRAFFIC_LIGHT", "STRATEGY_EVIDENCE", "FEATURE_PROVENANCE", "AGENT_ACTIVITY", "LATENCY_TIMELINE", "VENUE_QUOTES", "CONSOLIDATED_QUOTES", "FILLS", "EXECUTION_METRICS", "MECHANISTIC_TRACE", "COUNTERFACTUAL_COMPARISON"]
+report_policy_id = "PORTABLE_OFFLINE_REPORT_V1"
+warmup_repetitions = 1
+measured_repetitions = 20
+
+[[auxiliary_thresholds]]
+reduction_id = "ACK_LATENCY_P95"
+metric_id = "ack_latency_ns"
+statistic = "P95"
+pass_upper_inclusive = 50000000
+warning_upper_inclusive = 100000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "ACK_LATENCY_P99"
+metric_id = "ack_latency_ns"
+statistic = "P99"
+pass_upper_inclusive = 100000000
+warning_upper_inclusive = 250000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "ACK_PEAK_RSS_MAX"
+metric_id = "peak_rss_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 6442450944
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "TERMINAL_UPDATE_P99"
+metric_id = "update_latency_ns"
+statistic = "P99"
+pass_upper_inclusive = 50000000
+warning_upper_inclusive = 150000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "TERMINAL_UPDATE_MAX"
+metric_id = "update_latency_ns"
+statistic = "MAX"
+pass_upper_inclusive = 500000000
+warning_upper_inclusive = 500000000
+hard_failure = true
+
+[[auxiliary_thresholds]]
+reduction_id = "TERMINAL_PEAK_RSS_MAX"
+metric_id = "peak_rss_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 6442450944
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "GENERATION_WALL_P50"
+metric_id = "wall_time_ns"
+statistic = "P50"
+pass_upper_inclusive = 300000000000
+warning_upper_inclusive = 900000000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "GENERATION_PEAK_RSS_MAX"
+metric_id = "peak_rss_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 6442450944
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "LARGEST_CHECKPOINT_MAX"
+metric_id = "largest_checkpoint_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 536870912
+warning_upper_inclusive = 1073741824
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "FULL_DAY_BYTES_MAX"
+metric_id = "full_day_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 8589934592
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "LEDGER_GROWTH_MAX"
+metric_id = "ledger_growth_bytes_per_1000_events"
+statistic = "MAX"
+pass_upper_inclusive = 1048576
+warning_upper_inclusive = 2097152
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "CHECKPOINT_GROWTH_MAX"
+metric_id = "checkpoint_growth_bytes_per_simulation_hour"
+statistic = "MAX"
+pass_upper_inclusive = 536870912
+warning_upper_inclusive = 1073741824
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "REPLAY_WALL_P50"
+metric_id = "wall_time_ns"
+statistic = "P50"
+pass_upper_inclusive = 180000000000
+warning_upper_inclusive = 600000000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "REPLAY_PEAK_RSS_MAX"
+metric_id = "peak_rss_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 6442450944
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "MICROSCOPE_WALL_P95"
+metric_id = "wall_time_ns"
+statistic = "P95"
+pass_upper_inclusive = 5000000000
+warning_upper_inclusive = 15000000000
+hard_failure = false
+
+[[auxiliary_thresholds]]
+reduction_id = "MICROSCOPE_PEAK_RSS_MAX"
+metric_id = "peak_rss_bytes"
+statistic = "MAX"
+pass_upper_inclusive = 4294967296
+warning_upper_inclusive = 6442450944
+hard_failure = false

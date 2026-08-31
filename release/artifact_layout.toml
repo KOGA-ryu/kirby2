@@ -1,0 +1,200 @@
+schema_version = 1
+release_version = "0.1.0"
+canonical_archive_id = "CANONICAL_RELEASE_ARCHIVE_V1"
+source_classes = [
+  "CANDIDATE_PROJECT_WHEEL",
+  "CANDIDATE_SOURCE",
+  "CANDIDATE_LAUNCHER",
+  "CANDIDATE_DOCUMENTATION",
+  "CANDIDATE_ASSET",
+  "LOCKED_DEPENDENCY_WHEEL",
+  "GENERATED_MANIFEST",
+  "GENERATED_LICENSE",
+  "GENERATED_NOTICE",
+  "GENERATED_LAYOUT",
+  "CANDIDATE_STARTER_PACK",
+]
+
+[build_frontends]
+project_wheel = ["./.venv/bin/pip", "wheel", "--no-deps", "--no-build-isolation", "--no-index"]
+source_inventory = ["git", "archive"]
+archive_encoder = ["KIRBY2_STDLIB_USTAR_GZIP_V1"]
+
+[starter_set]
+schema_version = 1
+set_id = "RELEASE_STARTER_SET_V1"
+entries_sha256 = "3ca089d9cf9d9ce601b7d811ed8ac8871df9e6bf419708e9f5e6c0847c86115d"
+
+[[starter_set.entries]]
+role = "SCENARIO"
+manifest_path = "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
+manifest_sha256 = "4c3d8d845ab5e65ac00b4bf5ccf4dc85c5724348a70131d560c49b908904522c"
+pack_id = "f9400185db16772ccf7ae6ad336ce951720a9a289c35c7815877230fb85614b1"
+
+[[starter_set.entries]]
+role = "CURRICULUM"
+manifest_path = "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
+manifest_sha256 = "66b3f8942bd96267a7ac8dcc9a7b070cce73e5ba7f9d4166740afe0a6499273e"
+pack_id = "ef1cbe28be877d8db0dddb54f288ba06ea033f99f8d496d14aa1a6f706125a32"
+
+[[artifacts]]
+artifact_id = "linux-x86_64-desktop-bundle"
+artifact_form = "DESKTOP_TAR_GZ"
+target = "linux-x86_64"
+embedded_manifest = true
+archive_root = "kirby2-0.1.0-linux-x86_64"
+
+[[artifacts]]
+artifact_id = "linux-x86_64-wheelhouse"
+artifact_form = "HEADLESS_WHEELHOUSE_TAR_GZ"
+target = "linux-x86_64"
+embedded_manifest = true
+archive_root = "kirby2-0.1.0-linux-x86_64-wheelhouse"
+
+[[artifacts]]
+artifact_id = "macos-arm64-desktop-bundle"
+artifact_form = "DESKTOP_TAR_GZ"
+target = "macos-arm64"
+embedded_manifest = true
+archive_root = "kirby2-0.1.0-macos-arm64"
+
+[[artifacts]]
+artifact_id = "macos-arm64-wheelhouse"
+artifact_form = "HEADLESS_WHEELHOUSE_TAR_GZ"
+target = "macos-arm64"
+embedded_manifest = true
+archive_root = "kirby2-0.1.0-macos-arm64-wheelhouse"
+
+[[artifacts]]
+artifact_id = "project-wheel"
+artifact_form = "PY3_NONE_ANY_WHEEL"
+target = "any"
+embedded_manifest = false
+archive_root = "NOT_APPLICABLE"
+
+[[artifacts]]
+artifact_id = "source-archive"
+artifact_form = "SOURCE_TAR_GZ"
+target = "source"
+embedded_manifest = false
+archive_root = "kirby2-0.1.0"
+
+[[members]]
+member_id = "candidate-source-tree"
+artifact_ids = ["source-archive"]
+archive_path = "{git_path}"
+source_path = "{candidate_commit}"
+source_class = "CANDIDATE_SOURCE"
+availability = "WO40_E"
+
+[[members]]
+member_id = "project-wheel"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "wheelhouse/kirby2-0.1.0-py3-none-any.whl"
+source_path = "dist/kirby2-0.1.0-py3-none-any.whl"
+source_class = "CANDIDATE_PROJECT_WHEEL"
+availability = "WO40_F"
+
+[[members]]
+member_id = "linux-duckdb-wheel"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse"]
+archive_path = "wheelhouse/duckdb-1.5.5-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl"
+source_path = "release/wheelhouse/linux-x86_64/duckdb-1.5.5-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl"
+source_class = "LOCKED_DEPENDENCY_WHEEL"
+availability = "WO40_D1"
+
+[[members]]
+member_id = "macos-duckdb-wheel"
+artifact_ids = ["macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "wheelhouse/duckdb-1.5.5-cp314-cp314-macosx_11_0_arm64.whl"
+source_path = "release/wheelhouse/macos-arm64/duckdb-1.5.5-cp314-cp314-macosx_11_0_arm64.whl"
+source_class = "LOCKED_DEPENDENCY_WHEEL"
+availability = "WO40_D1"
+
+[[members]]
+member_id = "macos-launcher"
+artifact_ids = ["macos-arm64-desktop-bundle"]
+archive_path = "release/launchers/macos/kirby2"
+source_path = "release/launchers/macos/kirby2"
+source_class = "CANDIDATE_LAUNCHER"
+availability = "WO40_E"
+
+[[members]]
+member_id = "linux-launcher"
+artifact_ids = ["linux-x86_64-desktop-bundle"]
+archive_path = "release/launchers/linux/kirby2"
+source_path = "release/launchers/linux/kirby2"
+source_class = "CANDIDATE_LAUNCHER"
+availability = "WO40_E"
+
+[[members]]
+member_id = "headless-launcher"
+artifact_ids = ["linux-x86_64-wheelhouse", "macos-arm64-wheelhouse"]
+archive_path = "release/launchers/headless/kirby2"
+source_path = "release/launchers/headless/kirby2"
+source_class = "CANDIDATE_LAUNCHER"
+availability = "WO40_E"
+
+[[members]]
+member_id = "user-documentation"
+artifact_ids = ["linux-x86_64-desktop-bundle", "macos-arm64-desktop-bundle"]
+archive_path = "docs/{filename}"
+source_path = "docs/{filename}"
+source_class = "CANDIDATE_DOCUMENTATION"
+availability = "WO40_E"
+
+[[members]]
+member_id = "offline-microscope-assets"
+artifact_ids = ["linux-x86_64-desktop-bundle", "macos-arm64-desktop-bundle"]
+archive_path = "assets/microscope/{filename}"
+source_path = "kirby2/microscope/assets/{filename}"
+source_class = "CANDIDATE_ASSET"
+availability = "WO40_E"
+
+[[members]]
+member_id = "starter-scenario-pack"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "starter-packs/f9400185db16772ccf7ae6ad336ce951720a9a289c35c7815877230fb85614b1.k2pack"
+source_path = "kirby2/packs/fixtures/samples/starter_scenario/manifest.toml"
+source_class = "CANDIDATE_STARTER_PACK"
+availability = "WO40_D"
+
+[[members]]
+member_id = "starter-curriculum-pack"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "starter-packs/ef1cbe28be877d8db0dddb54f288ba06ea033f99f8d496d14aa1a6f706125a32.k2pack"
+source_path = "kirby2/packs/fixtures/samples/five_lesson_curriculum/manifest.toml"
+source_class = "CANDIDATE_STARTER_PACK"
+availability = "WO40_D"
+
+[[members]]
+member_id = "release-manifest"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "RELEASE_MANIFEST.json"
+source_path = "GENERATED:ReleaseManifestV1"
+source_class = "GENERATED_MANIFEST"
+availability = "WO40_F"
+
+[[members]]
+member_id = "license-inventory"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "LICENSES.json"
+source_path = "GENERATED:ReleaseLicenseInventoryV1"
+source_class = "GENERATED_LICENSE"
+availability = "WO40_F"
+
+[[members]]
+member_id = "third-party-notices"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "THIRD_PARTY_NOTICES.txt"
+source_path = "GENERATED:ReleaseNoticesV1"
+source_class = "GENERATED_NOTICE"
+availability = "WO40_F"
+
+[[members]]
+member_id = "artifact-layout"
+artifact_ids = ["linux-x86_64-desktop-bundle", "linux-x86_64-wheelhouse", "macos-arm64-desktop-bundle", "macos-arm64-wheelhouse"]
+archive_path = "ARTIFACT_LAYOUT.json"
+source_path = "GENERATED:ReleaseArtifactLayoutProjectionV1"
+source_class = "GENERATED_LAYOUT"
+availability = "WO40_F"

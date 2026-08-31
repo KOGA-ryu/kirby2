@@ -1,0 +1,159 @@
+schema_version = 1
+release_version = "0.1.0"
+protocol_id = "RELEASE_QUALIFICATION_V1"
+offline_required = true
+user_data_preservation_required = true
+evidence_gate_order = ["WO40-D1", "WO40-E", "WO40-F", "WO40-G", "WO40-H", "WO40-I", "WO40-J"]
+
+[retry_policy]
+attempts_per_clean_root = 1
+result_retry_count = 0
+environmental_interruption = "NEW_ATTEMPT_ONLY_BEFORE_USER_DATA_MUTATION"
+
+[cross_platform]
+workload_id = "CROSS_PLATFORM_INTEGER_CORE_V1"
+root_start = 4000000
+root_end_inclusive = 4000015
+
+[closeout]
+prerequisite_id = "WO40_J_PREREQUISITES_V1"
+required_gates = [
+  "K2X-02",
+  "WO31-A", "WO31-B", "WO31-C", "WO31-D", "WO31-E1", "WO31-E2", "WO31-E3", "WO31-E4", "WO31-E5", "WO31-E6", "WO31-F", "WO31-G", "WO31-H", "WO31-I", "WO31-I1",
+  "WO32-A", "WO32-B", "WO32-C", "WO32-D", "WO32-E",
+  "WO33-A", "WO33-A1", "WO33-B1", "WO33-B2", "WO33-C", "WO33-D", "WO33-E",
+  "WO34-A", "WO34-B", "WO34-C", "WO34-D",
+  "WO35-A", "WO35-B", "WO35-C", "WO35-D", "WO35-E", "WO35-F", "WO35-F1",
+  "WO36-A", "WO36-B", "WO36-C", "WO36-D", "WO36-E",
+  "WO37-A", "WO37-B", "WO37-C", "WO37-D", "WO37-E",
+  "WO39-A", "WO39-B", "WO39-C",
+  "WO38-A", "WO38-B", "WO38-C", "WO38-D", "WO38-E",
+  "WO39-D1", "WO39-D2", "WO39-E",
+  "WO40-A", "WO40-B", "WO40-B1", "WO40-C", "WO40-D", "WO40-D1", "WO40-E", "WO40-F", "WO40-G", "WO40-H", "WO40-I",
+]
+
+[[functional_steps]]
+step_id = "CLEAN_INSTALL"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "INSTALL_SELECTED_ARTIFACTS_OFFLINE"
+expected = "EXACT_ARTIFACT_SET_INSTALLED"
+
+[[functional_steps]]
+step_id = "LAUNCH"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "LAUNCH_INSTALLED_ARTIFACT"
+expected = "LOCAL_APPLICATION_READY"
+
+[[functional_steps]]
+step_id = "FULL_FIRST_RUN"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "RUN_COMPLETE_FIRST_RUN_FLOW"
+expected = "PATHS_HEALTH_STARTER_SET_AND_DEMO_PASS"
+
+[[functional_steps]]
+step_id = "STARTER_LESSON"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "OPEN_FIRST_STARTER_LESSON"
+expected = "EXACT_BUNDLED_LESSON_READY"
+
+[[functional_steps]]
+step_id = "PLACE_CANCEL"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "PLACE_AND_CANCEL_ONE_SIMULATED_ORDER"
+expected = "NO_FILL_AND_CONSERVATION_PASS"
+
+[[functional_steps]]
+step_id = "COMPLETE_SAVE"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "COMPLETE_AND_SAVE_STARTER_SESSION"
+expected = "IMMUTABLE_RUN_MANIFEST_COMMITTED"
+
+[[functional_steps]]
+step_id = "OPEN_REPLAY_MICROSCOPE"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "OPEN_SAVED_SESSION_AS_OBSERVED"
+expected = "ALL_SUPPORTED_PANES_RENDER_OFFLINE"
+
+[[functional_steps]]
+step_id = "EXPORT_PACK"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "EXPORT_SAVED_SESSION_PACK"
+expected = "PACK_VERIFIES_WITH_OWNING_ADAPTER"
+
+[[functional_steps]]
+step_id = "CLOSE"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "CLOSE_APPLICATION_CLEANLY"
+expected = "NO_ACTIVE_MUTATION_REMAINS"
+
+[[functional_steps]]
+step_id = "REOPEN_VERIFY_SAVED"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "REOPEN_AND_VERIFY_SAVED_SESSION"
+expected = "DECLARED_REPLAY_DIGEST_UNCHANGED"
+
+[[functional_steps]]
+step_id = "IMPORT_SECOND_CLEAN_ROOT"
+root_role = "SECONDARY_CLEAN_ROOT"
+mutation = "IMPORT_EXPORTED_PACK_OFFLINE"
+expected = "EXACT_PACK_ACTIVE_WITH_DEPENDENCIES"
+
+[[functional_steps]]
+step_id = "REPLAY_IMPORTED_LESSON"
+root_role = "SECONDARY_CLEAN_ROOT"
+mutation = "REPLAY_IMPORTED_LESSON"
+expected = "REPLAY_VERIFICATION_PASS"
+
+[[functional_steps]]
+step_id = "COMPARE_DECLARED_REPLAY_DIGEST"
+root_role = "BOTH_CLEAN_ROOTS"
+mutation = "COMPARE_DECLARED_REPLAY_DIGESTS"
+expected = "BYTE_EXACT_DIGEST_EQUALITY"
+
+[[functional_steps]]
+step_id = "RESTORE_BACKUP"
+root_role = "RESTORE_CLEAN_ROOT"
+mutation = "RESTORE_VERIFIED_BACKUP"
+expected = "PORTABLE_STATE_RESTORED_WITHOUT_OVERWRITE"
+
+[[functional_steps]]
+step_id = "CRASH_RECOVERY"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "INTERRUPT_AND_RECOVER_COMMITTED_SESSION"
+expected = "LAST_COMMITTED_CHECKPOINT_RECOVERED"
+
+[[functional_steps]]
+step_id = "EXPORT_DIAGNOSTICS"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "EXPORT_ALLOWLIST_DIAGNOSTICS"
+expected = "REDACTED_NEW_FILE_WITH_RECEIPT"
+
+[[functional_steps]]
+step_id = "UNINSTALL_PRESERVE_USER_DATA"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "REMOVE_APPLICATION_ARTIFACTS_ONLY"
+expected = "GOVERNED_USER_DATA_REMAINS_BYTE_IDENTICAL"
+
+[[headless_extra_steps]]
+step_id = "HEADLESS_SIMULATION"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "RUN_INSTALLED_HEADLESS_SIMULATION"
+expected = "SIMULATION_AND_REPLAY_PASS"
+
+[[headless_extra_steps]]
+step_id = "HEADLESS_AUDIT"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "RUN_INSTALLED_HEADLESS_AUDIT"
+expected = "AUDIT_RESULT_PASS"
+
+[[headless_extra_steps]]
+step_id = "HEADLESS_CALIBRATION"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "RUN_INSTALLED_HEADLESS_CALIBRATION"
+expected = "CALIBRATION_ARTIFACT_VERIFIES"
+
+[[headless_extra_steps]]
+step_id = "HEADLESS_DISTRIBUTED_WORKER"
+root_role = "PRIMARY_CLEAN_ROOT"
+mutation = "RUN_ONE_INSTALLED_DISTRIBUTED_WORK_UNIT"
+expected = "SIGNED_RESULT_AND_ARTIFACT_SET_VERIFY"

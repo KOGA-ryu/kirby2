@@ -1,0 +1,28 @@
+schema_version = 1
+lock_id = "KIRBY2_RELEASE_REQUIREMENTS_V1"
+python_implementation = "CPython"
+python_version = "3.14"
+project_requirement = "duckdb>=1.5,<2"
+no_index = true
+
+[[wheels]]
+name = "duckdb"
+version = "1.5.5"
+target = "linux-x86_64"
+filename = "duckdb-1.5.5-cp314-cp314-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl"
+sha256 = "fbf0f2d48b43c6c304d00463b463c27ead6c4b01c3c1816b750f728decf71afe"
+license_id = "MIT"
+license_member = "duckdb-1.5.5.dist-info/licenses/LICENSE"
+license_sha256 = "075c33400ffcb0c586dd106a029d3e733e9da3693f8fcb9cebfc651c8a2f14e3"
+license_size = 1072
+
+[[wheels]]
+name = "duckdb"
+version = "1.5.5"
+target = "macos-arm64"
+filename = "duckdb-1.5.5-cp314-cp314-macosx_11_0_arm64.whl"
+sha256 = "8c11775cc99a447618d5f1840126db17f2652f3eae05529df4f81f40e2df7151"
+license_id = "MIT"
+license_member = "duckdb-1.5.5.dist-info/licenses/LICENSE"
+license_sha256 = "075c33400ffcb0c586dd106a029d3e733e9da3693f8fcb9cebfc651c8a2f14e3"
+license_size = 1072

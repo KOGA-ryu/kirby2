@@ -15,10 +15,10 @@ import math
 import platform
 import sys
 import unicodedata
-from collections.abc import Callable, Mapping, TextIO
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TextIO
 
 from kirby2.orchestration.models import DigestReferenceV1, LogicalWorkUnit, WorkKindV1
 from kirby2.orchestration.protocol import (

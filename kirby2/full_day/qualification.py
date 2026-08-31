@@ -2624,12 +2624,19 @@ _BASE_MAXIMUM_PLACEMENT_DEPTH_TICKS: Final = 4
 _BASE_SCHEDULED_LIVENESS_CHILDREN: Final = 110
 _BASE_SCHEDULED_LIVENESS_BATCHES: Final = 11
 _QUALIFICATION_ACCOUNT: Final = "WO31_I_QUALIFICATION_FLOW"
+_RELEASE_PERFORMANCE_DEVELOPMENT_ROOT: Final = DEVELOPMENT_ROOTS[0]
+_RELEASE_PERFORMANCE_DEVELOPMENT_AUTHORITY: Final = object()
 
 
 def _require_protected_seed_authority(
     root_seed: int, authority: object | None
 ) -> None:
     if root_seed in DEVELOPMENT_ROOTS:
+        if (
+            root_seed == _RELEASE_PERFORMANCE_DEVELOPMENT_ROOT
+            and authority is _RELEASE_PERFORMANCE_DEVELOPMENT_AUTHORITY
+        ):
+            return
         raise RuntimeError("WO31-H development roots are unavailable to WO31-I")
     if root_seed not in {*QUALIFICATION_ROOTS, *HOLDOUT_ROOTS}:
         return
@@ -3328,6 +3335,47 @@ def _build_candidate_runtime(
     plan = _materialize_candidate_plan(
         candidate, root_seed, workload, authority=authority
     )
+    runtime = _compose_candidate_runtime(plan)
+    maximum_initial_pending = _enqueue_profile_workload(runtime, workload)
+    return plan, workload, runtime, maximum_initial_pending
+
+
+def materialize_release_performance_full_day_plan_v1():
+    """Materialize the one exact WO40 release plan and frozen workload.
+
+    WO31 keeps every historical development root unavailable to its own
+    qualification entrypoints.  WO40 separately preregisters the quiet-range
+    candidate at the first development root as a repeatable release workload.
+    This seam admits only that literal candidate/root pair and does not grant
+    qualification or holdout access.
+    """
+
+    candidate = load_full_day_profile_bundle().candidates.candidate(
+        QUIET_RANGE_PRESSURE
+    )
+    from kirby2.audit.full_day import _wo31f_plan
+
+    continuous_start, continuous_end = _continuous_bounds(_wo31f_plan())
+    workload = _generate_profile_workload(
+        candidate,
+        _RELEASE_PERFORMANCE_DEVELOPMENT_ROOT,
+        continuous_start_us=continuous_start,
+        continuous_end_us=continuous_end,
+        authority=_RELEASE_PERFORMANCE_DEVELOPMENT_AUTHORITY,
+    )
+    plan = _materialize_candidate_plan(
+        candidate,
+        _RELEASE_PERFORMANCE_DEVELOPMENT_ROOT,
+        workload,
+        authority=_RELEASE_PERFORMANCE_DEVELOPMENT_AUTHORITY,
+    )
+    return plan, workload
+
+
+def build_release_performance_full_day_source_v1():
+    """Compose the preregistered WO40 release workload's production runtime."""
+
+    plan, workload = materialize_release_performance_full_day_plan_v1()
     runtime = _compose_candidate_runtime(plan)
     maximum_initial_pending = _enqueue_profile_workload(runtime, workload)
     return plan, workload, runtime, maximum_initial_pending
@@ -4540,8 +4588,10 @@ __all__ = [
     "RealQualificationAuthorityV1",
     "TimeWeightedValueV1",
     "authorize_real_qualification",
+    "build_release_performance_full_day_source_v1",
     "evaluate_candidate_qualification",
     "load_qualification_development_fixture",
+    "materialize_release_performance_full_day_plan_v1",
     "probe_frozen_profile_workload_development",
     "qualify_day_profiles_once",
     "real_qualification_identity",

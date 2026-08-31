@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from kirby2.scenario_lang.commands import inspect_scenario_source
+from kirby2.scenario_lang.imports import validate_scenario_import_path
 from kirby2.scenario_lang.models import CompiledScenarioArtifactV1
 
 from .formats import canonical_json_bytes, load_canonical_json_bytes
@@ -185,7 +186,16 @@ def build_scenario_demo_inputs(
                 DomainPackRefusalCodeV1.SOURCE_PATH_UNSAFE,
                 "single-source demo cannot capture an activated external pack import",
             )
-        candidate = (source_root / document.logical_path).resolve(strict=True)
+        logical_prefix = "source-root:"
+        if not document.logical_path.startswith(logical_prefix):
+            raise DomainPackRefused(
+                DomainPackRefusalCodeV1.SOURCE_PATH_UNSAFE,
+                "single-source demo contains a non-source-root logical document",
+            )
+        relative = validate_scenario_import_path(
+            document.logical_path.removeprefix(logical_prefix)
+        )
+        candidate = source_root.joinpath(*relative.parts).resolve(strict=True)
         try:
             candidate.relative_to(source_root.resolve(strict=True))
         except ValueError as error:
