@@ -528,3 +528,71 @@ both clean providers, tools, and starter packs remain PASS; the report is byte-e
 the complete registry contains DEV-0001 through DEV-0010; and no target, dependency,
 threshold, matrix, retry rule, product boundary, network action, artifact build,
 qualification workload, or performance workload changes or runs.
+
+## DEV-0011 — Restart release candidate with verified build inputs
+
+- Interrupted canonical card: `WO40-F`
+- Exact first-parent predecessor: `da9612349db2f76863ee16fb7726c6d8f85f5329`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 build-release --candidate da961232c550068bb0d58c4fb3bc49144c1e5a62 --protocol release/qualification.toml --artifact-store .kirby2/release`
+- Observed terminal result: `READY` with exit status zero even though the supplied
+  forty-character lowercase identity did not exist as any Git object. No artifact
+  was created, but the build-plan decision falsely claimed that all preregistered
+  inputs were addressable.
+- Root cause: the CLI resolved Git only for the literal selector `HEAD`; an explicit
+  hash-shaped value reached `plan_release_build`, which checked syntax, ambient lock
+  presence, and ambient path presence but never resolved the commit or reconstructed
+  any input from its Git tree. The planner therefore did not prove HEAD equality,
+  tracked cleanliness, candidate-tree modes/paths, source-lock reproduction, or exact
+  candidate protocol/dependency/layout bytes before returning `READY`.
+- Repair: resolve the exact candidate commit, tree, and committer epoch; require it to
+  equal a clean tracked HEAD; enumerate the complete candidate Git tree with strict
+  UTF-8/NFC/case-fold/ustar and regular-blob rules; batch-read immutable Git blobs;
+  disable local replacement objects and inherited Git repository-routing overrides;
+  reject assume-unchanged/skip-worktree index flags and ignored or visible untracked
+  files inside build-input namespaces; and recheck cleanliness after every checkout
+  read;
+  reproduce the canonical `kirby2/` plus `pyproject.toml` source projection; compare
+  it with the exact candidate lock blob; and bind every frozen protocol file, source
+  identity, logical build ID, and current checkout byte to that candidate. Rerun the
+  complete no-network resource preflight immediately before `READY` and require its
+  rendering to equal the passing report. Return typed `REFUSED` outcomes for missing
+  commits, dirty tracked state, lock mismatch, protocol mismatch, or changed offline
+  resources. External wheelhouses, provider inventory, agent maps, and artifact-store
+  files remain outside the Git candidate projection.
+- Owned repair paths: `kirby2/release/build.py`, `kirby2/release/__init__.py`,
+  `kirby2/audit/release.py`, `kirby2/audit/expansion.py`,
+  `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0011` through K2X-02 immediately after resumed `WO40-E`
+  and before `WO40-F`; the closeout prerequisite deviation inventory extends
+  monotonically through `DEV-0011`.
+- Inherited gates: the five WO40-D protocol paths and protocol-set digest, the exact
+  passing WO40-D1 report/resources, and all WO40-E launchers, documentation, and
+  public release surfaces remain unchanged. The mechanically generated runner lock
+  is refreshed only because the repair changes production and audit Python sources.
+  This deviation performs no artifact build, provider connection, qualification, or
+  performance workload.
+- Exact commit subject: `Restart release candidate with verified build inputs`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 build-release --candidate da961232c550068bb0d58c4fb3bc49144c1e5a62 --protocol release/qualification.toml --artifact-store .kirby2/release
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m kirby2 audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the hostile nonexistent identity refuses as
+`CANDIDATE_COMMIT_INVALID`; a clean fixed predecessor fixture returns `READY` only
+after reproducing its 482-entry source lock and five-file protocol set; existing
+non-HEAD, replacement-object, staged, unstaged, assume-unchanged, skip-worktree,
+ignored untracked build-input, committed source-drift, and each protocol-drift
+fixture refuses with the exact typed code; a changed locked wheel refuses as
+`RESOURCE_PREFLIGHT_INCOMPLETE`; planning creates no output; WO40-E passes against
+the refreshed candidate lock; the complete registry contains DEV-0001 through
+DEV-0011; and no release artifact, network action, provider operation, qualification,
+or performance workload is created or executed.

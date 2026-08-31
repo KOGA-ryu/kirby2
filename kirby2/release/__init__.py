@@ -119,6 +119,7 @@ from .build import (
     ReleaseArtifactLayoutV1,
     ReleaseBuildRefusalCodeV1,
     ReleaseBuildRefused,
+    ReleaseCandidateInputsV1,
     ReleaseCleanProviderInventoryV1,
     ReleaseCleanProviderV1,
     ReleaseCommandOutcomeV1,
@@ -128,6 +129,7 @@ from .build import (
     load_release_protocol_bundle,
     plan_release_build,
     release_resource_preflight,
+    verify_release_candidate_inputs,
     verify_release_artifacts,
 )
 from .licenses import (
@@ -241,6 +243,7 @@ __all__ = [
     "ReleaseAuxiliaryPerformanceTemplateV1",
     "ReleaseBuildRefusalCodeV1",
     "ReleaseBuildRefused",
+    "ReleaseCandidateInputsV1",
     "ReleaseCleanProviderInventoryV1",
     "ReleaseCleanProviderV1",
     "ReleaseCommandOutcomeV1",
@@ -334,6 +337,7 @@ __all__ = [
     "verify_canonical_release_archive",
     "verify_closeout_prerequisites",
     "verify_installation",
+    "verify_release_candidate_inputs",
     "verify_release_artifacts",
     "validate_performance_attempt_sequence",
     "verify_performance_cell_artifacts",

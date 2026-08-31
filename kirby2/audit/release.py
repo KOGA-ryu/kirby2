@@ -34,6 +34,15 @@ WO40D1_AUDIT_CASE_COUNT = 2
 WO40E_AUDIT_CASE_COUNT = 4
 DEV0009_AUDIT_CASE_COUNT = 3
 DEV0010_AUDIT_CASE_COUNT = 2
+DEV0011_AUDIT_CASE_COUNT = 5
+
+_DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
+_DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
+    "f186ce81046e5c235fd80b24428e6d18dd680b33c8279e602b82fcfc524d2d98"
+)
+_DEV0011_PROTOCOL_SET_SHA256_V1 = (
+    "94f0050a592e3279a4b38b3d2e55b0ccfdc784202e67dca13e21a91fb631f9e8"
+)
 
 RELEASE_GATE_EVIDENCE_SCHEMA_ID_V1 = "KIRBY2_RELEASE_GATE_EVIDENCE_V1"
 RELEASE_CLOSEOUT_PREREQUISITE_PACKET_SCHEMA_ID_V1 = (
@@ -54,7 +63,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 11)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 12)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1724,6 +1733,535 @@ def audit_release_candidate_source() -> ReleaseAuditSuite:
     if len(cases) != WO40E_AUDIT_CASE_COUNT:
         raise RuntimeError("WO40-E release audit inventory changed")
     return ReleaseAuditSuite("WO40-E", cases)
+
+
+def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
+    """Prove the restarted WO40-F planner binds real immutable candidate inputs."""
+
+    from kirby2.release.build import (
+        ReleaseBuildRefusalCodeV1,
+        ReleaseCommandStatusV1,
+        load_release_protocol_bundle,
+        plan_release_build,
+    )
+    from kirby2.release.manifest import RELEASE_PROTOCOL_PATHS_V1
+
+    clean_failures: list[str] = []
+    identity_failures: list[str] = []
+    dirty_failures: list[str] = []
+    source_failures: list[str] = []
+    protocol_failures: list[str] = []
+    clean_evidence: dict[str, object] = {
+        "artifact_output_created": False,
+        "candidate_commit": _DEV0011_PREDECESSOR_COMMIT_V1,
+        "resource_drift_refusal_code": None,
+        "source_entry_count": 0,
+        "source_manifest_sha256": "0" * 64,
+    }
+    identity_evidence: dict[str, object] = {
+        "non_head_refusal_code": None,
+        "replacement_refusal_code": None,
+        "unresolved_refusal_code": None,
+    }
+    dirty_evidence: dict[str, object] = {
+        "assume_unchanged_refusal_code": None,
+        "skip_worktree_refusal_code": None,
+        "staged_refusal_code": None,
+        "untracked_refusal_code": None,
+        "unstaged_refusal_code": None,
+    }
+    source_evidence: dict[str, object] = {"refusal_code": None}
+    protocol_evidence: dict[str, object] = {"protocols": []}
+
+    def run_git(repository: Path, *arguments: str) -> bytes:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"temporary Git command failed: {arguments[0]}")
+        return result.stdout
+
+    def reset_fixture(repository: Path) -> None:
+        run_git(
+            repository,
+            "checkout",
+            "--quiet",
+            "--force",
+            "--detach",
+            _DEV0011_PREDECESSOR_COMMIT_V1,
+        )
+
+    def commit_fixture(repository: Path, relative: str, subject: str) -> str:
+        run_git(repository, "add", "--", relative)
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_DATE": "2001-01-01T00:00:00+0000",
+            "GIT_COMMITTER_DATE": "2001-01-01T00:00:00+0000",
+        }
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Kirby2 Release Audit",
+                "-c",
+                "user.email=release-audit.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                subject,
+            ],
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("temporary candidate commit failed")
+        return run_git(repository, "rev-parse", "--verify", "HEAD^{commit}").decode(
+            "ascii"
+        ).strip()
+
+    with TemporaryDirectory(prefix="kirby2-release-dev0011-") as temporary:
+        temporary_root = Path(temporary).resolve()
+        fixture = temporary_root / "candidate"
+        clone = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                "--no-checkout",
+                os.fspath(_repository_root()),
+                os.fspath(fixture),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        setup_error: str | None = None
+        try:
+            if clone.returncode != 0:
+                raise RuntimeError("temporary local clone failed")
+            reset_fixture(fixture)
+            (fixture / "UNTRACKED_DEV0011_SENTINEL.txt").write_text(
+                "untracked non-input bytes must not alter a Git-object build plan\n",
+                encoding="utf-8",
+            )
+            source_repository = _repository_root()
+            wheel_sources = tuple(
+                sorted(
+                    (source_repository / "release/wheelhouse").rglob("*.whl"),
+                    key=lambda path: os.fspath(path).encode("utf-8"),
+                )
+            )
+            if len(wheel_sources) != 2:
+                raise RuntimeError("release audit requires both frozen wheel inputs")
+            resource_sources = (
+                source_repository / ".venv/bin/pip",
+                source_repository / ".kirby2/release/clean-providers.toml",
+                *wheel_sources,
+            )
+            for source in resource_sources:
+                relative = source.relative_to(source_repository)
+                target = fixture / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.link(source, target)
+        except (OSError, RuntimeError, UnicodeError) as error:
+            setup_error = f"candidate fixture setup failed: {type(error).__name__}"
+
+        if setup_error is not None:
+            for failures in (
+                clean_failures,
+                identity_failures,
+                dirty_failures,
+                source_failures,
+                protocol_failures,
+            ):
+                failures.append(setup_error)
+        else:
+            output_root = fixture / "artifact-output"
+            try:
+                bundle = load_release_protocol_bundle(fixture)
+                outcome = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                inputs = outcome.payload.get("candidate_inputs")
+                if outcome.status is not ReleaseCommandStatusV1.READY:
+                    clean_failures.append("clean frozen predecessor did not return READY")
+                if type(inputs) is not dict:
+                    clean_failures.append("READY payload omitted verified candidate inputs")
+                    inputs = {}
+                if inputs.get("candidate_commit") != _DEV0011_PREDECESSOR_COMMIT_V1:
+                    clean_failures.append("READY payload candidate identity differs")
+                if inputs.get("tree_entry_count") != 515:
+                    clean_failures.append("READY payload candidate tree count differs")
+                if inputs.get("source_entry_count") != 482:
+                    clean_failures.append("READY payload source entry count differs")
+                if (
+                    inputs.get("source_manifest_sha256")
+                    != _DEV0011_SOURCE_MANIFEST_SHA256_V1
+                ):
+                    clean_failures.append("READY payload source manifest differs")
+                if inputs.get("protocol_set_sha256") != _DEV0011_PROTOCOL_SET_SHA256_V1:
+                    clean_failures.append("READY payload protocol set differs")
+                if inputs.get("tracked_tree_clean") is not True:
+                    clean_failures.append("READY payload does not prove tracked cleanliness")
+                if output_root.exists():
+                    clean_failures.append("build planning created an artifact output path")
+                wheel_source = wheel_sources[0]
+                wheel_target = fixture / wheel_source.relative_to(source_repository)
+                wheel_target.unlink()
+                wheel_target.write_bytes(b"DEV-0011 altered wheel fixture\n")
+                resource_drift = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                wheel_target.unlink()
+                os.link(wheel_source, wheel_target)
+                expected_resource_refusal = (
+                    ReleaseBuildRefusalCodeV1.RESOURCE_PREFLIGHT_INCOMPLETE.value
+                )
+                if (
+                    resource_drift.status is not ReleaseCommandStatusV1.REFUSED
+                    or resource_drift.refusal_code != expected_resource_refusal
+                ):
+                    clean_failures.append("live wheel drift did not refuse exactly")
+                clean_evidence = {
+                    "artifact_output_created": output_root.exists(),
+                    "candidate_commit": inputs.get("candidate_commit"),
+                    "resource_drift_refusal_code": resource_drift.refusal_code,
+                    "source_entry_count": inputs.get("source_entry_count"),
+                    "source_manifest_sha256": inputs.get("source_manifest_sha256"),
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                clean_failures.append(f"clean candidate fixture failed: {type(error).__name__}")
+
+            try:
+                reset_fixture(fixture)
+                bundle = load_release_protocol_bundle(fixture)
+                unresolved = plan_release_build(
+                    bundle,
+                    candidate_commit="0" * 40,
+                    output_root=output_root,
+                )
+                parent = run_git(
+                    fixture,
+                    "rev-parse",
+                    "--verify",
+                    f"{_DEV0011_PREDECESSOR_COMMIT_V1}^{{commit}}^",
+                ).decode("ascii").strip()
+                non_head = plan_release_build(
+                    bundle,
+                    candidate_commit=parent,
+                    output_root=output_root,
+                )
+                run_git(
+                    fixture,
+                    "replace",
+                    _DEV0011_PREDECESSOR_COMMIT_V1,
+                    parent,
+                )
+                reset_fixture(fixture)
+                replacement = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                run_git(
+                    fixture,
+                    "replace",
+                    "-d",
+                    _DEV0011_PREDECESSOR_COMMIT_V1,
+                )
+                reset_fixture(fixture)
+                expected_unresolved = ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID.value
+                expected_non_head = ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY.value
+                if (
+                    unresolved.status is not ReleaseCommandStatusV1.REFUSED
+                    or unresolved.refusal_code != expected_unresolved
+                ):
+                    identity_failures.append("unresolved commit did not refuse exactly")
+                if (
+                    non_head.status is not ReleaseCommandStatusV1.REFUSED
+                    or non_head.refusal_code != expected_non_head
+                ):
+                    identity_failures.append("existing non-HEAD commit did not refuse exactly")
+                if (
+                    replacement.status is not ReleaseCommandStatusV1.REFUSED
+                    or replacement.refusal_code != expected_non_head
+                ):
+                    identity_failures.append("replacement-object checkout did not refuse exactly")
+                identity_evidence = {
+                    "non_head_refusal_code": non_head.refusal_code,
+                    "replacement_refusal_code": replacement.refusal_code,
+                    "unresolved_refusal_code": unresolved.refusal_code,
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                identity_failures.append(
+                    f"candidate identity fixture failed: {type(error).__name__}"
+                )
+
+            try:
+                reset_fixture(fixture)
+                bundle = load_release_protocol_bundle(fixture)
+                source_path = fixture / "kirby2/__init__.py"
+                original = source_path.read_bytes()
+                source_path.write_bytes(original + b"\n# DEV-0011 unstaged drift\n")
+                unstaged = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                reset_fixture(fixture)
+                source_path.write_bytes(original + b"\n# DEV-0011 staged drift\n")
+                run_git(fixture, "add", "--", "kirby2/__init__.py")
+                staged = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                reset_fixture(fixture)
+                run_git(
+                    fixture,
+                    "update-index",
+                    "--assume-unchanged",
+                    "--",
+                    "kirby2/__init__.py",
+                )
+                source_path.write_bytes(original + b"\n# DEV-0011 hidden tracked drift\n")
+                assume_unchanged = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                run_git(
+                    fixture,
+                    "update-index",
+                    "--no-assume-unchanged",
+                    "--",
+                    "kirby2/__init__.py",
+                )
+                reset_fixture(fixture)
+                run_git(
+                    fixture,
+                    "update-index",
+                    "--skip-worktree",
+                    "--",
+                    "kirby2/__init__.py",
+                )
+                source_path.write_bytes(original + b"\n# DEV-0011 skipped tracked drift\n")
+                skip_worktree = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                run_git(
+                    fixture,
+                    "update-index",
+                    "--no-skip-worktree",
+                    "--",
+                    "kirby2/__init__.py",
+                )
+                reset_fixture(fixture)
+                untracked_path = fixture / "kirby2/dev0011_untracked_input.py"
+                exclude_path = fixture / ".git/info/exclude"
+                exclude_path.write_bytes(
+                    exclude_path.read_bytes()
+                    + b"\nkirby2/dev0011_untracked_input.py\n"
+                )
+                untracked_path.write_text("SENTINEL = True\n", encoding="utf-8")
+                untracked = plan_release_build(
+                    bundle,
+                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    output_root=output_root,
+                )
+                untracked_path.unlink()
+                expected = ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY.value
+                if (
+                    unstaged.status is not ReleaseCommandStatusV1.REFUSED
+                    or unstaged.refusal_code != expected
+                ):
+                    dirty_failures.append("unstaged tracked drift did not refuse exactly")
+                if (
+                    staged.status is not ReleaseCommandStatusV1.REFUSED
+                    or staged.refusal_code != expected
+                ):
+                    dirty_failures.append("staged tracked drift did not refuse exactly")
+                if (
+                    assume_unchanged.status is not ReleaseCommandStatusV1.REFUSED
+                    or assume_unchanged.refusal_code != expected
+                ):
+                    dirty_failures.append("assume-unchanged drift did not refuse exactly")
+                if (
+                    skip_worktree.status is not ReleaseCommandStatusV1.REFUSED
+                    or skip_worktree.refusal_code != expected
+                ):
+                    dirty_failures.append("skip-worktree drift did not refuse exactly")
+                if (
+                    untracked.status is not ReleaseCommandStatusV1.REFUSED
+                    or untracked.refusal_code != expected
+                ):
+                    dirty_failures.append("untracked build-input drift did not refuse exactly")
+                dirty_evidence = {
+                    "assume_unchanged_refusal_code": assume_unchanged.refusal_code,
+                    "skip_worktree_refusal_code": skip_worktree.refusal_code,
+                    "staged_refusal_code": staged.refusal_code,
+                    "untracked_refusal_code": untracked.refusal_code,
+                    "unstaged_refusal_code": unstaged.refusal_code,
+                }
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                dirty_failures.append(f"dirty candidate fixture failed: {type(error).__name__}")
+            finally:
+                try:
+                    reset_fixture(fixture)
+                except (OSError, RuntimeError):
+                    dirty_failures.append("dirty candidate fixture did not reset")
+
+            try:
+                reset_fixture(fixture)
+                source_path = fixture / "kirby2/__init__.py"
+                source_path.write_bytes(
+                    source_path.read_bytes() + b"\n# DEV-0011 committed source drift\n"
+                )
+                drift_commit = commit_fixture(
+                    fixture,
+                    "kirby2/__init__.py",
+                    "Create source-lock mismatch fixture",
+                )
+                bundle = load_release_protocol_bundle(fixture)
+                outcome = plan_release_build(
+                    bundle,
+                    candidate_commit=drift_commit,
+                    output_root=output_root,
+                )
+                expected = ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH.value
+                if (
+                    outcome.status is not ReleaseCommandStatusV1.REFUSED
+                    or outcome.refusal_code != expected
+                ):
+                    source_failures.append(
+                        "committed source projection drift did not refuse exactly"
+                    )
+                source_evidence = {"refusal_code": outcome.refusal_code}
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                source_failures.append(f"source-lock fixture failed: {type(error).__name__}")
+            finally:
+                try:
+                    reset_fixture(fixture)
+                except (OSError, RuntimeError):
+                    source_failures.append("source-lock fixture did not reset")
+
+            protocol_rows: list[list[str | None]] = []
+            for index, relative in enumerate(RELEASE_PROTOCOL_PATHS_V1):
+                try:
+                    reset_fixture(fixture)
+                    stale_bundle = load_release_protocol_bundle(fixture)
+                    protocol_path = fixture / relative
+                    protocol_path.write_bytes(
+                        protocol_path.read_bytes()
+                        + f"\n# DEV-0011 protocol drift {index}\n".encode("ascii")
+                    )
+                    drift_commit = commit_fixture(
+                        fixture,
+                        relative,
+                        f"Create protocol mismatch fixture {index}",
+                    )
+                    stale_outcome = plan_release_build(
+                        stale_bundle,
+                        candidate_commit=drift_commit,
+                        output_root=output_root,
+                    )
+                    fresh_outcome = plan_release_build(
+                        load_release_protocol_bundle(fixture),
+                        candidate_commit=drift_commit,
+                        output_root=output_root,
+                    )
+                    protocol_rows.append(
+                        [
+                            relative,
+                            stale_outcome.refusal_code,
+                            fresh_outcome.refusal_code,
+                        ]
+                    )
+                    expected = (
+                        ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH.value
+                    )
+                    if (
+                        stale_outcome.status is not ReleaseCommandStatusV1.REFUSED
+                        or stale_outcome.refusal_code != expected
+                    ):
+                        protocol_failures.append(
+                            f"stale-bundle protocol drift did not refuse: {relative}"
+                        )
+                    if (
+                        fresh_outcome.status is not ReleaseCommandStatusV1.REFUSED
+                        or fresh_outcome.refusal_code != expected
+                    ):
+                        protocol_failures.append(
+                            f"preflight-bound protocol drift did not refuse: {relative}"
+                        )
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    protocol_failures.append(
+                        f"protocol fixture failed for {relative}: {type(error).__name__}"
+                    )
+                finally:
+                    try:
+                        reset_fixture(fixture)
+                    except (OSError, RuntimeError):
+                        protocol_failures.append(
+                            f"protocol fixture did not reset: {relative}"
+                        )
+            protocol_evidence = {"protocols": protocol_rows}
+
+    cases = (
+        _case(
+            "clean_git_object_candidate_is_ready_without_writes",
+            "A clean candidate plus exact offline resources is ready; planning creates no artifacts.",
+            clean_evidence,
+            clean_failures,
+        ),
+        _case(
+            "unresolved_non_head_and_replaced_candidates_are_refused",
+            "Missing, non-HEAD, and locally replaced Git objects cannot become candidates.",
+            identity_evidence,
+            identity_failures,
+        ),
+        _case(
+            "tracked_and_untracked_candidate_drift_is_refused",
+            "Working-tree, index flags, and untracked build-input drift fail before dispatch.",
+            dirty_evidence,
+            dirty_failures,
+        ),
+        _case(
+            "candidate_source_projection_reproduces_the_lock",
+            "A committed source change without a regenerated lock is refused.",
+            source_evidence,
+            source_failures,
+        ),
+        _case(
+            "candidate_protocol_bytes_match_the_loaded_bundle",
+            "Each frozen protocol, dependency, and layout path is bound to the loaded protocol set.",
+            protocol_evidence,
+            protocol_failures,
+        ),
+    )
+    if len(cases) != DEV0011_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0011 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0011",
+        cases,
+        metadata=(("interrupted_card", "WO40-F"),),
+    )
 
 
 def _git_tracks_clean_working_file(repository: Path, relative: str) -> tuple[bool, str]:

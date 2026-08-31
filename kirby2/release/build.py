@@ -33,6 +33,7 @@ from .manifest import (
     RELEASE_PROTOCOL_PATHS_V1,
     RELEASE_VERSION_V1,
     ReleaseArtifactIndexV1,
+    ReleaseLogicalBuildProjectionV1,
     ReleaseProtocolFileV1,
 )
 from .packaging import (
@@ -55,6 +56,8 @@ from .performance import (
     RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1,
     RELEASE_RUNNER_SOURCE_POLICY_ID_V1,
     RELEASE_TOTAL_WALL_LIMIT_NS_V1,
+    RunnerSourceEntryV1,
+    RunnerSourceTreeV1,
     auxiliary_performance_templates,
 )
 from .qualification import (
@@ -97,8 +100,10 @@ class ReleaseBuildRefusalCodeV1(str, Enum):
     PROTOCOL_MISSING = "PROTOCOL_MISSING"
     PROTOCOL_INVALID = "PROTOCOL_INVALID"
     SOURCE_LOCK_MISSING = "SOURCE_LOCK_MISSING"
+    SOURCE_LOCK_MISMATCH = "SOURCE_LOCK_MISMATCH"
     CANDIDATE_COMMIT_INVALID = "CANDIDATE_COMMIT_INVALID"
     CANDIDATE_SOURCE_DIRTY = "CANDIDATE_SOURCE_DIRTY"
+    CANDIDATE_PROTOCOL_MISMATCH = "CANDIDATE_PROTOCOL_MISMATCH"
     RESOURCE_PREFLIGHT_INCOMPLETE = "RESOURCE_PREFLIGHT_INCOMPLETE"
     WHEEL_MISSING = "WHEEL_MISSING"
     WHEEL_DIGEST_MISMATCH = "WHEEL_DIGEST_MISMATCH"
@@ -117,6 +122,84 @@ class ReleaseBuildRefused(ValueError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code.value}: {detail}")
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseCandidateInputsV1:
+    candidate_commit: str
+    candidate_tree: str
+    source_date_epoch: int
+    tree_entry_count: int
+    source_entry_count: int
+    source_lock_object_id: str
+    source_lock_sha256: str
+    source_manifest_sha256: str
+    protocol_files: tuple[ReleaseProtocolFileV1, ...]
+    protocol_commit: str
+    protocol_set_sha256: str
+    resource_preflight_sha256: str
+    logical_build_id: str
+    tracked_tree_clean: bool
+
+    def __post_init__(self) -> None:
+        if _COMMIT.fullmatch(self.candidate_commit) is None:
+            raise ValueError("verified candidate commit is invalid")
+        if _COMMIT.fullmatch(self.candidate_tree) is None:
+            raise ValueError("verified candidate tree is invalid")
+        if type(self.source_date_epoch) is not int or self.source_date_epoch < 0:
+            raise ValueError("candidate source-date epoch must be nonnegative")
+        for label, value in (
+            ("candidate tree entry count", self.tree_entry_count),
+            ("candidate source entry count", self.source_entry_count),
+        ):
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{label} must be positive")
+        require_sha256(self.source_lock_sha256, "candidate source-lock digest")
+        if _COMMIT.fullmatch(self.source_lock_object_id) is None:
+            raise ValueError("candidate source-lock object ID is invalid")
+        require_sha256(
+            self.source_manifest_sha256,
+            "candidate source-manifest digest",
+        )
+        require_sha256(self.protocol_set_sha256, "candidate protocol-set digest")
+        if type(self.protocol_files) is not tuple or any(
+            type(item) is not ReleaseProtocolFileV1 for item in self.protocol_files
+        ):
+            raise TypeError("candidate protocol files must use exact V1 records")
+        if tuple(item.path for item in self.protocol_files) != RELEASE_PROTOCOL_PATHS_V1:
+            raise ValueError("candidate protocol file projection differs")
+        if _COMMIT.fullmatch(self.protocol_commit) is None:
+            raise ValueError("candidate protocol commit is invalid")
+        require_sha256(
+            self.resource_preflight_sha256,
+            "candidate resource-preflight digest",
+        )
+        if not self.logical_build_id.startswith("kirby2-release-"):
+            raise ValueError("candidate logical build ID has the wrong namespace")
+        require_sha256(
+            self.logical_build_id.removeprefix("kirby2-release-"),
+            "candidate logical build digest",
+        )
+        if self.tracked_tree_clean is not True:
+            raise ValueError("verified candidate requires a clean tracked tree")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "candidate_commit": self.candidate_commit,
+            "candidate_tree": self.candidate_tree,
+            "logical_build_id": self.logical_build_id,
+            "protocol_commit": self.protocol_commit,
+            "protocol_files": [item.as_dict() for item in self.protocol_files],
+            "protocol_set_sha256": self.protocol_set_sha256,
+            "resource_preflight_sha256": self.resource_preflight_sha256,
+            "source_date_epoch": self.source_date_epoch,
+            "source_entry_count": self.source_entry_count,
+            "source_lock_object_id": self.source_lock_object_id,
+            "source_lock_sha256": self.source_lock_sha256,
+            "source_manifest_sha256": self.source_manifest_sha256,
+            "tracked_tree_clean": self.tracked_tree_clean,
+            "tree_entry_count": self.tree_entry_count,
+        }
 
 
 def _exact(value: object, fields: set[str], label: str) -> dict[str, object]:
@@ -1343,6 +1426,525 @@ def release_resource_preflight(
     )
 
 
+def _candidate_tree_objects(
+    repository: Path,
+    candidate_commit: str,
+) -> dict[str, str]:
+    result = subprocess.run(
+        ["git", "ls-tree", "-r", "-z", "--full-tree", candidate_commit],
+        cwd=repository,
+        env=_candidate_git_environment(),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
+            "candidate commit tree cannot be read from the repository",
+        )
+    objects: dict[str, str] = {}
+    casefolded: set[str] = set()
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        header, separator, raw_path = record.partition(b"\t")
+        fields = header.split()
+        if not separator or len(fields) != 3:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate tree contains a malformed Git inventory record",
+            )
+        mode, object_type, raw_object_id = fields
+        if mode not in {b"100644", b"100755"} or object_type != b"blob":
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate tree contains a non-regular archive member",
+            )
+        try:
+            path = raw_path.decode("utf-8")
+            object_id = raw_object_id.decode("ascii")
+            normalize_release_path(path, label="candidate tree path")
+            normalize_release_path(
+                f"kirby2-{RELEASE_VERSION_V1}/{path}",
+                label="candidate source-archive path",
+            )
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate tree contains a noncanonical release path",
+            ) from error
+        if _COMMIT.fullmatch(object_id) is None:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate tree contains an invalid Git object identity",
+            )
+        folded = path.casefold()
+        if path in objects or folded in casefolded:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate tree paths are not unique under case folding",
+            )
+        objects[path] = object_id
+        casefolded.add(folded)
+    if not objects:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "candidate tree inventory is empty",
+        )
+    return objects
+
+
+def _candidate_blob_bytes(
+    repository: Path,
+    object_ids: tuple[str, ...],
+) -> dict[str, bytes]:
+    ordered_ids = tuple(dict.fromkeys(object_ids))
+    result = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        cwd=repository,
+        env=_candidate_git_environment(),
+        input=b"".join(f"{object_id}\n".encode("ascii") for object_id in ordered_ids),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "candidate blob inventory cannot be read from Git",
+        )
+    blobs: dict[str, bytes] = {}
+    offset = 0
+    for object_id in ordered_ids:
+        line_end = result.stdout.find(b"\n", offset)
+        if line_end < 0:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate blob batch response is incomplete",
+            )
+        header = result.stdout[offset:line_end].split()
+        if len(header) != 3 or header[0] != object_id.encode("ascii") or header[1] != b"blob":
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate object is not an exact Git blob",
+            )
+        try:
+            size = int(header[2].decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate blob size is invalid",
+            ) from error
+        body_start = line_end + 1
+        body_end = body_start + size
+        if body_end >= len(result.stdout) or result.stdout[body_end : body_end + 1] != b"\n":
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+                "candidate blob batch framing is invalid",
+            )
+        blobs[object_id] = result.stdout[body_start:body_end]
+        offset = body_end + 1
+    if offset != len(result.stdout):
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "candidate blob batch contains trailing data",
+        )
+    return blobs
+
+
+_CANDIDATE_GIT_ENVIRONMENT_OVERRIDES_V1 = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_WORK_TREE",
+    }
+)
+_CANDIDATE_UNTRACKED_INPUT_PATHS_V1 = (
+    "build",
+    "dist",
+    "kirby2",
+    "kirby2.egg-info",
+    "MANIFEST.in",
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "release/launchers",
+    "docs/INSTRUCTOR_RESEARCH.md",
+    "docs/LIMITATIONS.md",
+    "docs/SCENARIO_AUTHORING.md",
+    "docs/SECURITY_PRIVACY.md",
+    "docs/TROUBLESHOOTING.md",
+    "docs/USER_GUIDE.md",
+)
+
+
+def _candidate_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _CANDIDATE_GIT_ENVIRONMENT_OVERRIDES_V1
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["LC_ALL"] = "C"
+    return environment
+
+
+def _require_candidate_checkout_clean(
+    repository: Path,
+    candidate_commit: str,
+) -> None:
+    environment = _candidate_git_environment()
+    head = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    head_commit = head.stdout.decode("ascii", errors="replace").strip()
+    if head.returncode != 0 or head_commit != candidate_commit:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY,
+            "checked-out HEAD is not the requested release candidate",
+        )
+    index_flags = subprocess.run(
+        ["git", "ls-files", "-v", "-z", "--"],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    if index_flags.returncode != 0 or any(
+        record and not record.startswith(b"H ")
+        for record in index_flags.stdout.split(b"\0")
+    ):
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY,
+            "release candidate index contains a non-normal tracked-file flag",
+        )
+    for arguments in (
+        [
+            "git",
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--ignore-submodules=none",
+            "--",
+        ],
+        [
+            "git",
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "--ignore-submodules=none",
+            "--",
+        ],
+    ):
+        clean = subprocess.run(
+            arguments,
+            cwd=repository,
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+        if clean.returncode != 0:
+            raise ReleaseBuildRefused(
+                ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY,
+                "release candidate has staged or unstaged tracked changes",
+            )
+    untracked = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "--others",
+            "-z",
+            "--",
+            *_CANDIDATE_UNTRACKED_INPUT_PATHS_V1,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    unexpected_untracked: list[bytes] = []
+    for raw_path in untracked.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            unexpected_untracked.append(raw_path)
+            continue
+        parts = path.split("/")
+        interpreter_cache = "__pycache__" in parts and path.endswith(".pyc")
+        if not interpreter_cache:
+            unexpected_untracked.append(raw_path)
+    if untracked.returncode != 0 or unexpected_untracked:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_SOURCE_DIRTY,
+            "release candidate has an untracked file in a build-input namespace",
+        )
+
+
+def verify_release_candidate_inputs(
+    bundle: ReleaseProtocolBundleV1,
+    candidate_commit: str,
+) -> ReleaseCandidateInputsV1:
+    """Bind a clean checkout, frozen protocols, and source lock to one Git tree."""
+
+    if type(bundle) is not ReleaseProtocolBundleV1:
+        raise TypeError("candidate verification requires a release protocol bundle")
+    if _COMMIT.fullmatch(candidate_commit) is None:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
+            "candidate commit must be exactly forty lowercase hexadecimal characters",
+        )
+    repository = bundle.repository_root
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{candidate_commit}^{{commit}}"],
+        cwd=repository,
+        env=_candidate_git_environment(),
+        capture_output=True,
+        check=False,
+    )
+    resolved_commit = resolved.stdout.decode("ascii", errors="replace").strip()
+    if resolved.returncode != 0 or resolved_commit != candidate_commit:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
+            "candidate commit does not resolve to that exact repository commit",
+        )
+    metadata = subprocess.run(
+        ["git", "show", "-s", "--format=%T%x00%ct", candidate_commit],
+        cwd=repository,
+        env=_candidate_git_environment(),
+        capture_output=True,
+        check=False,
+    )
+    metadata_fields = metadata.stdout.rstrip(b"\n").split(b"\0")
+    try:
+        candidate_tree = metadata_fields[0].decode("ascii")
+        source_date_epoch = int(metadata_fields[1].decode("ascii"))
+    except (IndexError, UnicodeDecodeError, ValueError) as error:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
+            "candidate commit metadata cannot be resolved exactly",
+        ) from error
+    if (
+        metadata.returncode != 0
+        or len(metadata_fields) != 2
+        or _COMMIT.fullmatch(candidate_tree) is None
+        or source_date_epoch < 0
+    ):
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
+            "candidate commit metadata cannot be resolved exactly",
+        )
+    _require_candidate_checkout_clean(repository, candidate_commit)
+
+    tree_objects = _candidate_tree_objects(repository, candidate_commit)
+    lock_path = "release/performance_runner_sources.lock"
+    if lock_path not in tree_objects:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISSING,
+            "candidate commit does not contain the frozen runner-source lock",
+        )
+    missing_protocols = tuple(
+        path for path in RELEASE_PROTOCOL_PATHS_V1 if path not in tree_objects
+    )
+    if missing_protocols:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH,
+            "candidate commit does not contain every frozen release protocol",
+        )
+    preflight_report_path = "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md"
+    if preflight_report_path not in tree_objects:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.RESOURCE_PREFLIGHT_INCOMPLETE,
+            "candidate commit does not contain the passing resource-preflight report",
+        )
+    source_paths = tuple(
+        sorted(
+            (
+                path
+                for path in tree_objects
+                if path == "pyproject.toml" or path.startswith("kirby2/")
+            ),
+            key=lambda item: item.encode("utf-8"),
+        )
+    )
+    missing_candidate_inputs: list[str] = []
+    for item in bundle.artifact_layout.members:
+        if item.availability != "WO40_E" or item.source_path == "{candidate_commit}":
+            continue
+        if item.source_path.endswith("/{filename}"):
+            prefix = item.source_path.removesuffix("{filename}")
+            ready = any(path.startswith(prefix) for path in tree_objects)
+        else:
+            ready = item.source_path in tree_objects
+        if not ready:
+            missing_candidate_inputs.append(item.source_path)
+    if missing_candidate_inputs:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.FUTURE_SOURCE_INPUT_MISSING,
+            "candidate commit omits one or more frozen WO40-E inputs",
+        )
+    requested_paths = (
+        *source_paths,
+        lock_path,
+        *RELEASE_PROTOCOL_PATHS_V1,
+        preflight_report_path,
+    )
+    blobs = _candidate_blob_bytes(
+        repository,
+        tuple(tree_objects[path] for path in requested_paths),
+    )
+    candidate_lock_bytes = blobs[tree_objects[lock_path]]
+    current_lock_path = repository / lock_path
+    if not current_lock_path.is_file():
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISSING,
+            "working checkout does not contain the frozen runner-source lock",
+        )
+    try:
+        current_lock_matches = current_lock_path.read_bytes() == candidate_lock_bytes
+    except OSError as error:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "working source lock cannot be read exactly",
+        ) from error
+    if not current_lock_matches:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "working source lock differs from the candidate lock blob",
+        )
+    try:
+        locked_tree = RunnerSourceTreeV1.from_bytes(candidate_lock_bytes)
+        source_entries = tuple(
+            RunnerSourceEntryV1(
+                path=path,
+                sha256=hashlib.sha256(blobs[tree_objects[path]]).hexdigest(),
+            )
+            for path in source_paths
+        )
+        reproduced_tree = RunnerSourceTreeV1(
+            source_manifest=source_entries,
+            source_manifest_sha256=hashlib.sha256(
+                canonical_json_bytes([item.as_dict() for item in source_entries])
+            ).hexdigest(),
+        )
+    except (TypeError, ValueError) as error:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "candidate runner-source lock is invalid",
+        ) from error
+    if locked_tree != reproduced_tree:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.SOURCE_LOCK_MISMATCH,
+            "candidate source projection does not reproduce its runner-source lock",
+        )
+
+    candidate_protocols = tuple(
+        ReleaseProtocolFileV1(
+            path=path,
+            sha256=hashlib.sha256(blobs[tree_objects[path]]).hexdigest(),
+        )
+        for path in RELEASE_PROTOCOL_PATHS_V1
+    )
+    try:
+        current_protocols_match = all(
+            (repository / path).read_bytes() == blobs[tree_objects[path]]
+            for path in RELEASE_PROTOCOL_PATHS_V1
+        )
+    except OSError as error:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH,
+            "working release protocol bytes cannot be read",
+        ) from error
+    candidate_protocol_set = hashlib.sha256(
+        canonical_json_bytes([item.as_dict() for item in candidate_protocols])
+    ).hexdigest()
+    if (
+        not current_protocols_match
+        or candidate_protocols != bundle.protocol_files
+        or candidate_protocol_set != bundle.protocol_set_sha256
+    ):
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH,
+            "candidate protocol, dependency, or layout bytes differ from the loaded bundle",
+        )
+    history = subprocess.run(
+        [
+            "git",
+            "log",
+            "-1",
+            "--first-parent",
+            "--format=%H",
+            candidate_commit,
+            "--",
+            *RELEASE_PROTOCOL_PATHS_V1,
+        ],
+        cwd=repository,
+        env=_candidate_git_environment(),
+        capture_output=True,
+        check=False,
+    )
+    protocol_commit = history.stdout.decode("ascii", errors="replace").strip()
+    report_bytes = blobs[tree_objects[preflight_report_path]]
+    try:
+        report_lines = report_bytes.decode("utf-8").splitlines()
+        current_report_matches = (
+            repository / preflight_report_path
+        ).read_bytes() == report_bytes
+    except (OSError, UnicodeDecodeError) as error:
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.RESOURCE_PREFLIGHT_INCOMPLETE,
+            "candidate resource-preflight report cannot be read exactly",
+        ) from error
+    if (
+        history.returncode != 0
+        or _COMMIT.fullmatch(protocol_commit) is None
+        or not current_report_matches
+        or "Status: `PASS`" not in report_lines
+        or f"Protocol set SHA-256: `{candidate_protocol_set}`" not in report_lines
+        or f"WO40-D protocol commit: `{protocol_commit}`" not in report_lines
+    ):
+        raise ReleaseBuildRefused(
+            ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH,
+            "candidate protocol identities differ from the passing resource preflight",
+        )
+    _require_candidate_checkout_clean(repository, candidate_commit)
+    logical_projection = ReleaseLogicalBuildProjectionV1(
+        release_version=RELEASE_VERSION_V1,
+        candidate_commit=candidate_commit,
+        source_manifest_sha256=reproduced_tree.source_manifest_sha256,
+        protocol_files=candidate_protocols,
+        starter_set_entries_sha256=str(
+            bundle.artifact_layout.starter_set["entries_sha256"]
+        ),
+    )
+    return ReleaseCandidateInputsV1(
+        candidate_commit=candidate_commit,
+        candidate_tree=candidate_tree,
+        source_date_epoch=source_date_epoch,
+        tree_entry_count=len(tree_objects),
+        source_entry_count=len(source_entries),
+        source_lock_object_id=tree_objects[lock_path],
+        source_lock_sha256=hashlib.sha256(candidate_lock_bytes).hexdigest(),
+        source_manifest_sha256=reproduced_tree.source_manifest_sha256,
+        protocol_files=candidate_protocols,
+        protocol_commit=protocol_commit,
+        protocol_set_sha256=candidate_protocol_set,
+        resource_preflight_sha256=hashlib.sha256(report_bytes).hexdigest(),
+        logical_build_id=logical_projection.logical_build_id,
+        tracked_tree_clean=True,
+    )
+
+
 def plan_release_build(
     bundle: ReleaseProtocolBundleV1,
     *,
@@ -1350,11 +1952,6 @@ def plan_release_build(
     output_root: Path,
 ) -> ReleaseCommandOutcomeV1:
     _absolute(output_root, "release output root")
-    if _COMMIT.fullmatch(candidate_commit) is None:
-        raise ReleaseBuildRefused(
-            ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
-            "candidate commit must be exactly forty lowercase hexadecimal characters",
-        )
     source_lock = bundle.repository_root / "release/performance_runner_sources.lock"
     if not source_lock.is_file():
         return ReleaseCommandOutcomeV1(
@@ -1370,29 +1967,64 @@ def plan_release_build(
                 "required_source_lock": "release/performance_runner_sources.lock",
             },
         )
-    future_inputs: list[str] = []
-    for item in bundle.artifact_layout.members:
-        if item.availability != "WO40_E" or item.source_path == "{candidate_commit}":
-            continue
-        if item.source_path.endswith("/{filename}"):
-            directory = bundle.repository_root / item.source_path.removesuffix(
-                "/{filename}"
-            )
-            ready = directory.is_dir() and any(
-                path.is_file() for path in directory.iterdir()
-            )
-        else:
-            ready = (bundle.repository_root / item.source_path).is_file()
-        if not ready:
-            future_inputs.append(item.source_path)
-    if future_inputs:
+    try:
+        candidate_inputs = verify_release_candidate_inputs(bundle, candidate_commit)
+    except ReleaseBuildRefused as error:
         return ReleaseCommandOutcomeV1(
             command_id="BUILD_RELEASE",
-            status=ReleaseCommandStatusV1.NOT_EXERCISED,
+            status=ReleaseCommandStatusV1.REFUSED,
             protocol_set_sha256=bundle.protocol_set_sha256,
-            detail="Frozen candidate source inputs are not present.",
-            refusal_code=ReleaseBuildRefusalCodeV1.FUTURE_SOURCE_INPUT_MISSING.value,
-            payload={"candidate_commit": candidate_commit, "missing_paths": future_inputs},
+            detail=error.detail,
+            refusal_code=error.code.value,
+            payload={
+                "candidate_commit": candidate_commit,
+                "frontends": RELEASE_BUILD_FRONTENDS_V1,
+                "output_root": str(output_root),
+            },
+        )
+    provider_inventory = bundle.repository_root / ".kirby2/release/clean-providers.toml"
+    try:
+        preflight = release_resource_preflight(
+            bundle,
+            wheelhouse_root=(bundle.repository_root / "release/wheelhouse").resolve(),
+            provider_inventory=(
+                provider_inventory.resolve()
+                if provider_inventory.is_file()
+                else None
+            ),
+        )
+        expected_report = preflight.markdown().encode("utf-8")
+        observed_report = (
+            bundle.repository_root / "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md"
+        ).read_bytes()
+    except (OSError, ReleaseBuildRefused, TypeError, ValueError) as error:
+        return ReleaseCommandOutcomeV1(
+            command_id="BUILD_RELEASE",
+            status=ReleaseCommandStatusV1.REFUSED,
+            protocol_set_sha256=bundle.protocol_set_sha256,
+            detail=f"Live offline resource preflight failed: {type(error).__name__}.",
+            refusal_code=ReleaseBuildRefusalCodeV1.RESOURCE_PREFLIGHT_INCOMPLETE.value,
+            payload={
+                "candidate_commit": candidate_commit,
+                "candidate_inputs": candidate_inputs.as_dict(),
+                "output_root": str(output_root),
+            },
+        )
+    if preflight.status != "PASS" or observed_report != expected_report:
+        return ReleaseCommandOutcomeV1(
+            command_id="BUILD_RELEASE",
+            status=ReleaseCommandStatusV1.REFUSED,
+            protocol_set_sha256=bundle.protocol_set_sha256,
+            detail="Live offline resources or their exact passing report changed after preflight.",
+            refusal_code=ReleaseBuildRefusalCodeV1.RESOURCE_PREFLIGHT_INCOMPLETE.value,
+            payload={
+                "candidate_commit": candidate_commit,
+                "candidate_inputs": candidate_inputs.as_dict(),
+                "missing_resource_ids": [
+                    item.resource_id for item in preflight.missing_items
+                ],
+                "output_root": str(output_root),
+            },
         )
     return ReleaseCommandOutcomeV1(
         command_id="BUILD_RELEASE",
@@ -1402,9 +2034,15 @@ def plan_release_build(
         payload={
             "artifact_ids": [row[0] for row in RELEASE_ARTIFACT_ROWS_V1],
             "candidate_commit": candidate_commit,
+            "candidate_inputs": candidate_inputs.as_dict(),
             "frontends": RELEASE_BUILD_FRONTENDS_V1,
             "network": "FORBIDDEN",
             "output_root": str(output_root),
+            "resource_preflight": {
+                "protocol_commit": preflight.protocol_commit,
+                "report_sha256": hashlib.sha256(expected_report).hexdigest(),
+                "status": preflight.status,
+            },
         },
     )
 
@@ -1465,6 +2103,7 @@ __all__ = [
     "ReleaseArtifactLayoutV1",
     "ReleaseBuildRefusalCodeV1",
     "ReleaseBuildRefused",
+    "ReleaseCandidateInputsV1",
     "ReleaseCleanProviderInventoryV1",
     "ReleaseCleanProviderV1",
     "ReleaseCommandOutcomeV1",
@@ -1478,5 +2117,6 @@ __all__ = [
     "load_release_protocol_bundle",
     "plan_release_build",
     "release_resource_preflight",
+    "verify_release_candidate_inputs",
     "verify_release_artifacts",
 ]

@@ -101,6 +101,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0008", "WO40-E"),
     ("DEV-0009", "WO40-E"),
     ("DEV-0010", "WO40-E"),
+    ("DEV-0011", "WO40-F"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -180,6 +181,7 @@ REGISTERABLE_GATE_IDS = (
     "DEV-0009",
     "DEV-0010",
     "WO40-E",
+    "DEV-0011",
     "WO40-F",
     "WO40-G",
     "WO40-H",
@@ -5357,6 +5359,15 @@ def _audit_wo40e() -> ExpansionGateReport:
     return _release_suite_report("WO40-E", audit_release_candidate_source())
 
 
+def _audit_dev0011() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_candidate_input_restart
+
+    return _release_suite_report(
+        "DEV-0011",
+        audit_release_candidate_input_restart(),
+    )
+
+
 def _audit_wo40f() -> ExpansionGateReport:
     from kirby2.audit.release import audit_release_build_evidence
 
@@ -5468,6 +5479,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0009", _audit_dev0009),
     ("DEV-0010", _audit_dev0010),
     ("WO40-E", _audit_wo40e),
+    ("DEV-0011", _audit_dev0011),
     ("WO40-F", _audit_wo40f),
     ("WO40-G", _audit_wo40g),
     ("WO40-H", _audit_wo40h),
