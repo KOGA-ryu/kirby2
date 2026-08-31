@@ -11,6 +11,8 @@ dependencies = ["duckdb>=1.5,<2"]
 
 [project.scripts]
 kirby2 = "kirby2.__main__:main"
+kirby2-desktop = "kirby2.release.desktop:main"
+kirby2-headless = "kirby2.release.headless:main"
 
 [tool.setuptools.packages.find]
 include = ["kirby2*"]

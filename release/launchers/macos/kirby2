@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "Kirby2 macOS launcher requires Darwin arm64." >&2
+    exit 126
+fi
+if [ "$(uname -m)" != "arm64" ]; then
+    echo "Kirby2 macOS launcher requires Darwin arm64." >&2
+    exit 126
+fi
+
+if [ -n "${KIRBY2_PYTHON:-}" ]; then
+    if [ ! -x "$KIRBY2_PYTHON" ]; then
+        echo "KIRBY2_PYTHON must name an executable Python 3.14 path." >&2
+        exit 126
+    fi
+    if ! "$KIRBY2_PYTHON" -c 'import kirby2, platform, sys; raise SystemExit(platform.python_implementation() != "CPython" or sys.version_info[:2] != (3, 14))' >/dev/null 2>&1; then
+        echo "KIRBY2_PYTHON must contain installed Kirby2 under CPython 3.14." >&2
+        exit 126
+    fi
+    exec "$KIRBY2_PYTHON" -m kirby2.release.desktop "$@"
+fi
+
+if command -v kirby2-desktop >/dev/null 2>&1; then
+    exec kirby2-desktop "$@"
+fi
+
+for candidate in python3.14 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import kirby2, platform, sys; raise SystemExit(platform.python_implementation() != "CPython" or sys.version_info[:2] != (3, 14))' >/dev/null 2>&1; then
+        exec "$candidate" -m kirby2.release.desktop "$@"
+    fi
+done
+
+echo "Kirby2 is not installed in an available Python 3.14 runtime." >&2
+echo "Install the bundled wheelhouse offline, then set KIRBY2_PYTHON to that runtime." >&2
+exit 127
