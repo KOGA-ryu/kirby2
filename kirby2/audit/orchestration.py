@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
 import inspect
 import json
@@ -25,10 +27,16 @@ from kirby2.discovery.access import (
 )
 from kirby2.discovery.experiment import ExperimentPhaseV1
 from kirby2.discovery.partitions import StrategyPartitionV1
+from kirby2.orchestration.aggregation import (
+    ExperimentAggregateV1,
+    MetricValueKindV1,
+    aggregate_registered_results,
+)
 from kirby2.orchestration.artifacts import (
     ContentRequestV1,
     ResultBundleManifestV1,
 )
+from kirby2.orchestration.commands import ORCHESTRATION_COMMAND_MODULE
 from kirby2.orchestration.compatibility import (
     ConditionalTransferAuthorizationV1,
     OrchestrationCompatibilityRefused,
@@ -111,6 +119,16 @@ from kirby2.orchestration.resources import (
     WorkerResourceAdvertisementV1,
     record_from_canonical_bytes,
 )
+from kirby2.orchestration.recovery import (
+    RecoveryCheckpointV1,
+    RecoveryCompletionOrderV1,
+    RecoveryCoordinatorV1,
+    RecoveryEventKindV1,
+    RecoveryExperimentStatusV1,
+    RecoveryRefused,
+    RecoveryWorkRecordV1,
+    RecoveryWorkStateV1,
+)
 from kirby2.orchestration.seeds import (
     SeedDerivationV1,
     StableCellIdentityV1,
@@ -155,6 +173,7 @@ WO38A_AUDIT_CASE_COUNT = 5
 WO38B_AUDIT_CASE_COUNT = 5
 WO38C_ORCHESTRATION_AUDIT_CASE_COUNT = 4
 WO38D_AUDIT_CASE_COUNT = 6
+WO38E_AUDIT_CASE_COUNT = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +324,33 @@ def audit_authenticated_lan_orchestration() -> tuple[OrchestrationAuditCase, ...
         raise RuntimeError("WO38-D audit case inventory changed")
     if tuple(item.name for item in cases) != expected_names:
         raise RuntimeError("WO38-D audit case order or identity changed")
+    return cases
+
+
+def audit_distributed_recovery() -> tuple[OrchestrationAuditCase, ...]:
+    """Exercise the fixed WO38-E recovery and aggregation contract."""
+
+    compatibility = measure_local_worker_compatibility()
+    plan = _local_execution_plan(compatibility)
+    demo_case = _distributed_recovery_demo_case()
+    with TemporaryDirectory(prefix="kirby2-wo38e-audit-") as raw_root:
+        rooted_cases = _recovery_root_cases(
+            plan,
+            compatibility,
+            Path(raw_root).resolve(),
+        )
+    cases = (demo_case, *rooted_cases)
+    expected_names = (
+        "killed_worker_restart_recovers_the_complete_multiseed_experiment",
+        "late_identical_success_is_idempotent_and_conflict_is_quarantined",
+        "whole_experiment_aggregation_is_exact_complete_and_order_independent",
+        "cleanup_removes_only_unregistered_attempt_staging",
+        "recovery_commands_emit_durable_operational_events_without_identity_drift",
+    )
+    if len(cases) != WO38E_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO38-E audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO38-E audit case order or identity changed")
     return cases
 
 
@@ -1587,6 +1633,617 @@ def _resource_backpressure_and_cancellation_case(
     )
 
 
+def _distributed_recovery_demo_case() -> OrchestrationAuditCase:
+    demo = next(
+        command
+        for command in ORCHESTRATION_COMMAND_MODULE.commands
+        if command.name == "distributed-demo"
+    )
+    output = StringIO()
+    with contextlib.redirect_stdout(output):
+        exit_code = demo.handler(
+            argparse.Namespace(seed=42, kill_worker=True, workers=3)
+        )
+    payload = json.loads(output.getvalue())
+    expected_fields = frozenset(
+        {
+            "aggregate_sha256",
+            "completion_order",
+            "coordinator_restarted",
+            "lan",
+            "local_worker_count",
+            "logical_work_unit_count",
+            "plan_id",
+            "reference_backend",
+            "recovered_backend",
+            "retry_attempt_numbers",
+            "schema_id",
+            "schema_version",
+            "seed_count",
+            "status",
+            "strategy_identity",
+            "worker_killed",
+        }
+    )
+    retry_attempt_numbers = payload.get("retry_attempt_numbers")
+    strategy_identity = payload.get("strategy_identity")
+    lan = payload.get("lan")
+    checks = {
+        "demo_uses_the_exact_bounded_machine_readable_contract": (
+            exit_code == 0
+            and type(payload) is dict
+            and frozenset(payload) == expected_fields
+            and payload.get("schema_id")
+            == "KIRBY2_DISTRIBUTED_RECOVERY_DEMO_V1"
+            and payload.get("schema_version") == 1
+            and payload.get("status") == "PASS"
+            and _is_sha256(payload.get("plan_id"))
+            and _is_sha256(payload.get("aggregate_sha256"))
+        ),
+        "one_real_worker_is_killed_before_coordinator_reconstruction": (
+            payload.get("worker_killed") is True
+            and payload.get("coordinator_restarted") is True
+        ),
+        "all_six_unique_seeded_strategy_units_are_reissued_exactly_once": (
+            payload.get("logical_work_unit_count") == 6
+            and payload.get("seed_count") == 6
+            and type(retry_attempt_numbers) is list
+            and retry_attempt_numbers == [2] * 6
+            and type(strategy_identity) is dict
+            and DigestReferenceV1.from_dict(strategy_identity).name
+            == "demo-strategy:passive-observer-v1"
+        ),
+        "single_and_three_process_reverse_completion_match_whole_aggregate": (
+            payload.get("reference_backend") == "single-process-v1"
+            and payload.get("recovered_backend") == "local-subprocess-v1"
+            and payload.get("local_worker_count") == 3
+            and payload.get("completion_order") == "REVERSE"
+        ),
+        "unconfigured_lan_is_truthfully_not_exercised": (
+            lan
+            == {
+                "reason_code": "NO_EXPLICIT_LAN_CONFIGURATION",
+                "status": "NOT_EXERCISED",
+            }
+        ),
+    }
+    return _case(
+        "killed_worker_restart_recovers_the_complete_multiseed_experiment",
+        (
+            f"plan={payload.get('plan_id')} "
+            f"aggregate={payload.get('aggregate_sha256')}"
+        ),
+        checks,
+        payload,
+    )
+
+
+def _recovery_root_cases(
+    plan: ExperimentWorkPlanV1,
+    compatibility: WorkerCompatibilityV1,
+    root: Path,
+) -> tuple[OrchestrationAuditCase, ...]:
+    root.chmod(0o700)
+    paths = DataPaths(root / "primary")
+    recovery = RecoveryCoordinatorV1(paths)
+    plan_raw = plan.canonical_bytes()
+    submitted = recovery.submit(
+        plan,
+        recorded_at_utc="2026-01-01T00:00:00Z",
+    )
+    observed = recovery.status(plan.plan_id)
+    direct = OrchestrationCoordinatorV1().execute(
+        plan,
+        SingleProcessBackendV1(compatibility=compatibility),
+    )
+    completed = recovery.resume(
+        plan.plan_id,
+        SingleProcessBackendV1(compatibility=compatibility),
+        completion_order=RecoveryCompletionOrderV1.REVERSE,
+        recorded_at_utc="2026-01-01T00:01:00Z",
+    )
+    aggregate = completed.aggregate
+    if aggregate is None:
+        raise RuntimeError("WO38-E audit fixture did not complete its aggregate")
+    content = OrchestrationContentStoreV1(paths=paths)
+    manifest_map = {
+        item.logical_work_unit_id: item.selected_manifest_sha256
+        for item in completed.records
+        if item.selected_manifest_sha256 is not None
+    }
+    reordered_aggregate = aggregate_registered_results(
+        plan,
+        dict(reversed(tuple(manifest_map.items()))),
+        content,
+    )
+
+    target_result = direct.verified_results[0]
+    target_unit = next(
+        item
+        for item in plan.logical_units
+        if item.logical_work_unit_id == target_result.logical_work_unit_id
+    )
+    target_manifest = build_verified_result_manifest(
+        target_unit,
+        target_result,
+    )
+    target_manifest_sha256 = target_manifest.manifest_sha256
+    registered_manifest_before = content.read_result_manifest(
+        target_manifest_sha256
+    )
+    registered_artifacts_before = {
+        descriptor.artifact_id: content.read_result_artifact(
+            target_manifest_sha256,
+            descriptor,
+        )
+        for descriptor in registered_manifest_before.artifacts
+    }
+    attempt = content.begin_result_attempt(
+        attempt_id="wo38e-audit-cleanup-0001",
+        work_request_id=target_result.work_request_id,
+        logical_work_unit_id=target_result.logical_work_unit_id,
+    )
+    staged_descriptor = target_manifest.artifacts[0]
+    staged_artifact = next(
+        item
+        for item in target_result.artifacts
+        if item.artifact_id == staged_descriptor.artifact_id
+    )
+    content.stage_result_artifact(
+        attempt,
+        staged_descriptor,
+        staged_artifact.payload_bytes,
+    )
+    stage_leaves_before = _attempt_stage_leaves(paths)
+    cleaned = recovery.cleanup_unregistered_attempt(
+        attempt,
+        plan_id=plan.plan_id,
+        recorded_at_utc="2026-01-01T00:02:00Z",
+    )
+    stage_leaves_after = _attempt_stage_leaves(paths)
+    registered_manifest_after = content.read_result_manifest(
+        target_manifest_sha256
+    )
+    registered_artifacts_after = {
+        descriptor.artifact_id: content.read_result_artifact(
+            target_manifest_sha256,
+            descriptor,
+        )
+        for descriptor in registered_manifest_after.artifacts
+    }
+
+    duplicate = recovery.record_success(
+        plan.plan_id,
+        target_result,
+        attempt_number=1,
+        recorded_at_utc="2026-01-01T00:03:00Z",
+    )
+    conflicting_result = _conflicting_verified_result(target_result)
+    quarantined = recovery.record_success(
+        plan.plan_id,
+        conflicting_result,
+        attempt_number=1,
+        recorded_at_utc="2026-01-01T00:04:00Z",
+    )
+
+    cancellation_paths = DataPaths(root / "cancelled")
+    cancellation = RecoveryCoordinatorV1(cancellation_paths)
+    cancellation_submitted = cancellation.submit(
+        plan,
+        recorded_at_utc="2026-01-01T00:05:00Z",
+    )
+    cancellation_observed = cancellation.status(plan.plan_id)
+    cancelled = cancellation.cancel(
+        plan.plan_id,
+        reason_code="AUDIT_OPERATOR_CANCELLED",
+        recorded_at_utc="2026-01-01T00:06:00Z",
+    )
+    cancelled_again = cancellation.cancel(
+        plan.plan_id,
+        reason_code="AUDIT_OPERATOR_CANCELLED",
+        recorded_at_utc="2026-01-01T00:07:00Z",
+    )
+    cancelled_resume_refusal = _capture_recovery_refusal_code(
+        lambda: cancellation.resume(
+            plan.plan_id,
+            SingleProcessBackendV1(compatibility=compatibility),
+            recorded_at_utc="2026-01-01T00:08:00Z",
+        )
+    )
+
+    return (
+        _recovery_idempotence_case(
+            plan,
+            cleaned,
+            duplicate,
+            quarantined,
+            target_result,
+            conflicting_result,
+            recovery.status(plan.plan_id),
+        ),
+        _recovery_aggregation_case(
+            plan,
+            direct,
+            completed,
+            reordered_aggregate,
+        ),
+        _recovery_cleanup_case(
+            plan,
+            completed,
+            cleaned,
+            attempt,
+            stage_leaves_before,
+            stage_leaves_after,
+            registered_manifest_before,
+            registered_manifest_after,
+            registered_artifacts_before,
+            registered_artifacts_after,
+        ),
+        _recovery_command_and_event_case(
+            plan,
+            plan_raw,
+            submitted,
+            observed,
+            quarantined,
+            cancellation_submitted,
+            cancellation_observed,
+            cancelled,
+            cancelled_again,
+            cancelled_resume_refusal,
+            paths,
+            cancellation_paths,
+        ),
+    )
+
+
+def _recovery_idempotence_case(
+    plan: ExperimentWorkPlanV1,
+    prior: RecoveryCheckpointV1,
+    duplicate: RecoveryCheckpointV1,
+    quarantined: RecoveryCheckpointV1,
+    original_result: VerifiedWorkResultV1,
+    conflicting_result: VerifiedWorkResultV1,
+    restored: RecoveryCheckpointV1,
+) -> OrchestrationAuditCase:
+    duplicate_record = _recovery_record(
+        duplicate,
+        original_result.logical_work_unit_id,
+    )
+    quarantined_record = _recovery_record(
+        quarantined,
+        original_result.logical_work_unit_id,
+    )
+    successful_digests = tuple(
+        sorted(
+            (
+                original_result.scientific_result_sha256,
+                conflicting_result.scientific_result_sha256,
+            )
+        )
+    )
+    checks = {
+        "identical_late_success_adds_only_one_operational_event": (
+            duplicate.status is RecoveryExperimentStatusV1.COMPLETED
+            and duplicate.aggregate == prior.aggregate
+            and duplicate.records == prior.records
+            and duplicate.revision == prior.revision + 1
+            and duplicate.previous_checkpoint_sha256
+            == prior.checkpoint_sha256
+            and duplicate.events[:-1] == prior.events
+            and duplicate.events[-1].kind
+            is RecoveryEventKindV1.LATE_RESULT_IDEMPOTENT
+        ),
+        "identical_success_retains_one_selected_result_and_manifest": (
+            duplicate_record.selected_result_sha256
+            == original_result.scientific_result_sha256
+            and duplicate_record.successful_result_sha256s
+            == (original_result.scientific_result_sha256,)
+            and len(duplicate_record.registered_manifest_sha256s) == 1
+        ),
+        "different_success_quarantines_without_selecting_a_result": (
+            quarantined.status
+            is RecoveryExperimentStatusV1.QUARANTINED
+            and quarantined.aggregate is None
+            and quarantined_record.state
+            is RecoveryWorkStateV1.QUARANTINED
+            and quarantined_record.selected_result_sha256 is None
+            and quarantined_record.selected_manifest_sha256 is None
+            and quarantined_record.last_failure_code
+            == "DETERMINISM_FAILURE"
+        ),
+        "both_conflicting_successes_are_retained_as_immutable_evidence": (
+            quarantined_record.successful_result_sha256s
+            == successful_digests
+            and len(quarantined_record.registered_manifest_sha256s) == 2
+            and RecoveryEventKindV1.DETERMINISM_FAILURE
+            in tuple(item.kind for item in quarantined.events)
+        ),
+        "quarantined_checkpoint_is_canonical_durable_and_plan_exact": (
+            restored == quarantined
+            and RecoveryCheckpointV1.from_canonical_bytes(
+                quarantined.canonical_bytes()
+            )
+            == quarantined
+            and quarantined.plan == plan
+        ),
+    }
+    return _case(
+        "late_identical_success_is_idempotent_and_conflict_is_quarantined",
+        (
+            f"plan={plan.plan_id} "
+            f"status={quarantined.status.value}"
+        ),
+        checks,
+        {
+            "conflicting_result_sha256": (
+                conflicting_result.scientific_result_sha256
+            ),
+            "duplicate_checkpoint_sha256": duplicate.checkpoint_sha256,
+            "original_result_sha256": original_result.scientific_result_sha256,
+            "quarantined_checkpoint_sha256": quarantined.checkpoint_sha256,
+            "registered_manifest_sha256s": list(
+                quarantined_record.registered_manifest_sha256s
+            ),
+        },
+    )
+
+
+def _recovery_aggregation_case(
+    plan: ExperimentWorkPlanV1,
+    direct: CoordinatorRunResultV1,
+    completed: RecoveryCheckpointV1,
+    reordered: ExperimentAggregateV1,
+) -> OrchestrationAuditCase:
+    aggregate = completed.aggregate
+    if aggregate is None:
+        raise RuntimeError("WO38-E aggregate case received no aggregate")
+    expected_result_digests = tuple(
+        item.scientific_result_sha256 for item in direct.verified_results
+    )
+    checks = {
+        "aggregate_covers_every_planned_logical_unit_once_in_id_order": (
+            tuple(item.logical_work_unit_id for item in aggregate.members)
+            == tuple(item.logical_work_unit_id for item in plan.logical_units)
+            and len(aggregate.members) == len(plan.logical_units)
+            and len({item.logical_work_unit_id for item in aggregate.members})
+            == len(plan.logical_units)
+        ),
+        "member_results_are_the_independently_verified_reference_results": (
+            tuple(
+                item.scientific_result_sha256 for item in aggregate.members
+            )
+            == expected_result_digests
+        ),
+        "manifest_mapping_and_completion_order_cannot_change_aggregate": (
+            reordered == aggregate
+            and reordered.canonical_bytes() == aggregate.canonical_bytes()
+            and reordered.aggregate_sha256 == aggregate.aggregate_sha256
+        ),
+        "metric_reductions_are_complete_exact_and_binary_float_free": (
+            all(
+                item.value_count == len(plan.logical_units)
+                for item in aggregate.metric_columns
+            )
+            and all(
+                item.exact_numeric_sum is not None
+                for item in aggregate.metric_columns
+                if item.value_kind
+                in {MetricValueKindV1.INTEGER, MetricValueKindV1.DECIMAL}
+            )
+            and not _contains_binary_float(aggregate.as_dict())
+        ),
+        "whole_aggregate_round_trips_as_one_canonical_identity": (
+            ExperimentAggregateV1.from_canonical_bytes(
+                aggregate.canonical_bytes()
+            )
+            == aggregate
+            and completed.status is RecoveryExperimentStatusV1.COMPLETED
+        ),
+    }
+    return _case(
+        "whole_experiment_aggregation_is_exact_complete_and_order_independent",
+        (
+            f"plan={plan.plan_id} "
+            f"aggregate={aggregate.aggregate_sha256}"
+        ),
+        checks,
+        {
+            "aggregate_sha256": aggregate.aggregate_sha256,
+            "logical_work_unit_ids": [
+                item.logical_work_unit_id for item in aggregate.members
+            ],
+            "metric_columns": [
+                item.as_dict() for item in aggregate.metric_columns
+            ],
+        },
+    )
+
+
+def _recovery_cleanup_case(
+    plan: ExperimentWorkPlanV1,
+    completed: RecoveryCheckpointV1,
+    cleaned: RecoveryCheckpointV1,
+    attempt: ResultAttemptStageV1,
+    stage_leaves_before: tuple[str, ...],
+    stage_leaves_after: tuple[str, ...],
+    manifest_before: ResultBundleManifestV1,
+    manifest_after: ResultBundleManifestV1,
+    artifacts_before: dict[str, bytes],
+    artifacts_after: dict[str, bytes],
+) -> OrchestrationAuditCase:
+    aggregate = completed.aggregate
+    if aggregate is None:
+        raise RuntimeError("WO38-E cleanup case received no aggregate")
+    checks = {
+        "one_private_attempt_stage_exists_before_exact_cleanup": (
+            stage_leaves_before == (attempt.stage_key_sha256,)
+        ),
+        "cleanup_removes_the_attempt_stage_and_records_the_operation": (
+            stage_leaves_after == ()
+            and cleaned.events[-1].kind
+            is RecoveryEventKindV1.STAGING_DISCARDED
+            and cleaned.events[-1].logical_work_unit_id
+            == attempt.logical_work_unit_id
+        ),
+        "registered_manifest_and_artifact_bytes_survive_cleanup_exactly": (
+            manifest_after == manifest_before
+            and artifacts_after == artifacts_before
+            and all(
+                hashlib.sha256(payload).hexdigest()
+                == next(
+                    item.sha256
+                    for item in manifest_after.artifacts
+                    if item.artifact_id == artifact_id
+                )
+                for artifact_id, payload in artifacts_after.items()
+            )
+        ),
+        "cleanup_changes_only_operational_checkpoint_history": (
+            cleaned.status is RecoveryExperimentStatusV1.COMPLETED
+            and cleaned.aggregate == aggregate
+            and cleaned.records == completed.records
+            and cleaned.plan == plan
+        ),
+        "attempt_identity_never_enters_registered_or_aggregate_bytes": (
+            attempt.attempt_id.encode("ascii")
+            not in manifest_after.canonical_bytes()
+            and attempt.attempt_id.encode("ascii")
+            not in aggregate.canonical_bytes()
+        ),
+    }
+    return _case(
+        "cleanup_removes_only_unregistered_attempt_staging",
+        (
+            f"attempt={attempt.stage_key_sha256} "
+            f"manifest={manifest_after.manifest_sha256}"
+        ),
+        checks,
+        {
+            "aggregate_sha256": aggregate.aggregate_sha256,
+            "attempt_stage_key_sha256": attempt.stage_key_sha256,
+            "manifest_sha256": manifest_after.manifest_sha256,
+            "staging_after": list(stage_leaves_after),
+            "staging_before": list(stage_leaves_before),
+        },
+    )
+
+
+def _recovery_command_and_event_case(
+    plan: ExperimentWorkPlanV1,
+    plan_raw: bytes,
+    submitted: RecoveryCheckpointV1,
+    observed: RecoveryCheckpointV1,
+    final_primary: RecoveryCheckpointV1,
+    cancellation_submitted: RecoveryCheckpointV1,
+    cancellation_observed: RecoveryCheckpointV1,
+    cancelled: RecoveryCheckpointV1,
+    cancelled_again: RecoveryCheckpointV1,
+    cancelled_resume_refusal: str | None,
+    primary_paths: DataPaths,
+    cancellation_paths: DataPaths,
+) -> OrchestrationAuditCase:
+    orchestrate = next(
+        command
+        for command in ORCHESTRATION_COMMAND_MODULE.commands
+        if command.name == "orchestrate"
+    )
+    if orchestrate.configure is None:
+        raise RuntimeError("orchestrate command has no parser configuration")
+    parser = argparse.ArgumentParser(add_help=False)
+    orchestrate.configure(parser)
+    action = next(
+        item
+        for item in parser._actions
+        if isinstance(item, argparse._SubParsersAction)
+    )
+    action_names = tuple(action.choices)
+    required_event_kinds = {
+        RecoveryEventKindV1.SUBMITTED,
+        RecoveryEventKindV1.RESUMED,
+        RecoveryEventKindV1.ATTEMPT_STARTED,
+        RecoveryEventKindV1.RESULT_ACCEPTED,
+        RecoveryEventKindV1.RESULT_REGISTERED,
+        RecoveryEventKindV1.COMPLETED,
+        RecoveryEventKindV1.STAGING_DISCARDED,
+        RecoveryEventKindV1.LATE_RESULT_IDEMPOTENT,
+        RecoveryEventKindV1.DETERMINISM_FAILURE,
+    }
+    observed_event_kinds = {item.kind for item in final_primary.events}
+    temporary_files = tuple(
+        sorted(
+            path.name
+            for paths in (primary_paths, cancellation_paths)
+            for path in paths.checkpoints.rglob("*")
+            if path.name.startswith(".recovery-tmp-")
+        )
+    )
+    checks = {
+        "central_command_registry_exposes_the_complete_modular_surface": (
+            ORCHESTRATION_COMMAND_MODULE.module_id
+            == "DISTRIBUTED_ORCHESTRATION"
+            and tuple(
+                command.name
+                for command in ORCHESTRATION_COMMAND_MODULE.commands
+            )
+            == ("orchestrate", "orchestration-demo", "distributed-demo")
+            and action_names
+            == (
+                "plan",
+                "coordinator",
+                "worker",
+                "submit",
+                "status",
+                "cancel",
+                "resume",
+                "lan-worker",
+            )
+        ),
+        "status_reads_do_not_mutate_checkpoint_state": (
+            observed == submitted
+            and cancellation_observed == cancellation_submitted
+        ),
+        "every_primary_state_change_has_a_closed_operational_event": (
+            required_event_kinds <= observed_event_kinds
+            and tuple(item.sequence for item in final_primary.events)
+            == tuple(range(1, len(final_primary.events) + 1))
+        ),
+        "whole_experiment_cancel_is_durable_idempotent_and_terminal": (
+            cancelled.status is RecoveryExperimentStatusV1.CANCELLED
+            and cancelled_again == cancelled
+            and all(
+                item.state is RecoveryWorkStateV1.CANCELLED
+                for item in cancelled.records
+            )
+            and cancelled.events[-1].kind is RecoveryEventKindV1.CANCELLED
+            and cancelled_resume_refusal == "PLAN_CANCELLED"
+        ),
+        "operational_events_and_atomic_storage_do_not_change_work_identity": (
+            plan.canonical_bytes() == plan_raw
+            and submitted.plan == final_primary.plan == cancelled.plan == plan
+            and temporary_files == ()
+            and RecoveryCheckpointV1.from_canonical_bytes(
+                cancelled.canonical_bytes()
+            )
+            == cancelled
+        ),
+    }
+    return _case(
+        "recovery_commands_emit_durable_operational_events_without_identity_drift",
+        (
+            f"actions={len(action_names)} "
+            f"events={len(final_primary.events)}"
+        ),
+        checks,
+        {
+            "action_names": list(action_names),
+            "cancelled_checkpoint_sha256": cancelled.checkpoint_sha256,
+            "cancelled_resume_refusal": cancelled_resume_refusal,
+            "event_kinds": [item.kind.value for item in final_primary.events],
+            "temporary_files": list(temporary_files),
+        },
+    )
+
+
 def _permutation_invariant_planning_case(
     cells: tuple[LogicalWorkCellV1, ...],
     plan: ExperimentWorkPlanV1,
@@ -2786,6 +3443,16 @@ def _capture_lease_refusal_code(operation) -> str | None:
     return None
 
 
+def _capture_recovery_refusal_code(operation) -> str | None:
+    try:
+        operation()
+    except RecoveryRefused as error:
+        return error.code
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        return f"UNEXPECTED:{type(error).__name__}:{error}"
+    return None
+
+
 def _lan_audit_resource_limits() -> ResourceLimitsV1:
     return ResourceLimitsV1(
         maximum_concurrent_runs=1,
@@ -2942,6 +3609,77 @@ def _resource_claim(
     )
 
 
+def _conflicting_verified_result(
+    original: VerifiedWorkResultV1,
+) -> VerifiedWorkResultV1:
+    metrics = tuple(
+        item for item in original.artifacts if item.artifact_id == "metrics.json"
+    )
+    if len(metrics) != 1:
+        raise RuntimeError("WO38-E conflict fixture requires one metrics artifact")
+    changed_metrics = InlineArtifactV1.from_json_object(
+        "metrics.json",
+        {
+            "baseline_metrics_sha256": metrics[0].sha256,
+            "scientific_conflict": "WO38-E_AUDIT_CONFLICT",
+        },
+    )
+    artifacts = tuple(
+        sorted(
+            (
+                changed_metrics,
+                *(
+                    item
+                    for item in original.artifacts
+                    if item.artifact_id != "metrics.json"
+                ),
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    manifest = WorkerResultManifestV1(
+        work_request_id=original.work_request_id,
+        logical_work_unit_id=original.logical_work_unit_id,
+        worker_compatibility_sha256=original.worker_compatibility_sha256,
+        artifacts=tuple(item.digest_reference for item in artifacts),
+        runtime_audit_results=tuple(
+            item.result_reference for item in original.runtime_audit_results
+        ),
+    )
+    return VerifiedWorkResultV1(
+        work_request_id=original.work_request_id,
+        logical_work_unit_id=original.logical_work_unit_id,
+        worker_compatibility_sha256=original.worker_compatibility_sha256,
+        worker_result_manifest_sha256=manifest.manifest_sha256,
+        artifacts=artifacts,
+        runtime_audit_results=original.runtime_audit_results,
+    )
+
+
+def _recovery_record(
+    checkpoint: RecoveryCheckpointV1,
+    logical_work_unit_id: str,
+) -> RecoveryWorkRecordV1:
+    records = tuple(
+        item
+        for item in checkpoint.records
+        if item.logical_work_unit_id == logical_work_unit_id
+    )
+    if len(records) != 1:
+        raise RuntimeError("WO38-E checkpoint lost its exact recovery record")
+    return records[0]
+
+
+def _contains_binary_float(value: object) -> bool:
+    if type(value) is float:
+        return True
+    if type(value) is dict:
+        return any(_contains_binary_float(item) for item in value.values())
+    if type(value) in {list, tuple}:
+        return any(_contains_binary_float(item) for item in value)
+    return False
+
+
 def _attempt_object_root(
     paths: DataPaths,
     attempt: ResultAttemptStageV1,
@@ -2974,9 +3712,10 @@ def _file_names(root: Path) -> tuple[str, ...]:
     return tuple(sorted(path.name for path in root.iterdir() if path.is_file()))
 
 
-def _is_sha256(value: str) -> bool:
+def _is_sha256(value: object) -> bool:
     return (
-        len(value) == 64
+        type(value) is str
+        and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
 
@@ -3004,8 +3743,10 @@ __all__ = [
     "WO38B_AUDIT_CASE_COUNT",
     "WO38C_ORCHESTRATION_AUDIT_CASE_COUNT",
     "WO38D_AUDIT_CASE_COUNT",
+    "WO38E_AUDIT_CASE_COUNT",
     "OrchestrationAuditCase",
     "audit_authenticated_lan_orchestration",
+    "audit_distributed_recovery",
     "audit_local_orchestration",
     "audit_logical_work_and_attempt_identity",
     "audit_verified_content_exchange",

@@ -163,6 +163,7 @@ REGISTERABLE_GATE_IDS = (
     "WO38-B",
     "WO38-C",
     "WO38-D",
+    "WO38-E",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4875,6 +4876,48 @@ def _audit_wo38d() -> ExpansionGateReport:
     )
 
 
+def _audit_wo38e() -> ExpansionGateReport:
+    from kirby2.audit.orchestration import (
+        WO38E_AUDIT_CASE_COUNT,
+        audit_distributed_recovery,
+    )
+
+    cases = audit_distributed_recovery()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO38-E",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO38E_AUDIT_CASE_COUNT)),
+            ("reissue_policy", "SAME_LOGICAL_ID_NEW_ATTEMPT_V1"),
+            ("late_result_policy", "IDEMPOTENT_OR_QUARANTINED_V1"),
+            ("aggregation", "LOGICAL_ID_ORDER_EXACT_REDUCTION_V1"),
+            ("cleanup", "UNREGISTERED_ATTEMPT_ONLY_V1"),
+            ("demonstration", "KILL_RESTART_MULTI_PROCESS_WHOLE_RUN_V1"),
+            ("lan_status", "NOT_EXERCISED_WITHOUT_EXPLICIT_CONFIGURATION"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4939,6 +4982,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO38-B", _audit_wo38b),
     ("WO38-C", _audit_wo38c),
     ("WO38-D", _audit_wo38d),
+    ("WO38-E", _audit_wo38e),
 )
 
 
