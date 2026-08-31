@@ -14,9 +14,10 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkstemp
@@ -35,6 +36,7 @@ WO40E_AUDIT_CASE_COUNT = 4
 DEV0009_AUDIT_CASE_COUNT = 3
 DEV0010_AUDIT_CASE_COUNT = 2
 DEV0011_AUDIT_CASE_COUNT = 5
+DEV0012_AUDIT_CASE_COUNT = 4
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -63,7 +65,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 12)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 13)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1738,11 +1740,14 @@ def audit_release_candidate_source() -> ReleaseAuditSuite:
 def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
     """Prove the restarted WO40-F planner binds real immutable candidate inputs."""
 
+    import kirby2.release.build as release_build_module
+
     from kirby2.release.build import (
         ReleaseBuildRefusalCodeV1,
         ReleaseCommandStatusV1,
         load_release_protocol_bundle,
         plan_release_build,
+        release_resource_preflight,
     )
     from kirby2.release.manifest import RELEASE_PROTOCOL_PATHS_V1
 
@@ -1772,6 +1777,8 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
     }
     source_evidence: dict[str, object] = {"refusal_code": None}
     protocol_evidence: dict[str, object] = {"protocols": []}
+    fixture_candidate = _DEV0011_PREDECESSOR_COMMIT_V1
+    source_repository = _repository_root()
 
     def run_git(repository: Path, *arguments: str) -> bytes:
         result = subprocess.run(
@@ -1791,7 +1798,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
             "--quiet",
             "--force",
             "--detach",
-            _DEV0011_PREDECESSOR_COMMIT_V1,
+            fixture_candidate,
         )
 
     def commit_fixture(repository: Path, relative: str, subject: str) -> str:
@@ -1829,7 +1836,70 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
             "ascii"
         ).strip()
 
-    with TemporaryDirectory(prefix="kirby2-release-dev0011-") as temporary:
+    @contextlib.contextmanager
+    def activate_fixture_runtime(
+        repository: Path,
+        source_repository: Path,
+    ) -> Iterable[None]:
+        """Point runtime discovery at the hardlinked detached-fixture venv."""
+
+        runtime_sys = release_build_module.sys
+        runtime_site = release_build_module.site
+        runtime_sysconfig = release_build_module.sysconfig
+        source_site_packages = (
+            source_repository / ".venv/lib/python3.14/site-packages"
+        ).resolve(strict=True)
+        fixture_site_packages = (
+            repository / ".venv/lib/python3.14/site-packages"
+        ).resolve(strict=True)
+        original_prefix = runtime_sys.prefix
+        original_executable = runtime_sys.executable
+        original_path = tuple(runtime_sys.path)
+        original_getsitepackages = runtime_site.getsitepackages
+        original_get_path = runtime_sysconfig.get_path
+
+        def fixture_getsitepackages(prefixes: object = None) -> list[str]:
+            del prefixes
+            return [os.fspath(fixture_site_packages)]
+
+        def fixture_get_path(name: str, *args: object, **kwargs: object) -> str:
+            if name in {"purelib", "platlib"}:
+                return os.fspath(fixture_site_packages)
+            return original_get_path(name, *args, **kwargs)
+
+        fixture_path: list[str] = []
+        for value in original_path:
+            try:
+                resolved = Path(value).resolve(strict=False)
+            except (OSError, TypeError, ValueError):
+                fixture_path.append(value)
+                continue
+            fixture_path.append(
+                os.fspath(fixture_site_packages)
+                if resolved == source_site_packages
+                else value
+            )
+        runtime_sys.prefix = os.fspath(repository / ".venv")
+        runtime_sys.executable = os.fspath(repository / ".venv/bin/python")
+        runtime_sys.path[:] = fixture_path
+        runtime_site.getsitepackages = fixture_getsitepackages
+        runtime_sysconfig.get_path = fixture_get_path
+        try:
+            yield
+        finally:
+            runtime_sys.prefix = original_prefix
+            runtime_sys.executable = original_executable
+            runtime_sys.path[:] = original_path
+            runtime_site.getsitepackages = original_getsitepackages
+            runtime_sysconfig.get_path = original_get_path
+
+    with (
+        TemporaryDirectory(
+            prefix="kirby2-release-dev0011-",
+            dir=source_repository / ".kirby2",
+        ) as temporary,
+        contextlib.ExitStack() as fixture_stack,
+    ):
         temporary_root = Path(temporary).resolve()
         fixture = temporary_root / "candidate"
         clone = subprocess.run(
@@ -1854,7 +1924,15 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 "untracked non-input bytes must not alter a Git-object build plan\n",
                 encoding="utf-8",
             )
-            source_repository = _repository_root()
+            shutil.copytree(
+                source_repository / ".venv",
+                fixture / ".venv",
+                copy_function=os.link,
+                symlinks=True,
+            )
+            fixture_stack.enter_context(
+                activate_fixture_runtime(fixture, source_repository)
+            )
             wheel_sources = tuple(
                 sorted(
                     (source_repository / "release/wheelhouse").rglob("*.whl"),
@@ -1864,7 +1942,6 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
             if len(wheel_sources) != 2:
                 raise RuntimeError("release audit requires both frozen wheel inputs")
             resource_sources = (
-                source_repository / ".venv/bin/pip",
                 source_repository / ".kirby2/release/clean-providers.toml",
                 *wheel_sources,
             )
@@ -1873,6 +1950,22 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 target = fixture / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.link(source, target)
+            fixture_bundle = load_release_protocol_bundle(fixture)
+            fixture_preflight = release_resource_preflight(
+                fixture_bundle,
+                wheelhouse_root=fixture / "release/wheelhouse",
+                provider_inventory=fixture / ".kirby2/release/clean-providers.toml",
+            )
+            (fixture / "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md").write_text(
+                fixture_preflight.markdown(),
+                encoding="utf-8",
+            )
+            fixture_candidate = commit_fixture(
+                fixture,
+                "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+                "Refresh historical resource report fixture",
+            )
+            reset_fixture(fixture)
         except (OSError, RuntimeError, UnicodeError) as error:
             setup_error = f"candidate fixture setup failed: {type(error).__name__}"
 
@@ -1891,7 +1984,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 bundle = load_release_protocol_bundle(fixture)
                 outcome = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 inputs = outcome.payload.get("candidate_inputs")
@@ -1900,7 +1993,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 if type(inputs) is not dict:
                     clean_failures.append("READY payload omitted verified candidate inputs")
                     inputs = {}
-                if inputs.get("candidate_commit") != _DEV0011_PREDECESSOR_COMMIT_V1:
+                if inputs.get("candidate_commit") != fixture_candidate:
                     clean_failures.append("READY payload candidate identity differs")
                 if inputs.get("tree_entry_count") != 515:
                     clean_failures.append("READY payload candidate tree count differs")
@@ -1923,7 +2016,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 wheel_target.write_bytes(b"DEV-0011 altered wheel fixture\n")
                 resource_drift = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 wheel_target.unlink()
@@ -1936,9 +2029,49 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                     or resource_drift.refusal_code != expected_resource_refusal
                 ):
                     clean_failures.append("live wheel drift did not refuse exactly")
+                pip_source = source_repository / ".venv/bin/pip"
+                pip_target = fixture / ".venv/bin/pip"
+                pip_target.unlink()
+                pip_target.write_bytes(b"#!/bin/sh\nexit 99\n")
+                pip_target.chmod(0o755)
+                pip_drift = plan_release_build(
+                    bundle,
+                    candidate_commit=fixture_candidate,
+                    output_root=output_root,
+                )
+                pip_target.unlink()
+                os.link(pip_source, pip_target)
+                if (
+                    pip_drift.status is not ReleaseCommandStatusV1.REFUSED
+                    or pip_drift.refusal_code != expected_resource_refusal
+                ):
+                    clean_failures.append("live packaging-tool drift did not refuse exactly")
+                provider_source = (
+                    source_repository / ".kirby2/release/clean-providers.toml"
+                )
+                provider_target = fixture / ".kirby2/release/clean-providers.toml"
+                provider_raw = provider_source.read_bytes()
+                provider_target.unlink()
+                provider_target.write_bytes(
+                    provider_raw + b"\n# DEV-0012 raw inventory fingerprint drift\n"
+                )
+                provider_drift = plan_release_build(
+                    bundle,
+                    candidate_commit=fixture_candidate,
+                    output_root=output_root,
+                )
+                provider_target.unlink()
+                os.link(provider_source, provider_target)
+                if (
+                    provider_drift.status is not ReleaseCommandStatusV1.REFUSED
+                    or provider_drift.refusal_code != expected_resource_refusal
+                ):
+                    clean_failures.append("raw provider-inventory drift did not refuse exactly")
                 clean_evidence = {
                     "artifact_output_created": output_root.exists(),
                     "candidate_commit": inputs.get("candidate_commit"),
+                    "packaging_tool_drift_refusal_code": pip_drift.refusal_code,
+                    "provider_inventory_drift_refusal_code": provider_drift.refusal_code,
                     "resource_drift_refusal_code": resource_drift.refusal_code,
                     "source_entry_count": inputs.get("source_entry_count"),
                     "source_manifest_sha256": inputs.get("source_manifest_sha256"),
@@ -1958,7 +2091,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                     fixture,
                     "rev-parse",
                     "--verify",
-                    f"{_DEV0011_PREDECESSOR_COMMIT_V1}^{{commit}}^",
+                    f"{fixture_candidate}^{{commit}}^",
                 ).decode("ascii").strip()
                 non_head = plan_release_build(
                     bundle,
@@ -1968,20 +2101,20 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 run_git(
                     fixture,
                     "replace",
-                    _DEV0011_PREDECESSOR_COMMIT_V1,
+                    fixture_candidate,
                     parent,
                 )
                 reset_fixture(fixture)
                 replacement = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 run_git(
                     fixture,
                     "replace",
                     "-d",
-                    _DEV0011_PREDECESSOR_COMMIT_V1,
+                    fixture_candidate,
                 )
                 reset_fixture(fixture)
                 expected_unresolved = ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID.value
@@ -2019,7 +2152,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 source_path.write_bytes(original + b"\n# DEV-0011 unstaged drift\n")
                 unstaged = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 reset_fixture(fixture)
@@ -2027,7 +2160,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 run_git(fixture, "add", "--", "kirby2/__init__.py")
                 staged = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 reset_fixture(fixture)
@@ -2041,7 +2174,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 source_path.write_bytes(original + b"\n# DEV-0011 hidden tracked drift\n")
                 assume_unchanged = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 run_git(
@@ -2062,7 +2195,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 source_path.write_bytes(original + b"\n# DEV-0011 skipped tracked drift\n")
                 skip_worktree = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 run_git(
@@ -2082,7 +2215,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 untracked_path.write_text("SENTINEL = True\n", encoding="utf-8")
                 untracked = plan_release_build(
                     bundle,
-                    candidate_commit=_DEV0011_PREDECESSOR_COMMIT_V1,
+                    candidate_commit=fixture_candidate,
                     output_root=output_root,
                 )
                 untracked_path.unlink()
@@ -2259,6 +2392,450 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
         raise RuntimeError("DEV-0011 release audit inventory changed")
     return ReleaseAuditSuite(
         "DEV-0011",
+        cases,
+        metadata=(("interrupted_card", "WO40-F"),),
+    )
+
+
+def audit_release_resource_fingerprint_restart() -> ReleaseAuditSuite:
+    """Prove every passing live resource fingerprint is report-bound."""
+
+    import kirby2.release.build as release_build_module
+    import py_compile
+
+    from kirby2.release.build import (
+        ReleaseBuildDistributionV1,
+        ReleaseBuildRuntimeSnapshotV1,
+        ReleaseResourceItemV1,
+        ReleaseResourcePreflightV1,
+        load_release_protocol_bundle,
+        release_resource_preflight,
+    )
+
+    repository = _repository_root()
+    bundle = load_release_protocol_bundle(repository)
+    provider_inventory = repository / ".kirby2/release/clean-providers.toml"
+    live = release_resource_preflight(
+        bundle,
+        wheelhouse_root=repository / "release/wheelhouse",
+        provider_inventory=(provider_inventory if provider_inventory.is_file() else None),
+    )
+    projection = canonical_json_bytes([item.as_dict() for item in live.items])
+    expected_snapshot = _sha256(projection)
+    rendered = live.markdown().encode("utf-8")
+    snapshot_line = (
+        f"Resource snapshot SHA-256: `{expected_snapshot}`\n".encode("ascii")
+    )
+    snapshot_failures: list[str] = []
+    if live.resource_snapshot_sha256 != expected_snapshot:
+        snapshot_failures.append("resource snapshot does not match its canonical item projection")
+    if rendered.count(snapshot_line) != 1:
+        snapshot_failures.append("resource report does not contain exactly one snapshot binding")
+    if live.as_dict().get("resource_snapshot_sha256") != expected_snapshot:
+        snapshot_failures.append("machine-readable preflight omits the resource snapshot")
+    if live.build_runtime is None:
+        snapshot_failures.append("passing preflight omits the build runtime snapshot")
+    inventory_item = next(
+        (item for item in live.items if item.resource_id == "clean-provider-inventory"),
+        None,
+    )
+    observed_inventory_sha256: str | None = None
+    if inventory_item is None or not provider_inventory.is_file():
+        snapshot_failures.append("live provider inventory resource is unavailable")
+    else:
+        observed_inventory_sha256 = _sha256(provider_inventory.read_bytes())
+        if inventory_item.observed_sha256 != observed_inventory_sha256:
+            snapshot_failures.append("raw provider inventory bytes are not fingerprinted")
+    snapshot_case = _case(
+        "canonical_resource_projection_is_report_bound",
+        "The exact ordered resource records, including raw provider bytes, own one report digest.",
+        {
+            "item_count": len(live.items),
+            "provider_inventory_sha256": observed_inventory_sha256,
+            "report_sha256": _sha256(rendered),
+            "resource_snapshot_sha256": live.resource_snapshot_sha256,
+        },
+        snapshot_failures,
+    )
+
+    runtime_failures: list[str] = []
+    altered_runtime_sha256: str | None = None
+    altered_environment_sha256: str | None = None
+    baseline_runtime_sha256: str | None = None
+    external_import_root_refused = False
+    inexact_backend_version_refused = False
+    nonisolated_startup_refused = False
+    user_site_policy_refused = False
+    runtime_item = next(
+        (item for item in live.items if item.resource_id == "build-runtime-and-backend"),
+        None,
+    )
+    if live.build_runtime is None or runtime_item is None:
+        runtime_failures.append("build runtime resource is unavailable")
+    else:
+        baseline_runtime_sha256 = live.build_runtime.logical_sha256
+        if runtime_item.status != "PASS":
+            runtime_failures.append("build runtime resource is not passing")
+        if runtime_item.observed_sha256 != baseline_runtime_sha256:
+            runtime_failures.append("resource item does not bind the build runtime snapshot")
+        if tuple(item.name for item in live.build_runtime.distributions) != (
+            "pip",
+            "setuptools",
+        ):
+            runtime_failures.append("pip/setuptools distribution order differs")
+        if tuple(item.module for item in live.build_runtime.imports) != (
+            "pip",
+            "setuptools",
+            "setuptools.build_meta",
+        ):
+            runtime_failures.append("resolved build import inventory differs")
+        if live.build_runtime.site_packages_file_count <= sum(
+            item.file_count for item in live.build_runtime.distributions
+        ):
+            runtime_failures.append("full site-packages projection is not independently bound")
+        if live.build_runtime.python_installation_entry_count <= 0:
+            runtime_failures.append("CPython installation projection is empty")
+        if (
+            live.build_runtime.virtual_environment_entry_count
+            <= live.build_runtime.site_packages_file_count
+        ):
+            runtime_failures.append(
+                "full virtual-environment projection is not independently bound"
+            )
+        configuration_path = repository / ".venv/pyvenv.cfg"
+        if (
+            not configuration_path.is_file()
+            or live.build_runtime.virtual_environment_configuration_sha256
+            != _sha256(configuration_path.read_bytes())
+        ):
+            runtime_failures.append("virtual-environment configuration is not bound")
+        if live.build_runtime.effective_import_paths != tuple(
+            release_build_module.sys.path
+        ):
+            runtime_failures.append("effective import roots are not exactly bound")
+        nonisolated_probe = subprocess.run(
+            [
+                os.fspath(repository / ".venv/bin/python"),
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    "from kirby2.release.build import inspect_release_build_runtime, "
+                    "load_release_protocol_bundle; "
+                    "r=Path.cwd().resolve(); "
+                    "b=load_release_protocol_bundle(r); "
+                    "exec(\"try:\\n inspect_release_build_runtime(b, "
+                    "pip_frontend=r/'.venv/bin/pip')\\nexcept ValueError as e:\\n "
+                    "print('REFUSED' if 'isolated startup' in str(e) else 'WRONG')"
+                    "\\nelse:\\n print('ACCEPTED')\")"
+                ),
+            ],
+            cwd=repository,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            check=False,
+        )
+        nonisolated_startup_refused = (
+            nonisolated_probe.returncode == 0
+            and nonisolated_probe.stdout == b"REFUSED\n"
+            and not nonisolated_probe.stderr
+        )
+        if not nonisolated_startup_refused:
+            runtime_failures.append("non-isolated Python startup was not refused")
+        hostile_environment_digest = (
+            "0" * 64
+            if live.build_runtime.virtual_environment_configuration_sha256 != "0" * 64
+            else "1" * 64
+        )
+        altered_environment = replace(
+            live.build_runtime,
+            virtual_environment_configuration_sha256=hostile_environment_digest,
+        )
+        altered_environment_sha256 = altered_environment.logical_sha256
+        if altered_environment_sha256 == baseline_runtime_sha256:
+            runtime_failures.append(
+                "virtual-environment configuration drift did not change runtime identity"
+            )
+        original_user_site = release_build_module.site.ENABLE_USER_SITE
+        try:
+            release_build_module.site.ENABLE_USER_SITE = True
+            try:
+                release_build_module.inspect_release_build_runtime(
+                    bundle,
+                    pip_frontend=repository / ".venv/bin/pip",
+                )
+            except ValueError:
+                user_site_policy_refused = True
+            else:
+                runtime_failures.append("enabled user site-packages were accepted")
+        finally:
+            release_build_module.site.ENABLE_USER_SITE = original_user_site
+        original_import_paths = tuple(release_build_module.sys.path)
+        try:
+            release_build_module.sys.path.append(
+                os.fspath(repository / ".kirby2/unprojected-import-root")
+            )
+            try:
+                release_build_module.inspect_release_build_runtime(
+                    bundle,
+                    pip_frontend=repository / ".venv/bin/pip",
+                )
+            except ValueError:
+                external_import_root_refused = True
+            else:
+                runtime_failures.append("unprojected external import root was accepted")
+        finally:
+            release_build_module.sys.path[:] = original_import_paths
+        original_distribution_snapshot = (
+            release_build_module._build_distribution_snapshot
+        )
+
+        def inexact_distribution_snapshot(
+            name: str,
+        ) -> tuple[ReleaseBuildDistributionV1, Path]:
+            row, root = original_distribution_snapshot(name)
+            if name == "setuptools":
+                row = replace(row, version="80.9.0rc1")
+            return row, root
+
+        try:
+            release_build_module._build_distribution_snapshot = (
+                inexact_distribution_snapshot
+            )
+            try:
+                release_build_module.inspect_release_build_runtime(
+                    bundle,
+                    pip_frontend=repository / ".venv/bin/pip",
+                )
+            except ValueError:
+                inexact_backend_version_refused = True
+            else:
+                runtime_failures.append("inexact setuptools prerelease was accepted")
+        finally:
+            release_build_module._build_distribution_snapshot = (
+                original_distribution_snapshot
+            )
+        setuptools = live.build_runtime.distributions[1]
+        hostile_projection = (
+            "0" * 64
+            if setuptools.file_projection_sha256 != "0" * 64
+            else "1" * 64
+        )
+        altered_setuptools = ReleaseBuildDistributionV1(
+            name=setuptools.name,
+            version=setuptools.version,
+            file_count=setuptools.file_count,
+            file_projection_sha256=hostile_projection,
+        )
+        altered_runtime = ReleaseBuildRuntimeSnapshotV1(
+            runtime=live.build_runtime.runtime,
+            python_executable_sha256=live.build_runtime.python_executable_sha256,
+            virtual_environment_configuration_sha256=(
+                live.build_runtime.virtual_environment_configuration_sha256
+            ),
+            effective_import_paths=live.build_runtime.effective_import_paths,
+            virtual_environment_entry_count=(
+                live.build_runtime.virtual_environment_entry_count
+            ),
+            virtual_environment_projection_sha256=(
+                live.build_runtime.virtual_environment_projection_sha256
+            ),
+            zlib_extension_sha256=live.build_runtime.zlib_extension_sha256,
+            zlib_runtime_version=live.build_runtime.zlib_runtime_version,
+            archive_encoder_probe_sha256=(
+                live.build_runtime.archive_encoder_probe_sha256
+            ),
+            distributions=(live.build_runtime.distributions[0], altered_setuptools),
+            imports=live.build_runtime.imports,
+            python_installation_entry_count=(
+                live.build_runtime.python_installation_entry_count
+            ),
+            python_installation_projection_sha256=(
+                live.build_runtime.python_installation_projection_sha256
+            ),
+            site_packages_file_count=live.build_runtime.site_packages_file_count,
+            site_packages_projection_sha256=(
+                live.build_runtime.site_packages_projection_sha256
+            ),
+        )
+        altered_runtime_sha256 = altered_runtime.logical_sha256
+        if altered_runtime_sha256 == baseline_runtime_sha256:
+            runtime_failures.append("setuptools file drift did not change runtime identity")
+    runtime_case = _case(
+        "build_runtime_and_backend_bytes_are_fingerprint_bound",
+        "CPython, virtual-environment policy, import roots, zlib, pip, and "
+        "setuptools own one identity.",
+        {
+            "altered_environment_sha256": altered_environment_sha256,
+            "altered_runtime_sha256": altered_runtime_sha256,
+            "baseline_runtime_sha256": baseline_runtime_sha256,
+            "distribution_count": (
+                0 if live.build_runtime is None else len(live.build_runtime.distributions)
+            ),
+            "external_import_root_refused": external_import_root_refused,
+            "inexact_backend_version_refused": inexact_backend_version_refused,
+            "nonisolated_startup_refused": nonisolated_startup_refused,
+            "user_site_policy_refused": user_site_policy_refused,
+        },
+        runtime_failures,
+    )
+
+    shadow_failures: list[str] = []
+    shadow_evidence: dict[str, object] = {
+        "baseline_file_count": 0,
+        "bytecode_projection_changed": False,
+        "unrecorded_shadow_refused": False,
+    }
+    with TemporaryDirectory(prefix="kirby2-release-dev0012-shadow-") as temporary:
+        site_packages = Path(temporary) / "site-packages"
+        recorded = (
+            Path("setuptools/__init__.py"),
+            Path("setuptools/build_meta.py"),
+            Path("setuptools-80.9.0.dist-info/METADATA"),
+        )
+        for relative in recorded:
+            target = site_packages / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(f"fixture:{relative.as_posix()}\n".encode("ascii"))
+
+        class _SyntheticDistribution:
+            files = recorded
+            metadata = {"Name": "setuptools"}
+            version = "80.9.0"
+
+            @staticmethod
+            def locate_file(relative: object) -> Path:
+                return site_packages / Path(str(relative))
+
+        original_distribution = release_build_module.importlib_metadata.distribution
+        try:
+            release_build_module.importlib_metadata.distribution = (
+                lambda _name: _SyntheticDistribution()
+            )
+            baseline, _base = release_build_module._build_distribution_snapshot(
+                "setuptools"
+            )
+            shadow_evidence["baseline_file_count"] = baseline.file_count
+            shadow = site_packages / "setuptools/build_meta/__init__.py"
+            shadow.parent.mkdir(parents=True, exist_ok=True)
+            shadow.write_text("SENTINEL = True\n", encoding="utf-8")
+            try:
+                release_build_module._build_distribution_snapshot("setuptools")
+            except ValueError:
+                shadow_evidence["unrecorded_shadow_refused"] = True
+            else:
+                shadow_failures.append("unrecorded backend package shadow was accepted")
+        except (OSError, TypeError, ValueError) as error:
+            shadow_failures.append(
+                f"backend shadow fixture failed: {type(error).__name__}"
+            )
+        finally:
+            release_build_module.importlib_metadata.distribution = original_distribution
+        bytecode_root = Path(temporary) / "bytecode-site"
+        bytecode_source = bytecode_root / "setuptools/build_meta.py"
+        bytecode_source.parent.mkdir(parents=True, exist_ok=True)
+        bytecode_source.write_text("SENTINEL = 'source'\n", encoding="utf-8")
+        try:
+            baseline_count, baseline_sha256 = (
+                release_build_module._tree_file_projection(
+                    bytecode_root,
+                    label="synthetic bytecode site-packages",
+                )
+            )
+            py_compile.compile(
+                os.fspath(bytecode_source),
+                doraise=True,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+            hostile_count, hostile_sha256 = (
+                release_build_module._tree_file_projection(
+                    bytecode_root,
+                    label="synthetic bytecode site-packages",
+                )
+            )
+            bytecode_changed = (
+                hostile_count > baseline_count
+                and hostile_sha256 != baseline_sha256
+            )
+            shadow_evidence["bytecode_projection_changed"] = bytecode_changed
+            if not bytecode_changed:
+                shadow_failures.append(
+                    "unchecked-hash bytecode did not change the environment projection"
+                )
+        except (OSError, TypeError, ValueError, py_compile.PyCompileError) as error:
+            shadow_failures.append(
+                f"unchecked-hash bytecode fixture failed: {type(error).__name__}"
+            )
+    shadow_case = _case(
+        "unrecorded_build_backend_shadows_are_refused",
+        "Unrecorded backend packages and executable bytecode cannot evade inventory.",
+        shadow_evidence,
+        shadow_failures,
+    )
+
+    drift_failures: list[str] = []
+    tool_index = next(
+        (
+            index
+            for index, item in enumerate(live.items)
+            if item.resource_id == "project-wheel-frontend"
+            and item.status == "PASS"
+            and item.observed_sha256 is not None
+        ),
+        None,
+    )
+    altered_snapshot: str | None = None
+    altered_report_sha256: str | None = None
+    if tool_index is None:
+        drift_failures.append("passing project wheel frontend fingerprint is unavailable")
+    else:
+        original = live.items[tool_index]
+        hostile_digest = (
+            "0" * 64 if original.observed_sha256 != "0" * 64 else "1" * 64
+        )
+        hostile_item = ReleaseResourceItemV1(
+            resource_id=original.resource_id,
+            target=original.target,
+            kind=original.kind,
+            status=original.status,
+            expected_sha256=original.expected_sha256,
+            observed_sha256=hostile_digest,
+            detail=original.detail,
+        )
+        hostile_items = list(live.items)
+        hostile_items[tool_index] = hostile_item
+        altered = ReleaseResourcePreflightV1(
+            protocol_set_sha256=live.protocol_set_sha256,
+            protocol_commit=live.protocol_commit,
+            items=tuple(hostile_items),
+            build_runtime=live.build_runtime,
+            no_network=True,
+        )
+        altered_snapshot = altered.resource_snapshot_sha256
+        altered_report = altered.markdown().encode("utf-8")
+        altered_report_sha256 = _sha256(altered_report)
+        if live.status != "PASS" or altered.status != "PASS":
+            drift_failures.append("fingerprint-only fixture unexpectedly changed readiness")
+        if altered_snapshot == live.resource_snapshot_sha256:
+            drift_failures.append("changed passing tool bytes did not change the snapshot")
+        if altered_report == rendered:
+            drift_failures.append("changed passing tool bytes did not change report bytes")
+    drift_case = _case(
+        "passing_packaging_tool_drift_changes_report_identity",
+        "A status-preserving packaging-tool byte change invalidates exact committed evidence.",
+        {
+            "altered_report_sha256": altered_report_sha256,
+            "altered_resource_snapshot_sha256": altered_snapshot,
+            "baseline_report_sha256": _sha256(rendered),
+            "baseline_resource_snapshot_sha256": live.resource_snapshot_sha256,
+        },
+        drift_failures,
+    )
+
+    cases = (snapshot_case, runtime_case, shadow_case, drift_case)
+    if len(cases) != DEV0012_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0012 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0012",
         cases,
         metadata=(("interrupted_card", "WO40-F"),),
     )

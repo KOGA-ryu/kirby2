@@ -596,3 +596,103 @@ fixture refuses with the exact typed code; a changed locked wheel refuses as
 the refreshed candidate lock; the complete registry contains DEV-0001 through
 DEV-0011; and no release artifact, network action, provider operation, qualification,
 or performance workload is created or executed.
+
+## DEV-0012 — Bind release preflight resource fingerprints
+
+- Interrupted canonical card: `WO40-F`
+- Exact first-parent predecessor: `470cb3e1f11b0cbb431a97588e27a5d3017bbdfc`
+- Reproducer: in a clean detached candidate fixture with the exact passing report,
+  replace the executable `.venv/bin/pip` bytes with `#!/bin/sh` plus `exit 99` while
+  retaining executable mode, then rerun `build-release` for that candidate. A second
+  read-only reproducer inspects the active virtual environment: `pip` is present but
+  `setuptools` is absent even though `pyproject.toml` requires `setuptools>=68` and
+  the frozen frontend uses `pip wheel --no-build-isolation --no-index`.
+- Observed terminal result: `READY` with no refusal code. The report SHA-256 before
+  and after the tool-byte replacement was identical even though the live preflight
+  observed a different packaging-tool digest. The same passing preflight also
+  declared the offline no-isolation wheel frontend ready without its importable build
+  backend, and did not bind the preregistered CPython/zlib reproducibility fingerprint.
+- Root cause: passing resource rows carried `expected_sha256` and
+  `observed_sha256` in memory, but the committed Markdown rendered neither value and
+  serialized only failing rows. Exact report comparison therefore did not bind
+  passing packaging tools, the raw provider-inventory bytes, provider fingerprints,
+  or other successful resources. Packaging-tool discovery checked only launcher
+  existence and executable mode; it did not inventory the active interpreter, zlib
+  extension/behavior, or the actual `pip` and `setuptools` distribution bytes.
+- Repair: hash the canonical ordered projection of every complete resource item and
+  include that resource-snapshot SHA-256 in both the tracked report and
+  machine-readable preflight result. Add a typed build-runtime snapshot containing
+  the exact CPython manifest fields, the resolved complete CPython installation
+  projection, executable and zlib-extension digests, compile and runtime zlib
+  versions, a frozen archive-encoder behavior probe, and canonical
+  path/mode/size/digest projections for actual `pip` and `setuptools` files; require
+  CPython 3.14, reject unrecorded files beneath either distribution's owned roots,
+  bind the complete active site-packages file projection including executable
+  bytecode caches, bind the exact `pyvenv.cfg` bytes and ordered effective import
+  path plus the complete virtual-environment tree (including the frontend directory
+  and constrained interpreter symlinks), require a real virtual environment with
+  user and system site-packages
+  disabled, reject every package/import root outside the projected CPython and
+  virtual-environment trees, and require the resolved
+  `pip`, `setuptools`, and `setuptools.build_meta` origins to be their recorded files;
+  reject Python path overrides, require isolated safe-path interpreter startup and
+  load only the named candidate `kirby2` package without adding the checkout root to
+  `sys.path`, require exact `setuptools==80.9.0`,
+  and require a wheel frontend whose declared interpreter is the inspected runtime.
+  The missing backend was
+  supplied as exact external resource
+  `setuptools==80.9.0` before regenerating the read-only report. Preserve the
+  planner's exact live-report byte comparison and carry the full runtime snapshot in
+  its READY record. Extend the detached DEV-0011 fixture so changing either executable
+  `pip` bytes or parse-valid raw provider-inventory bytes refuses as
+  `RESOURCE_PREFLIGHT_INCOMPLETE`, while the unchanged fixture remains `READY` and
+  creates no artifact path. Register a focused audit proving a status-preserving
+  packaging-tool fingerprint change alters both the resource snapshot and report,
+  backend-file or virtual-environment-policy drift changes the runtime identity,
+  external import roots are refused, and unrecorded backend shadows or unchecked-hash
+  bytecode cannot remain invisible.
+- Owned repair paths: `kirby2/__main__.py`, `kirby2/release/build.py`,
+  `kirby2/release/__init__.py`,
+  `kirby2/audit/release.py`, `kirby2/audit/expansion.py`,
+  `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`,
+  `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0012` through K2X-02 immediately after `DEV-0011` and
+  before resumed `WO40-F`; the closeout prerequisite deviation inventory extends
+  monotonically through `DEV-0012`.
+- Inherited gates: the exact candidate, source lock, five frozen protocol files,
+  artifact layout, dependency wheel digests, clean-provider capability rules, and
+  all product boundaries remain unchanged. One bounded setup download supplies the
+  previously absent build backend; every release preflight and build remains
+  no-network. This repair performs no artifact build, provider connection,
+  qualification, or performance workload.
+- Exact commit subject: `Bind release preflight resource fingerprints`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py release-resource-preflight --platforms release/platforms.toml --lock release/requirements.lock --qualification release/qualification.toml --no-network --output KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the tracked passing report contains one exact canonical resource-snapshot
+digest and a passing build-runtime/backend item; its runtime snapshot binds CPython,
+the full resolved CPython installation, zlib, the archive encoder, `pip`, and
+`setuptools`, plus the exact virtual-environment configuration and ordered effective
+import roots and complete virtual-environment tree; changing only a passing tool
+fingerprint changes the report identity without changing readiness; backend-file
+drift changes runtime identity; non-isolated startup and any backend version other
+than exact `80.9.0` are refused; its resolved import origins and complete
+site-packages projection excludes invisible backend shadows and executable bytecode;
+user/system site-packages and unprojected external import roots are refused;
+changing actual fixture
+`pip` bytes or adding a
+parse-valid comment to the raw provider inventory refuses the build plan; the prior
+DEV-0011 candidate, source, protocol, and wheel drift checks remain passing; the
+complete registry contains DEV-0001 through DEV-0012; and no release artifact,
+provider operation, qualification, or performance workload is created or executed.

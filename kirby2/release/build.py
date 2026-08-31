@@ -9,14 +9,23 @@ build from the working tree or fetch a dependency.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata as importlib_metadata
+import importlib.util as importlib_util
 import json
 import os
+import platform
 import re
 import shutil
+import site
+import stat
 import subprocess
+import sys
+import sysconfig
 import tomllib
+import zlib
 from dataclasses import dataclass
 from enum import Enum
+from importlib.machinery import PathFinder
 from pathlib import Path
 from typing import ClassVar
 
@@ -35,10 +44,12 @@ from .manifest import (
     ReleaseArtifactIndexV1,
     ReleaseLogicalBuildProjectionV1,
     ReleaseProtocolFileV1,
+    ReleaseRuntimeV1,
 )
 from .packaging import (
     RELEASE_SOURCE_CLASS_ORDER_V1,
     ReleaseSourceClassV1,
+    canonical_gzip_bytes,
     normalize_release_path,
 )
 from .performance import (
@@ -1008,10 +1019,192 @@ class ReleaseResourceItemV1:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseBuildDistributionV1:
+    name: str
+    version: str
+    file_count: int
+    file_projection_sha256: str
+
+    def __post_init__(self) -> None:
+        _text(self.name, "build distribution name", 128)
+        _text(self.version, "build distribution version", 128)
+        if type(self.file_count) is not int or self.file_count <= 0:
+            raise ValueError("build distribution file count must be positive")
+        require_sha256(
+            self.file_projection_sha256,
+            "build distribution file-projection digest",
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "file_count": self.file_count,
+            "file_projection_sha256": self.file_projection_sha256,
+            "name": self.name,
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseBuildImportV1:
+    module: str
+    path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        _text(self.module, "build import module", 128)
+        normalize_release_path(self.path, label="build import path")
+        require_sha256(self.sha256, "build import digest")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "module": self.module,
+            "path": self.path,
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseBuildRuntimeSnapshotV1:
+    runtime: ReleaseRuntimeV1
+    python_executable_sha256: str
+    virtual_environment_configuration_sha256: str
+    effective_import_paths: tuple[str, ...]
+    virtual_environment_entry_count: int
+    virtual_environment_projection_sha256: str
+    zlib_extension_sha256: str
+    zlib_runtime_version: str
+    archive_encoder_probe_sha256: str
+    distributions: tuple[ReleaseBuildDistributionV1, ...]
+    imports: tuple[ReleaseBuildImportV1, ...]
+    python_installation_entry_count: int
+    python_installation_projection_sha256: str
+    site_packages_file_count: int
+    site_packages_projection_sha256: str
+
+    schema_id: ClassVar[str] = "KIRBY2_RELEASE_BUILD_RUNTIME_SNAPSHOT_V1"
+    schema_version: ClassVar[int] = 1
+
+    def __post_init__(self) -> None:
+        if type(self.runtime) is not ReleaseRuntimeV1:
+            raise TypeError("build runtime snapshot requires an exact runtime record")
+        require_sha256(self.python_executable_sha256, "Python executable digest")
+        require_sha256(
+            self.virtual_environment_configuration_sha256,
+            "virtual-environment configuration digest",
+        )
+        if (
+            type(self.effective_import_paths) is not tuple
+            or not self.effective_import_paths
+            or any(type(item) is not str for item in self.effective_import_paths)
+        ):
+            raise TypeError("effective import paths must be a nonempty text tuple")
+        folded_import_paths: set[str] = set()
+        for import_path in self.effective_import_paths:
+            require_nfc_text(
+                import_path,
+                "effective import path",
+                maximum_bytes=4096,
+            )
+            key = import_path.casefold()
+            if key in folded_import_paths:
+                raise ValueError("effective import paths collide under case folding")
+            folded_import_paths.add(key)
+        if (
+            type(self.virtual_environment_entry_count) is not int
+            or self.virtual_environment_entry_count <= 0
+        ):
+            raise ValueError("virtual-environment entry count must be positive")
+        require_sha256(
+            self.virtual_environment_projection_sha256,
+            "virtual-environment projection digest",
+        )
+        require_sha256(self.zlib_extension_sha256, "zlib extension digest")
+        require_sha256(
+            self.archive_encoder_probe_sha256,
+            "archive encoder probe digest",
+        )
+        _text(self.zlib_runtime_version, "zlib runtime version", 128)
+        if type(self.distributions) is not tuple or any(
+            type(item) is not ReleaseBuildDistributionV1
+            for item in self.distributions
+        ):
+            raise TypeError("build distributions must use exact V1 records")
+        names = tuple(item.name for item in self.distributions)
+        if names != ("pip", "setuptools"):
+            raise ValueError("build distribution inventory must be pip then setuptools")
+        if type(self.imports) is not tuple or any(
+            type(item) is not ReleaseBuildImportV1 for item in self.imports
+        ):
+            raise TypeError("build imports must use exact V1 records")
+        if tuple(item.module for item in self.imports) != (
+            "pip",
+            "setuptools",
+            "setuptools.build_meta",
+        ):
+            raise ValueError("build import inventory differs")
+        if (
+            type(self.python_installation_entry_count) is not int
+            or self.python_installation_entry_count <= 0
+        ):
+            raise ValueError("Python installation entry count must be positive")
+        require_sha256(
+            self.python_installation_projection_sha256,
+            "Python installation projection digest",
+        )
+        if (
+            type(self.site_packages_file_count) is not int
+            or self.site_packages_file_count <= 0
+        ):
+            raise ValueError("site-packages file count must be positive")
+        require_sha256(
+            self.site_packages_projection_sha256,
+            "site-packages projection digest",
+        )
+
+    @property
+    def logical_sha256(self) -> str:
+        return hashlib.sha256(canonical_json_bytes(self.as_dict())).hexdigest()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "archive_encoder_probe_sha256": self.archive_encoder_probe_sha256,
+            "distributions": [item.as_dict() for item in self.distributions],
+            "effective_import_paths": list(self.effective_import_paths),
+            "imports": [item.as_dict() for item in self.imports],
+            "python_executable_sha256": self.python_executable_sha256,
+            "python_installation_entry_count": (
+                self.python_installation_entry_count
+            ),
+            "python_installation_projection_sha256": (
+                self.python_installation_projection_sha256
+            ),
+            "runtime": self.runtime.as_dict(),
+            "schema_id": self.schema_id,
+            "schema_version": self.schema_version,
+            "site_packages_file_count": self.site_packages_file_count,
+            "site_packages_projection_sha256": (
+                self.site_packages_projection_sha256
+            ),
+            "virtual_environment_configuration_sha256": (
+                self.virtual_environment_configuration_sha256
+            ),
+            "virtual_environment_entry_count": (
+                self.virtual_environment_entry_count
+            ),
+            "virtual_environment_projection_sha256": (
+                self.virtual_environment_projection_sha256
+            ),
+            "zlib_extension_sha256": self.zlib_extension_sha256,
+            "zlib_runtime_version": self.zlib_runtime_version,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ReleaseResourcePreflightV1:
     protocol_set_sha256: str
     protocol_commit: str | None
     items: tuple[ReleaseResourceItemV1, ...]
+    build_runtime: ReleaseBuildRuntimeSnapshotV1 | None
     no_network: bool
 
     schema_id: ClassVar[str] = RELEASE_RESOURCE_PREFLIGHT_SCHEMA_ID_V1
@@ -1019,7 +1212,10 @@ class ReleaseResourcePreflightV1:
 
     def __post_init__(self) -> None:
         require_sha256(self.protocol_set_sha256, "preflight protocol-set digest")
-        if self.protocol_commit is not None and _COMMIT.fullmatch(self.protocol_commit) is None:
+        if (
+            self.protocol_commit is not None
+            and _COMMIT.fullmatch(self.protocol_commit) is None
+        ):
             raise ValueError("preflight protocol commit is invalid")
         if self.no_network is not True:
             raise ValueError("release resource preflight must be no-network")
@@ -1027,22 +1223,57 @@ class ReleaseResourcePreflightV1:
             type(item) is not ReleaseResourceItemV1 for item in self.items
         ):
             raise TypeError("release preflight items must use exact V1 records")
+        if (
+            self.build_runtime is not None
+            and type(self.build_runtime) is not ReleaseBuildRuntimeSnapshotV1
+        ):
+            raise TypeError("release preflight build runtime must use the exact V1 record")
+        runtime_items = tuple(
+            item
+            for item in self.items
+            if item.resource_id == "build-runtime-and-backend"
+        )
+        if len(runtime_items) != 1:
+            raise ValueError("release preflight requires one build runtime resource")
+        runtime_item = runtime_items[0]
+        if self.build_runtime is None:
+            if runtime_item.status == "PASS" or runtime_item.observed_sha256 is not None:
+                raise ValueError("unavailable build runtime resource is inconsistent")
+        elif (
+            runtime_item.status != "PASS"
+            or runtime_item.observed_sha256 != self.build_runtime.logical_sha256
+        ):
+            raise ValueError("passing build runtime resource identity differs")
 
     @property
     def status(self) -> str:
-        return "PASS" if self.items and all(item.status == "PASS" for item in self.items) else "NOT_READY"
+        return (
+            "PASS"
+            if self.items and all(item.status == "PASS" for item in self.items)
+            else "NOT_READY"
+        )
 
     @property
     def missing_items(self) -> tuple[ReleaseResourceItemV1, ...]:
         return tuple(item for item in self.items if item.status != "PASS")
 
+    @property
+    def resource_snapshot_sha256(self) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes([item.as_dict() for item in self.items])
+        ).hexdigest()
+
     def as_dict(self) -> dict[str, object]:
         return {
+            "build_runtime": (
+                None if self.build_runtime is None else self.build_runtime.as_dict()
+            ),
             "items": [item.as_dict() for item in self.items],
             "missing_item_count": len(self.missing_items),
             "no_network": self.no_network,
             "protocol_commit": self.protocol_commit,
             "protocol_set_sha256": self.protocol_set_sha256,
+            "resource_snapshot_sha256": self.resource_snapshot_sha256,
             "schema_id": self.schema_id,
             "schema_version": self.schema_version,
             "status": self.status,
@@ -1056,6 +1287,7 @@ class ReleaseResourcePreflightV1:
             "",
             f"Protocol set SHA-256: `{self.protocol_set_sha256}`",
             f"WO40-D protocol commit: `{self.protocol_commit or 'UNAVAILABLE'}`",
+            f"Resource snapshot SHA-256: `{self.resource_snapshot_sha256}`",
             "",
             "This inspection was read-only and no-network. It did not download, install, build, connect to a provider, or alter credentials.",
             "",
@@ -1214,6 +1446,449 @@ def _resolve_release_protocol_commit(
     return protocol_commit, True
 
 
+def _build_distribution_snapshot(
+    name: str,
+) -> tuple[ReleaseBuildDistributionV1, Path]:
+    try:
+        distribution = importlib_metadata.distribution(name)
+    except importlib_metadata.PackageNotFoundError as error:
+        raise FileNotFoundError(
+            f"Required build distribution {name} is absent."
+        ) from error
+    files = distribution.files
+    if not files:
+        raise ValueError(f"Build distribution {name} has no file inventory.")
+    base = Path(distribution.locate_file("")).resolve(strict=True)
+    rows: list[dict[str, object]] = []
+    folded: set[str] = set()
+    recorded_paths: set[str] = set()
+    owned_roots: set[str] = set()
+    for entry in files:
+        candidate = Path(distribution.locate_file(entry))
+        if candidate.is_symlink():
+            raise ValueError(f"Build distribution {name} contains a symlink.")
+        prospective = candidate.resolve(strict=False)
+        try:
+            prospective.relative_to(base)
+        except ValueError:
+            continue
+        if not candidate.is_file():
+            raise ValueError(f"Build distribution {name} has a missing file.")
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(base).as_posix()
+        parts = relative.split("/")
+        if "__pycache__" in parts or relative.endswith(".pyc"):
+            continue
+        if not resolved.is_file():
+            raise ValueError(f"Build distribution {name} contains a non-file entry.")
+        normalize_release_path(relative, label=f"{name} distribution path")
+        key = relative.casefold()
+        if key in folded:
+            raise ValueError(f"Build distribution {name} paths collide under case folding.")
+        folded.add(key)
+        recorded_paths.add(relative)
+        owned_roots.add(parts[0])
+        raw = resolved.read_bytes()
+        rows.append(
+            {
+                "mode": stat.S_IMODE(resolved.stat().st_mode),
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    for root_name in sorted(owned_roots, key=lambda value: value.encode("utf-8")):
+        owned_root = base / root_name
+        candidates = (
+            tuple(owned_root.rglob("*")) if owned_root.is_dir() else (owned_root,)
+        )
+        for candidate in candidates:
+            if candidate.is_symlink():
+                raise ValueError(f"Build distribution {name} contains a symlink.")
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise ValueError(
+                    f"Build distribution {name} contains a non-file entry."
+                )
+            relative = candidate.resolve(strict=True).relative_to(base).as_posix()
+            parts = relative.split("/")
+            if "__pycache__" in parts or relative.endswith(".pyc"):
+                continue
+            normalize_release_path(relative, label=f"{name} distribution path")
+            if relative not in recorded_paths:
+                raise ValueError(
+                    f"Build distribution {name} contains an unrecorded file."
+                )
+    rows.sort(key=lambda row: str(row["path"]).encode("utf-8"))
+    if not rows:
+        raise ValueError(f"Build distribution {name} has no in-environment files.")
+    normalized_name = distribution.metadata.get("Name", "").casefold()
+    if normalized_name != name:
+        raise ValueError(f"Build distribution {name} metadata identity differs.")
+    return (
+        ReleaseBuildDistributionV1(
+            name=name,
+            version=_text(
+                distribution.version,
+                f"{name} build distribution version",
+                128,
+            ),
+            file_count=len(rows),
+            file_projection_sha256=hashlib.sha256(
+                canonical_json_bytes(rows)
+            ).hexdigest(),
+        ),
+        base,
+    )
+
+
+def _tree_file_projection(
+    root: Path,
+    *,
+    label: str,
+    allow_relative_symlinks: bool = False,
+    allowed_absolute_symlink_root: Path | None = None,
+) -> tuple[int, str]:
+    root = root.resolve(strict=True)
+    if allowed_absolute_symlink_root is not None:
+        allowed_absolute_symlink_root = allowed_absolute_symlink_root.resolve(
+            strict=True
+        )
+    if not root.is_dir():
+        raise ValueError(f"{label} projection root is not a directory.")
+    rows: list[dict[str, object]] = []
+    folded: set[str] = set()
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            if not allow_relative_symlinks:
+                raise ValueError(f"{label} contains a symlink.")
+            relative = candidate.relative_to(root).as_posix()
+            normalize_release_path(relative, label=f"{label} path")
+            key = relative.casefold()
+            if key in folded:
+                raise ValueError(f"{label} paths collide under case folding.")
+            folded.add(key)
+            target = require_nfc_text(
+                os.readlink(candidate),
+                f"{label} symlink target",
+                maximum_bytes=4096,
+            )
+            if Path(target).is_absolute():
+                if allowed_absolute_symlink_root is None:
+                    raise ValueError(
+                        f"{label} contains an absolute symlink target."
+                    )
+                try:
+                    candidate.resolve(strict=True).relative_to(
+                        allowed_absolute_symlink_root
+                    )
+                except (OSError, ValueError) as error:
+                    raise ValueError(
+                        f"{label} contains an external absolute symlink target."
+                    ) from error
+            rows.append(
+                {
+                    "kind": "SYMLINK",
+                    "mode": stat.S_IMODE(candidate.lstat().st_mode),
+                    "path": relative,
+                    "target": target,
+                }
+            )
+            continue
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise ValueError(f"{label} contains a non-file entry.")
+        relative = candidate.resolve(strict=True).relative_to(root).as_posix()
+        normalize_release_path(relative, label=f"{label} path")
+        key = relative.casefold()
+        if key in folded:
+            raise ValueError(f"{label} paths collide under case folding.")
+        folded.add(key)
+        raw = candidate.read_bytes()
+        rows.append(
+            {
+                "kind": "REGULAR",
+                "mode": stat.S_IMODE(candidate.stat().st_mode),
+                "path": relative,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+        )
+    rows.sort(key=lambda row: str(row["path"]).encode("utf-8"))
+    if not rows:
+        raise ValueError(f"{label} file projection is empty.")
+    return len(rows), hashlib.sha256(canonical_json_bytes(rows)).hexdigest()
+
+
+def _build_import_snapshot(
+    module: str,
+    spec: object,
+    *,
+    site_packages: Path,
+    expected_path: str,
+) -> ReleaseBuildImportV1:
+    origin_value = getattr(spec, "origin", None)
+    if not isinstance(origin_value, str):
+        raise ValueError(f"Build import {module} has no file origin.")
+    origin = Path(origin_value)
+    if origin.is_symlink() or not origin.is_file():
+        raise ValueError(f"Build import {module} origin is not a regular file.")
+    try:
+        relative = origin.resolve(strict=True).relative_to(site_packages).as_posix()
+    except ValueError as error:
+        raise ValueError(f"Build import {module} resolves outside site-packages.") from error
+    normalize_release_path(relative, label=f"{module} import path")
+    if relative != expected_path:
+        raise ValueError(f"Build import {module} resolves to an unexpected origin.")
+    raw = origin.read_bytes()
+    return ReleaseBuildImportV1(
+        module=module,
+        path=relative,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def inspect_release_build_runtime(
+    bundle: ReleaseProtocolBundleV1,
+    *,
+    pip_frontend: Path,
+) -> ReleaseBuildRuntimeSnapshotV1:
+    """Fingerprint the exact interpreter, zlib encoder, and imported build backend."""
+
+    if type(bundle) is not ReleaseProtocolBundleV1:
+        raise TypeError("build runtime inspection requires a release protocol bundle")
+    if (
+        sys.flags.isolated != 1
+        or sys.flags.safe_path is not True
+        or sys.flags.no_user_site != 1
+    ):
+        raise ValueError(
+            "Build interpreter must use isolated startup with a safe import path."
+        )
+    pip_path = _absolute(pip_frontend, "project wheel frontend")
+    if not pip_path.is_file() or not os.access(pip_path, os.X_OK):
+        raise FileNotFoundError("Required project wheel frontend is absent.")
+    first_line = pip_path.read_bytes().splitlines()[:1]
+    if not first_line or not first_line[0].startswith(b"#!"):
+        raise ValueError("Project wheel frontend does not declare its interpreter.")
+    try:
+        frontend_python = Path(first_line[0][2:].decode("utf-8")).resolve(strict=True)
+        active_python = Path(sys.executable).resolve(strict=True)
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError("Project wheel frontend interpreter cannot be resolved.") from error
+    if frontend_python != active_python:
+        raise ValueError("Project wheel frontend and active build interpreter differ.")
+    if any(os.environ.get(name) for name in ("PYTHONHOME", "PYTHONPATH")):
+        raise ValueError("Build interpreter environment contains a Python path override.")
+
+    cache_tag = sys.implementation.cache_tag
+    runtime = ReleaseRuntimeV1(
+        python_implementation=platform.python_implementation(),
+        python_version=platform.python_version(),
+        cache_tag=(cache_tag if isinstance(cache_tag, str) else ""),
+        compiler=platform.python_compiler(),
+        zlib_version=zlib.ZLIB_VERSION,
+    )
+    if runtime.python_implementation != "CPython" or tuple(
+        runtime.python_version.split(".")[:2]
+    ) != ("3", "14"):
+        raise ValueError("Build interpreter differs from the frozen CPython 3.14 line.")
+
+    try:
+        virtual_environment = Path(sys.prefix).resolve(strict=True)
+        python_installation = Path(sys.base_prefix).resolve(strict=True)
+        frontend_environment = pip_path.parent.parent.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("Build virtual-environment roots cannot be resolved.") from error
+    if virtual_environment == python_installation:
+        raise ValueError("Build interpreter is not running inside a virtual environment.")
+    if virtual_environment != frontend_environment:
+        raise ValueError("Project wheel frontend is outside the active virtual environment.")
+    virtual_environment_configuration = virtual_environment / "pyvenv.cfg"
+    if (
+        virtual_environment_configuration.is_symlink()
+        or not virtual_environment_configuration.is_file()
+    ):
+        raise ValueError("Build virtual-environment configuration is not a regular file.")
+    try:
+        virtual_environment_configuration_bytes = (
+            virtual_environment_configuration.read_bytes()
+        )
+        virtual_environment_configuration_text = (
+            virtual_environment_configuration_bytes.decode("utf-8")
+        )
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError("Build virtual-environment configuration is unreadable.") from error
+    virtual_environment_policy: dict[str, str] = {}
+    for line in virtual_environment_configuration_text.splitlines():
+        if not line.strip():
+            continue
+        if "=" not in line:
+            raise ValueError("Build virtual-environment configuration is malformed.")
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip().casefold()
+        value = raw_value.strip()
+        if (
+            re.fullmatch(r"[a-z][a-z0-9-]*", key) is None
+            or not value
+            or key in virtual_environment_policy
+        ):
+            raise ValueError("Build virtual-environment configuration is malformed.")
+        virtual_environment_policy[key] = value
+    include_system_site_packages = virtual_environment_policy.get(
+        "include-system-site-packages",
+        "",
+    )
+    if include_system_site_packages.casefold() != "false":
+        raise ValueError("Build virtual environment permits system site-packages.")
+    if site.ENABLE_USER_SITE is not False:
+        raise ValueError("Build virtual environment permits user site-packages.")
+
+    zlib_runtime_version = _text(
+        zlib.ZLIB_RUNTIME_VERSION,
+        "zlib runtime version",
+        128,
+    )
+    zlib_path_value = getattr(zlib, "__file__", None)
+    if not isinstance(zlib_path_value, str):
+        raise FileNotFoundError("The zlib extension module has no file identity.")
+    zlib_path = Path(zlib_path_value)
+    if zlib_path.is_symlink():
+        raise ValueError("The zlib extension module may not be a symlink.")
+    zlib_path = zlib_path.resolve(strict=True)
+    if not zlib_path.is_file():
+        raise FileNotFoundError("The zlib extension module is absent.")
+
+    distribution_rows = tuple(
+        _build_distribution_snapshot(name) for name in ("pip", "setuptools")
+    )
+    distributions = tuple(row[0] for row in distribution_rows)
+    site_packages = distribution_rows[0][1]
+    if distribution_rows[1][1] != site_packages:
+        raise ValueError("Pip and setuptools are installed in different environments.")
+    site_packages = site_packages.resolve(strict=True)
+    configured_site_packages: list[Path] = []
+    try:
+        for value in site.getsitepackages():
+            configured_site_packages.append(Path(value).resolve(strict=True))
+        purelib = Path(sysconfig.get_path("purelib")).resolve(strict=True)
+        platlib = Path(sysconfig.get_path("platlib")).resolve(strict=True)
+    except (OSError, TypeError) as error:
+        raise ValueError("Build site-package policy cannot be resolved.") from error
+    if tuple(configured_site_packages) != (site_packages,):
+        raise ValueError("Build interpreter exposes an external site-packages root.")
+    if purelib != site_packages or platlib != site_packages:
+        raise ValueError("Build installation schemes expose another package root.")
+    effective_import_paths = tuple(sys.path)
+    if not effective_import_paths:
+        raise ValueError("Build import path is empty.")
+    seen_import_paths: set[str] = set()
+    observed_site_packages = 0
+    for value in effective_import_paths:
+        if type(value) is not str:
+            raise TypeError("Build import path contains a non-text entry.")
+        normalized = require_nfc_text(
+            value,
+            "effective build import path",
+            maximum_bytes=4096,
+        )
+        candidate = Path(normalized)
+        if not candidate.is_absolute():
+            raise ValueError("Build import path contains a relative external root.")
+        resolved = candidate.resolve(strict=False)
+        if resolved == site_packages:
+            observed_site_packages += 1
+        else:
+            try:
+                resolved.relative_to(python_installation)
+            except ValueError as error:
+                raise ValueError(
+                    "Build import path contains an unprojected external root."
+                ) from error
+        key = normalized.casefold()
+        if key in seen_import_paths:
+            raise ValueError("Build import paths collide under case folding.")
+        seen_import_paths.add(key)
+    if observed_site_packages != 1:
+        raise ValueError("Build import path must contain one projected site-packages root.")
+    if distributions[1].version != "80.9.0":
+        raise ValueError("Setuptools differs from the authorized exact version 80.9.0.")
+    pip_spec = importlib_util.find_spec("pip")
+    setuptools_spec = importlib_util.find_spec("setuptools")
+    backend_spec = PathFinder.find_spec(
+        "setuptools.build_meta",
+        [os.fspath(site_packages / "setuptools")],
+    )
+    if pip_spec is None or setuptools_spec is None or backend_spec is None:
+        raise ValueError("Required build imports cannot be resolved.")
+    imports = (
+        _build_import_snapshot(
+            "pip",
+            pip_spec,
+            site_packages=site_packages,
+            expected_path="pip/__init__.py",
+        ),
+        _build_import_snapshot(
+            "setuptools",
+            setuptools_spec,
+            site_packages=site_packages,
+            expected_path="setuptools/__init__.py",
+        ),
+        _build_import_snapshot(
+            "setuptools.build_meta",
+            backend_spec,
+            site_packages=site_packages,
+            expected_path="setuptools/build_meta.py",
+        ),
+    )
+    site_packages_file_count, site_packages_projection_sha256 = (
+        _tree_file_projection(site_packages, label="build site-packages")
+    )
+    python_installation_entry_count, python_installation_projection_sha256 = (
+        _tree_file_projection(
+            python_installation,
+            label="CPython installation",
+            allow_relative_symlinks=True,
+        )
+    )
+    virtual_environment_entry_count, virtual_environment_projection_sha256 = (
+        _tree_file_projection(
+            virtual_environment,
+            label="build virtual environment",
+            allow_relative_symlinks=True,
+            allowed_absolute_symlink_root=python_installation,
+        )
+    )
+    probe_input = b"KIRBY2_RELEASE_ARCHIVE_ENCODER_PROBE_V1\n" + bytes(range(256))
+    return ReleaseBuildRuntimeSnapshotV1(
+        runtime=runtime,
+        python_executable_sha256=hashlib.sha256(active_python.read_bytes()).hexdigest(),
+        virtual_environment_configuration_sha256=hashlib.sha256(
+            virtual_environment_configuration_bytes
+        ).hexdigest(),
+        effective_import_paths=effective_import_paths,
+        virtual_environment_entry_count=virtual_environment_entry_count,
+        virtual_environment_projection_sha256=(
+            virtual_environment_projection_sha256
+        ),
+        zlib_extension_sha256=hashlib.sha256(zlib_path.read_bytes()).hexdigest(),
+        zlib_runtime_version=zlib_runtime_version,
+        archive_encoder_probe_sha256=hashlib.sha256(
+            canonical_gzip_bytes(probe_input)
+        ).hexdigest(),
+        distributions=distributions,
+        imports=imports,
+        python_installation_entry_count=python_installation_entry_count,
+        python_installation_projection_sha256=(
+            python_installation_projection_sha256
+        ),
+        site_packages_file_count=site_packages_file_count,
+        site_packages_projection_sha256=site_packages_projection_sha256,
+    )
+
+
 def release_resource_preflight(
     bundle: ReleaseProtocolBundleV1,
     *,
@@ -1296,9 +1971,10 @@ def release_resource_preflight(
                 detail="Exact local wheel digest matched." if observed == wheel.sha256 else "Local wheel bytes differ from the frozen lock.",
             )
         )
+    pip_frontend = bundle.repository_root / ".venv/bin/pip"
     tools = (
         ("git", shutil.which("git")),
-        ("project-wheel-frontend", bundle.repository_root / ".venv/bin/pip"),
+        ("project-wheel-frontend", pip_frontend),
     )
     for resource_id, candidate in tools:
         path = None if candidate is None else Path(candidate)
@@ -1324,6 +2000,37 @@ def release_resource_preflight(
                 ),
             )
         )
+
+    build_runtime: ReleaseBuildRuntimeSnapshotV1 | None = None
+    runtime_status = "PASS"
+    runtime_detail = (
+        "Isolated CPython startup, the virtual environment, import roots, zlib, "
+        "archive encoder, and exact pip/setuptools bytes were fingerprinted."
+    )
+    try:
+        build_runtime = inspect_release_build_runtime(
+            bundle,
+            pip_frontend=pip_frontend,
+        )
+    except FileNotFoundError as error:
+        runtime_status = "MISSING"
+        runtime_detail = str(error)
+    except (OSError, TypeError, ValueError) as error:
+        runtime_status = "INVALID"
+        runtime_detail = str(error)
+    items.append(
+        ReleaseResourceItemV1(
+            resource_id="build-runtime-and-backend",
+            target="build-host",
+            kind="BUILD_RUNTIME_SNAPSHOT",
+            status=runtime_status,
+            expected_sha256=None,
+            observed_sha256=(
+                None if build_runtime is None else build_runtime.logical_sha256
+            ),
+            detail=runtime_detail,
+        )
+    )
 
     providers: dict[str, ReleaseCleanProviderV1] = {}
     inventory_status = "MISSING"
@@ -1422,6 +2129,7 @@ def release_resource_preflight(
         protocol_set_sha256=bundle.protocol_set_sha256,
         protocol_commit=protocol_commit_value,
         items=tuple(items),
+        build_runtime=build_runtime,
         no_network=True,
     )
 
@@ -2039,8 +2747,14 @@ def plan_release_build(
             "network": "FORBIDDEN",
             "output_root": str(output_root),
             "resource_preflight": {
+                "build_runtime": (
+                    None
+                    if preflight.build_runtime is None
+                    else preflight.build_runtime.as_dict()
+                ),
                 "protocol_commit": preflight.protocol_commit,
                 "report_sha256": hashlib.sha256(expected_report).hexdigest(),
+                "resource_snapshot_sha256": preflight.resource_snapshot_sha256,
                 "status": preflight.status,
             },
         },
@@ -2101,8 +2815,11 @@ __all__ = [
     "RELEASE_COMMAND_OUTCOME_SCHEMA_ID_V1",
     "RELEASE_RESOURCE_PREFLIGHT_SCHEMA_ID_V1",
     "ReleaseArtifactLayoutV1",
+    "ReleaseBuildDistributionV1",
+    "ReleaseBuildImportV1",
     "ReleaseBuildRefusalCodeV1",
     "ReleaseBuildRefused",
+    "ReleaseBuildRuntimeSnapshotV1",
     "ReleaseCandidateInputsV1",
     "ReleaseCleanProviderInventoryV1",
     "ReleaseCleanProviderV1",
@@ -2114,6 +2831,7 @@ __all__ = [
     "ReleaseProtocolBundleV1",
     "ReleaseResourceItemV1",
     "ReleaseResourcePreflightV1",
+    "inspect_release_build_runtime",
     "load_release_protocol_bundle",
     "plan_release_build",
     "release_resource_preflight",

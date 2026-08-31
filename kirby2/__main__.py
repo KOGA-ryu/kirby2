@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import secrets
@@ -10,6 +11,23 @@ import sys
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+# The release commands are invoked as ``python -I kirby2/__main__.py``.  Isolated
+# startup deliberately excludes the checkout during site initialization.  Load only
+# the named ``kirby2`` package afterward; the repository root never becomes a general
+# import path where untracked startup hooks or module shadows could execute.
+if __name__ == "__main__" and sys.flags.isolated:
+    _package_root = Path(__file__).resolve().parent
+    _package_spec = importlib.util.spec_from_file_location(
+        "kirby2",
+        _package_root / "__init__.py",
+        submodule_search_locations=[str(_package_root)],
+    )
+    if _package_spec is None or _package_spec.loader is None:
+        raise RuntimeError("isolated Kirby2 package bootstrap failed")
+    _package = importlib.util.module_from_spec(_package_spec)
+    sys.modules["kirby2"] = _package
+    _package_spec.loader.exec_module(_package)
 
 from kirby2.scenarios import (
     get_scenario_definition,
