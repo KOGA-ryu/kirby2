@@ -38,6 +38,23 @@ from kirby2.packs.hostile_fixtures import (
     build_hostile_archive_fixtures,
     load_hostile_archive_fixture_specs,
 )
+from kirby2.packs.dependencies import (
+    PackRuntimeEnvironmentV1,
+    resolve_pack_dependencies,
+    semver_satisfies,
+    validate_installability,
+)
+from kirby2.packs.install import (
+    PACK_REGISTRY_LOCK_FILENAME,
+    PackInstallOperationV1,
+    PackInstallRefusalCodeV1,
+    PackInstallRefused,
+    deactivate_pack,
+    install_pack,
+    lookup_installed_pack,
+    read_pack_registry,
+    remove_deactivated_pack,
+)
 from kirby2.packs.models import (
     PackCompatibilityLevelV1,
     PackCompatibilityV1,
@@ -62,6 +79,14 @@ from kirby2.packs.staging import (
     revalidate_pack_stage,
     stage_pack_archive_bytes,
 )
+from kirby2.packs.registry import (
+    PACK_REGISTRY_FILENAME,
+    PackRegistryEntryV1,
+    PackRegistryV1,
+    canonical_pack_registry_bytes,
+    load_pack_registry_bytes,
+    pack_object_relative_path,
+)
 from kirby2.packs.validation import (
     DEFAULT_PACK_VALIDATION_LIMITS_V1,
     PackRefusalCodeV1,
@@ -75,10 +100,12 @@ from kirby2.packs.validation import (
     validate_structural_payload,
     validation_policy_id,
 )
+from kirby2.research.paths import DataAreaId, DataPaths
 
 
 WO39A_AUDIT_CASE_COUNT = 5
 WO39B_AUDIT_CASE_COUNT = 4
+WO39C_AUDIT_CASE_COUNT = 4
 
 _JSON_PATH = "data/scenario.json"
 _JSON_SCHEMA_ID = "KIRBY2_WO39A_AUDIT_SCENARIO_V1"
@@ -1069,13 +1096,686 @@ def _safe_preflight_binds(
     )
 
 
+def audit_atomic_pack_installation() -> tuple[PackAuditCase, ...]:
+    """Exercise the fixed WO39-C local resolution and mutation boundary."""
+
+    base, payloads = _fixture_pack()
+    provider, consumer = _installation_manifests(base)
+    environment = _runtime_environment(provider)
+    workflow_cases = _installation_workflow_cases(
+        provider,
+        consumer,
+        payloads,
+        environment,
+    )
+    cases = (
+        _local_dependency_resolution_case(base, environment),
+        *workflow_cases,
+    )
+    expected_names = (
+        "local_dependency_resolution_is_exact_ordered_and_fail_closed",
+        "installation_is_atomic_idempotent_content_addressed_and_read_only",
+        "failed_installations_preserve_the_prior_registry_and_stage",
+        "dependent_refusal_and_recoverable_removal_preserve_run_evidence",
+    )
+    if len(cases) != WO39C_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO39-C audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO39-C audit case order or identity changed")
+    return cases
+
+
+def _installation_manifests(
+    base: PackManifestV1,
+) -> tuple[PackManifestV1, PackManifestV1]:
+    provider = replace(
+        base,
+        name="local-provider",
+        title="Local dependency provider",
+        dependencies=(),
+    )
+    dependency = PackDependencyV1(
+        creator_id=provider.creator_id,
+        namespace=provider.namespace,
+        name=provider.name,
+        version_constraint="1.0.0",
+        expected_pack_id=provider.pack_id,
+    )
+    consumer = replace(
+        base,
+        name="local-consumer",
+        title="Local dependency consumer",
+        dependencies=(dependency,),
+    )
+    return provider, consumer
+
+
+def _runtime_environment(manifest: PackManifestV1) -> PackRuntimeEnvironmentV1:
+    installable = next(
+        item
+        for item in manifest.compatibility
+        if item.level is PackCompatibilityLevelV1.INSTALLABLE
+    )
+    return PackRuntimeEnvironmentV1(
+        engine_component_id="KIRBY2_ENGINE_V1",
+        engine_version="0.1.0",
+        compiler_versions=tuple(
+            sorted(
+                (item.component_id, "1.0.0")
+                for item in installable.compilers
+            )
+        ),
+        schema_versions=tuple(
+            sorted(
+                (item.schema_id, item.supported_versions[0])
+                for item in installable.schemas
+            )
+        ),
+    )
+
+
+def _local_dependency_resolution_case(
+    base: PackManifestV1,
+    environment: PackRuntimeEnvironmentV1,
+) -> PackAuditCase:
+    provider_a = replace(
+        base,
+        name="resolution-provider-a",
+        title="Resolution provider A",
+        dependencies=(),
+    )
+    provider_b = replace(
+        base,
+        name="resolution-provider-b",
+        title="Resolution provider B",
+        dependencies=(),
+    )
+    provider_a_newer = replace(
+        provider_a,
+        title="Resolution provider A newer compatible version",
+        version="1.1.0",
+    )
+    provider_a_entry = PackRegistryEntryV1.from_manifest(
+        provider_a,
+        (),
+        active=True,
+    )
+    provider_b_entry = PackRegistryEntryV1.from_manifest(
+        provider_b,
+        (),
+        active=True,
+    )
+    selected_entries = tuple(
+        sorted(
+            (provider_a_entry, provider_b_entry),
+            key=lambda item: item.sort_key,
+        )
+    )
+    entries = tuple(
+        sorted(
+            (
+                *selected_entries,
+                PackRegistryEntryV1.from_manifest(
+                    provider_a_newer,
+                    (),
+                    active=True,
+                ),
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    registry = PackRegistryV1(entries=entries)
+    dependencies = tuple(
+        sorted(
+            (
+                PackDependencyV1(
+                    creator_id=item.creator_id,
+                    namespace=item.namespace,
+                    name=item.name,
+                    version_constraint=">=1.0.0,<2.0.0",
+                    expected_pack_id=item.pack_id,
+                )
+                for item in (provider_b, provider_a)
+            ),
+            key=lambda item: item.sort_key,
+        )
+    )
+    root = replace(
+        base,
+        name="resolution-root",
+        title="Deterministic dependency resolution root",
+        dependencies=dependencies,
+    )
+    first = resolve_pack_dependencies(root, registry, environment)
+    second = resolve_pack_dependencies(root, registry, environment)
+    root_entry = PackRegistryEntryV1.from_manifest(
+        root,
+        first.registry_edges,
+        active=True,
+    )
+    complete_registry = PackRegistryV1(
+        entries=tuple(sorted((*entries, root_entry), key=lambda item: item.sort_key))
+    )
+    registry_raw = canonical_pack_registry_bytes(complete_registry)
+
+    digest_conflict_dependency = replace(
+        dependencies[0],
+        expected_pack_id=_digest("WO39-C wrong dependency digest"),
+    )
+    digest_conflict = replace(
+        root,
+        dependencies=tuple(
+            sorted(
+                (digest_conflict_dependency, *dependencies[1:]),
+                key=lambda item: item.sort_key,
+            )
+        ),
+    )
+    version_conflict_dependency = replace(
+        dependencies[0],
+        version_constraint=">=2.0.0,<3.0.0",
+    )
+    version_conflict = replace(
+        root,
+        dependencies=tuple(
+            sorted(
+                (version_conflict_dependency, *dependencies[1:]),
+                key=lambda item: item.sort_key,
+            )
+        ),
+    )
+    self_requirement = PackDependencyV1(
+        creator_id=provider_a.creator_id,
+        namespace=provider_a.namespace,
+        name=provider_a.name,
+        version_constraint=provider_a.version,
+        expected_pack_id=provider_a.pack_id,
+    )
+    self_cycle = replace(provider_a, dependencies=(self_requirement,))
+    incompatible_environment = replace(environment, engine_version="9.0.0")
+
+    refusal_text = {
+        "missing": _capture_exception_text(
+            lambda: resolve_pack_dependencies(
+                root,
+                PackRegistryV1.empty(),
+                environment,
+            )
+        ),
+        "digest": _capture_exception_text(
+            lambda: resolve_pack_dependencies(
+                digest_conflict,
+                registry,
+                environment,
+            )
+        ),
+        "version": _capture_exception_text(
+            lambda: resolve_pack_dependencies(
+                version_conflict,
+                registry,
+                environment,
+            )
+        ),
+        "cycle": _capture_exception_text(
+            lambda: resolve_pack_dependencies(
+                self_cycle,
+                PackRegistryV1(entries=(provider_a_entry,)),
+                environment,
+            )
+        ),
+        "engine": _capture_exception_text(
+            lambda: validate_installability(root, incompatible_environment)
+        ),
+        "ambiguous_key": _capture_exception_text(
+            lambda: PackRegistryV1(entries=(provider_a_entry, provider_a_entry))
+        ),
+    }
+    expected_order = tuple(item.key for item in selected_entries)
+    checks = {
+        "resolution_repeats_byte_for_byte": first.as_dict() == second.as_dict(),
+        "dependency_first_order_uses_full_registry_keys": (
+            tuple(item.key for item in first.dependency_first_order)
+            == expected_order
+        ),
+        "direct_edges_are_digest_bound_and_canonical": (
+            first.registry_edges == root_entry.resolved_dependencies
+            and tuple(item.key for item in first.direct_dependencies)
+            == expected_order
+        ),
+        "exact_digest_beats_a_newer_semver_compatible_candidate": (
+            any(
+                item.key == provider_a.registry_key
+                and item.pack_id == provider_a.pack_id
+                for item in first.direct_dependencies
+            )
+            and all(
+                item.pack_id != provider_a_newer.pack_id
+                for item in first.direct_dependencies
+            )
+        ),
+        "canonical_registry_round_trips_and_sorts": (
+            load_pack_registry_bytes(registry_raw) == complete_registry
+            and complete_registry.keys
+            == tuple(sorted(complete_registry.keys, key=lambda item: item.sort_key))
+        ),
+        "semver_range_is_closed_and_exact": (
+            semver_satisfies("1.5.0", ">=1.0.0,<2.0.0")
+            and not semver_satisfies("2.0.0", ">=1.0.0,<2.0.0")
+        ),
+        "missing_dependency_has_no_remote_fallback": (
+            refusal_text["missing"] is not None
+            and "MISSING_PACK_DEPENDENCY" in refusal_text["missing"]
+        ),
+        "digest_conflict_is_refused": (
+            refusal_text["digest"] is not None
+            and "PACK_DEPENDENCY_DIGEST_CONFLICT" in refusal_text["digest"]
+        ),
+        "version_conflict_is_refused": (
+            refusal_text["version"] is not None
+            and "PACK_DEPENDENCY_VERSION_CONFLICT" in refusal_text["version"]
+        ),
+        "cycle_is_refused": (
+            refusal_text["cycle"] is not None
+            and "PACK_DEPENDENCY_CYCLE" in refusal_text["cycle"]
+        ),
+        "incompatible_engine_is_refused": (
+            refusal_text["engine"] is not None
+            and "INCOMPATIBLE_PACK_ENGINE" in refusal_text["engine"]
+        ),
+        "duplicate_provider_key_cannot_enter_registry": (
+            refusal_text["ambiguous_key"] is not None
+            and "keys must be unique" in refusal_text["ambiguous_key"]
+        ),
+    }
+    return _case(
+        "local_dependency_resolution_is_exact_ordered_and_fail_closed",
+        f"root={root.pack_id} dependencies={len(expected_order)}",
+        checks,
+        {
+            "dependency_order": [item.as_dict() for item in expected_order],
+            "installed_candidates": [
+                item.key.as_dict() for item in registry.entries
+            ],
+            "registry_sha256": complete_registry.sha256,
+            "refusals": refusal_text,
+        },
+    )
+
+
+def _installation_workflow_cases(
+    provider: PackManifestV1,
+    consumer: PackManifestV1,
+    payloads: dict[str, bytes],
+    environment: PackRuntimeEnvironmentV1,
+) -> tuple[PackAuditCase, PackAuditCase, PackAuditCase]:
+    with TemporaryDirectory(prefix="kirby2-wo39c-install-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        paths = DataPaths(root)
+        paths.ensure_pack_installation_areas()
+        paths.ensure(DataAreaId.RUNS)
+        run_evidence = paths.runs / "completed-run-evidence.json"
+        run_bytes = canonical_json_bytes(
+            {
+                "run_id": "WO39C_COMPLETED_RUN_EVIDENCE",
+                "schema_id": "KIRBY2_WO39C_RUN_EVIDENCE_V1",
+                "schema_version": 1,
+            }
+        )
+        run_evidence.write_bytes(run_bytes)
+
+        provider_archive = _normalized_archive(
+            provider,
+            payloads,
+            reverse_input=False,
+        )
+        provider_stage = stage_pack_archive_bytes(provider_archive, paths.staging)
+        provider_receipt = install_pack(
+            provider_stage,
+            paths=paths,
+            environment=environment,
+        )
+        provider_object = paths.packs.joinpath(
+            *provider_receipt.object_path.split("/")
+        )
+        provider_stage_moved = not provider_stage.stage_path.exists()
+
+        repeated_stage = stage_pack_archive_bytes(provider_archive, paths.staging)
+        repeated_receipt = install_pack(
+            repeated_stage,
+            paths=paths,
+            environment=environment,
+        )
+        discard_pack_stage(repeated_stage)
+
+        consumer_archive = _normalized_archive(
+            consumer,
+            payloads,
+            reverse_input=False,
+        )
+        consumer_stage = stage_pack_archive_bytes(consumer_archive, paths.staging)
+        consumer_receipt = install_pack(
+            consumer_stage,
+            paths=paths,
+            environment=environment,
+        )
+        consumer_object = paths.packs.joinpath(
+            *consumer_receipt.object_path.split("/")
+        )
+        registry_after_install = read_pack_registry(paths=paths)
+        registry_after_install_sha256 = registry_after_install.sha256
+        registry_path = paths.packs / PACK_REGISTRY_FILENAME
+        lock_path = paths.packs / PACK_REGISTRY_LOCK_FILENAME
+        lock_metadata = lock_path.stat(follow_symlinks=False)
+
+        installed_modes_safe = _installed_tree_is_read_only(
+            provider_object
+        ) and _installed_tree_is_read_only(consumer_object)
+        installation_checks = {
+            "new_stages_publish_by_atomic_inode_move": (
+                provider_receipt.installed_new_object
+                and consumer_receipt.installed_new_object
+                and provider_stage_moved
+                and not consumer_stage.stage_path.exists()
+            ),
+            "published_objects_use_canonical_content_addresses": (
+                provider_receipt.object_path
+                == pack_object_relative_path(provider.pack_id)
+                and consumer_receipt.object_path
+                == pack_object_relative_path(consumer.pack_id)
+                and provider_object.is_dir()
+                and consumer_object.is_dir()
+            ),
+            "installed_objects_are_exact_read_only_trees": installed_modes_safe,
+            "registry_contains_sorted_active_exact_bindings": (
+                len(registry_after_install.entries) == 2
+                and all(item.active for item in registry_after_install.entries)
+                and registry_after_install.require(provider.registry_key).pack_id
+                == provider.pack_id
+                and registry_after_install.require(consumer.registry_key).pack_id
+                == consumer.pack_id
+            ),
+            "registry_file_contains_exact_canonical_snapshot_bytes": (
+                registry_path.read_bytes()
+                == canonical_pack_registry_bytes(registry_after_install)
+            ),
+            "registry_lock_is_one_owner_only_empty_regular_file": (
+                not lock_path.is_symlink()
+                and stat.S_ISREG(lock_metadata.st_mode)
+                and stat.S_IMODE(lock_metadata.st_mode) == 0o600
+                and lock_metadata.st_nlink == 1
+                and lock_metadata.st_size == 0
+            ),
+            "consumer_records_exact_local_dependency_edge": (
+                consumer_receipt.resolved_dependencies
+                == registry_after_install.require(
+                    consumer.registry_key
+                ).resolved_dependencies
+                and len(consumer_receipt.resolved_dependencies) == 1
+                and consumer_receipt.resolved_dependencies[0].pack_id
+                == provider.pack_id
+            ),
+            "repeat_install_is_idempotent": (
+                not repeated_receipt.installed_new_object
+                and not repeated_receipt.registry_changed
+                and repeated_receipt.registry_before_sha256
+                == repeated_receipt.registry_after_sha256
+            ),
+            "installed_lookup_returns_exact_entry": (
+                lookup_installed_pack(provider.registry_key, paths=paths)
+                == registry_after_install.require(provider.registry_key)
+            ),
+        }
+        installation_case = _case(
+            "installation_is_atomic_idempotent_content_addressed_and_read_only",
+            (
+                f"registry={registry_after_install.sha256} "
+                f"objects={len(registry_after_install.entries)}"
+            ),
+            installation_checks,
+            {
+                "consumer_receipt_sha256": consumer_receipt.sha256,
+                "provider_receipt_sha256": provider_receipt.sha256,
+                "registry_sha256": registry_after_install.sha256,
+            },
+        )
+
+        conflict_manifest = replace(
+            consumer,
+            title="Conflicting bytes under one immutable registry key",
+        )
+        conflict_archive = _normalized_archive(
+            conflict_manifest,
+            payloads,
+            reverse_input=False,
+        )
+        conflict_stage = stage_pack_archive_bytes(conflict_archive, paths.staging)
+        conflict = _capture_install_refusal(
+            lambda: install_pack(
+                conflict_stage,
+                paths=paths,
+                environment=environment,
+            )
+        )
+        conflict_stage_intact = revalidate_pack_stage(conflict_stage) is not None
+        conflict_registry_unchanged = (
+            read_pack_registry(paths=paths).sha256 == registry_after_install_sha256
+        )
+        discard_pack_stage(conflict_stage)
+
+        missing_dependency = PackDependencyV1(
+            creator_id=_digest("WO39-C missing creator"),
+            namespace="org.kirby2.missing",
+            name="absent-provider",
+            version_constraint="1.0.0",
+            expected_pack_id=_digest("WO39-C missing pack"),
+        )
+        missing_manifest = replace(
+            provider,
+            name="missing-dependency-consumer",
+            title="Missing dependency refusal",
+            dependencies=(missing_dependency,),
+        )
+        missing_archive = _normalized_archive(
+            missing_manifest,
+            payloads,
+            reverse_input=False,
+        )
+        missing_stage = stage_pack_archive_bytes(missing_archive, paths.staging)
+        missing = _capture_install_refusal(
+            lambda: install_pack(
+                missing_stage,
+                paths=paths,
+                environment=environment,
+            )
+        )
+        missing_stage_intact = revalidate_pack_stage(missing_stage) is not None
+        missing_registry_unchanged = (
+            read_pack_registry(paths=paths).sha256 == registry_after_install_sha256
+        )
+        discard_pack_stage(missing_stage)
+
+        with TemporaryDirectory(prefix="kirby2-wo39c-foreign-") as foreign_raw:
+            foreign_root = Path(foreign_raw).resolve()
+            foreign_root.chmod(0o700)
+            foreign_stage = stage_pack_archive_bytes(
+                provider_archive,
+                foreign_root,
+            )
+            foreign = _capture_install_refusal(
+                lambda: install_pack(
+                    foreign_stage,
+                    paths=paths,
+                    environment=environment,
+                )
+            )
+            foreign_stage_intact = revalidate_pack_stage(foreign_stage) is not None
+            discard_pack_stage(foreign_stage)
+        foreign_registry_unchanged = (
+            read_pack_registry(paths=paths).sha256 == registry_after_install_sha256
+        )
+        failure_checks = {
+            "immutable_key_conflict_is_refused": conflict
+            == (
+                PackInstallRefusalCodeV1.REGISTRY_KEY_CONFLICT,
+                PackInstallOperationV1.INSTALL,
+            ),
+            "missing_dependency_is_refused_without_fetch": missing
+            == (
+                PackInstallRefusalCodeV1.DEPENDENCY_RESOLUTION_FAILED,
+                PackInstallOperationV1.INSTALL,
+            ),
+            "foreign_staging_root_is_refused": foreign
+            == (
+                PackInstallRefusalCodeV1.STAGING_ROOT_MISMATCH,
+                PackInstallOperationV1.INSTALL,
+            ),
+            "failed_stages_remain_intact_and_recoverable": (
+                conflict_stage_intact
+                and missing_stage_intact
+                and foreign_stage_intact
+            ),
+            "all_failures_preserve_prior_registry_digest": (
+                conflict_registry_unchanged
+                and missing_registry_unchanged
+                and foreign_registry_unchanged
+            ),
+            "failure_cleanup_leaves_staging_area_empty": (
+                not any(paths.staging.iterdir())
+            ),
+        }
+        failure_case = _case(
+            "failed_installations_preserve_the_prior_registry_and_stage",
+            (
+                f"registry={registry_after_install_sha256} "
+                f"conflict={None if conflict is None else conflict[0].value}"
+            ),
+            failure_checks,
+            {
+                "conflict_code": None if conflict is None else conflict[0].value,
+                "foreign_code": None if foreign is None else foreign[0].value,
+                "missing_code": None if missing is None else missing[0].value,
+                "registry_sha256": registry_after_install_sha256,
+            },
+        )
+
+        dependent_deactivation = _capture_install_refusal(
+            lambda: deactivate_pack(provider.registry_key, paths=paths)
+        )
+        active_removal = _capture_install_refusal(
+            lambda: remove_deactivated_pack(provider.registry_key, paths=paths)
+        )
+        consumer_deactivation = deactivate_pack(consumer.registry_key, paths=paths)
+        consumer_removal = remove_deactivated_pack(
+            consumer.registry_key,
+            paths=paths,
+        )
+        provider_deactivation = deactivate_pack(provider.registry_key, paths=paths)
+        provider_removal = remove_deactivated_pack(
+            provider.registry_key,
+            paths=paths,
+        )
+        final_registry = read_pack_registry(paths=paths)
+        consumer_recovery = paths.packs.joinpath(
+            *consumer_removal.recovery_path.split("/")
+        )
+        provider_recovery = paths.packs.joinpath(
+            *provider_removal.recovery_path.split("/")
+        )
+        removal_checks = {
+            "active_dependency_cannot_be_deactivated": dependent_deactivation
+            == (
+                PackInstallRefusalCodeV1.ACTIVE_DEPENDENTS,
+                PackInstallOperationV1.DEACTIVATE,
+            ),
+            "active_pack_cannot_be_removed": active_removal
+            == (
+                PackInstallRefusalCodeV1.PACK_STILL_ACTIVE,
+                PackInstallOperationV1.REMOVE,
+            ),
+            "dependent_is_deactivated_before_removal": (
+                not consumer_deactivation.already_inactive
+                and consumer_deactivation.registry_before_sha256
+                != consumer_deactivation.registry_after_sha256
+            ),
+            "provider_is_removable_only_after_dependent_is_gone": (
+                not provider_deactivation.already_inactive
+                and provider_deactivation.registry_before_sha256
+                != provider_deactivation.registry_after_sha256
+            ),
+            "removal_is_recoverable_not_destructive": (
+                consumer_recovery.is_dir()
+                and provider_recovery.is_dir()
+                and not consumer_object.exists()
+                and not provider_object.exists()
+            ),
+            "registry_is_empty_after_ordered_removal": final_registry.entries == (),
+            "completed_run_evidence_is_byte_identical": (
+                run_evidence.read_bytes() == run_bytes
+            ),
+            "registry_and_run_areas_remain_separate": (
+                paths.runs != paths.packs
+                and paths.runs not in paths.packs.parents
+                and paths.packs not in paths.runs.parents
+            ),
+        }
+        removal_case = _case(
+            "dependent_refusal_and_recoverable_removal_preserve_run_evidence",
+            (
+                f"final_registry={final_registry.sha256} "
+                f"run_bytes={len(run_bytes)}"
+            ),
+            removal_checks,
+            {
+                "consumer_removal_sha256": consumer_removal.sha256,
+                "final_registry_sha256": final_registry.sha256,
+                "provider_removal_sha256": provider_removal.sha256,
+                "run_evidence_sha256": hashlib.sha256(run_bytes).hexdigest(),
+            },
+        )
+        return installation_case, failure_case, removal_case
+
+
+def _installed_tree_is_read_only(root: Path) -> bool:
+    if root.is_symlink() or not root.is_dir():
+        return False
+    entries = (root, *tuple(root.rglob("*")))
+    return all(
+        not path.is_symlink()
+        and stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+        == (0o500 if path.is_dir() else 0o400)
+        for path in entries
+    )
+
+
+def _capture_install_refusal(
+    operation,
+) -> tuple[PackInstallRefusalCodeV1, PackInstallOperationV1] | None:
+    try:
+        operation()
+    except PackInstallRefused as error:
+        return error.code, error.operation
+    return None
+
+
+def _capture_exception_text(operation) -> str | None:
+    try:
+        operation()
+    except (KeyError, LookupError, RuntimeError, TypeError, ValueError) as error:
+        return str(error)
+    return None
+
+
 def _normalized_archive(
     manifest: PackManifestV1,
     payloads: dict[str, bytes],
     *,
     reverse_input: bool,
 ) -> bytes:
-    pairs = [(K2PACK_MANIFEST_PATH, canonical_manifest_bytes(manifest)), *payloads.items()]
+    pairs = [
+        (K2PACK_MANIFEST_PATH, canonical_manifest_bytes(manifest)),
+        *payloads.items(),
+    ]
     if reverse_input:
         pairs.reverse()
     values = dict(pairs)
@@ -1168,7 +1868,9 @@ def _case(
 __all__ = [
     "WO39A_AUDIT_CASE_COUNT",
     "WO39B_AUDIT_CASE_COUNT",
+    "WO39C_AUDIT_CASE_COUNT",
     "PackAuditCase",
+    "audit_atomic_pack_installation",
     "audit_canonical_pack_identity",
     "audit_hostile_archive_validation_and_staging",
 ]

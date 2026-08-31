@@ -158,6 +158,7 @@ REGISTERABLE_GATE_IDS = (
     "WO37-E",
     "WO39-A",
     "WO39-B",
+    "WO39-C",
 )
 _BASELINE_ARTIFACT_SHA256 = (
     "41b934c01794435e4477143a7894faf2f88bb7d4fd11b49c078cf962a955318d"
@@ -4650,6 +4651,45 @@ def _audit_wo39b() -> ExpansionGateReport:
     )
 
 
+def _audit_wo39c() -> ExpansionGateReport:
+    from kirby2.audit.packs import (
+        WO39C_AUDIT_CASE_COUNT,
+        audit_atomic_pack_installation,
+    )
+
+    cases = audit_atomic_pack_installation()
+    checks = tuple(
+        ExpansionGateCheck(
+            code=case.name,
+            status=(
+                ExpansionGateStatus.FAIL
+                if case.failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=case.detail,
+            required=True,
+        )
+        for case in cases
+    )
+    failures = tuple(
+        f"{case.name}: {failure}"
+        for case in cases
+        for failure in case.failures
+    )
+    return ExpansionGateReport(
+        card_id="WO39-C",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(WO39C_AUDIT_CASE_COUNT)),
+            ("dependency_policy", "LOCAL_EXACT_VERSION_AND_DIGEST_ONLY_V1"),
+            ("activation_policy", "ATOMIC_REGISTRY_LOCKED_CAS_V1"),
+            ("removal_policy", "DEACTIVATE_THEN_RECOVERABLE_MOVE_V1"),
+        ),
+    )
+
+
 GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("DEV-0001", _audit_dev0001),
     ("K2X-02", _audit_k2x02),
@@ -4709,6 +4749,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO37-E", _audit_wo37e),
     ("WO39-A", _audit_wo39a),
     ("WO39-B", _audit_wo39b),
+    ("WO39-C", _audit_wo39c),
 )
 
 
