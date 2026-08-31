@@ -1,0 +1,116 @@
+schema_id = "KIRBY2_HOSTILE_ARCHIVE_FIXTURE_SET_V1"
+schema_version = 1
+
+[[fixtures]]
+fixture_id = "absolute_path"
+attack_kind = "ABSOLUTE_PATH"
+expected_code = "PATH_ABSOLUTE"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "parent_traversal"
+attack_kind = "PARENT_TRAVERSAL"
+expected_code = "PATH_PARENT_TRAVERSAL"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "backslash_path"
+attack_kind = "BACKSLASH_PATH"
+expected_code = "PATH_BACKSLASH"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "windows_drive_path"
+attack_kind = "WINDOWS_DRIVE_PATH"
+expected_code = "PATH_WINDOWS_DRIVE"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "unc_path"
+attack_kind = "UNC_PATH"
+expected_code = "PATH_UNC"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "symlink_entry"
+attack_kind = "SYMLINK_ENTRY"
+expected_code = "ENTRY_SYMLINK"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "hardlink_entry"
+attack_kind = "HARDLINK_ENTRY"
+expected_code = "ENTRY_HARDLINK"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "device_entry"
+attack_kind = "DEVICE_ENTRY"
+expected_code = "ENTRY_DEVICE"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "fifo_entry"
+attack_kind = "FIFO_ENTRY"
+expected_code = "ENTRY_FIFO"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "special_entry"
+attack_kind = "SPECIAL_ENTRY"
+expected_code = "ENTRY_SPECIAL_FILE"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "duplicate_path"
+attack_kind = "DUPLICATE_PATH"
+expected_code = "PATH_DUPLICATE"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "casefold_collision"
+attack_kind = "CASEFOLD_COLLISION"
+expected_code = "PATH_CASEFOLD_COLLISION"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "file_directory_collision"
+attack_kind = "FILE_DIRECTORY_COLLISION"
+expected_code = "PATH_FILE_DIRECTORY_COLLISION"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "undeclared_file"
+attack_kind = "UNDECLARED_FILE"
+expected_code = "UNDECLARED_FILE"
+expected_phase = "MANIFEST"
+
+[[fixtures]]
+fixture_id = "digest_mismatch"
+attack_kind = "DIGEST_MISMATCH"
+expected_code = "PAYLOAD_DIGEST_MISMATCH"
+expected_phase = "CONTENT_STREAM"
+
+[[fixtures]]
+fixture_id = "nested_archive"
+attack_kind = "NESTED_ARCHIVE"
+expected_code = "NESTED_ARCHIVE"
+expected_phase = "CONTENT_STREAM"
+
+[[fixtures]]
+fixture_id = "type_spoofing"
+attack_kind = "TYPE_SPOOFING"
+expected_code = "TYPE_SPOOFING"
+expected_phase = "CONTENT_STREAM"
+
+[[fixtures]]
+fixture_id = "compression_ratio"
+attack_kind = "COMPRESSION_RATIO"
+expected_code = "COMPRESSION_RATIO_LIMIT"
+expected_phase = "CENTRAL_DIRECTORY"
+
+[[fixtures]]
+fixture_id = "unsupported_compression"
+attack_kind = "UNSUPPORTED_COMPRESSION"
+expected_code = "COMPRESSION_METHOD_UNSUPPORTED"
+expected_phase = "CENTRAL_DIRECTORY"

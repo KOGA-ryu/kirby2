@@ -31,7 +31,10 @@ include = ["kirby2*"]
 ]
 "kirby2.observability" = ["README.md"]
 "kirby2.orchestration" = ["examples/*.toml", "fixtures/test_pki/*"]
-"kirby2.packs" = ["fixtures/samples/*/*.toml"]
+"kirby2.packs" = [
+  "fixtures/hostile_archive/*.toml",
+  "fixtures/samples/*/*.toml",
+]
 "kirby2.scenarios" = ["accepted_scenarios.json"]
 "kirby2.historical" = ["FEATURES.md", "LESSONS.md", "fixtures/*.json", "lessons/*.json"]
 "kirby2.latency" = ["README.md"]

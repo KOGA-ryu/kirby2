@@ -7,7 +7,10 @@ import io
 import stat
 import zipfile
 from dataclasses import dataclass, replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from kirby2.packs.archive import preflight_pack_archive_bytes
 from kirby2.packs.formats import (
     K2PACK_MANIFEST_PATH,
     K2PACK_ZIP_COMPRESSION,
@@ -30,6 +33,11 @@ from kirby2.packs.identity import (
     pack_identity_projection,
     verify_pack_payload_identity,
 )
+from kirby2.packs.hostile_fixtures import (
+    HOSTILE_ARCHIVE_FIXTURE_SCHEMA_ID,
+    build_hostile_archive_fixtures,
+    load_hostile_archive_fixture_specs,
+)
 from kirby2.packs.models import (
     PackCompatibilityLevelV1,
     PackCompatibilityV1,
@@ -47,9 +55,30 @@ from kirby2.packs.models import (
     PackTypeV1,
     PackVersionRequirementV1,
 )
+from kirby2.packs.staging import (
+    PACK_STAGE_CAPABILITY_SCHEMA_ID,
+    PackStageVerificationV1,
+    discard_pack_stage,
+    revalidate_pack_stage,
+    stage_pack_archive_bytes,
+)
+from kirby2.packs.validation import (
+    DEFAULT_PACK_VALIDATION_LIMITS_V1,
+    PackRefusalCodeV1,
+    PackValidationLimitsV1,
+    PackValidationPhaseV1,
+    PackValidationRefused,
+    validate_manifest_complexity,
+    validate_pack_member_path,
+    validate_pack_member_paths,
+    validate_parse_complexity,
+    validate_structural_payload,
+    validation_policy_id,
+)
 
 
 WO39A_AUDIT_CASE_COUNT = 5
+WO39B_AUDIT_CASE_COUNT = 4
 
 _JSON_PATH = "data/scenario.json"
 _JSON_SCHEMA_ID = "KIRBY2_WO39A_AUDIT_SCENARIO_V1"
@@ -566,6 +595,480 @@ def _data_only_refusal_case(manifest: PackManifestV1) -> PackAuditCase:
     )
 
 
+def audit_hostile_archive_validation_and_staging() -> tuple[PackAuditCase, ...]:
+    """Exercise the fixed WO39-B preflight, limit, and private-stage boundary."""
+
+    manifest, payloads = _fixture_pack()
+    archive_bytes = _normalized_archive(
+        manifest,
+        payloads,
+        reverse_input=False,
+    )
+    cases = (
+        _hostile_archive_fixture_case(manifest, payloads),
+        _archive_path_policy_case(),
+        _archive_resource_policy_case(manifest, payloads, archive_bytes),
+        _private_stage_lifecycle_case(manifest, payloads, archive_bytes),
+    )
+    expected_names = (
+        "every_governed_hostile_archive_is_refused_before_staging",
+        "portable_path_and_collision_policy_is_closed",
+        "archive_resource_and_parse_budgets_fail_with_stable_codes",
+        "safe_nested_pack_stages_revalidates_detects_tamper_and_discards",
+    )
+    if len(cases) != WO39B_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO39-B audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO39-B audit case order or identity changed")
+    return cases
+
+
+def _hostile_archive_fixture_case(
+    manifest: PackManifestV1,
+    payloads: dict[str, bytes],
+) -> PackAuditCase:
+    specs = load_hostile_archive_fixture_specs()
+    fixtures = build_hostile_archive_fixtures(manifest, payloads)
+    observed: list[dict[str, object]] = []
+    stable = True
+    roots_clean = True
+    with TemporaryDirectory(prefix="kirby2-wo39b-hostile-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        for fixture in fixtures:
+            stage = None
+            try:
+                stage = stage_pack_archive_bytes(
+                    fixture.archive_bytes,
+                    root,
+                    limits=fixture.limits,
+                )
+            except PackValidationRefused as error:
+                refusal = error.refusal
+                matches = (
+                    refusal.code is fixture.spec.expected_code
+                    and refusal.phase is fixture.spec.expected_phase
+                )
+                stable = stable and matches
+                observed.append(
+                    {
+                        "code": refusal.code.value,
+                        "fixture_id": fixture.fixture_id,
+                        "phase": refusal.phase.value,
+                        "transport_sha256": fixture.transport_sha256,
+                    }
+                )
+            else:
+                stable = False
+                observed.append(
+                    {
+                        "code": "UNEXPECTED_STAGE",
+                        "fixture_id": fixture.fixture_id,
+                        "phase": "STAGE_WRITE",
+                        "transport_sha256": fixture.transport_sha256,
+                    }
+                )
+            finally:
+                if stage is not None:
+                    discard_pack_stage(stage, limits=fixture.limits)
+            roots_clean = roots_clean and not any(root.iterdir())
+    checks = {
+        "fixture_manifest_uses_governed_schema": (
+            HOSTILE_ARCHIVE_FIXTURE_SCHEMA_ID
+            == "KIRBY2_HOSTILE_ARCHIVE_FIXTURE_SET_V1"
+        ),
+        "fixture_specs_and_generated_archives_are_one_to_one": (
+            len(fixtures) == len(specs) == 19
+            and tuple(item.fixture_id for item in fixtures)
+            == tuple(item.fixture_id for item in specs)
+        ),
+        "every_fixture_returns_its_exact_stable_code_and_phase": stable,
+        "no_hostile_failure_leaves_a_partial_stage": roots_clean,
+        "fixture_transports_are_unique": (
+            len({item.transport_sha256 for item in fixtures}) == len(fixtures)
+        ),
+    }
+    return _case(
+        "every_governed_hostile_archive_is_refused_before_staging",
+        f"fixtures={len(fixtures)} stable={stable} clean={roots_clean}",
+        checks,
+        {"observed_refusals": observed},
+    )
+
+
+def _archive_path_policy_case() -> PackAuditCase:
+    default = DEFAULT_PACK_VALIDATION_LIMITS_V1
+    path_probes = {
+        "absolute": (
+            lambda: validate_pack_member_path("/escape.json", limits=default),
+            PackRefusalCodeV1.PATH_ABSOLUTE,
+        ),
+        "parent": (
+            lambda: validate_pack_member_path("../escape.json", limits=default),
+            PackRefusalCodeV1.PATH_PARENT_TRAVERSAL,
+        ),
+        "backslash": (
+            lambda: validate_pack_member_path("data\\escape.json", limits=default),
+            PackRefusalCodeV1.PATH_BACKSLASH,
+        ),
+        "windows_drive": (
+            lambda: validate_pack_member_path("C:/escape.json", limits=default),
+            PackRefusalCodeV1.PATH_WINDOWS_DRIVE,
+        ),
+        "unc": (
+            lambda: validate_pack_member_path("//server/share.json", limits=default),
+            PackRefusalCodeV1.PATH_UNC,
+        ),
+        "nul": (
+            lambda: validate_pack_member_path("data/evil\x00.json", limits=default),
+            PackRefusalCodeV1.PATH_NUL,
+        ),
+        "length": (
+            lambda: validate_pack_member_path(
+                "data/long.json",
+                limits=replace(default, maximum_path_bytes=8),
+            ),
+            PackRefusalCodeV1.PATH_LENGTH_LIMIT,
+        ),
+        "depth": (
+            lambda: validate_pack_member_path(
+                "a/b/c/value.json",
+                limits=replace(default, maximum_path_depth=2),
+            ),
+            PackRefusalCodeV1.PATH_DEPTH_LIMIT,
+        ),
+        "duplicate": (
+            lambda: validate_pack_member_paths(
+                ("data/value.json", "data/value.json"),
+                limits=default,
+            ),
+            PackRefusalCodeV1.PATH_DUPLICATE,
+        ),
+        "casefold": (
+            lambda: validate_pack_member_paths(
+                ("data/Value.json", "data/value.json"),
+                limits=default,
+            ),
+            PackRefusalCodeV1.PATH_CASEFOLD_COLLISION,
+        ),
+        "unicode": (
+            lambda: validate_pack_member_paths(
+                ("data/caf\u00e9.json", "data/cafe\u0301.json"),
+                limits=default,
+            ),
+            PackRefusalCodeV1.PATH_UNICODE_COLLISION,
+        ),
+        "file_directory": (
+            lambda: validate_pack_member_paths(
+                ("data/collision", "data/collision/value.json"),
+                limits=default,
+            ),
+            PackRefusalCodeV1.PATH_FILE_DIRECTORY_COLLISION,
+        ),
+    }
+    outcomes = {
+        name: _capture_refusal(operation)
+        for name, (operation, _) in path_probes.items()
+    }
+    checks = {
+        f"{name}_uses_{expected.value}": (
+            outcomes[name]
+            == (expected, PackValidationPhaseV1.CENTRAL_DIRECTORY)
+        )
+        for name, (_, expected) in path_probes.items()
+    }
+    return _case(
+        "portable_path_and_collision_policy_is_closed",
+        f"refused={sum(checks.values())}/{len(checks)}",
+        checks,
+        {
+            "observed_codes": {
+                name: None if outcome is None else outcome[0].value
+                for name, outcome in outcomes.items()
+            }
+        },
+    )
+
+
+def _archive_resource_policy_case(
+    manifest: PackManifestV1,
+    payloads: dict[str, bytes],
+    archive_bytes: bytes,
+) -> PackAuditCase:
+    default = DEFAULT_PACK_VALIDATION_LIMITS_V1
+    manifest_bytes = canonical_manifest_bytes(manifest)
+    total_expanded = len(manifest_bytes) + sum(len(raw) for raw in payloads.values())
+    maximum_member = max(len(manifest_bytes), *(len(raw) for raw in payloads.values()))
+    total_limits = replace(
+        default,
+        maximum_manifest_bytes=len(manifest_bytes),
+        maximum_file_expanded_bytes=maximum_member,
+        maximum_total_expanded_bytes=total_expanded - 1,
+    )
+    extra_dependency = PackDependencyV1(
+        creator_id=_digest("WO39-B extra dependency creator"),
+        namespace="org.kirby2.extra",
+        name="second-base",
+        version_constraint="1.0.0",
+        expected_pack_id=_digest("WO39-B extra dependency pack"),
+    )
+    dependency_manifest = replace(
+        manifest,
+        dependencies=tuple(
+            sorted(
+                (*manifest.dependencies, extra_dependency),
+                key=lambda item: item.sort_key,
+            )
+        ),
+    )
+    selected = manifest.inventory[0]
+    resource_probes = {
+        "archive_bytes": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                limits=replace(
+                    default,
+                    maximum_archive_bytes=len(archive_bytes) - 1,
+                ),
+            ),
+            PackRefusalCodeV1.ARCHIVE_TOO_LARGE,
+            PackValidationPhaseV1.TRANSPORT,
+        ),
+        "entry_count": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                limits=replace(default, maximum_entries=2),
+            ),
+            PackRefusalCodeV1.ENTRY_COUNT_LIMIT,
+            PackValidationPhaseV1.CENTRAL_DIRECTORY,
+        ),
+        "central_directory": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                limits=replace(default, maximum_central_directory_bytes=1),
+            ),
+            PackRefusalCodeV1.CENTRAL_DIRECTORY_LIMIT,
+            PackValidationPhaseV1.CENTRAL_DIRECTORY,
+        ),
+        "file_expansion": (
+            lambda: validate_structural_payload(
+                selected,
+                payloads[selected.path],
+                limits=replace(
+                    default,
+                    maximum_manifest_bytes=1,
+                    maximum_file_expanded_bytes=1,
+                ),
+            ),
+            PackRefusalCodeV1.FILE_EXPANDED_SIZE_LIMIT,
+            PackValidationPhaseV1.CONTENT_STREAM,
+        ),
+        "total_expansion": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                limits=total_limits,
+            ),
+            PackRefusalCodeV1.TOTAL_EXPANDED_SIZE_LIMIT,
+            PackValidationPhaseV1.CENTRAL_DIRECTORY,
+        ),
+        "dependency_count": (
+            lambda: validate_manifest_complexity(
+                dependency_manifest,
+                limits=replace(default, maximum_dependencies=1),
+            ),
+            PackRefusalCodeV1.DEPENDENCY_COUNT_LIMIT,
+            PackValidationPhaseV1.MANIFEST,
+        ),
+        "parse_depth": (
+            lambda: validate_parse_complexity(
+                {"a": {"b": {"c": {"d": 1}}}},
+                limits=replace(default, maximum_parse_depth=2),
+            ),
+            PackRefusalCodeV1.PARSE_COMPLEXITY_LIMIT,
+            PackValidationPhaseV1.CONTENT_STREAM,
+        ),
+        "event_rows": (
+            lambda: validate_parse_complexity(
+                {},
+                limits=replace(default, maximum_event_rows=1),
+                event_rows=2,
+            ),
+            PackRefusalCodeV1.PARSE_COMPLEXITY_LIMIT,
+            PackValidationPhaseV1.CONTENT_STREAM,
+        ),
+        "expected_pack_id": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                expected_pack_id=_digest("wrong expected pack"),
+            ),
+            PackRefusalCodeV1.EXPECTED_PACK_ID_MISMATCH,
+            PackValidationPhaseV1.MANIFEST,
+        ),
+        "expected_transport": (
+            lambda: preflight_pack_archive_bytes(
+                archive_bytes,
+                expected_transport_sha256=_digest("wrong expected transport"),
+            ),
+            PackRefusalCodeV1.EXPECTED_TRANSPORT_DIGEST_MISMATCH,
+            PackValidationPhaseV1.TRANSPORT,
+        ),
+    }
+    outcomes = {
+        name: _capture_refusal(operation)
+        for name, (operation, _, _) in resource_probes.items()
+    }
+    checks = {
+        f"{name}_uses_{code.value}": outcomes[name] == (code, phase)
+        for name, (_, code, phase) in resource_probes.items()
+    }
+    checks.update(
+        {
+            "validation_policy_round_trips_exactly": (
+                PackValidationLimitsV1.from_dict(default.as_dict()) == default
+            ),
+            "validation_policy_id_is_content_derived": (
+                default.validation_policy_id == validation_policy_id(default)
+            ),
+            "safe_archive_preflight_binds_policy_and_identities": (
+                _safe_preflight_binds(manifest, archive_bytes, default)
+            ),
+        }
+    )
+    return _case(
+        "archive_resource_and_parse_budgets_fail_with_stable_codes",
+        f"bounded={sum(checks.values())}/{len(checks)}",
+        checks,
+        {
+            "observed_codes": {
+                name: None if outcome is None else outcome[0].value
+                for name, outcome in outcomes.items()
+            },
+            "validation_policy_id": default.validation_policy_id,
+        },
+    )
+
+
+def _private_stage_lifecycle_case(
+    manifest: PackManifestV1,
+    payloads: dict[str, bytes],
+    archive_bytes: bytes,
+) -> PackAuditCase:
+    with TemporaryDirectory(prefix="kirby2-wo39b-safe-") as raw_root:
+        root = Path(raw_root).resolve()
+        root.chmod(0o700)
+        stage = stage_pack_archive_bytes(
+            archive_bytes,
+            root,
+            expected_pack_id=manifest.pack_id,
+            expected_transport_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+        )
+        initial = revalidate_pack_stage(stage)
+        expected_files = {
+            K2PACK_MANIFEST_PATH: canonical_manifest_bytes(manifest),
+            **payloads,
+        }
+        actual_files = {
+            path.relative_to(stage.stage_path).as_posix(): path.read_bytes()
+            for path in stage.stage_path.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        tree_entries = tuple(stage.stage_path.rglob("*"))
+        safe_modes = all(
+            not path.is_symlink()
+            and stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+            == (0o700 if path.is_dir() else 0o600)
+            for path in tree_entries
+        )
+        round_trip = PackStageVerificationV1.from_canonical_bytes(
+            initial.canonical_bytes()
+        )
+        target = stage.stage_path.joinpath(*manifest.inventory[0].path.split("/"))
+        original = target.read_bytes()
+        target.write_bytes(bytes((original[0] ^ 1,)) + original[1:])
+        tamper = _capture_refusal(lambda: revalidate_pack_stage(stage))
+        target.write_bytes(original)
+        restored = revalidate_pack_stage(stage)
+        checks = {
+            "stage_is_only_activation_eligible_not_active": (
+                stage.schema_id == PACK_STAGE_CAPABILITY_SCHEMA_ID
+                and stage.as_dict()["schema_id"]
+                == "KIRBY2_ACTIVATION_ELIGIBLE_PACK_STAGE_V1"
+            ),
+            "stage_binds_manifest_transport_inventory_and_policy": (
+                stage.pack_id == manifest.pack_id
+                and stage.preflight.transport_sha256
+                == hashlib.sha256(archive_bytes).hexdigest()
+                and stage.inventory_sha256 == stage.preflight.inventory_sha256
+                and stage.validation_policy_id
+                == DEFAULT_PACK_VALIDATION_LIMITS_V1.validation_policy_id
+            ),
+            "nested_tree_contains_only_exact_declared_regular_bytes": (
+                actual_files == expected_files and safe_modes
+            ),
+            "stage_verification_is_canonical_and_repeatable": (
+                initial == round_trip == restored == stage.verification
+            ),
+            "post_extraction_tamper_is_refused_on_revalidation": (
+                tamper
+                == (
+                    PackRefusalCodeV1.PAYLOAD_DIGEST_MISMATCH,
+                    PackValidationPhaseV1.STAGE_REVALIDATION,
+                )
+            ),
+            "stage_counts_bind_exact_payload_inventory": (
+                stage.file_count == len(payloads)
+                and stage.total_byte_count
+                == sum(len(raw) for raw in payloads.values())
+            ),
+        }
+        evidence = {
+            "pack_id": stage.pack_id,
+            "stage_verification_sha256": stage.verification_sha256,
+            "staged_tree_sha256": stage.staged_tree_sha256,
+            "tamper_code": None if tamper is None else tamper[0].value,
+        }
+        discard_pack_stage(stage)
+        checks["discard_removes_the_exact_private_stage"] = not any(root.iterdir())
+    return _case(
+        "safe_nested_pack_stages_revalidates_detects_tamper_and_discards",
+        (
+            f"pack={manifest.pack_id} files={len(payloads)} "
+            f"tamper={evidence['tamper_code']}"
+        ),
+        checks,
+        evidence,
+    )
+
+
+def _capture_refusal(
+    operation,
+) -> tuple[PackRefusalCodeV1, PackValidationPhaseV1] | None:
+    try:
+        operation()
+    except PackValidationRefused as error:
+        return error.refusal.code, error.refusal.phase
+    return None
+
+
+def _safe_preflight_binds(
+    manifest: PackManifestV1,
+    archive_bytes: bytes,
+    limits: PackValidationLimitsV1,
+) -> bool:
+    preflight = preflight_pack_archive_bytes(
+        archive_bytes,
+        limits=limits,
+        expected_pack_id=manifest.pack_id,
+        expected_transport_sha256=hashlib.sha256(archive_bytes).hexdigest(),
+    )
+    return (
+        preflight.manifest == manifest
+        and preflight.pack_id == manifest.pack_id
+        and preflight.validation_policy_id == limits.validation_policy_id
+        and len(preflight.payload_members) == len(manifest.inventory)
+    )
+
+
 def _normalized_archive(
     manifest: PackManifestV1,
     payloads: dict[str, bytes],
@@ -664,6 +1167,8 @@ def _case(
 
 __all__ = [
     "WO39A_AUDIT_CASE_COUNT",
+    "WO39B_AUDIT_CASE_COUNT",
     "PackAuditCase",
     "audit_canonical_pack_identity",
+    "audit_hostile_archive_validation_and_staging",
 ]
