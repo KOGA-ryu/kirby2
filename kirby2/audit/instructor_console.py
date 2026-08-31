@@ -82,6 +82,7 @@ from kirby2.research.store import LearnerArtifactStore
 
 WO37A_AUDIT_CASE_COUNT = 6
 WO37B_AUDIT_CASE_COUNT = 4
+WO37C_AUDIT_CASE_COUNT = 4
 
 _LEARNER_ENTROPY = bytes(range(32))
 _INSTRUCTOR_ENTROPY = bytes(range(32, 64))
@@ -2049,10 +2050,256 @@ def _wo37b_rubric_correction_case(demo: object) -> InstructorConsoleAuditCase:
     )
 
 
+def audit_reproducible_local_studies() -> tuple[
+    InstructorConsoleAuditCase,
+    ...,
+]:
+    """Exercise WO37-C protocol locks, amendments, and claim boundaries."""
+
+    from kirby2.instructor.commands import build_instructor_demo
+
+    demo = build_instructor_demo(42)
+    cases = (
+        _wo37c_round_trip_case(demo),
+        _wo37c_protocol_lock_case(demo),
+        _wo37c_compatibility_case(demo),
+        _wo37c_claim_scope_case(demo),
+    )
+    expected_names = (
+        "study_protocol_ledger_and_cohort_summary_round_trip_exactly",
+        "locked_studies_refuse_mutation_and_record_visible_amendments",
+        "incompatible_versions_refuse_pooling_or_stratify_explicitly",
+        "descriptive_design_refuses_unsupported_causal_language",
+    )
+    if len(cases) != WO37C_AUDIT_CASE_COUNT:
+        raise RuntimeError("WO37-C audit case inventory changed")
+    if tuple(item.name for item in cases) != expected_names:
+        raise RuntimeError("WO37-C audit case order or identity changed")
+    return cases
+
+
+def _wo37c_round_trip_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.cohorts import CohortSummaryV1
+    from kirby2.instructor.studies import StudyExecutionLedgerV1, StudyRevisionV1
+
+    study_raw = demo.study_revision.canonical_bytes()
+    ledger_raw = demo.study_ledger.canonical_bytes()
+    summary_raw = demo.cohort_summary.canonical_bytes()
+    study = StudyRevisionV1.from_json_bytes(study_raw)
+    ledger = StudyExecutionLedgerV1.from_json_bytes(ledger_raw)
+    summary = CohortSummaryV1.from_json_bytes(summary_raw)
+    checks = {
+        "study_round_trip": study.canonical_bytes() == study_raw,
+        "ledger_round_trip": ledger.canonical_bytes() == ledger_raw,
+        "cohort_summary_round_trip": summary.canonical_bytes() == summary_raw,
+        "all_six_attempts_are_bound": len(ledger.included_attempts) == 6,
+        "counts_denominators_and_uncertainty_are_explicit": (
+            summary.member_count == 2
+            and summary.eligible_denominator == 6
+            and summary.included_count + summary.missing_count == 6
+            and len(summary.uncertainty) == len(summary.estimates)
+        ),
+        "protocol_identity_is_consistent": (
+            ledger.study_revision.sha256 == study.sha256
+            and summary.protocol_lock_sha256 == ledger.protocol_lock.sha256
+        ),
+    }
+    return _case_from_checks(
+        "study_protocol_ledger_and_cohort_summary_round_trip_exactly",
+        (
+            f"study={study.study_id} attempts={len(ledger.included_attempts)} "
+            f"denominator={summary.eligible_denominator}"
+        ),
+        checks,
+        {
+            "protocol_lock_id": ledger.protocol_lock.protocol_lock_id,
+            "study_id": study.study_id,
+        },
+    )
+
+
+def _wo37c_protocol_lock_case(demo: object) -> InstructorConsoleAuditCase:
+    from dataclasses import replace
+
+    from kirby2.instructor.studies import append_study_amendment, revise_study
+
+    study = demo.study_revision
+    ledger = demo.study_ledger
+    study_bytes = study.canonical_bytes()
+    ledger_bytes = ledger.canonical_bytes()
+    changed_manifest = replace(
+        study.manifest,
+        hypothesis=study.manifest.hypothesis + " Post-observation mutation.",
+    )
+    lock_refused = _raises(
+        lambda: revise_study(
+            study,
+            changed_manifest,
+            protocol_lock=ledger.protocol_lock,
+        )
+    )
+    execution_refused = _raises(
+        lambda: revise_study(
+            study,
+            changed_manifest,
+            execution_ledger=ledger,
+        )
+    )
+    amended = append_study_amendment(
+        ledger,
+        amended_at_utc="2026-01-02T00:00:00Z",
+        rationale="Record a prospective analysis clarification without rewriting history.",
+        changed_fields=("hypothesis",),
+        replacement_protocol_sha256=_digest("wo37c-prospective-amendment"),
+        prospective_only=True,
+    )
+    checks = {
+        "protocol_lock_refuses_revision": lock_refused,
+        "executed_ledger_refuses_revision": execution_refused,
+        "amendment_is_appended": (
+            len(amended.amendments) == len(ledger.amendments) + 1
+            and amended.amendments[-1].prospective_only
+        ),
+        "amendment_binds_original_protocol": (
+            amended.amendments[-1].protocol_lock_sha256
+            == ledger.protocol_lock.sha256
+        ),
+        "source_study_is_unchanged": study.canonical_bytes() == study_bytes,
+        "source_ledger_is_unchanged": ledger.canonical_bytes() == ledger_bytes,
+        "included_attempts_are_preserved": (
+            amended.included_attempts == ledger.included_attempts
+        ),
+    }
+    return _case_from_checks(
+        "locked_studies_refuse_mutation_and_record_visible_amendments",
+        (
+            f"locked_refused={lock_refused} executed_refused={execution_refused} "
+            f"amendments={len(amended.amendments)}"
+        ),
+        checks,
+        {"amendment_id": amended.amendments[-1].amendment_id},
+    )
+
+
+def _wo37c_compatibility_case(demo: object) -> InstructorConsoleAuditCase:
+    from dataclasses import replace
+
+    from kirby2.instructor.statistics import (
+        CompatibilityActionV1,
+        CompatibilityRefusalV1,
+        CompatibilityResolutionV1,
+        summarize_observations,
+    )
+
+    first, second = demo.cohort_summary.observations[:2]
+    changed_signature = replace(
+        second.version_signature,
+        score_version=second.version_signature.score_version + 1,
+        score_sha256=_digest("wo37c-incompatible-score-version"),
+    )
+    incompatible = replace(second, version_signature=changed_signature)
+    observations = (first, incompatible)
+    refusal = None
+    try:
+        summarize_observations(
+            observations,
+            compatibility_action=CompatibilityActionV1.POOL,
+        )
+    except CompatibilityRefusalV1 as error:
+        refusal = error.decision
+    stratified = summarize_observations(
+        observations,
+        compatibility_action=CompatibilityActionV1.STRATIFY,
+    )
+    checks = {
+        "pooling_is_refused": (
+            refusal is not None
+            and refusal.resolution is CompatibilityResolutionV1.REFUSED
+            and not refusal.can_pool
+        ),
+        "refusal_records_both_signatures": (
+            refusal is not None and refusal.signature_count == 2
+        ),
+        "explicit_stratification_succeeds": (
+            stratified.compatibility_decision.resolution
+            is CompatibilityResolutionV1.STRATIFIED
+            and len(stratified.estimates) == 2
+        ),
+        "source_observations_are_preserved": (
+            first == demo.cohort_summary.observations[0]
+            and second == demo.cohort_summary.observations[1]
+        ),
+    }
+    return _case_from_checks(
+        "incompatible_versions_refuse_pooling_or_stratify_explicitly",
+        (
+            f"signatures={len(stratified.compatibility_decision.signatures)} "
+            f"resolution={stratified.compatibility_decision.resolution.value}"
+        ),
+        checks,
+        {
+            "stratified_summary_sha256": hashlib.sha256(
+                stratified.canonical_bytes()
+            ).hexdigest()
+        },
+    )
+
+
+def _wo37c_claim_scope_case(demo: object) -> InstructorConsoleAuditCase:
+    from kirby2.instructor.statistics import (
+        AnalysisCapabilityV1,
+        UnsupportedCausalClaimError,
+        require_claim_capability,
+    )
+
+    causal_refused = False
+    try:
+        require_claim_capability(
+            requested_capability=AnalysisCapabilityV1.CAUSAL,
+            design_capability=demo.study_revision.manifest.design,
+            analysis_capability=AnalysisCapabilityV1.DESCRIPTIVE,
+        )
+    except UnsupportedCausalClaimError:
+        causal_refused = True
+    descriptive_allowed = True
+    try:
+        require_claim_capability(
+            requested_capability=AnalysisCapabilityV1.DESCRIPTIVE,
+            design_capability=demo.study_revision.manifest.design,
+            analysis_capability=AnalysisCapabilityV1.DESCRIPTIVE,
+        )
+    except (TypeError, ValueError):
+        descriptive_allowed = False
+    checks = {
+        "causal_language_is_refused": causal_refused,
+        "descriptive_language_is_allowed": descriptive_allowed,
+        "study_declares_descriptive_design": (
+            demo.study_revision.manifest.design.capability.value == "DESCRIPTIVE"
+        ),
+        "summary_remains_descriptive": (
+            demo.cohort_summary.requested_capability
+            is AnalysisCapabilityV1.DESCRIPTIVE
+            and demo.cohort_summary.analysis_capability
+            is AnalysisCapabilityV1.DESCRIPTIVE
+        ),
+    }
+    return _case_from_checks(
+        "descriptive_design_refuses_unsupported_causal_language",
+        (
+            f"design={demo.study_revision.manifest.design.capability.value} "
+            f"causal_refused={causal_refused}"
+        ),
+        checks,
+        {"study_id": demo.study_revision.study_id},
+    )
+
+
 __all__ = [
     "WO37A_AUDIT_CASE_COUNT",
     "WO37B_AUDIT_CASE_COUNT",
+    "WO37C_AUDIT_CASE_COUNT",
     "InstructorConsoleAuditCase",
     "audit_pseudonymous_profiles_and_consent",
+    "audit_reproducible_local_studies",
     "audit_versioned_assignments_rubrics_reviews",
 ]
