@@ -696,3 +696,80 @@ parse-valid comment to the raw provider inventory refuses the build plan; the pr
 DEV-0011 candidate, source, protocol, and wheel drift checks remain passing; the
 complete registry contains DEV-0001 through DEV-0012; and no release artifact,
 provider operation, qualification, or performance workload is created or executed.
+
+## DEV-0013 — Execute deterministic release artifact builds
+
+- Interrupted canonical card: `WO40-F`
+- Exact first-parent predecessor: `d314080c64f2551085b852094bc99c8f60cf0daa`
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py build-release --candidate HEAD --protocol release/qualification.toml --artifact-store .kirby2/release`
+- Observed terminal result: `READY` with exit status zero after candidate and resource
+  validation, but with no six-artifact build, repeated-build comparison, canonical
+  build record, structural artifact verification, or immutable activation marker.
+  `verify-release-artifacts` checked only the sizes and SHA-256 values named by an
+  existing index; it did not reconstruct or validate the promised wheel, source
+  archive, desktop bundles, embedded manifests, member plans, license inventory,
+  starter packs, display assets, or developer-data exclusions.
+- Root cause: DEV-0011 correctly made the candidate, source lock, and protocol bytes
+  immutable inputs, and DEV-0012 correctly bound the complete runtime and offline
+  resource fingerprints. Those repairs were necessary preconditions, but they
+  deliberately stopped at a read-only `READY` plan. The preregistered WO40-F command
+  therefore still had no production executor, typed build record, two-attempt byte
+  comparison, or verifier capable of proving the artifact semantics fixed by WO40-D.
+- Repair: add one deterministic, no-network artifact executor which consumes only the
+  verified candidate blobs and frozen external wheelhouse resources; materializes
+  two isolated attempts under the frozen reproducibility environment; builds the
+  exact project wheel, source archive, two headless wheelhouse archives, and two
+  desktop bundles; compares all six transports byte-for-byte across attempts; and
+  publishes immutable artifacts plus a canonical build record before writing the
+  artifact index last as the activation marker. Add a strict wheel and archive
+  verifier which recomputes member, manifest, license, starter-pack, display-asset,
+  source, and no-developer-data claims rather than trusting the index. Bind the build
+  record to the candidate tree/epoch, source lock, protocol, resource snapshot,
+  runtime snapshot, exact attempt observations, seven preregistered WO40-F checks,
+  and the final artifact index. Isolate disposable attempt trees in owner-only system
+  temporary storage outside both the candidate and governed artifact store. Treat
+  metadata-only File Provider provenance updates as non-content changes while still
+  binding publication rollback to the no-follow file identity and exact SHA-256.
+  Wire the existing declarative CLI handlers to these public contracts and extend
+  immutable build-evidence validation to require both the index and build record.
+  The deviation audit inspects policy and typed parsing only; it does not perform the
+  one-time artifact build.
+- Owned repair paths: `kirby2/release/artifacts.py`, `kirby2/release/wheels.py`,
+  `kirby2/release/build.py`, `kirby2/release/manifest.py`,
+  `kirby2/release/commands.py`, `kirby2/release/__init__.py`,
+  `kirby2/audit/release.py`, `kirby2/audit/expansion.py`,
+  `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0013` through K2X-02 immediately after `DEV-0012` and
+  before resumed `WO40-F`; the closeout prerequisite deviation inventory extends
+  monotonically through `DEV-0013`.
+- Inherited gates: targets, artifact IDs and member layout, dependency pins and wheel
+  digests, launchers, documentation, starter packs, display assets, license policy,
+  qualification matrix, performance thresholds, retry policy, and all five product
+  boundaries remain unchanged. No network, provider connection, brokerage action,
+  qualification workload, performance workload, telemetry, updater, or background
+  service is authorized. After the owned source changes and mechanically regenerated
+  source lock commit cleanly, that commit is the new sole candidate; WO40-F then runs
+  the already registered build command and commits evidence only.
+- Exact commit subject: `Execute deterministic release artifact builds`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0013
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the public executor policy is exactly versioned and requires two
+attempts; the canonical build-record parser refuses noncanonical, wrong-schema, and
+wrong-attempt fixtures without invoking a build; both build and verification entry
+points are public; the complete registry contains DEV-0001 through DEV-0013; the
+prior candidate/resource gates remain passing; and no artifact, provider operation,
+qualification workload, or performance workload is created or executed by the
+deviation audit.

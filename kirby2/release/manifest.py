@@ -113,7 +113,7 @@ RELEASE_REQUIRED_KNOWN_LIMITATIONS_V1 = (
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 _UTC_SECOND = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 _NORMALIZED_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
-_ARTIFACT_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_ARTIFACT_ID = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*\Z")
 
 
 def _sha256(raw: bytes) -> str:

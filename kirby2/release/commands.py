@@ -28,8 +28,8 @@ from .first_run import run_first_run
 from .platform_paths import select_release_paths
 from .build import (
     ReleaseCommandStatusV1,
+    build_release_artifacts,
     load_release_protocol_bundle,
-    plan_release_build,
     release_resource_preflight,
     verify_release_artifacts,
 )
@@ -356,13 +356,13 @@ def _configure_build_release(parser: argparse.ArgumentParser) -> None:
 def _handle_build_release(args: argparse.Namespace) -> int:
     _require_protocol_path(args.protocol, "release/qualification.toml")
     bundle = _release_protocol_bundle()
-    outcome = plan_release_build(
+    outcome = build_release_artifacts(
         bundle,
         candidate_commit=_candidate_commit(args.candidate),
-        output_root=_resolved_path(args.artifact_store),
+        artifact_root=_resolved_path(args.artifact_store),
     )
     _print_json(outcome.as_dict())
-    return 0 if outcome.status in {ReleaseCommandStatusV1.READY, ReleaseCommandStatusV1.PASS} else 2
+    return 0 if outcome.status is ReleaseCommandStatusV1.COMPLETE else 2
 
 
 def _configure_verify_release_artifacts(parser: argparse.ArgumentParser) -> None:
@@ -372,14 +372,16 @@ def _configure_verify_release_artifacts(parser: argparse.ArgumentParser) -> None
 
 def _handle_verify_release_artifacts(args: argparse.Namespace) -> int:
     bundle = _release_protocol_bundle()
-    outcome = verify_release_artifacts(bundle, _resolved_path(args.artifact_store))
     candidate = _candidate_commit(args.candidate)
-    candidate_matches = outcome.payload.get("candidate_commit", candidate) == candidate
-    payload = {**outcome.as_dict(), "candidate_commit": candidate, "candidate_matches": candidate_matches}
-    _print_json(payload)
+    outcome = verify_release_artifacts(
+        bundle,
+        _resolved_path(args.artifact_store),
+        candidate_commit=candidate,
+    )
+    _print_json(outcome.as_dict())
     if outcome.status is ReleaseCommandStatusV1.NOT_EXERCISED:
         return 2
-    return 0 if outcome.status is ReleaseCommandStatusV1.PASS and candidate_matches else 1
+    return 0 if outcome.status is ReleaseCommandStatusV1.PASS else 1
 
 
 def _configure_resource_preflight(parser: argparse.ArgumentParser) -> None:

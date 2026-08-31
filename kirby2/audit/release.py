@@ -11,13 +11,14 @@ from __future__ import annotations
 import ast
 import contextlib
 import hashlib
+import inspect
 import io
 import os
 import re
 import shutil
 import stat
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkstemp
@@ -37,6 +38,7 @@ DEV0009_AUDIT_CASE_COUNT = 3
 DEV0010_AUDIT_CASE_COUNT = 2
 DEV0011_AUDIT_CASE_COUNT = 5
 DEV0012_AUDIT_CASE_COUNT = 4
+DEV0013_AUDIT_CASE_COUNT = 3
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -65,7 +67,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 13)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 14)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -2841,6 +2843,204 @@ def audit_release_resource_fingerprint_restart() -> ReleaseAuditSuite:
     )
 
 
+def audit_release_artifact_executor_restart() -> ReleaseAuditSuite:
+    """Prove the restarted WO40-F executor owns a strict, bounded public seam."""
+
+    from kirby2.release.artifacts import (
+        RELEASE_ARTIFACT_BUILD_POLICY_ID_V1,
+        RELEASE_BUILD_ATTEMPT_COUNT_V1,
+        RELEASE_BUILD_RECORD_SCHEMA_ID_V1,
+        ReleaseArtifactBuildRecordV1,
+        build_release_artifacts,
+        verify_release_artifacts,
+    )
+
+    policy_failures: list[str] = []
+    if (
+        type(RELEASE_ARTIFACT_BUILD_POLICY_ID_V1) is not str
+        or RELEASE_ARTIFACT_BUILD_POLICY_ID_V1
+        != "KIRBY2_RELEASE_ARTIFACT_BUILD_POLICY_V1"
+    ):
+        policy_failures.append("artifact-build policy identity differs")
+    if (
+        type(RELEASE_BUILD_RECORD_SCHEMA_ID_V1) is not str
+        or RELEASE_BUILD_RECORD_SCHEMA_ID_V1 != "KIRBY2_RELEASE_BUILD_RECORD_V1"
+    ):
+        policy_failures.append("build-record schema identity differs")
+    if (
+        type(RELEASE_BUILD_ATTEMPT_COUNT_V1) is not int
+        or RELEASE_BUILD_ATTEMPT_COUNT_V1 != 2
+    ):
+        policy_failures.append("release build does not require exactly two attempts")
+    if not is_dataclass(ReleaseArtifactBuildRecordV1):
+        policy_failures.append("build record is not a dataclass")
+        record_fields: tuple[str, ...] = ()
+    else:
+        record_fields = tuple(item.name for item in fields(ReleaseArtifactBuildRecordV1))
+        parameters = getattr(ReleaseArtifactBuildRecordV1, "__dataclass_params__", None)
+        if parameters is None or not parameters.frozen:
+            policy_failures.append("build record is not immutable")
+        if not hasattr(ReleaseArtifactBuildRecordV1, "__slots__"):
+            policy_failures.append("build record is not slot-bounded")
+    if (
+        getattr(ReleaseArtifactBuildRecordV1, "schema_id", None)
+        != RELEASE_BUILD_RECORD_SCHEMA_ID_V1
+    ):
+        policy_failures.append("build record does not own the public schema identity")
+    for member in ("from_bytes", "canonical_bytes"):
+        if not callable(getattr(ReleaseArtifactBuildRecordV1, member, None)):
+            policy_failures.append(f"build record omits {member}")
+    if not isinstance(getattr(ReleaseArtifactBuildRecordV1, "sha256", None), property):
+        policy_failures.append("build record omits its canonical SHA-256 property")
+    if "checks" not in record_fields:
+        policy_failures.append("build record omits the seven WO40-F check bindings")
+    policy_case = _case(
+        "artifact_executor_policy_and_record_are_versioned",
+        "The two-attempt executor and immutable canonical build record have exact public identities.",
+        {
+            "attempt_count": RELEASE_BUILD_ATTEMPT_COUNT_V1,
+            "policy_id": RELEASE_ARTIFACT_BUILD_POLICY_ID_V1,
+            "record_fields": list(record_fields),
+            "record_schema_id": RELEASE_BUILD_RECORD_SCHEMA_ID_V1,
+        },
+        policy_failures,
+    )
+
+    parser_failures: list[str] = []
+    hostile_records = (
+        ("empty_object", canonical_json_bytes({})),
+        (
+            "wrong_policy",
+            canonical_json_bytes(
+                {
+                    "attempt_count": RELEASE_BUILD_ATTEMPT_COUNT_V1,
+                    "policy_id": "KIRBY2_RELEASE_ARTIFACT_BUILD_POLICY_HOSTILE",
+                    "schema_id": RELEASE_BUILD_RECORD_SCHEMA_ID_V1,
+                }
+            ),
+        ),
+        (
+            "wrong_schema",
+            canonical_json_bytes(
+                {
+                    "attempt_count": RELEASE_BUILD_ATTEMPT_COUNT_V1,
+                    "policy_id": RELEASE_ARTIFACT_BUILD_POLICY_ID_V1,
+                    "schema_id": "KIRBY2_RELEASE_BUILD_RECORD_HOSTILE",
+                }
+            ),
+        ),
+        (
+            "wrong_attempt_count",
+            canonical_json_bytes(
+                {
+                    "attempt_count": 1,
+                    "policy_id": RELEASE_ARTIFACT_BUILD_POLICY_ID_V1,
+                    "schema_id": RELEASE_BUILD_RECORD_SCHEMA_ID_V1,
+                }
+            ),
+        ),
+        (
+            "noncanonical_json",
+            (
+                b'{ "attempt_count": 2, "policy_id": '
+                b'"KIRBY2_RELEASE_ARTIFACT_BUILD_POLICY_V1", "schema_id": '
+                b'"KIRBY2_RELEASE_BUILD_RECORD_V1" }\n'
+            ),
+        ),
+    )
+    refused: list[str] = []
+    unexpected: list[list[str]] = []
+    parser = getattr(ReleaseArtifactBuildRecordV1, "from_bytes", None)
+    if not callable(parser):
+        parser_failures.append("build record has no strict byte parser")
+    else:
+        for fixture_id, raw in hostile_records:
+            try:
+                parser(raw)
+            except (TypeError, ValueError):
+                refused.append(fixture_id)
+            except Exception as error:  # pragma: no cover - surfaced as audit evidence
+                unexpected.append([fixture_id, type(error).__name__])
+                parser_failures.append(
+                    f"{fixture_id} produced untyped parser failure {type(error).__name__}"
+                )
+            else:
+                parser_failures.append(f"{fixture_id} was accepted")
+    parser_case = _case(
+        "build_record_parser_refuses_fixture_drift",
+        "Missing, policy-drifted, schema-drifted, one-attempt, and noncanonical records refuse.",
+        {
+            "fixture_count": len(hostile_records),
+            "refused": refused,
+            "unexpected": unexpected,
+        },
+        parser_failures,
+    )
+
+    surface_failures: list[str] = []
+
+    def signature_projection(target: object) -> list[list[object]]:
+        signature = inspect.signature(target)
+        return [
+            [
+                name,
+                parameter.kind.name,
+                parameter.default is inspect.Parameter.empty,
+            ]
+            for name, parameter in signature.parameters.items()
+        ]
+
+    expected_build_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["candidate_commit", "KEYWORD_ONLY", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+    ]
+    expected_verify_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+        ["candidate_commit", "KEYWORD_ONLY", False],
+    ]
+    observed_build_signature: list[list[object]] = []
+    observed_verify_signature: list[list[object]] = []
+    if not callable(build_release_artifacts):
+        surface_failures.append("public build executor is not callable")
+    else:
+        observed_build_signature = signature_projection(build_release_artifacts)
+        if observed_build_signature != expected_build_signature:
+            surface_failures.append("public build executor signature differs")
+    if not callable(verify_release_artifacts):
+        surface_failures.append("public artifact verifier is not callable")
+    else:
+        observed_verify_signature = signature_projection(verify_release_artifacts)
+        if observed_verify_signature != expected_verify_signature:
+            surface_failures.append("public artifact verifier signature differs")
+    for label, target in (
+        ("build", build_release_artifacts),
+        ("verify", verify_release_artifacts),
+    ):
+        if getattr(target, "__module__", None) != "kirby2.release.artifacts":
+            surface_failures.append(f"public {label} surface is not owned by artifacts")
+    surface_case = _case(
+        "artifact_build_and_verification_surfaces_are_bounded",
+        "The preregistered CLI can call exact keyword-bounded builder and verifier seams.",
+        {
+            "build_signature": observed_build_signature,
+            "executor_invocations": 0,
+            "verify_signature": observed_verify_signature,
+        },
+        surface_failures,
+    )
+
+    cases = (policy_case, parser_case, surface_case)
+    if len(cases) != DEV0013_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0013 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0013",
+        cases,
+        metadata=(("interrupted_card", "WO40-F"),),
+    )
+
+
 def _git_tracks_clean_working_file(repository: Path, relative: str) -> tuple[bool, str]:
     tracked = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", relative],
@@ -2944,8 +3144,14 @@ def audit_release_frozen_evidence(gate_id: str) -> ReleaseAuditSuite:
 
     build_evidence: ReleaseGateEvidenceV1 | None = None
     if gate_id == "WO40-F":
+        from kirby2.release.artifacts import ReleaseArtifactBuildRecordV1
+
         artifact_root = repository / ".kirby2/release"
-        artifact_verification = verify_release_artifacts(bundle, artifact_root)
+        artifact_verification = verify_release_artifacts(
+            bundle,
+            artifact_root,
+            candidate_commit=evidence.candidate_commit,
+        )
         if artifact_verification.status is not ReleaseCommandStatusV1.PASS:
             failures.append("immutable release artifact verification did not pass")
         index_path = artifact_root / "release-artifact-index.json"
@@ -2953,6 +3159,37 @@ def audit_release_frozen_evidence(gate_id: str) -> ReleaseAuditSuite:
             failures.append("build evidence artifact-index digest differs")
         if artifact_verification.payload.get("candidate_commit") != evidence.candidate_commit:
             failures.append("build evidence candidate differs from artifact index")
+        records_by_id = {
+            str(row["evidence_id"]): row for row in evidence.evidence_records
+        }
+        if set(records_by_id) != {"artifact-index", "release-build-record"}:
+            failures.append("build evidence must reference exactly the index and build record")
+        else:
+            expected_paths = {
+                "artifact-index": ".kirby2/release/release-artifact-index.json",
+                "release-build-record": ".kirby2/release/release-build-record.json",
+            }
+            if any(
+                records_by_id[evidence_id]["path"] != path
+                for evidence_id, path in expected_paths.items()
+            ):
+                failures.append("build evidence record paths differ from the governed store")
+            record_path = artifact_root / "release-build-record.json"
+            try:
+                record = ReleaseArtifactBuildRecordV1.from_bytes(
+                    record_path.read_bytes()
+                )
+            except (OSError, TypeError, ValueError) as error:
+                failures.append(
+                    f"release build record failed parsing: {type(error).__name__}"
+                )
+            else:
+                if record.candidate_commit != evidence.candidate_commit:
+                    failures.append("release build record candidate differs")
+                if record.artifact_index_sha256 != evidence.artifact_index_sha256:
+                    failures.append("release build record artifact index differs")
+                if tuple(item.as_dict() for item in record.checks) != evidence.checks:
+                    failures.append("release build record check bindings differ")
     else:
         build_path = repository / RELEASE_FUTURE_EVIDENCE_PATHS_V1["WO40-F"]
         if not build_path.is_file():

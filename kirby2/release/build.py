@@ -124,6 +124,14 @@ class ReleaseBuildRefusalCodeV1(str, Enum):
     ARTIFACT_DIGEST_MISMATCH = "ARTIFACT_DIGEST_MISMATCH"
     OUTPUT_EXISTS = "OUTPUT_EXISTS"
     NETWORK_POLICY_MISMATCH = "NETWORK_POLICY_MISMATCH"
+    BUILD_ATTEMPT_FAILED = "BUILD_ATTEMPT_FAILED"
+    BUILD_ATTEMPT_TIMEOUT = "BUILD_ATTEMPT_TIMEOUT"
+    BUILD_NONDETERMINISTIC = "BUILD_NONDETERMINISTIC"
+    CANDIDATE_INPUT_DRIFT = "CANDIDATE_INPUT_DRIFT"
+    RESOURCE_INPUT_DRIFT = "RESOURCE_INPUT_DRIFT"
+    ARTIFACT_SEMANTIC_MISMATCH = "ARTIFACT_SEMANTIC_MISMATCH"
+    ARTIFACT_STORE_UNSAFE = "ARTIFACT_STORE_UNSAFE"
+    PUBLICATION_FAILED = "PUBLICATION_FAILED"
     FUTURE_SOURCE_INPUT_MISSING = "FUTURE_SOURCE_INPUT_MISSING"
     EVIDENCE_MISSING = "EVIDENCE_MISSING"
 
@@ -2297,6 +2305,11 @@ def _candidate_git_environment() -> dict[str, str]:
         if key not in _CANDIDATE_GIT_ENVIRONMENT_OVERRIDES_V1
     }
     environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CONFIG_SYSTEM"] = os.devnull
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["LC_ALL"] = "C"
     return environment
 
@@ -2402,8 +2415,17 @@ def _require_candidate_checkout_clean(
 def verify_release_candidate_inputs(
     bundle: ReleaseProtocolBundleV1,
     candidate_commit: str,
+    *,
+    require_checkout: bool = True,
 ) -> ReleaseCandidateInputsV1:
-    """Bind a clean checkout, frozen protocols, and source lock to one Git tree."""
+    """Bind frozen protocols and the source lock to one immutable Git tree.
+
+    Build execution requires the candidate to be the clean checked-out ``HEAD``.
+    Read-only verification after the evidence-only WO40-F commit instead resolves
+    the original candidate's Git objects while allowing ``HEAD`` to advance.  The
+    latter never grants build authority and never reads candidate bytes from the
+    working tree.
+    """
 
     if type(bundle) is not ReleaseProtocolBundleV1:
         raise TypeError("candidate verification requires a release protocol bundle")
@@ -2452,7 +2474,10 @@ def verify_release_candidate_inputs(
             ReleaseBuildRefusalCodeV1.CANDIDATE_COMMIT_INVALID,
             "candidate commit metadata cannot be resolved exactly",
         )
-    _require_candidate_checkout_clean(repository, candidate_commit)
+    if type(require_checkout) is not bool:
+        raise TypeError("candidate checkout policy must be Boolean")
+    if require_checkout:
+        _require_candidate_checkout_clean(repository, candidate_commit)
 
     tree_objects = _candidate_tree_objects(repository, candidate_commit)
     lock_path = "release/performance_runner_sources.lock"
@@ -2625,7 +2650,8 @@ def verify_release_candidate_inputs(
             ReleaseBuildRefusalCodeV1.CANDIDATE_PROTOCOL_MISMATCH,
             "candidate protocol identities differ from the passing resource preflight",
         )
-    _require_candidate_checkout_clean(repository, candidate_commit)
+    if require_checkout:
+        _require_candidate_checkout_clean(repository, candidate_commit)
     logical_projection = ReleaseLogicalBuildProjectionV1(
         release_version=RELEASE_VERSION_V1,
         candidate_commit=candidate_commit,
@@ -2761,50 +2787,41 @@ def plan_release_build(
     )
 
 
+def build_release_artifacts(
+    bundle: ReleaseProtocolBundleV1,
+    *,
+    candidate_commit: str,
+    artifact_root: Path,
+) -> ReleaseCommandOutcomeV1:
+    """Execute the frozen WO40-F builder through its isolated implementation.
+
+    The lazy import keeps protocol loading and resource preflight independent from
+    the executor while preserving this module's established public command seam.
+    """
+
+    from .artifacts import build_release_artifacts as execute_release_artifacts
+
+    return execute_release_artifacts(
+        bundle,
+        candidate_commit=candidate_commit,
+        artifact_root=artifact_root,
+    )
+
+
 def verify_release_artifacts(
     bundle: ReleaseProtocolBundleV1,
     artifact_root: Path,
+    *,
+    candidate_commit: str | None = None,
 ) -> ReleaseCommandOutcomeV1:
-    root = _absolute(artifact_root, "artifact root")
-    index_path = root / "release-artifact-index.json"
-    if not index_path.is_file():
-        return ReleaseCommandOutcomeV1(
-            command_id="VERIFY_RELEASE_ARTIFACTS",
-            status=ReleaseCommandStatusV1.NOT_EXERCISED,
-            protocol_set_sha256=bundle.protocol_set_sha256,
-            detail="No immutable release artifact index exists yet.",
-            refusal_code=ReleaseBuildRefusalCodeV1.ARTIFACT_INDEX_MISSING.value,
-            payload={"expected_index": str(index_path)},
-        )
-    index = ReleaseArtifactIndexV1.from_bytes(index_path.read_bytes())
-    failures: list[dict[str, object]] = []
-    for row in index.artifacts:
-        path = root / row.artifact_id
-        if not path.is_file():
-            failures.append({"artifact_id": row.artifact_id, "code": "ARTIFACT_MISSING"})
-            continue
-        raw = path.read_bytes()
-        observed = hashlib.sha256(raw).hexdigest()
-        if len(raw) != row.size or observed != row.transport_sha256:
-            failures.append(
-                {
-                    "artifact_id": row.artifact_id,
-                    "code": "ARTIFACT_IDENTITY_MISMATCH",
-                    "observed_sha256": observed,
-                    "observed_size": len(raw),
-                }
-            )
-    return ReleaseCommandOutcomeV1(
-        command_id="VERIFY_RELEASE_ARTIFACTS",
-        status=ReleaseCommandStatusV1.PASS if not failures else ReleaseCommandStatusV1.FAIL,
-        protocol_set_sha256=bundle.protocol_set_sha256,
-        detail="All six indexed transports matched." if not failures else "One or more indexed transports differed.",
-        payload={
-            "artifact_index_sha256": index.sha256,
-            "candidate_commit": index.candidate_commit,
-            "failures": failures,
-            "logical_build_id": index.logical_build_id,
-        },
+    """Deeply reconstruct and verify one activated immutable artifact set."""
+
+    from .artifacts import verify_release_artifacts as verify_artifact_set
+
+    return verify_artifact_set(
+        bundle,
+        artifact_root=artifact_root,
+        candidate_commit=candidate_commit,
     )
 
 
@@ -2836,5 +2853,6 @@ __all__ = [
     "plan_release_build",
     "release_resource_preflight",
     "verify_release_candidate_inputs",
+    "build_release_artifacts",
     "verify_release_artifacts",
 ]
