@@ -108,6 +108,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0014", "WO40-G"),
     ("DEV-0015", "WO40-H"),
     ("DEV-0016", "WO40-I"),
+    ("DEV-0017", "WO40-J"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -197,6 +198,7 @@ REGISTERABLE_GATE_IDS = (
     "WO40-H",
     "DEV-0016",
     "WO40-I",
+    "DEV-0017",
     "WO40-J",
 )
 _BASELINE_ARTIFACT_SHA256 = (
@@ -5438,6 +5440,11 @@ def _audit_wo40h() -> ExpansionGateReport:
 def _audit_dev0016() -> ExpansionGateReport:
     """Prove the performance execution surface without importing or invoking it."""
 
+    import subprocess
+    import tomllib
+
+    from kirby2.ui.terminal import RELEASE_TERMINAL_PRESENTATION_POLICY_V2
+
     repository = Path(__file__).resolve().parents[2]
     source_paths = {
         "audit": repository / "kirby2/audit/release.py",
@@ -5540,18 +5547,113 @@ def _audit_dev0016() -> ExpansionGateReport:
 
     protocol_failures: list[str] = []
     thresholds = repository / "release/performance_thresholds.toml"
+    threshold_raw = b""
     try:
-        threshold_sha256 = hashlib.sha256(thresholds.read_bytes()).hexdigest()
+        threshold_raw = thresholds.read_bytes()
+        threshold_sha256 = hashlib.sha256(threshold_raw).hexdigest()
     except OSError as error:
         threshold_sha256 = "UNAVAILABLE"
         protocol_failures.append(
             f"performance threshold bytes are unavailable: {type(error).__name__}"
         )
     expected_threshold_sha256 = (
-        "9dc132220e48813c842d9f8a76381abe72db60f0efbfac2e0f83d7702c12aff4"
+        "2424b8fadc7531f4efa70f22dceffd99145dc9fef78e78868a37f88039e75f8c"
     )
     if threshold_sha256 != expected_threshold_sha256:
-        protocol_failures.append("performance threshold bytes differ from WO40-D")
+        protocol_failures.append("performance threshold bytes differ from DEV-0017 V2")
+    historical_threshold_sha256 = "UNAVAILABLE"
+    terminal_protocol_compatibility = False
+    historical_commit = "8ee892575372c3e296454ae6c3b2b991e481699e"
+    historical_expected_sha256 = (
+        "9dc132220e48813c842d9f8a76381abe72db60f0efbfac2e0f83d7702c12aff4"
+    )
+    git_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_WORK_TREE",
+        }
+    }
+    git_environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    try:
+        historical_result = subprocess.run(
+            [
+                "git",
+                "show",
+                f"{historical_commit}:release/performance_thresholds.toml",
+            ],
+            cwd=repository,
+            env=git_environment,
+            capture_output=True,
+            check=False,
+        )
+        if historical_result.returncode != 0:
+            raise ValueError("DEV-0017 predecessor threshold blob is unavailable")
+        historical_threshold_sha256 = hashlib.sha256(
+            historical_result.stdout
+        ).hexdigest()
+        if historical_threshold_sha256 != historical_expected_sha256:
+            raise ValueError("DEV-0017 predecessor threshold bytes differ")
+        current_protocol = tomllib.loads(threshold_raw.decode("utf-8"))
+        historical_protocol = tomllib.loads(
+            historical_result.stdout.decode("utf-8")
+        )
+        current_projection = json.loads(json.dumps(current_protocol))
+        templates = current_projection.get("auxiliary_templates")
+        terminal_rows = (
+            []
+            if type(templates) is not list
+            else [
+                row
+                for row in templates
+                if type(row) is dict
+                and row.get("workload_id") == "RELEASE_TERMINAL_UPDATE_V1"
+            ]
+        )
+        if len(terminal_rows) != 1:
+            raise ValueError("active terminal threshold template count differs")
+        input_identity = terminal_rows[0].get("input_identity")
+        parameters = (
+            input_identity.get("parameters")
+            if type(input_identity) is dict
+            else None
+        )
+        if type(parameters) is not dict or "presentation" not in parameters:
+            raise ValueError("active terminal presentation identity is missing")
+        presentation = parameters.pop("presentation")
+        if presentation != RELEASE_TERMINAL_PRESENTATION_POLICY_V2:
+            raise ValueError("active terminal presentation identity differs")
+        if current_projection != historical_protocol:
+            raise ValueError("threshold protocol changed beyond terminal presentation")
+        terminal_protocol_compatibility = True
+    except (
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        tomllib.TOMLDecodeError,
+    ) as error:
+        protocol_failures.append(
+            f"V1/V2 threshold compatibility failed: {type(error).__name__}"
+        )
     for source_id in ("execution", "performance"):
         if source_id in source_errors:
             protocol_failures.append(
@@ -5564,6 +5666,11 @@ def _audit_dev0016() -> ExpansionGateReport:
     )
     if execution_policy != "KIRBY2_RELEASE_PERFORMANCE_EXECUTION_V1":
         protocol_failures.append("performance execution policy differs")
+    executor_threshold_sha256 = assigned_literal(
+        execution_tree, "_FROZEN_THRESHOLD_MANIFEST_SHA256_V1"
+    )
+    if executor_threshold_sha256 != expected_threshold_sha256:
+        protocol_failures.append("performance executor threshold digest differs")
     frozen_counts = {
         "RELEASE_PERFORMANCE_QUEUE_SIZE_V1": 256,
         "RELEASE_PERFORMANCE_WORKER_COUNT_V1": 4,
@@ -5686,7 +5793,8 @@ def _audit_dev0016() -> ExpansionGateReport:
     cases = (
         (
             "frozen_performance_protocol_and_execution_policy_are_bound",
-            "Frozen threshold bytes, 10,000/4/256 counts, and one execution policy remain exact.",
+            "Exact V2 bytes differ from the predecessor only by the declared terminal "
+            "presentation identity; 10,000/4/256 and executor pins remain exact.",
             protocol_failures,
         ),
         (
@@ -5734,8 +5842,13 @@ def _audit_dev0016() -> ExpansionGateReport:
             ("audit_case_count", str(len(cases))),
             ("execution_policy", "KIRBY2_RELEASE_PERFORMANCE_EXECUTION_V1"),
             ("executor_invocations", "0"),
+            ("historical_threshold_manifest_sha256", historical_threshold_sha256),
             ("interrupted_card", "WO40-I"),
             ("provider_invocations", "0"),
+            (
+                "terminal_protocol_compatibility",
+                "PASS" if terminal_protocol_compatibility else "FAIL",
+            ),
             ("threshold_manifest_sha256", threshold_sha256),
             ("workload_invocations", "0"),
         ),
@@ -5746,6 +5859,15 @@ def _audit_wo40i() -> ExpansionGateReport:
     from kirby2.audit.release import audit_release_performance_evidence
 
     return _release_suite_report("WO40-I", audit_release_performance_evidence())
+
+
+def _audit_dev0017() -> ExpansionGateReport:
+    from kirby2.audit.release import audit_release_performance_failure_restart
+
+    return _release_suite_report(
+        "DEV-0017",
+        audit_release_performance_failure_restart(),
+    )
 
 
 def _audit_wo40j() -> ExpansionGateReport:
@@ -5845,6 +5967,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO40-H", _audit_wo40h),
     ("DEV-0016", _audit_dev0016),
     ("WO40-I", _audit_wo40i),
+    ("DEV-0017", _audit_dev0017),
     ("WO40-J", _audit_wo40j),
 )
 

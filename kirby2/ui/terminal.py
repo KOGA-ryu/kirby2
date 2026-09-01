@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import curses
+import hashlib
 import math
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from kirby2.session.bindings import BindingMap, SessionCommand
 from kirby2.session.live import LevelView, LiveMarketSession, SessionSnapshot
@@ -20,6 +21,58 @@ if TYPE_CHECKING:
 
 MINIMUM_WIDTH = 116
 MINIMUM_HEIGHT = 34
+
+# Production-owned identity for the deterministic noninteractive presentation
+# stream used by the installed desktop playback seam.  Release qualification
+# transcribes this exact object into its input identity; production does not import
+# benchmark configuration in order to decide how a terminal frame is presented.
+RELEASE_TERMINAL_PRESENTATION_POLICY_V2 = {
+    "boundary_policy_id": "CONTINUOUS_INCLUDE_START_EXCLUDE_END_V1",
+    "causal_source_policy_id": (
+        "LATEST_NONREGRESSING_CLIENT_VISIBLE_MARKET_STATE_AT_OR_BEFORE_TICK_V1"
+    ),
+    "clock_source_id": "TIME_PERF_COUNTER_NS_V1",
+    "duplicate_source_policy_id": "ALLOW_REUSE_AND_ASYNC_SEQUENCE_REORDER_V1",
+    "frame_milliseconds": 50,
+    "latency_boundary_policy_id": "RENDER_HASH_WRITE_AND_DRAIN_V1",
+    "policy_id": "RELEASE_TERMINAL_PRESENTATION_V2",
+    "schema_version": 2,
+    "simulation_speed_milli": 10_000,
+    "simulation_step_us": 500_000,
+    "update_ordinal_policy_id": "CONTIGUOUS_VISIBLE_UPDATES_FROM_ZERO_V1",
+    "visible_change_policy_id": "ADJACENT_RENDERED_FRAME_SHA256_DIFFERS_V1",
+}
+
+
+_TERMINAL_FRAME_DIGEST_CHAIN_DOMAIN_V1 = (
+    b"KIRBY2_TERMINAL_FRAME_DIGEST_CHAIN_V1\x00"
+)
+
+
+def advance_terminal_frame_digest_chain_v1(
+    previous_chain_sha256: str | None,
+    frame_sha256: str,
+) -> str:
+    """Hash domain, prior raw digest (zero for first), and current frame digest."""
+
+    def digest_bytes(value: str, label: str) -> bytes:
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"{label} must be a lowercase SHA-256 digest")
+        return bytes.fromhex(value)
+
+    previous = (
+        bytes(32)
+        if previous_chain_sha256 is None
+        else digest_bytes(previous_chain_sha256, "previous terminal frame chain")
+    )
+    frame = digest_bytes(frame_sha256, "terminal frame")
+    return hashlib.sha256(
+        _TERMINAL_FRAME_DIGEST_CHAIN_DOMAIN_V1 + previous + frame
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +107,180 @@ class TerminalUiConfig:
     @property
     def simulation_step_us(self) -> int:
         return max(1, round(self.frame_milliseconds * 1_000 * self.speed))
+
+
+class TerminalFrameFlushSink(Protocol):
+    """Production sink contract for one complete visible terminal frame."""
+
+    def write_and_flush(self, lines: tuple[str, ...]) -> int:
+        """Write all frame bytes and return only after they are client-visible."""
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalPresentedFrameV2:
+    """One genuinely changed frame after the production flush boundary."""
+
+    policy_id: str
+    tick_ordinal: int
+    update_ordinal: int
+    presentation_time_us: int
+    causal_source_sequence: int
+    market_state_id: str
+    frame_sha256: str
+    frame_digest_chain_sha256: str
+    frame_bytes: int
+    latency_ns: int
+    schema_version: int = 2
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "causal_source_sequence": self.causal_source_sequence,
+            "frame_bytes": self.frame_bytes,
+            "frame_digest_chain_sha256": self.frame_digest_chain_sha256,
+            "frame_sha256": self.frame_sha256,
+            "latency_ns": self.latency_ns,
+            "market_state_id": self.market_state_id,
+            "policy_id": self.policy_id,
+            "presentation_time_us": self.presentation_time_us,
+            "schema_version": self.schema_version,
+            "tick_ordinal": self.tick_ordinal,
+            "update_ordinal": self.update_ordinal,
+        }
+
+
+class TerminalFramePresenterV2:
+    """Render, visible-change filter, and synchronously flush terminal frames.
+
+    Tick ordinals describe the frozen presentation cadence.  Update ordinals are
+    assigned only after the rendered bytes differ from the immediately preceding
+    visible frame, so an unchanged duplicate can never become a sample merely by
+    receiving a fresh ordinal.  Asynchronous delivery may expose creation-sequence
+    IDs out of order; the desktop playback owner separately proves nonregressing
+    delivery time and market-state cut time.  Changed-frame latency begins immediately
+    before rendering and ends only after the sink's synchronous write-and-drain return;
+    evidence-object and digest-chain assembly occurs outside that measured boundary.
+    """
+
+    def __init__(
+        self,
+        bindings: BindingMap,
+        config: TerminalUiConfig,
+        sink: TerminalFrameFlushSink,
+        *,
+        width: int,
+        policy_id: str,
+        visible_change_policy_id: str,
+        clock_source_id: str,
+        latency_boundary_policy_id: str,
+    ) -> None:
+        if type(bindings) is not BindingMap or type(config) is not TerminalUiConfig:
+            raise TypeError("terminal presenter requires exact bindings and UI config")
+        if not callable(getattr(sink, "write_and_flush", None)):
+            raise TypeError("terminal presenter sink omits write_and_flush")
+        if type(width) is not int or width <= 0:
+            raise ValueError("terminal presenter width must be positive")
+        if type(policy_id) is not str or not policy_id:
+            raise ValueError("terminal presenter policy ID is invalid")
+        if (
+            visible_change_policy_id
+            != "ADJACENT_RENDERED_FRAME_SHA256_DIFFERS_V1"
+            or clock_source_id != "TIME_PERF_COUNTER_NS_V1"
+            or latency_boundary_policy_id != "RENDER_HASH_WRITE_AND_DRAIN_V1"
+        ):
+            raise ValueError("terminal presenter policy contract differs")
+        self._bindings = bindings
+        self._config = config
+        self._sink = sink
+        self._width = width
+        self._policy_id = policy_id
+        self._next_tick_ordinal = 0
+        self._next_update_ordinal = 0
+        self._last_presentation_time_us: int | None = None
+        self._last_causal_source_sequence: int | None = None
+        self._last_visible_sha256: str | None = None
+        self._last_frame_digest_chain_sha256: str | None = None
+
+    @property
+    def tick_count(self) -> int:
+        return self._next_tick_ordinal
+
+    @property
+    def visible_update_count(self) -> int:
+        return self._next_update_ordinal
+
+    def present(
+        self,
+        snapshot: SessionSnapshot,
+        *,
+        tick_ordinal: int,
+        presentation_time_us: int,
+        causal_source_sequence: int,
+    ) -> TerminalPresentedFrameV2 | None:
+        """Present one cadence tick, returning ``None`` for unchanged bytes."""
+
+        if type(snapshot) is not SessionSnapshot:
+            raise TypeError("terminal presentation requires SessionSnapshot")
+        if type(tick_ordinal) is not int or tick_ordinal != self._next_tick_ordinal:
+            raise ValueError("terminal presentation tick ordinals must be contiguous")
+        if (
+            type(presentation_time_us) is not int
+            or presentation_time_us < 0
+            or snapshot.simulation_time_us != presentation_time_us
+        ):
+            raise ValueError("terminal presentation time differs from its snapshot")
+        if (
+            self._last_presentation_time_us is not None
+            and presentation_time_us <= self._last_presentation_time_us
+        ):
+            raise ValueError("terminal presentation times must increase")
+        if (
+            type(causal_source_sequence) is not int
+            or causal_source_sequence <= 0
+            or snapshot.exchange_event_sequence != causal_source_sequence
+        ):
+            raise ValueError("terminal causal source sequence differs from its snapshot")
+        started_ns = time.perf_counter_ns()
+        lines = render_terminal_frame(
+            snapshot,
+            self._bindings,
+            self._config,
+            width=self._width,
+        )
+        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        frame_sha256 = hashlib.sha256(payload).hexdigest()
+        if frame_sha256 == self._last_visible_sha256:
+            self._next_tick_ordinal += 1
+            self._last_presentation_time_us = presentation_time_us
+            self._last_causal_source_sequence = causal_source_sequence
+            return None
+
+        frame_bytes = self._sink.write_and_flush(lines)
+        latency_ns = time.perf_counter_ns() - started_ns
+        if frame_bytes != len(payload):
+            raise RuntimeError("terminal sink did not flush the complete frame")
+        frame_digest_chain_sha256 = advance_terminal_frame_digest_chain_v1(
+            self._last_frame_digest_chain_sha256,
+            frame_sha256,
+        )
+        presented = TerminalPresentedFrameV2(
+            policy_id=self._policy_id,
+            tick_ordinal=tick_ordinal,
+            update_ordinal=self._next_update_ordinal,
+            presentation_time_us=presentation_time_us,
+            causal_source_sequence=causal_source_sequence,
+            market_state_id=snapshot.market_state_id,
+            frame_sha256=frame_sha256,
+            frame_digest_chain_sha256=frame_digest_chain_sha256,
+            frame_bytes=frame_bytes,
+            latency_ns=latency_ns,
+        )
+        self._next_tick_ordinal += 1
+        self._next_update_ordinal += 1
+        self._last_presentation_time_us = presentation_time_us
+        self._last_causal_source_sequence = causal_source_sequence
+        self._last_visible_sha256 = frame_sha256
+        self._last_frame_digest_chain_sha256 = frame_digest_chain_sha256
+        return presented
 
 
 def render_terminal_frame(

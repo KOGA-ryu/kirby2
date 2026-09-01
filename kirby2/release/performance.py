@@ -26,6 +26,7 @@ from kirby2.packs.formats import (
     require_nfc_text,
     require_sha256,
 )
+from kirby2.ui.terminal import RELEASE_TERMINAL_PRESENTATION_POLICY_V2
 
 
 RELEASE_BENCHMARK_FIXTURES_ID_V1 = "RELEASE_BENCHMARK_FIXTURES_V1"
@@ -1776,6 +1777,12 @@ _TERMINAL_IDENTITY = {
     "term": "dumb",
 }
 
+# ``RELEASE_TERMINAL_UPDATE_V1`` originally treated each delivered market-state
+# message as one terminal update.  The pinned quiet-range source has only a sparse
+# delivery stream, while the production terminal advances on a presentation clock.
+# Keep the workload/sample ID stable, but transcribe the production-owned V2 policy
+# into input identity so historical V1 FAIL evidence is never reinterpreted.
+
 _PANE_IDS = (
     "LEVEL2_LADDER", "TIME_AND_SALES", "DEPTH_HEATMAP", "INDIVIDUAL_QUEUE",
     "PLAYER_ORDERS", "ORDER_LIFECYCLE", "POSITION", "TRAFFIC_LIGHT",
@@ -1859,6 +1866,7 @@ def auxiliary_performance_templates(
                     "root_seed": 3102000,
                     "source_artifact_manifest_sha256": source_artifact_manifest_sha256,
                     "start_selector": "CONTINUOUS_START",
+                    "presentation": RELEASE_TERMINAL_PRESENTATION_POLICY_V2,
                     "terminal": _TERMINAL_IDENTITY,
                     "warmup_updates": 100,
                 },
@@ -2526,6 +2534,7 @@ __all__ = [
     "RELEASE_PERFORMANCE_ROOTS_V1",
     "RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1",
     "RELEASE_RUNNER_SOURCE_POLICY_ID_V1",
+    "RELEASE_TERMINAL_PRESENTATION_POLICY_V2",
     "ReleaseAuxiliaryPerformanceResultV1",
     "ReleaseAuxiliaryPerformanceTemplateV1",
     "ReleasePerformanceCapabilityRecordV1",

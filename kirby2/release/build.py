@@ -34,6 +34,7 @@ from kirby2.packs.formats import (
     require_nfc_text,
     require_sha256,
 )
+from kirby2.ui.terminal import RELEASE_TERMINAL_PRESENTATION_POLICY_V2
 
 from .first_run import RELEASE_STARTER_SET_ID_V1, build_release_starter_set
 from .licenses import ReleaseRequirementsLockV1
@@ -134,6 +135,13 @@ class ReleaseBuildRefusalCodeV1(str, Enum):
     PUBLICATION_FAILED = "PUBLICATION_FAILED"
     FUTURE_SOURCE_INPUT_MISSING = "FUTURE_SOURCE_INPUT_MISSING"
     EVIDENCE_MISSING = "EVIDENCE_MISSING"
+
+
+class _ReleaseTerminalProtocolCompatibilityV1(str, Enum):
+    """Closed compatibility selector for current and exact historical protocols."""
+
+    ACTIVE_V2 = "ACTIVE_V2"
+    HISTORICAL_TERMINAL_V1 = "HISTORICAL_TERMINAL_V1"
 
 
 class ReleaseBuildRefused(ValueError):
@@ -585,6 +593,62 @@ class ReleaseProtocolBundleV1:
         }
 
 
+def release_terminal_presentation_feasibility_v2(
+    *,
+    source_outer_event_count: int,
+    continuous_start_us: int,
+    continuous_end_us: int,
+) -> dict[str, object]:
+    """Prove the frozen V2 cadence can admit the required changed-frame prefix.
+
+    This is the preactivation structural proof.  Installed execution separately
+    proves the actual first 5,100 frames change and flush; this check prevents a
+    manifest whose cadence is arithmetically incapable of supplying that prefix.
+    """
+
+    policy = RELEASE_TERMINAL_PRESENTATION_POLICY_V2
+    if type(source_outer_event_count) is not int or source_outer_event_count <= 0:
+        raise ValueError("terminal presentation source must contain outer events")
+    if (
+        type(continuous_start_us) is not int
+        or type(continuous_end_us) is not int
+        or not 0 <= continuous_start_us < continuous_end_us
+    ):
+        raise ValueError("terminal presentation continuous boundary is invalid")
+    step = policy["simulation_step_us"]
+    frame_milliseconds = policy["frame_milliseconds"]
+    speed_milli = policy["simulation_speed_milli"]
+    if (
+        type(step) is not int
+        or type(frame_milliseconds) is not int
+        or type(speed_milli) is not int
+        or step <= 0
+        or frame_milliseconds * speed_milli != step
+        or step < 1_000
+        or step % 1_000 != 0
+    ):
+        raise ValueError("terminal presentation cadence is not a visible clock step")
+    available = len(range(continuous_start_us, continuous_end_us, step))
+    required = 100 + 5_000
+    if available < required:
+        raise ValueError("terminal presentation cadence cannot supply 5100 updates")
+    return {
+        "available_tick_count": available,
+        "boundary_policy_id": policy["boundary_policy_id"],
+        "clock_source_id": policy["clock_source_id"],
+        "continuous_end_us": continuous_end_us,
+        "continuous_start_us": continuous_start_us,
+        "frame_milliseconds": frame_milliseconds,
+        "policy_id": policy["policy_id"],
+        "required_update_count": required,
+        "simulation_speed_milli": speed_milli,
+        "simulation_step_us": step,
+        "source_outer_event_count": source_outer_event_count,
+        "status": "PASS",
+        "visible_clock_resolution_us": 1_000,
+    }
+
+
 def _release_performance_source_identities(
     repository_root: Path,
 ) -> tuple[str, str, str, str]:
@@ -648,6 +712,17 @@ def _release_performance_source_identities(
     )
 
     plan, _workload = materialize_release_performance_full_day_plan_v1()
+    continuous_phases = tuple(
+        phase for phase in plan.calendar.phases if phase.phase_id == "CONTINUOUS"
+    )
+    if len(continuous_phases) != 1:
+        raise ValueError("terminal presentation source has no unique continuous phase")
+    continuous = continuous_phases[0]
+    release_terminal_presentation_feasibility_v2(
+        source_outer_event_count=proof["outer_event_count"],  # type: ignore[arg-type]
+        continuous_start_us=continuous.start.simulation_time_us,
+        continuous_end_us=continuous.end.simulation_time_us,
+    )
     return (
         hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
         source_artifact_manifest_sha256,
@@ -661,7 +736,10 @@ def _validate_release_performance_protocol(
     *,
     repository_root: Path,
     artifact_layout: ReleaseArtifactLayoutV1,
+    terminal_compatibility: _ReleaseTerminalProtocolCompatibilityV1,
 ) -> None:
+    if type(terminal_compatibility) is not _ReleaseTerminalProtocolCompatibilityV1:
+        raise TypeError("terminal protocol compatibility must use the private enum")
     try:
         value = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
@@ -731,7 +809,30 @@ def _validate_release_performance_protocol(
         profile_manifest_sha256=profile_manifest_sha256,
         selected_plan_sha256=selected_plan_sha256,
     )
-    if value["auxiliary_templates"] != [item.as_dict() for item in auxiliary]:
+    expected_auxiliary = [item.as_dict() for item in auxiliary]
+    if (
+        terminal_compatibility
+        is _ReleaseTerminalProtocolCompatibilityV1.HISTORICAL_TERMINAL_V1
+    ):
+        terminal_rows = [
+            row
+            for row in expected_auxiliary
+            if row.get("workload_id") == "RELEASE_TERMINAL_UPDATE_V1"
+        ]
+        if len(terminal_rows) != 1:
+            raise ValueError("historical terminal template count differs")
+        input_identity = terminal_rows[0].get("input_identity")
+        parameters = (
+            input_identity.get("parameters")
+            if type(input_identity) is dict
+            else None
+        )
+        if type(parameters) is not dict or "presentation" not in parameters:
+            raise ValueError("historical terminal presentation source is missing")
+        presentation = parameters.pop("presentation")
+        if presentation != RELEASE_TERMINAL_PRESENTATION_POLICY_V2:
+            raise ValueError("historical terminal presentation source differs")
+    if value["auxiliary_templates"] != expected_auxiliary:
         raise ValueError("auxiliary performance workload templates differ")
     expected_thresholds = [
         {
@@ -1349,6 +1450,9 @@ def load_release_protocol_bundle(
     repository_root: Path,
     *,
     verify_starter_set: bool = True,
+    _terminal_compatibility: _ReleaseTerminalProtocolCompatibilityV1 = (
+        _ReleaseTerminalProtocolCompatibilityV1.ACTIVE_V2
+    ),
 ) -> ReleaseProtocolBundleV1:
     root = _absolute(repository_root, "repository root")
     raw_by_path: dict[str, bytes] = {}
@@ -1372,6 +1476,7 @@ def load_release_protocol_bundle(
             raw_by_path["release/performance_thresholds.toml"],
             repository_root=root,
             artifact_layout=artifact_layout,
+            terminal_compatibility=_terminal_compatibility,
         )
         return ReleaseProtocolBundleV1(
             repository_root=root,
@@ -2851,6 +2956,7 @@ __all__ = [
     "inspect_release_build_runtime",
     "load_release_protocol_bundle",
     "plan_release_build",
+    "release_terminal_presentation_feasibility_v2",
     "release_resource_preflight",
     "verify_release_candidate_inputs",
     "build_release_artifacts",

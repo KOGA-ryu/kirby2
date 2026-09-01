@@ -113,6 +113,11 @@ QUEUE_REACTIVE_FLOW_NATIVE_LEDGER_ID = "QUEUE_REACTIVE_FLOW_PROPOSALS_V1"
 DELIVERY_NATIVE_LEDGER_ID = "DELIVERY_ASYNC_EVENTS_V1"
 RESEARCH_NATIVE_LEDGER_ID = "FEATURE_STRATEGY_PLAYER_EVENTS_V1"
 
+# The exact identity token allows composed restore to defer only child-level
+# canonical round trips to FullDayRuntime's complete outer fixed point.  Public
+# standalone child restore APIs never receive or expose this authority.
+_NESTED_RESTORE_CONSTRUCTION_TOKEN = object()
+
 _WORK_CALENDAR_BOUNDARY = "CALENDAR_BOUNDARY"
 _WORK_SCHEDULED_INFORMATION = "SCHEDULED_INFORMATION"
 _WORK_SHOCK_CANDIDATE = "SHOCK_CANDIDATE"
@@ -6565,7 +6570,10 @@ class FullDayRuntime:
                 "full-day checkpoint exceeds the plan deterministic byte limit"
             )
         raw_engine = _plain_object(payload["engine"], "mechanics engine")
-        engine = MarketMechanicsEngine.from_checkpoint_state(raw_engine)
+        engine = MarketMechanicsEngine._from_full_day_checkpoint_state(
+            raw_engine,
+            _construction_token=_NESTED_RESTORE_CONSTRUCTION_TOKEN,
+        )
         if payload["engine_state_sha256"] != canonical_sha256(raw_engine):
             raise ValueError("runtime checkpoint engine digest mismatch")
         raw_clock = _plain_object(payload["clock"], "runtime clock")
@@ -6597,7 +6605,7 @@ class FullDayRuntime:
                 raise ValueError("agent scheduler state digest mismatch")
             from kirby2.agents.ecology import AgentScheduler
 
-            scheduler = AgentScheduler.from_checkpoint_state(
+            scheduler = AgentScheduler._from_full_day_checkpoint_state(
                 raw_scheduler_state,
                 engine=engine,
                 clock=engine.clock,
@@ -6605,6 +6613,7 @@ class FullDayRuntime:
                 _prevalidated_engine_state_sha256=str(
                     payload["engine_state_sha256"]
                 ),
+                _construction_token=_NESTED_RESTORE_CONSTRUCTION_TOKEN,
             )
         else:
             raise ValueError("agent scheduler checkpoint union status is unsupported")
@@ -6992,7 +7001,6 @@ class FullDayRuntime:
             runtime._microsteps_at_time.setdefault(key.simulation_time_us, set()).add(
                 key.microstep
             )
-        runtime.assert_invariants()
         if canonical_json_bytes(runtime.checkpoint_state()) != canonical_json_bytes(payload):
             raise ValueError("full-day runtime checkpoint is not a canonical fixed point")
         return runtime

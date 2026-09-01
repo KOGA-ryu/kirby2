@@ -10,15 +10,18 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fcntl
 import hashlib
 import inspect
 import io
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess
 import tarfile
+import tomllib
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -42,6 +45,7 @@ DEV0012_AUDIT_CASE_COUNT = 4
 DEV0013_AUDIT_CASE_COUNT = 3
 DEV0014_AUDIT_CASE_COUNT = 3
 DEV0015_AUDIT_CASE_COUNT = 4
+DEV0017_AUDIT_CASE_COUNT = 4
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -70,7 +74,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 17)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 18)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -1748,8 +1752,11 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
     import kirby2.release.build as release_build_module
 
     from kirby2.release.build import (
+        _ReleaseTerminalProtocolCompatibilityV1,
         ReleaseBuildRefusalCodeV1,
+        ReleaseBuildRefused,
         ReleaseCommandStatusV1,
+        ReleaseProtocolBundleV1,
         load_release_protocol_bundle,
         plan_release_build,
         release_resource_preflight,
@@ -1764,6 +1771,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
     clean_evidence: dict[str, object] = {
         "artifact_output_created": False,
         "candidate_commit": _DEV0011_PREDECESSOR_COMMIT_V1,
+        "default_v2_legacy_refusal_code": None,
         "resource_drift_refusal_code": None,
         "source_entry_count": 0,
         "source_manifest_sha256": "0" * 64,
@@ -1784,6 +1792,14 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
     protocol_evidence: dict[str, object] = {"protocols": []}
     fixture_candidate = _DEV0011_PREDECESSOR_COMMIT_V1
     source_repository = _repository_root()
+
+    def load_historical_fixture_bundle(repository: Path) -> ReleaseProtocolBundleV1:
+        return load_release_protocol_bundle(
+            repository,
+            _terminal_compatibility=(
+                _ReleaseTerminalProtocolCompatibilityV1.HISTORICAL_TERMINAL_V1
+            ),
+        )
 
     def run_git(repository: Path, *arguments: str) -> bytes:
         result = subprocess.run(
@@ -1955,7 +1971,19 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                 target = fixture / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.link(source, target)
-            fixture_bundle = load_release_protocol_bundle(fixture)
+            try:
+                load_release_protocol_bundle(fixture)
+            except ReleaseBuildRefused as error:
+                clean_evidence["default_v2_legacy_refusal_code"] = error.code.value
+                if error.code is not ReleaseBuildRefusalCodeV1.PROTOCOL_INVALID:
+                    raise RuntimeError(
+                        "active V2 loader returned the wrong legacy refusal"
+                    ) from error
+            else:
+                raise RuntimeError(
+                    "active V2 loader accepted the historical V1 protocol"
+                )
+            fixture_bundle = load_historical_fixture_bundle(fixture)
             fixture_preflight = release_resource_preflight(
                 fixture_bundle,
                 wheelhouse_root=fixture / "release/wheelhouse",
@@ -1986,7 +2014,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
         else:
             output_root = fixture / "artifact-output"
             try:
-                bundle = load_release_protocol_bundle(fixture)
+                bundle = load_historical_fixture_bundle(fixture)
                 outcome = plan_release_build(
                     bundle,
                     candidate_commit=fixture_candidate,
@@ -2086,7 +2114,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
 
             try:
                 reset_fixture(fixture)
-                bundle = load_release_protocol_bundle(fixture)
+                bundle = load_historical_fixture_bundle(fixture)
                 unresolved = plan_release_build(
                     bundle,
                     candidate_commit="0" * 40,
@@ -2151,7 +2179,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
 
             try:
                 reset_fixture(fixture)
-                bundle = load_release_protocol_bundle(fixture)
+                bundle = load_historical_fixture_bundle(fixture)
                 source_path = fixture / "kirby2/__init__.py"
                 original = source_path.read_bytes()
                 source_path.write_bytes(original + b"\n# DEV-0011 unstaged drift\n")
@@ -2276,7 +2304,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                     "kirby2/__init__.py",
                     "Create source-lock mismatch fixture",
                 )
-                bundle = load_release_protocol_bundle(fixture)
+                bundle = load_historical_fixture_bundle(fixture)
                 outcome = plan_release_build(
                     bundle,
                     candidate_commit=drift_commit,
@@ -2303,7 +2331,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
             for index, relative in enumerate(RELEASE_PROTOCOL_PATHS_V1):
                 try:
                     reset_fixture(fixture)
-                    stale_bundle = load_release_protocol_bundle(fixture)
+                    stale_bundle = load_historical_fixture_bundle(fixture)
                     protocol_path = fixture / relative
                     protocol_path.write_bytes(
                         protocol_path.read_bytes()
@@ -2320,7 +2348,7 @@ def audit_release_candidate_input_restart() -> ReleaseAuditSuite:
                         output_root=output_root,
                     )
                     fresh_outcome = plan_release_build(
-                        load_release_protocol_bundle(fixture),
+                        load_historical_fixture_bundle(fixture),
                         candidate_commit=drift_commit,
                         output_root=output_root,
                     )
@@ -4815,6 +4843,1934 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
             ("executor_invocations", "0"),
             ("interrupted_card", "WO40-H"),
             ("ssh_invocations", "0"),
+        ),
+    )
+
+
+def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
+    """Prove DEV-0017 authority and repair seams without rolling or executing."""
+
+    repository = _repository_root()
+    predecessor = "8ee892575372c3e296454ae6c3b2b991e481699e"
+    candidate = "10b0d205ce0efdeff5e4e833c7cbfa808ccaf1cc"
+
+    def git_blob(relative: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "show", f"{predecessor}:{relative}"],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError(f"predecessor blob is unavailable: {relative}")
+        return completed.stdout
+
+    authority_failures: list[str] = []
+    ledger_path = repository / "KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md"
+    try:
+        predecessor_ledger = git_blob(ledger_path.name)
+        current_ledger = ledger_path.read_bytes()
+    except (OSError, ValueError) as error:
+        predecessor_ledger = b""
+        current_ledger = b""
+        authority_failures.append(
+            f"deviation ledger could not be compared: {type(error).__name__}"
+        )
+    if predecessor_ledger and not current_ledger.startswith(predecessor_ledger):
+        authority_failures.append("DEV-0001 through DEV-0016 bytes were edited")
+    suffix = current_ledger[len(predecessor_ledger) :] if predecessor_ledger else b""
+    try:
+        suffix_text = suffix.decode("utf-8")
+    except UnicodeDecodeError:
+        suffix_text = ""
+        authority_failures.append("DEV-0017 suffix is not UTF-8")
+    required_authority_tokens = {
+        "## DEV-0017 — Repair measured performance failures and restart closeout",
+        "Interrupted canonical card: `WO40-J`",
+        predecessor,
+        candidate,
+        "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3",
+        "KIRBY2_RELEASE_HISTORY_ATOMIC_RENAME_V1",
+        "592 outer events",
+        "41 client-delivered market-state messages",
+        "39 eligible messages",
+        "TerminalFramePresenterV2",
+        "VerifiedFullDaySessionV1",
+        "LATEST_NONREGRESSING_CLIENT_VISIBLE_MARKET_STATE_AT_OR_BEFORE_TICK_V1",
+        "RENDER_HASH_WRITE_AND_DRAIN_V1",
+        "HISTORICAL_TERMINAL_V1",
+        "_NESTED_RESTORE_CONSTRUCTION_TOKEN",
+        "frame-digest-chain SHA-256",
+        "pins the new exact V2 threshold-manifest SHA-256",
+        "time.perf_counter_ns",
+        "Repair measured release performance failures",
+        "Reverify release resources for DEV-0017",
+        "WO40-F`, `WO40-G`, `WO40-H`, and `WO40-I`",
+    }
+    missing_authority_tokens = sorted(
+        token for token in required_authority_tokens if token not in suffix_text
+    )
+    if (
+        suffix_text.count("## DEV-0017") != 1
+        or "## DEV-0018" in suffix_text
+        or missing_authority_tokens
+    ):
+        authority_failures.append("DEV-0017 authority record is missing or differs")
+    expected_owned_paths = (
+        "kirby2/release/history.py",
+        "kirby2/agents/ecology.py",
+        "kirby2/exchange/mechanics_engine.py",
+        "kirby2/release/build.py",
+        "kirby2/release/performance.py",
+        "kirby2/release/performance_execution.py",
+        "kirby2/release/performance_auxiliary.py",
+        "kirby2/release/desktop.py",
+        "kirby2/ui/terminal.py",
+        "kirby2/full_day/store.py",
+        "kirby2/full_day/runtime.py",
+        "kirby2/audit/release.py",
+        "kirby2/audit/expansion.py",
+        "release/performance_thresholds.toml",
+        "release/performance_runner_sources.lock",
+        "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md",
+    )
+    owned_match = re.search(
+        r"(?ms)^- Owned repair paths:(.*?)(?=^- Gate registration:)",
+        suffix_text,
+    )
+    owned_paths = (
+        ()
+        if owned_match is None
+        else tuple(re.findall(r"`([^`]+)`", owned_match.group(1)))
+    )
+    if owned_paths != expected_owned_paths:
+        authority_failures.append("DEV-0017 owned repair paths differ")
+    source_commit_subject = "Repair measured release performance failures"
+    d1_commit_subject = "Reverify release resources for DEV-0017"
+    observed_commit_subjects = tuple(
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"(?m)^- Exact ([^:\n]+) commit subject:\s*`([^`\n]+)`$",
+            suffix_text,
+        )
+    )
+    expected_commit_subjects = (
+        ("source/protocol repair", source_commit_subject),
+        ("D1 evidence", d1_commit_subject),
+    )
+    if observed_commit_subjects != expected_commit_subjects:
+        authority_failures.append("DEV-0017 exact commit subjects differ")
+    authority_case = _case(
+        "append_only_restart_authority_and_candidate_order_are_exact",
+        "The predecessor ledger is byte-preserved and DEV-0017 requires source, D1, F/G/H/I, then J.",
+        {
+            "commit_subjects": [list(item) for item in observed_commit_subjects],
+            "d1_commit_subject": d1_commit_subject,
+            "interrupted_card": "WO40-J",
+            "missing_tokens": missing_authority_tokens,
+            "owned_repair_paths": list(owned_paths),
+            "predecessor": predecessor,
+            "predecessor_prefix_bytes": len(predecessor_ledger),
+            "source_commit_subject": source_commit_subject,
+        },
+        authority_failures,
+    )
+
+    historical_failures: list[str] = []
+    historical_statuses: list[list[str]] = []
+    performance_checks: dict[str, str] = {}
+    evidence_paths = {
+        "WO40-F": "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+        "WO40-G": "KIRBY2_RELEASE_MACOS_EVIDENCE.md",
+        "WO40-H": "KIRBY2_RELEASE_LINUX_EVIDENCE.md",
+        "WO40-I": "KIRBY2_RELEASE_PERFORMANCE_EVIDENCE.md",
+    }
+    expected_statuses = {
+        "WO40-F": "PASS",
+        "WO40-G": "PASS",
+        "WO40-H": "PASS",
+        "WO40-I": "FAIL",
+    }
+    for gate_id, relative in evidence_paths.items():
+        try:
+            evidence = parse_release_gate_evidence_markdown(git_blob(relative))
+        except (OSError, TypeError, ValueError) as error:
+            historical_failures.append(
+                f"{gate_id} historical evidence failed: {type(error).__name__}"
+            )
+            continue
+        historical_statuses.append([gate_id, evidence.status])
+        if (
+            evidence.gate_id != gate_id
+            or evidence.status != expected_statuses[gate_id]
+            or evidence.candidate_commit != candidate
+        ):
+            historical_failures.append(f"{gate_id} historical identity differs")
+        if gate_id == "WO40-I":
+            performance_checks = {
+                row["check_id"]: row["status"]
+                for row in evidence.checks
+                if type(row) is dict
+                and type(row.get("check_id")) is str
+                and type(row.get("status")) is str
+            }
+            expected_facts = {
+                "auxiliary_result_count": 5,
+                "complete_artifact_records": 10_000,
+                "complete_audit_records": 10_000,
+                "complete_result_records": 10_000,
+                "complete_run_work_units": 10_000,
+                "unique_complete_run_ids": 10_000,
+            }
+            if evidence.facts != expected_facts:
+                historical_failures.append("WO40-I complete-record facts differ")
+    required_performance_statuses = {
+        "AUXILIARY:RELEASE_TERMINAL_UPDATE_V1": "FAIL",
+        "AUXILIARY:RELEASE_FULL_DAY_GENERATION_V1": "WARNING",
+        "AUXILIARY:RELEASE_MICROSCOPE_LOAD_V1": "FAIL",
+        "EXACT_10000_COMPLETE_WORK_UNITS": "PASS",
+        "UNIQUE_COMPLETE_RUN_LOGICAL_IDS": "PASS",
+        "FULL_RESULT_ARTIFACT_AUDIT_RECORDS": "PASS",
+    }
+    if any(
+        performance_checks.get(check_id) != status
+        for check_id, status in required_performance_statuses.items()
+    ):
+        historical_failures.append("WO40-I measured status projection differs")
+    try:
+        preflight_raw = git_blob("KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md")
+    except ValueError as error:
+        preflight_raw = b""
+        historical_failures.append(f"historical D1 failed: {type(error).__name__}")
+    expected_preflight_sha256 = (
+        "a4e791a0e401f657448f8bfe6364789d4e2cfcf5032c1344b3a401911d6bb9cc"
+    )
+    if (
+        _sha256(preflight_raw) != expected_preflight_sha256
+        or b"Status: `PASS`\n" not in preflight_raw
+        or b"Protocol set SHA-256: `94f0050a592e3279a4b38b3d2e55b0ccfdc784202e67dca13e21a91fb631f9e8`\n"
+        not in preflight_raw
+    ):
+        historical_failures.append("historical D1 report identity differs")
+    historical_case = _case(
+        "predecessor_d1_and_fghi_results_are_truthfully_bound",
+        "Git evidence preserves D1/F/G/H PASS, I FAIL, both failures, one warning, and 10,000 records.",
+        {
+            "candidate_commit": candidate,
+            "d1_sha256": _sha256(preflight_raw),
+            "gate_statuses": historical_statuses,
+            "performance_statuses": {
+                key: performance_checks.get(key)
+                for key in sorted(required_performance_statuses)
+            },
+        },
+        historical_failures,
+    )
+
+    history_failures: list[str] = []
+    history_path = repository / "kirby2/release/history.py"
+    try:
+        history_source = history_path.read_text(encoding="utf-8")
+        history_tree = ast.parse(history_source, filename=os.fspath(history_path))
+    except (OSError, UnicodeDecodeError, SyntaxError) as error:
+        history_source = ""
+        history_tree = ast.Module(body=[], type_ignores=[])
+        history_failures.append(
+            f"release-history source failed: {type(error).__name__}"
+        )
+
+    def top_level_function(tree: ast.Module, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            ),
+            None,
+        )
+
+    def top_level_class(tree: ast.Module, name: str) -> ast.ClassDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.ClassDef) and item.name == name
+            ),
+            None,
+        )
+
+    def assigned_literal(tree: ast.Module, name: str) -> object:
+        for item in tree.body:
+            if not isinstance(item, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = item.targets if isinstance(item, ast.Assign) else [item.target]
+            if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                value = item.value
+                try:
+                    return ast.literal_eval(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    required_history_classes = (
+        "ReleaseHistoryFileV1",
+        "ReleaseHistoryGateResultV1",
+        "ReleaseHistoryManifestV3",
+        "ReleaseHistoryRolloverPlanV1",
+        "ReleaseHistoryRolloverReceiptV1",
+        "ReleaseHistoryRolloverStateV1",
+    )
+    required_history_functions = (
+        "inspect_dev0017_release_history_rollover",
+        "plan_dev0017_release_history_rollover",
+        "execute_dev0017_release_history_rollover",
+        "verify_release_history_snapshot_v3",
+    )
+    required_history_helpers = (
+        "_lock_release_directory",
+        "_open_history_lock",
+        "_remove_preparation_root",
+        "_rename_exclusive_at",
+        "_verify_complete_snapshot_tree",
+        "_verify_execution_authority",
+    )
+    if any(top_level_class(history_tree, name) is None for name in required_history_classes):
+        history_failures.append("release-history typed records are incomplete")
+    if any(
+        top_level_function(history_tree, name) is None
+        for name in (*required_history_functions, *required_history_helpers)
+    ):
+        history_failures.append("release-history lifecycle surface is incomplete")
+    if (
+        assigned_literal(history_tree, "DEV0017_RELEASE_EVIDENCE_COMMIT_V1")
+        != predecessor
+        or assigned_literal(history_tree, "DEV0017_SOURCE_CANDIDATE_COMMIT_V1")
+        != candidate
+        or assigned_literal(history_tree, "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3")
+        != "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3"
+        or assigned_literal(history_tree, "RELEASE_HISTORY_ROLLOVER_POLICY_ID_V1")
+        != "KIRBY2_RELEASE_HISTORY_ATOMIC_RENAME_V1"
+        or assigned_literal(history_tree, "DEV0017_RESOURCE_PREFLIGHT_PATH_V1")
+        != "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md"
+        or assigned_literal(history_tree, "DEV0017_EVIDENCE_STATUS_BY_GATE_V1")
+        != (
+            ("WO40-D1", "PASS"),
+            ("WO40-F", "PASS"),
+            ("WO40-G", "PASS"),
+            ("WO40-H", "PASS"),
+            ("WO40-I", "FAIL"),
+        )
+    ):
+        history_failures.append("release-history predecessor or schema identity differs")
+    calls = [item for item in ast.walk(history_tree) if isinstance(item, ast.Call)]
+    attribute_calls = {
+        item.func.attr
+        for item in calls
+        if isinstance(item.func, ast.Attribute)
+    }
+    name_calls = {
+        item.func.id for item in calls if isinstance(item.func, ast.Name)
+    }
+    forbidden_bulk_calls = {
+        "copy",
+        "copy2",
+        "copyfile",
+        "copytree",
+        "rmtree",
+        "remove",
+        "replace",
+    }
+    observed_forbidden = sorted((attribute_calls | name_calls) & forbidden_bulk_calls)
+    raw_rename_calls = sum(
+        1
+        for item in calls
+        if isinstance(item.func, ast.Attribute)
+        and isinstance(item.func.value, ast.Name)
+        and item.func.value.id == "os"
+        and item.func.attr == "rename"
+    )
+    exclusive_rename_calls = sum(
+        1
+        for item in calls
+        if isinstance(item.func, ast.Name)
+        and item.func.id == "_rename_exclusive_at"
+    )
+    imports_shutil = any(
+        (
+            isinstance(item, ast.Import)
+            and any(alias.name == "shutil" for alias in item.names)
+        )
+        or (isinstance(item, ast.ImportFrom) and item.module == "shutil")
+        for item in history_tree.body
+    )
+    execute_node = top_level_function(
+        history_tree, "execute_dev0017_release_history_rollover"
+    )
+    execute_calls = {
+        item.func.id
+        for item in ast.walk(execute_node)
+        if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+    } if execute_node is not None else set()
+    required_execute_calls = {
+        "inspect_dev0017_release_history_rollover",
+        "plan_dev0017_release_history_rollover",
+        "_inventory_active_store",
+        "_stage_rollover",
+        "_verify_complete_snapshot_tree",
+        "_verify_execution_authority",
+        "_lock_release_directory",
+        "_rename_exclusive_at",
+        "_harden_tree",
+    }
+    cleanup_node = top_level_function(history_tree, "_remove_preparation_root")
+    cleanup_unlinks = 0 if cleanup_node is None else sum(
+        1
+        for item in ast.walk(cleanup_node)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Attribute)
+        and isinstance(item.func.value, ast.Name)
+        and item.func.value.id == "os"
+        and item.func.attr == "unlink"
+    )
+    all_unlinks = sum(
+        1
+        for item in calls
+        if isinstance(item.func, ast.Attribute)
+        and isinstance(item.func.value, ast.Name)
+        and item.func.value.id == "os"
+        and item.func.attr == "unlink"
+    )
+    if (
+        observed_forbidden
+        or imports_shutil
+        or "rename" in attribute_calls
+        or raw_rename_calls != 0
+        or exclusive_rename_calls != 5
+        or cleanup_unlinks != 1
+        or all_unlinks != cleanup_unlinks
+        or not required_execute_calls.issubset(execute_calls)
+        or "renameatx_np" not in history_source
+        or "_DARWIN_RENAME_EXCL" not in history_source
+        or history_source.count("os.fsync(state_descriptor)") < 3
+        or "artifacts" not in history_source
+        or "clean-providers.toml" not in history_source
+    ):
+        history_failures.append("release-history rollover is not rename-only and fail-closed")
+
+    lifecycle_states: dict[str, str] = {}
+    hostile_path_results: dict[str, str] = {}
+    exclusive_conflict_preserved = False
+    manifest_hostile_refusals = 0
+    hostile_lock_preserved = False
+    lock_replacement_refused = False
+    known_cleanup_completed = False
+    unknown_cleanup_preserved = False
+    exact_extra_refused = False
+    descriptor_symlink_refused = False
+    try:
+        from kirby2.release import history as release_history
+
+        with TemporaryDirectory(prefix="kirby2-release-dev0017-history-") as temporary:
+            temporary_root = Path(temporary)
+
+            def pristine_layout(name: str):
+                repository_root = temporary_root / name
+                state_root = repository_root / ".kirby2"
+                state_root.mkdir(parents=True)
+                (state_root / "release").mkdir()
+                (state_root / "release-history").mkdir()
+                return release_history.inspect_dev0017_release_history_rollover(
+                    repository_root
+                )
+
+            ready = pristine_layout("ready")
+            lifecycle_states["READY"] = ready.state.value
+
+            prepared = pristine_layout("prepared")
+            prepared.history_staging_root.mkdir()
+            prepared.next_active_root.mkdir()
+            lifecycle_states["PREPARED"] = (
+                release_history.inspect_dev0017_release_history_rollover(
+                    prepared.repository_root
+                ).state.value
+            )
+
+            incomplete = pristine_layout("preparation-incomplete")
+            incomplete.next_active_root.mkdir()
+            lifecycle_states["PREPARATION_INCOMPLETE"] = (
+                release_history.inspect_dev0017_release_history_rollover(
+                    incomplete.repository_root
+                ).state.value
+            )
+
+            quarantined = pristine_layout("old-store-quarantined")
+            quarantined.history_staging_root.mkdir()
+            (quarantined.history_staging_root / "artifacts").mkdir()
+            quarantined.next_active_root.mkdir()
+            quarantined.active_root.rmdir()
+            lifecycle_states["OLD_STORE_QUARANTINED"] = (
+                release_history.inspect_dev0017_release_history_rollover(
+                    quarantined.repository_root
+                ).state.value
+            )
+
+            pending = pristine_layout("history-pending")
+            pending.history_staging_root.mkdir()
+            (pending.history_staging_root / "artifacts").mkdir()
+            lifecycle_states["ACTIVE_REPLACED_HISTORY_PENDING"] = (
+                release_history.inspect_dev0017_release_history_rollover(
+                    pending.repository_root
+                ).state.value
+            )
+
+            complete = pristine_layout("complete")
+            complete.history_final_root.mkdir()
+            lifecycle_states["COMPLETE"] = (
+                release_history.inspect_dev0017_release_history_rollover(
+                    complete.repository_root
+                ).state.value
+            )
+
+            hostile = pristine_layout("hostile-symlink")
+            external = temporary_root / "external"
+            external.mkdir()
+            hostile.history_staging_root.symlink_to(
+                external,
+                target_is_directory=True,
+            )
+            try:
+                release_history.inspect_dev0017_release_history_rollover(
+                    hostile.repository_root
+                )
+            except release_history.ReleaseHistoryRefused as error:
+                hostile_path_results["symlink_stage"] = error.code.value
+
+            unsafe = pristine_layout("hostile-mode")
+            unsafe.next_active_root.mkdir(mode=0o700)
+            unsafe.next_active_root.chmod(0o777)
+            try:
+                release_history.inspect_dev0017_release_history_rollover(
+                    unsafe.repository_root
+                )
+            except release_history.ReleaseHistoryRefused as error:
+                hostile_path_results["writable_stage"] = error.code.value
+
+            lock_hostile = pristine_layout("hostile-lock")
+            lock_target = temporary_root / "lock-target"
+            lock_target.write_bytes(b"do-not-touch")
+            lock_target.chmod(0o640)
+            lock_target_mode = stat.S_IMODE(lock_target.lstat().st_mode)
+            lock_hostile.lock_path.symlink_to(lock_target)
+            state_descriptor = os.open(
+                lock_hostile.repository_root / ".kirby2",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                try:
+                    release_history._open_history_lock(
+                        state_descriptor,
+                        os.fstat(state_descriptor).st_dev,
+                    )
+                except release_history.ReleaseHistoryRefused:
+                    pass
+            finally:
+                os.close(state_descriptor)
+            hostile_lock_preserved = (
+                lock_target.read_bytes() == b"do-not-touch"
+                and stat.S_IMODE(lock_target.lstat().st_mode) == lock_target_mode
+            )
+
+            lock_replacement = pristine_layout("replaced-lock")
+            state_descriptor = os.open(
+                lock_replacement.repository_root / ".kirby2",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            lock_descriptor = release_history._open_history_lock(
+                state_descriptor,
+                os.fstat(state_descriptor).st_dev,
+            )
+            try:
+                lock_replacement.lock_path.rename(
+                    lock_replacement.lock_path.with_suffix(".moved")
+                )
+                lock_replacement.lock_path.write_bytes(b"")
+                lock_replacement.lock_path.chmod(0o600)
+                try:
+                    release_history._revalidate_history_lock(
+                        state_descriptor,
+                        lock_descriptor,
+                    )
+                except release_history.ReleaseHistoryRefused:
+                    lock_replacement_refused = True
+            finally:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)
+                os.close(state_descriptor)
+
+            cleanup = pristine_layout("hostile-cleanup")
+            cleanup.next_active_build_root.mkdir()
+            unknown = cleanup.next_active_build_root / "unknown"
+            unknown.write_bytes(b"preserve")
+            state_descriptor = os.open(
+                cleanup.repository_root / ".kirby2",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                try:
+                    release_history._remove_preparation_root(
+                        state_descriptor,
+                        cleanup.repository_root / ".kirby2",
+                        cleanup.next_active_build_root.name,
+                        frozenset({"clean-providers.toml"}),
+                    )
+                except release_history.ReleaseHistoryRefused:
+                    pass
+            finally:
+                os.close(state_descriptor)
+            unknown_cleanup_preserved = unknown.read_bytes() == b"preserve"
+
+            known_cleanup = pristine_layout("known-cleanup")
+            known_cleanup.next_active_build_root.mkdir()
+            (known_cleanup.next_active_build_root / "clean-providers.toml").write_bytes(
+                b"partial"
+            )
+            state_descriptor = os.open(
+                known_cleanup.repository_root / ".kirby2",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                release_history._remove_preparation_root(
+                    state_descriptor,
+                    known_cleanup.repository_root / ".kirby2",
+                    known_cleanup.next_active_build_root.name,
+                    frozenset({"clean-providers.toml"}),
+                )
+            finally:
+                os.close(state_descriptor)
+            known_cleanup_completed = not known_cleanup.next_active_build_root.exists()
+
+            rename_probe = pristine_layout("exclusive-rename")
+            probe_parent = rename_probe.repository_root / ".kirby2"
+            source = probe_parent / "exclusive-source"
+            destination = probe_parent / "exclusive-destination"
+            source.mkdir()
+            destination.mkdir()
+            source_identity = source.lstat().st_ino
+            destination_identity = destination.lstat().st_ino
+            probe_descriptor = os.open(
+                probe_parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                moved = release_history._rename_exclusive_at(
+                    probe_descriptor,
+                    b"exclusive-source",
+                    probe_descriptor,
+                    b"exclusive-destination",
+                )
+            finally:
+                os.close(probe_descriptor)
+            exclusive_conflict_preserved = (
+                not moved
+                and source.lstat().st_ino == source_identity
+                and destination.lstat().st_ino == destination_identity
+            )
+
+        digest = "0" * 64
+        manifest_files = tuple(
+            sorted(
+                (
+                    *(
+                        release_history.ReleaseHistoryFileV1(path, 0, digest)
+                        for path in release_history.DEV0017_EVIDENCE_PATH_BY_GATE_V1.values()
+                    ),
+                    release_history.ReleaseHistoryFileV1(
+                        "artifacts/clean-providers.toml", 0, digest
+                    ),
+                ),
+                key=lambda item: item.path.encode("utf-8"),
+            )
+        )
+        gate_results = tuple(
+            release_history.ReleaseHistoryGateResultV1(gate_id, status)
+            for gate_id, status in release_history.DEV0017_EVIDENCE_STATUS_BY_GATE_V1
+        )
+        release_history.ReleaseHistoryManifestV3(
+            release_evidence_commit=predecessor,
+            source_candidate_commit=candidate,
+            gate_results=gate_results,
+            files=manifest_files,
+        )
+        for hostile_results, hostile_files in (
+            (gate_results[1:], manifest_files),
+            (gate_results, manifest_files[1:]),
+        ):
+            try:
+                release_history.ReleaseHistoryManifestV3(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=hostile_results,
+                    files=hostile_files,
+                )
+            except ValueError:
+                manifest_hostile_refusals += 1
+
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        exact_manifest = release_history.ReleaseHistoryManifestV3(
+            release_evidence_commit=predecessor,
+            source_candidate_commit=candidate,
+            gate_results=gate_results,
+            files=tuple(
+                release_history.ReleaseHistoryFileV1(
+                    record.path,
+                    0,
+                    empty_digest,
+                )
+                for record in manifest_files
+            ),
+        )
+        with TemporaryDirectory(
+            prefix="kirby2-release-dev0017-exact-tree-"
+        ) as temporary:
+            exact_root = Path(temporary) / "snapshot"
+            (exact_root / "artifacts").mkdir(parents=True)
+            for record in exact_manifest.files:
+                path = exact_root / record.path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"")
+            (exact_root / "HISTORY_MANIFEST.json").write_bytes(
+                exact_manifest.canonical_bytes()
+            )
+            release_history._verify_complete_snapshot_tree(
+                exact_root,
+                exact_manifest,
+                require_historical_modes=False,
+            )
+            (exact_root / "unexpected").write_bytes(b"")
+            try:
+                release_history._verify_complete_snapshot_tree(
+                    exact_root,
+                    exact_manifest,
+                    require_historical_modes=False,
+                )
+            except release_history.ReleaseHistoryRefused:
+                exact_extra_refused = True
+            (exact_root / "unexpected").unlink()
+            external = Path(temporary) / "external"
+            external.mkdir()
+            (exact_root / "artifacts" / "hostile").symlink_to(
+                external,
+                target_is_directory=True,
+            )
+            try:
+                release_history._verify_complete_snapshot_tree(
+                    exact_root,
+                    exact_manifest,
+                    require_historical_modes=False,
+                )
+            except release_history.ReleaseHistoryRefused:
+                descriptor_symlink_refused = True
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        history_failures.append(
+            f"release-history isolated hostile audit failed: {type(error).__name__}"
+        )
+    expected_lifecycle_states = {
+        state: state
+        for state in (
+            "READY",
+            "PREPARED",
+            "PREPARATION_INCOMPLETE",
+            "OLD_STORE_QUARANTINED",
+            "ACTIVE_REPLACED_HISTORY_PENDING",
+            "COMPLETE",
+        )
+    }
+    if (
+        lifecycle_states != expected_lifecycle_states
+        or hostile_path_results
+        != {
+            "symlink_stage": "PATH_IDENTITY_MISMATCH",
+            "writable_stage": "PATH_IDENTITY_MISMATCH",
+        }
+        or not exclusive_conflict_preserved
+        or manifest_hostile_refusals != 2
+        or not hostile_lock_preserved
+        or not lock_replacement_refused
+        or not known_cleanup_completed
+        or not unknown_cleanup_preserved
+        or not exact_extra_refused
+        or not descriptor_symlink_refused
+    ):
+        history_failures.append("release-history isolated lifecycle or hostile probes differ")
+    history_case = _case(
+        "complete_active_store_rollover_is_atomic_and_noncopying",
+        "The V3 lifecycle binds five documents plus the full active tree and exposes no bulk copy/delete path.",
+        {
+            "bulk_copy_or_delete_calls": observed_forbidden,
+            "executor_invocations": 0,
+            "history_schema": "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3",
+            "public_function_count": len(required_history_functions),
+            "bounded_preparation_unlinks": cleanup_unlinks,
+            "exclusive_rename_call_count": exclusive_rename_calls,
+            "exclusive_rename_conflict_preserved": exclusive_conflict_preserved,
+            "exact_extra_refused": exact_extra_refused,
+            "descriptor_symlink_refused": descriptor_symlink_refused,
+            "hostile_lock_preserved": hostile_lock_preserved,
+            "hostile_path_results": hostile_path_results,
+            "lifecycle_states": lifecycle_states,
+            "manifest_hostile_refusals": manifest_hostile_refusals,
+            "lock_replacement_refused": lock_replacement_refused,
+            "known_cleanup_completed": known_cleanup_completed,
+            "unknown_cleanup_preserved": unknown_cleanup_preserved,
+            "raw_rename_call_count": raw_rename_calls,
+            "rollover_invocations": 0,
+        },
+        history_failures,
+    )
+
+    repair_failures: list[str] = []
+    source_paths = {
+        "auxiliary": repository / "kirby2/release/performance_auxiliary.py",
+        "build": repository / "kirby2/release/build.py",
+        "desktop": repository / "kirby2/release/desktop.py",
+        "ecology": repository / "kirby2/agents/ecology.py",
+        "execution": repository / "kirby2/release/performance_execution.py",
+        "mechanics": repository / "kirby2/exchange/mechanics_engine.py",
+        "performance": repository / "kirby2/release/performance.py",
+        "runtime": repository / "kirby2/full_day/runtime.py",
+        "store": repository / "kirby2/full_day/store.py",
+        "terminal": repository / "kirby2/ui/terminal.py",
+    }
+    trees: dict[str, ast.Module] = {}
+    sources: dict[str, str] = {}
+    for source_id, path in source_paths.items():
+        try:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=os.fspath(path))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            repair_failures.append(
+                f"{source_id} repair source failed: {type(error).__name__}"
+            )
+            source = ""
+            tree = ast.Module(body=[], type_ignores=[])
+        sources[source_id] = source
+        trees[source_id] = tree
+
+    expected_policy = {
+        "boundary_policy_id": "CONTINUOUS_INCLUDE_START_EXCLUDE_END_V1",
+        "causal_source_policy_id": (
+            "LATEST_NONREGRESSING_CLIENT_VISIBLE_MARKET_STATE_AT_OR_BEFORE_TICK_V1"
+        ),
+        "clock_source_id": "TIME_PERF_COUNTER_NS_V1",
+        "duplicate_source_policy_id": "ALLOW_REUSE_AND_ASYNC_SEQUENCE_REORDER_V1",
+        "frame_milliseconds": 50,
+        "latency_boundary_policy_id": "RENDER_HASH_WRITE_AND_DRAIN_V1",
+        "policy_id": "RELEASE_TERMINAL_PRESENTATION_V2",
+        "schema_version": 2,
+        "simulation_speed_milli": 10_000,
+        "simulation_step_us": 500_000,
+        "update_ordinal_policy_id": "CONTIGUOUS_VISIBLE_UPDATES_FROM_ZERO_V1",
+        "visible_change_policy_id": "ADJACENT_RENDERED_FRAME_SHA256_DIFFERS_V1",
+    }
+    observed_policy = assigned_literal(
+        trees["terminal"], "RELEASE_TERMINAL_PRESENTATION_POLICY_V2"
+    )
+    if observed_policy != expected_policy:
+        repair_failures.append("production terminal presentation policy differs")
+    required_terminal_classes = (
+        "TerminalFrameFlushSink",
+        "TerminalPresentedFrameV2",
+        "TerminalFramePresenterV2",
+    )
+    required_desktop_surface = (
+        "ReleaseTerminalPresentationTickV2",
+        "ReleaseTerminalPresentedUpdateV2",
+        "iter_release_terminal_presentation_ticks_v2",
+        "present_release_terminal_updates_v2",
+    )
+    if any(
+        top_level_class(trees["terminal"], name) is None
+        for name in required_terminal_classes
+    ):
+        repair_failures.append("terminal presentation classes are incomplete")
+    if any(
+        top_level_class(trees["desktop"], name) is None
+        and top_level_function(trees["desktop"], name) is None
+        for name in required_desktop_surface
+    ):
+        repair_failures.append("release desktop presentation surface is incomplete")
+    if top_level_function(
+        trees["build"], "release_terminal_presentation_feasibility_v2"
+    ) is None:
+        repair_failures.append("terminal presentation feasibility proof is missing")
+    performance_imports_policy = any(
+        isinstance(item, ast.ImportFrom)
+        and item.module == "kirby2.ui.terminal"
+        and any(
+            alias.name == "RELEASE_TERMINAL_PRESENTATION_POLICY_V2"
+            for alias in item.names
+        )
+        for item in trees["performance"].body
+    )
+    if not performance_imports_policy:
+        repair_failures.append("performance template does not transcribe UI-owned policy")
+
+    def direct_called_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            item.func.id
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+        }
+
+    def class_method(
+        tree: ast.Module,
+        class_name: str,
+        method_name: str,
+    ) -> ast.FunctionDef | None:
+        class_node = top_level_class(tree, class_name)
+        if class_node is None:
+            return None
+        return next(
+            (
+                item
+                for item in class_node.body
+                if isinstance(item, ast.FunctionDef) and item.name == method_name
+            ),
+            None,
+        )
+
+    def exact_object_fields(
+        node: ast.AST | None,
+        label: str,
+    ) -> tuple[frozenset[str], ...]:
+        if node is None:
+            return ()
+        fields: list[frozenset[str]] = []
+        for item in ast.walk(node):
+            if (
+                not isinstance(item, ast.Call)
+                or not isinstance(item.func, ast.Name)
+                or item.func.id != "_exact_object"
+                or len(item.args) < 3
+            ):
+                continue
+            try:
+                observed_label = ast.literal_eval(item.args[2])
+                observed_fields = ast.literal_eval(item.args[1])
+            except (TypeError, ValueError):
+                continue
+            if observed_label == label and isinstance(
+                observed_fields, (set, frozenset)
+            ):
+                fields.append(frozenset(observed_fields))
+        return tuple(fields)
+
+    def assigned_dict_fields(
+        node: ast.AST | None,
+        name: str,
+    ) -> tuple[frozenset[str], ...]:
+        if node is None:
+            return ()
+        fields: list[frozenset[str]] = []
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Assign) or not isinstance(item.value, ast.Dict):
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in item.targets
+            ):
+                continue
+            keys = item.value.keys
+            if any(
+                not isinstance(key, ast.Constant) or type(key.value) is not str
+                for key in keys
+            ):
+                continue
+            fields.append(frozenset(key.value for key in keys))
+        return tuple(fields)
+
+    def returned_dict_shapes(
+        node: ast.AST | None,
+    ) -> tuple[tuple[frozenset[str], int], ...]:
+        if node is None:
+            return ()
+        shapes: list[tuple[frozenset[str], int]] = []
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Return) or not isinstance(item.value, ast.Dict):
+                continue
+            explicit: set[str] = set()
+            unpack_count = 0
+            valid = True
+            for key in item.value.keys:
+                if key is None:
+                    unpack_count += 1
+                elif isinstance(key, ast.Constant) and type(key.value) is str:
+                    explicit.add(key.value)
+                else:
+                    valid = False
+            if valid:
+                shapes.append((frozenset(explicit), unpack_count))
+        return tuple(shapes)
+
+    def annotated_class_fields(
+        tree: ast.Module,
+        class_name: str,
+    ) -> frozenset[str]:
+        class_node = top_level_class(tree, class_name)
+        if class_node is None:
+            return frozenset()
+        return frozenset(
+            item.target.id
+            for item in class_node.body
+            if isinstance(item, ast.AnnAssign)
+            and isinstance(item.target, ast.Name)
+        )
+
+    terminal_frame_fields = frozenset(
+        {
+            "causal_source_sequence",
+            "frame_bytes",
+            "frame_digest_chain_sha256",
+            "frame_sha256",
+            "latency_ns",
+            "market_state_id",
+            "policy_id",
+            "presentation_time_us",
+            "schema_version",
+            "tick_ordinal",
+            "update_ordinal",
+        }
+    )
+    terminal_v2_row_fields = frozenset(
+        {
+            *terminal_frame_fields,
+            "source_delivery_time_us",
+            "source_market_time_us",
+        }
+    )
+    terminal_v1_row_fields = frozenset(
+        {
+            "frame_bytes",
+            "latency_ns",
+            "market_state_id",
+            "message_sequence",
+            "ordinal",
+        }
+    )
+    terminal_v2_feasibility_fields = frozenset(
+        {
+            "available_tick_count",
+            "boundary_policy_id",
+            "causal_source_policy_id",
+            "clock_source_id",
+            "consumed_tick_count",
+            "continuous_end_us",
+            "continuous_start_us",
+            "delivered_source_sequence_count",
+            "delivered_source_sequence_reorder_count",
+            "delivered_source_sequences",
+            "duplicate_source_policy_id",
+            "eligible_visible_update_count",
+            "first_causal_source_sequence",
+            "first_presentation_time_us",
+            "frame_milliseconds",
+            "last_causal_source_sequence",
+            "last_presentation_time_us",
+            "latency_boundary_policy_id",
+            "policy_id",
+            "presented_source_sequence_reorder_count",
+            "presented_source_sequence_reuse_count",
+            "required_update_count",
+            "schema_version",
+            "simulation_speed_milli",
+            "simulation_step_us",
+            "skipped_unchanged_tick_count",
+            "status",
+            "update_ordinal_policy_id",
+            "visible_change_policy_id",
+        }
+    )
+    terminal_v2_receipt_fields = frozenset(
+        {
+            "first_message_sequence",
+            "first_update_ordinal",
+            "last_message_sequence",
+            "last_update_ordinal",
+            "peak_rss_bytes",
+            "presentation",
+            "presentation_feasibility",
+            "rendered_update_count",
+            "run_id",
+            "source_evidence_sha256",
+            "source_materialization",
+            "status",
+            "terminal",
+            "update_inventory_sha256",
+        }
+    )
+    terminal_v1_receipt_fields = frozenset(
+        {
+            "first_message_sequence",
+            "last_message_sequence",
+            "peak_rss_bytes",
+            "rendered_update_count",
+            "run_id",
+            "source_evidence_sha256",
+            "source_materialization",
+            "status",
+            "terminal",
+            "update_inventory_sha256",
+        }
+    )
+    terminal_sink_common_fields = frozenset(
+        {
+            "bytes_drained",
+            "bytes_written",
+            "color",
+            "columns",
+            "drain_policy",
+            "encoding",
+            "rows",
+            "term",
+        }
+    )
+    terminal_v2_sink_fields = frozenset(
+        {
+            *terminal_sink_common_fields,
+            "drained_sha256",
+            "frame_digest_chain_sha256",
+            "written_sha256",
+        }
+    )
+    terminal_v1_sink_fields = frozenset(
+        {*terminal_sink_common_fields, "sha256"}
+    )
+
+    v1_workload = top_level_function(trees["auxiliary"], "_terminal_update_workload_v1")
+    v2_workload = top_level_function(trees["auxiliary"], "_terminal_update_workload_v2")
+    v1_verifier = top_level_function(trees["auxiliary"], "_verify_terminal_evidence_v1")
+    v2_verifier = top_level_function(trees["auxiliary"], "_verify_terminal_evidence_v2")
+    desktop_present = top_level_function(
+        trees["desktop"], "present_release_terminal_updates_v2"
+    )
+    sink_receipt_state = class_method(
+        trees["auxiliary"], "_ContinuouslyDrainedPty", "_receipt_state"
+    )
+    sink_receipt_v1 = class_method(
+        trees["auxiliary"], "_ContinuouslyDrainedPty", "receipt"
+    )
+    sink_receipt_v2 = class_method(
+        trees["auxiliary"], "_ContinuouslyDrainedPty", "receipt_v2"
+    )
+    frame_as_dict = class_method(
+        trees["terminal"], "TerminalPresentedFrameV2", "as_dict"
+    )
+    desktop_update_as_dict = class_method(
+        trees["desktop"], "ReleaseTerminalPresentedUpdateV2", "as_dict"
+    )
+    expected_schema_observations = {
+        "desktop_feasibility": assigned_dict_fields(desktop_present, "feasibility"),
+        "terminal_frame_as_dict": returned_dict_shapes(frame_as_dict),
+        "terminal_v1_receipt": assigned_dict_fields(v1_workload, "receipt"),
+        "terminal_v1_row": exact_object_fields(
+            v1_verifier, "terminal update evidence row"
+        ),
+        "terminal_v1_sink_common": assigned_dict_fields(
+            sink_receipt_state, "common"
+        ),
+        "terminal_v1_sink_receipt": returned_dict_shapes(sink_receipt_v1),
+        "terminal_v2_feasibility": exact_object_fields(
+            v2_verifier, "terminal presentation feasibility evidence"
+        ),
+        "terminal_v2_receipt": exact_object_fields(
+            v2_verifier, "terminal V2 receipt evidence"
+        ),
+        "terminal_v2_receipt_production": assigned_dict_fields(v2_workload, "receipt"),
+        "terminal_v2_row": exact_object_fields(
+            v2_verifier, "terminal V2 update evidence row"
+        ),
+        "terminal_v2_sink": exact_object_fields(
+            v2_verifier, "terminal sink receipt evidence"
+        ),
+        "terminal_v2_sink_receipt": returned_dict_shapes(sink_receipt_v2),
+    }
+    expected_schema_shapes = {
+        "desktop_feasibility": (terminal_v2_feasibility_fields,),
+        "terminal_frame_as_dict": ((terminal_frame_fields, 0),),
+        "terminal_v1_receipt": (terminal_v1_receipt_fields,),
+        "terminal_v1_row": (terminal_v1_row_fields,),
+        "terminal_v1_sink_common": (terminal_sink_common_fields,),
+        "terminal_v1_sink_receipt": ((frozenset({"sha256"}), 1),),
+        "terminal_v2_feasibility": (terminal_v2_feasibility_fields,),
+        "terminal_v2_receipt": (terminal_v2_receipt_fields,),
+        "terminal_v2_receipt_production": (terminal_v2_receipt_fields,),
+        "terminal_v2_row": (terminal_v2_row_fields,),
+        "terminal_v2_sink": (terminal_v2_sink_fields,),
+        "terminal_v2_sink_receipt": (
+            (
+                frozenset(
+                    {
+                        "drained_sha256",
+                        "frame_digest_chain_sha256",
+                        "written_sha256",
+                    }
+                ),
+                1,
+            ),
+        ),
+    }
+    if expected_schema_observations != expected_schema_shapes:
+        repair_failures.append("terminal V1/V2 evidence schemas differ")
+    if (
+        annotated_class_fields(trees["terminal"], "TerminalPresentedFrameV2")
+        != terminal_frame_fields
+        or returned_dict_shapes(desktop_update_as_dict)
+        != ((frozenset({"source_delivery_time_us", "source_market_time_us"}), 1),)
+    ):
+        repair_failures.append("terminal V2 production row schema differs")
+
+    v1_grammar_source = "\n".join(
+        ast.unparse(node)
+        for node in (v1_workload, v1_verifier, sink_receipt_v1)
+        if node is not None
+    )
+    v2_grammar_source = "\n".join(
+        ast.unparse(node)
+        for node in (v2_workload, v2_verifier, sink_receipt_v2)
+        if node is not None
+    )
+    v2_only_fields = {
+        "drained_sha256",
+        "frame_digest_chain_sha256",
+        "latency_boundary_policy_id",
+        "written_sha256",
+    }
+    v1_grammar_literals = {
+        item.value
+        for node in (v1_workload, v1_verifier, sink_receipt_v1)
+        if node is not None
+        for item in ast.walk(node)
+        if isinstance(item, ast.Constant) and type(item.value) is str
+    }
+    if (
+        bool(v1_grammar_literals & v2_only_fields)
+        or "sink.receipt()" not in v1_grammar_source
+        or "sink.receipt_v2()" in v1_grammar_source
+        or "sink.receipt_v2()" not in v2_grammar_source
+        or any(field not in v2_grammar_source for field in v2_only_fields)
+    ):
+        repair_failures.append("terminal historical V1 or repaired V2 grammar differs")
+
+    def assigned_dict_values(
+        node: ast.AST | None,
+        name: str,
+    ) -> dict[str, ast.AST]:
+        if node is None:
+            return {}
+        matches: list[dict[str, ast.AST]] = []
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Assign) or not isinstance(item.value, ast.Dict):
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in item.targets
+            ):
+                continue
+            if any(
+                not isinstance(key, ast.Constant) or type(key.value) is not str
+                for key in item.value.keys
+            ):
+                continue
+            matches.append(
+                {
+                    key.value: value
+                    for key, value in zip(
+                        item.value.keys, item.value.values, strict=True
+                    )
+                }
+            )
+        return matches[0] if len(matches) == 1 else {}
+
+    def expression_matches(node: ast.AST | None, source: str) -> bool:
+        if node is None:
+            return False
+        try:
+            expected = ast.parse(source, mode="eval").body
+        except SyntaxError:
+            return False
+        return ast.dump(node, include_attributes=False) == ast.dump(
+            expected, include_attributes=False
+        )
+
+    desktop_feasibility_values = assigned_dict_values(
+        desktop_present, "feasibility"
+    )
+    required_feasibility_expressions = {
+        "delivered_source_sequence_count": "len(delivered_sequences)",
+        "delivered_source_sequence_reorder_count": (
+            "sum(right < left for left, right in "
+            "zip(delivered_sequences, delivered_sequences[1:]))"
+        ),
+        "delivered_source_sequences": "list(delivered_sequences)",
+        "latency_boundary_policy_id": "policy['latency_boundary_policy_id']",
+        "presented_source_sequence_reorder_count": (
+            "sum(right < left for left, right in zip(sequences, sequences[1:]))"
+        ),
+        "presented_source_sequence_reuse_count": (
+            "sum(left == right for left, right in zip(sequences, sequences[1:]))"
+        ),
+    }
+    if any(
+        not expression_matches(desktop_feasibility_values.get(field), expression)
+        for field, expression in required_feasibility_expressions.items()
+    ):
+        repair_failures.append("terminal raw-delivery or presented counters differ")
+
+    tick_builder = top_level_function(
+        trees["desktop"], "_presentation_ticks_from_deliveries_v2"
+    )
+    input_builder = top_level_function(
+        trees["desktop"], "_terminal_presentation_inputs_v2"
+    )
+    tick_builder_source = "" if tick_builder is None else ast.unparse(tick_builder)
+    input_builder_source = "" if input_builder is None else ast.unparse(input_builder)
+    desktop_present_source = "" if desktop_present is None else ast.unparse(
+        desktop_present
+    )
+    required_tick_builder_fragments = {
+        (
+            "while cursor < len(messages) and "
+            "messages[cursor].delivery_time_us <= presentation_time:"
+        ),
+        "candidate = messages[cursor]",
+        "cursor += 1",
+        (
+            "selected is None or candidate.source_market_time_us >= "
+            "selected.source_market_time_us"
+        ),
+        "selected = candidate",
+    }
+    required_desktop_present_fragments = {
+        "delivered_sequences = tuple((item.source_sequence for item in delivered_states))",
+        "sequences = tuple((item.frame.causal_source_sequence for item in updates))",
+        "source_delivery_times != tuple(sorted(source_delivery_times))",
+        "source_market_times != tuple(sorted(source_market_times))",
+    }
+    if (
+        any(
+            fragment not in tick_builder_source
+            for fragment in required_tick_builder_fragments
+        )
+        or "delivery_time < last_delivery_time or sequence in message_sequences"
+        not in input_builder_source
+        or any(
+            fragment not in desktop_present_source
+            for fragment in required_desktop_present_fragments
+        )
+    ):
+        repair_failures.append("terminal consume-all nonregressing causal seam differs")
+
+    obsolete_terminal_literals = {
+        "LATEST_DELIVERED_MARKET_STATE_AT_OR_BEFORE_TICK_V1",
+        "source_sequence_reorder_count",
+        "source_sequence_reuse_count",
+    }
+    observed_terminal_literals = {
+        item.value
+        for tree in (trees["terminal"], trees["desktop"], trees["auxiliary"])
+        for item in ast.walk(tree)
+        if isinstance(item, ast.Constant) and type(item.value) is str
+    }
+    if observed_terminal_literals & obsolete_terminal_literals:
+        repair_failures.append("terminal repair retains obsolete policy/evidence literals")
+
+    def first_call_line(
+        node: ast.AST | None,
+        *,
+        name: str | None = None,
+        attribute: str | None = None,
+    ) -> int:
+        if node is None:
+            return 0
+        lines = [
+            item.lineno
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and (
+                (name is not None and isinstance(item.func, ast.Name) and item.func.id == name)
+                or (
+                    attribute is not None
+                    and isinstance(item.func, ast.Attribute)
+                    and item.func.attr == attribute
+                )
+            )
+        ]
+        return min(lines) if lines else 0
+
+    def assignment_line(node: ast.AST | None, name: str) -> int:
+        if node is None:
+            return 0
+        lines = [
+            item.lineno
+            for item in ast.walk(node)
+            if isinstance(item, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in (
+                    item.targets if isinstance(item, ast.Assign) else [item.target]
+                )
+            )
+        ]
+        return min(lines) if lines else 0
+
+    presenter_method = class_method(
+        trees["terminal"], "TerminalFramePresenterV2", "present"
+    )
+    latency_order = (
+        assignment_line(presenter_method, "started_ns"),
+        first_call_line(presenter_method, name="render_terminal_frame"),
+        first_call_line(presenter_method, attribute="sha256"),
+        first_call_line(presenter_method, attribute="write_and_flush"),
+        assignment_line(presenter_method, "latency_ns"),
+        first_call_line(
+            presenter_method, name="advance_terminal_frame_digest_chain_v1"
+        ),
+        first_call_line(presenter_method, name="TerminalPresentedFrameV2"),
+    )
+    if not all(
+        left < right for left, right in zip(latency_order, latency_order[1:])
+    ):
+        repair_failures.append("terminal render/hash/write/drain latency boundary differs")
+
+    sink_write = class_method(
+        trees["auxiliary"], "_ContinuouslyDrainedPty", "write_and_flush"
+    )
+    sink_write_source = "" if sink_write is None else ast.unparse(sink_write)
+    v2_verifier_source = "" if v2_verifier is None else ast.unparse(v2_verifier)
+    if (
+        top_level_function(
+            trees["terminal"], "advance_terminal_frame_digest_chain_v1"
+        )
+        is None
+        or "self._written_digest.update(payload)" not in sink_write_source
+        or "self._bytes_read < target" not in sink_write_source
+        or "advance_terminal_frame_digest_chain_v1" not in sink_write_source
+        or "advance_terminal_frame_digest_chain_v1" not in v2_verifier_source
+        or "terminal_bytes = sum(frame_bytes)" not in v2_verifier_source
+        or "terminal['written_sha256'] != terminal['drained_sha256']"
+        not in v2_verifier_source
+        or (
+            "terminal['frame_digest_chain_sha256'] != "
+            "frame_digest_chain_sha256"
+        )
+        not in v2_verifier_source
+    ):
+        repair_failures.append("terminal PTY byte or ordered-frame digest proof differs")
+
+    def qualified_attribute_calls(
+        node: ast.AST | None,
+        owner: str,
+        attribute: str,
+    ) -> tuple[ast.Call, ...]:
+        if node is None:
+            return ()
+        return tuple(
+            item
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == attribute
+            and isinstance(item.func.value, ast.Name)
+            and item.func.value.id == owner
+        )
+
+    def call_keyword(call: ast.Call, name: str) -> ast.AST | None:
+        matching = tuple(item.value for item in call.keywords if item.arg == name)
+        return matching[0] if len(matching) == 1 else None
+
+    def expression_count(node: ast.AST | None, source: str) -> int:
+        if node is None:
+            return 0
+        try:
+            expected = ast.parse(source, mode="eval").body
+        except SyntaxError:
+            return 0
+        expected_dump = ast.dump(expected, include_attributes=False)
+        return sum(
+            ast.dump(item, include_attributes=False) == expected_dump
+            for item in ast.walk(node)
+            if isinstance(item, ast.expr)
+        )
+
+    def unguarded_call_count(
+        node: ast.AST | None,
+        *,
+        name: str | None = None,
+        receiver: str | None = None,
+        attribute: str | None = None,
+    ) -> int:
+        if node is None:
+            return 0
+        parent = {
+            child: item
+            for item in ast.walk(node)
+            for child in ast.iter_child_nodes(item)
+        }
+        count = 0
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Call):
+                continue
+            matches_name = (
+                name is not None
+                and isinstance(item.func, ast.Name)
+                and item.func.id == name
+            )
+            matches_attribute = (
+                receiver is not None
+                and attribute is not None
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == attribute
+                and isinstance(item.func.value, ast.Name)
+                and item.func.value.id == receiver
+            )
+            if not (matches_name or matches_attribute):
+                continue
+            ancestor = parent.get(item)
+            guarded = False
+            while ancestor is not None and ancestor is not node:
+                if isinstance(ancestor, ast.If):
+                    guarded = True
+                    break
+                ancestor = parent.get(ancestor)
+            if not guarded:
+                count += 1
+        return count
+
+    runtime_restore = class_method(
+        trees["runtime"], "FullDayRuntime", "from_checkpoint_state"
+    )
+    mechanics_restore = class_method(
+        trees["mechanics"], "MarketMechanicsEngine", "_restore_checkpoint_state"
+    )
+    mechanics_public_restore = class_method(
+        trees["mechanics"], "MarketMechanicsEngine", "from_checkpoint_state"
+    )
+    mechanics_private_restore = class_method(
+        trees["mechanics"],
+        "MarketMechanicsEngine",
+        "_from_full_day_checkpoint_state",
+    )
+    ecology_restore = class_method(
+        trees["ecology"], "AgentScheduler", "_restore_checkpoint_state"
+    )
+    ecology_public_restore = class_method(
+        trees["ecology"], "AgentScheduler", "from_checkpoint_state"
+    )
+    ecology_private_restore = class_method(
+        trees["ecology"], "AgentScheduler", "_from_full_day_checkpoint_state"
+    )
+
+    token_assignments = tuple(
+        item
+        for tree in (trees["runtime"], trees["mechanics"], trees["ecology"])
+        for item in tree.body
+        if isinstance(item, ast.Assign)
+        and len(item.targets) == 1
+        and isinstance(item.targets[0], ast.Name)
+        and item.targets[0].id == "_NESTED_RESTORE_CONSTRUCTION_TOKEN"
+    )
+    token_owner_exact = (
+        len(token_assignments) == 1
+        and isinstance(token_assignments[0].value, ast.Call)
+        and isinstance(token_assignments[0].value.func, ast.Name)
+        and token_assignments[0].value.func.id == "object"
+        and not token_assignments[0].value.args
+        and not token_assignments[0].value.keywords
+        and token_assignments[0] in trees["runtime"].body
+    )
+
+    runtime_mechanics_calls = qualified_attribute_calls(
+        runtime_restore,
+        "MarketMechanicsEngine",
+        "_from_full_day_checkpoint_state",
+    )
+    runtime_scheduler_calls = qualified_attribute_calls(
+        runtime_restore,
+        "AgentScheduler",
+        "_from_full_day_checkpoint_state",
+    )
+    runtime_private_forwarding_exact = all(
+        len(calls) == 1
+        and isinstance(call_keyword(calls[0], "_construction_token"), ast.Name)
+        and call_keyword(calls[0], "_construction_token").id  # type: ignore[union-attr]
+        == "_NESTED_RESTORE_CONSTRUCTION_TOKEN"
+        for calls in (runtime_mechanics_calls, runtime_scheduler_calls)
+    )
+
+    def wrapper_token_is(
+        node: ast.AST | None,
+        expected_name: str | None,
+    ) -> bool:
+        calls = qualified_attribute_calls(node, "cls", "_restore_checkpoint_state")
+        if len(calls) != 1:
+            return False
+        value = call_keyword(calls[0], "_construction_token")
+        if expected_name is None:
+            return isinstance(value, ast.Constant) and value.value is None
+        return isinstance(value, ast.Name) and value.id == expected_name
+
+    child_wrapper_forwarding_exact = (
+        wrapper_token_is(mechanics_public_restore, None)
+        and wrapper_token_is(mechanics_private_restore, "_construction_token")
+        and wrapper_token_is(ecology_public_restore, None)
+        and wrapper_token_is(ecology_private_restore, "_construction_token")
+    )
+    mechanics_defer_exact = (
+        expression_count(mechanics_restore, "_construction_token is not None") == 1
+        and expression_count(
+            mechanics_restore,
+            "_construction_token is not _NESTED_RESTORE_CONSTRUCTION_TOKEN",
+        )
+        == 1
+        and expression_count(
+            mechanics_restore,
+            "not defer_full_day_fixed_point and "
+            "_canonical_json_bytes(engine.checkpoint_state()) "
+            "!= _canonical_json_bytes(payload)",
+        )
+        == 1
+        and sum(
+            isinstance(item, ast.Name)
+            and item.id == "defer_full_day_fixed_point"
+            and isinstance(item.ctx, ast.Load)
+            for item in ast.walk(mechanics_restore)
+        )
+        == 2
+    )
+    ecology_defer_exact = (
+        expression_count(ecology_restore, "_construction_token is not None") == 1
+        and expression_count(
+            ecology_restore,
+            "_construction_token is not _NESTED_RESTORE_CONSTRUCTION_TOKEN",
+        )
+        == 1
+        and expression_count(
+            ecology_restore,
+            "not defer_full_day_fixed_point and "
+            "canonical_json_bytes(scheduler.checkpoint_state()) "
+            "!= canonical_json_bytes(payload)",
+        )
+        == 1
+        and sum(
+            isinstance(item, ast.Name)
+            and item.id == "defer_full_day_fixed_point"
+            and isinstance(item.ctx, ast.Load)
+            for item in ast.walk(ecology_restore)
+        )
+        == 2
+    )
+    outer_fixed_point_count = expression_count(
+        runtime_restore,
+        "canonical_json_bytes(runtime.checkpoint_state()) "
+        "!= canonical_json_bytes(payload)",
+    )
+    mechanics_restore_source = (
+        "" if mechanics_restore is None else ast.unparse(mechanics_restore)
+    )
+    ecology_restore_source = "" if ecology_restore is None else ast.unparse(
+        ecology_restore
+    )
+    runtime_restore_source = "" if runtime_restore is None else ast.unparse(
+        runtime_restore
+    )
+    child_validation_exact = (
+        unguarded_call_count(
+            mechanics_restore, name="_validate_strict_checkpoint_json"
+        )
+        == 1
+        and unguarded_call_count(mechanics_restore, name="_require_exact_fields")
+        >= 1
+        and unguarded_call_count(
+            mechanics_restore, receiver="engine", attribute="assert_invariants"
+        )
+        == 1
+        and unguarded_call_count(ecology_restore, name="validate_strict_json") == 1
+        and unguarded_call_count(
+            ecology_restore, receiver="scheduler", attribute="assert_invariants"
+        )
+        == 1
+        and "if set(payload) != expected:" in ecology_restore_source
+        and "if set(raw_state) != state_expected:" in ecology_restore_source
+        and "payload['definition_sha256'] != definition.sha256()"
+        in ecology_restore_source
+        and "payload['engine_state_sha256'] != engine_state_sha256"
+        in ecology_restore_source
+        and "validate_strict_json(payload)" in runtime_restore_source
+        and "_require_exact_fields(payload, expected, 'FullDayRuntime checkpoint')"
+        in runtime_restore_source
+        and "payload['engine_state_sha256'] != canonical_sha256(raw_engine)"
+        in runtime_restore_source
+        and "raw_scheduler['state_sha256'] != canonical_sha256(raw_scheduler_state)"
+        in runtime_restore_source
+        and "_validate_strict_checkpoint_json(payload)" in mechanics_restore_source
+    )
+    restore_structure = {
+        "child_validation_unconditional": child_validation_exact,
+        "child_wrapper_forwarding_exact": child_wrapper_forwarding_exact,
+        "ecology_canonical_only_deferred": ecology_defer_exact,
+        "mechanics_canonical_only_deferred": mechanics_defer_exact,
+        "outer_fixed_point_count": outer_fixed_point_count,
+        "runtime_private_forwarding_exact": runtime_private_forwarding_exact,
+        "token_owner_exact": token_owner_exact,
+    }
+    if (
+        not all(
+            value is True
+            for key, value in restore_structure.items()
+            if key != "outer_fixed_point_count"
+        )
+        or outer_fixed_point_count != 1
+    ):
+        repair_failures.append("composed restore ownership or fixed-point structure differs")
+
+    restore_probe_results: dict[str, str] = {}
+    try:
+        from kirby2.agents.ecology import AgentScheduler
+        from kirby2.exchange.mechanics_engine import MarketMechanicsEngine
+
+        restore_probes = {
+            "mechanics_public_extra_field": lambda: (
+                MarketMechanicsEngine.from_checkpoint_state({"unexpected": None})
+            ),
+            "mechanics_wrong_private_token": lambda: (
+                MarketMechanicsEngine._from_full_day_checkpoint_state(
+                    {}, _construction_token=object()
+                )
+            ),
+            "scheduler_public_extra_field": lambda: (
+                AgentScheduler.from_checkpoint_state(
+                    {"unexpected": None}, engine=object()  # type: ignore[arg-type]
+                )
+            ),
+            "scheduler_wrong_private_token": lambda: (
+                AgentScheduler._from_full_day_checkpoint_state(
+                    {},
+                    engine=object(),  # type: ignore[arg-type]
+                    clock=None,
+                    order_id_allocator=None,
+                    _prevalidated_engine_state_sha256="0" * 64,
+                    _construction_token=object(),
+                )
+            ),
+        }
+        for probe_id, probe in restore_probes.items():
+            try:
+                probe()
+            except Exception as error:
+                restore_probe_results[probe_id] = type(error).__name__
+            else:
+                restore_probe_results[probe_id] = "NO_EXCEPTION"
+    except (ImportError, OSError, RuntimeError) as error:
+        repair_failures.append(
+            f"composed restore bounded probes failed: {type(error).__name__}"
+        )
+    expected_restore_probe_results = {
+        "mechanics_public_extra_field": "ValueError",
+        "mechanics_wrong_private_token": "TypeError",
+        "scheduler_public_extra_field": "ValueError",
+        "scheduler_wrong_private_token": "TypeError",
+    }
+    if restore_probe_results != expected_restore_probe_results:
+        repair_failures.append("composed restore hostile refusals differ")
+
+    workload_router = top_level_function(trees["auxiliary"], "_terminal_update_workload")
+    evidence_router = top_level_function(trees["auxiliary"], "_verify_terminal_evidence")
+    validator = top_level_function(trees["auxiliary"], "_validate_template_contract")
+    validator_source = "" if validator is None else ast.unparse(validator)
+    if not {
+        "_terminal_update_workload_v1",
+        "_terminal_update_workload_v2",
+    }.issubset(direct_called_names(workload_router)):
+        repair_failures.append("terminal workload does not retain closed V1/V2 branches")
+    if not {
+        "_verify_terminal_evidence_v1",
+        "_verify_terminal_evidence_v2",
+    }.issubset(direct_called_names(evidence_router)):
+        repair_failures.append("terminal verifier does not retain closed V1/V2 branches")
+    if (
+        "'presentation' not in parameters" not in ast.unparse(workload_router)
+        if workload_router is not None
+        else True
+    ):
+        repair_failures.append("legacy terminal selection is not absence-only")
+    if (
+        "RELEASE_TERMINAL_PRESENTATION_POLICY_V2" not in validator_source
+        or "legacy_keys" not in validator_source
+        or "presentation" not in validator_source
+    ):
+        repair_failures.append("terminal template validator does not require exact V2 policy")
+
+    try:
+        current_protocol = tomllib.loads(
+            (repository / "release/performance_thresholds.toml").read_text(
+                encoding="utf-8"
+            )
+        )
+        historical_protocol = tomllib.loads(
+            git_blob("release/performance_thresholds.toml").decode("utf-8")
+        )
+        current_projection = json.loads(json.dumps(current_protocol))
+        terminal_rows = [
+            row
+            for row in current_projection.get("auxiliary_templates", [])
+            if type(row) is dict and row.get("workload_id") == "RELEASE_TERMINAL_UPDATE_V1"
+        ]
+        if len(terminal_rows) != 1:
+            raise ValueError("active terminal template count differs")
+        parameters = terminal_rows[0]["input_identity"]["parameters"]
+        presentation = parameters.pop("presentation")
+        if presentation != expected_policy or current_projection != historical_protocol:
+            raise ValueError("protocol changed beyond the V2 presentation identity")
+    except (KeyError, OSError, TypeError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError) as error:
+        presentation = None
+        repair_failures.append(
+            f"terminal protocol compatibility failed: {type(error).__name__}"
+        )
+
+    store_session = top_level_class(trees["store"], "VerifiedFullDaySessionV1")
+    store_class = top_level_class(trees["store"], "FullDayStore")
+    store_methods = set()
+    if store_class is not None:
+        store_methods = {
+            item.name for item in store_class.body if isinstance(item, ast.FunctionDef)
+        }
+    session_methods = set()
+    if store_session is not None:
+        session_methods = {
+            item.name for item in store_session.body if isinstance(item, ast.FunctionDef)
+        }
+    if (
+        store_session is None
+        or "open_verified_day" not in store_methods
+        or not {"seek", "inspection"}.issubset(session_methods)
+    ):
+        repair_failures.append("one-context verified full-day store surface is incomplete")
+    microscope = top_level_function(trees["auxiliary"], "_microscope_attempt")
+    microscope_attributes = [
+        item.func.attr
+        for item in ast.walk(microscope)
+        if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute)
+    ] if microscope is not None else []
+    if (
+        microscope_attributes.count("open_verified_day") != 1
+        or microscope_attributes.count("seek") != 1
+        or microscope_attributes.count("inspection") != 1
+    ):
+        repair_failures.append("microscope repetition does not use one verified context")
+
+    def attribute_call_count(node: ast.AST | None, name: str) -> int:
+        if node is None:
+            return 0
+        return sum(
+            1
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == name
+        )
+
+    measured_functions = (
+        "_generation_attempt",
+        "_replay_attempt",
+        "_microscope_attempt",
+        "_interactive_ack_workload",
+        "_terminal_update_workload_v1",
+    )
+    measured_clock_counts = {
+        name: attribute_call_count(
+            top_level_function(trees["auxiliary"], name), "perf_counter_ns"
+        )
+        for name in measured_functions
+    }
+    presenter = top_level_class(trees["terminal"], "TerminalFramePresenterV2")
+    presenter_method = None
+    if presenter is not None:
+        presenter_method = next(
+            (
+                item
+                for item in presenter.body
+                if isinstance(item, ast.FunctionDef) and item.name == "present"
+            ),
+            None,
+        )
+    measured_clock_counts["TerminalFramePresenterV2.present"] = attribute_call_count(
+        presenter_method, "perf_counter_ns"
+    )
+    auxiliary_monotonic_ns = attribute_call_count(trees["auxiliary"], "monotonic_ns")
+    auxiliary_deadline_monotonic = attribute_call_count(
+        top_level_function(trees["auxiliary"], "_ContinuouslyDrainedPty"),
+        "monotonic",
+    )
+    # The PTY method lives on a class; count against the full tree to retain the
+    # distinction between measured samples and timeout coordination.
+    auxiliary_monotonic = attribute_call_count(trees["auxiliary"], "monotonic")
+    coordinator_monotonic_ns = attribute_call_count(trees["execution"], "monotonic_ns")
+    if (
+        any(count < 2 for count in measured_clock_counts.values())
+        or auxiliary_monotonic_ns != 0
+        or auxiliary_monotonic < 2
+        or coordinator_monotonic_ns < 8
+    ):
+        repair_failures.append("measured and coordinator clock authorities are not separated")
+    repair_case = _case(
+        "terminal_microscope_and_clock_repairs_are_explicit_and_compatible",
+        "V1 stays historical; V2, composed restore, microscope, and clock ownership are exact.",
+        {
+            "coordinator_monotonic_ns_calls": coordinator_monotonic_ns,
+            "legacy_evidence_parsed": performance_checks != {},
+            "latency_boundary_line_order": list(latency_order),
+            "measured_perf_counter_ns_calls": measured_clock_counts,
+            "microscope_call_projection": microscope_attributes,
+            "numeric_threshold_changes": 0,
+            "presentation_policy": presentation,
+            "restore_hostile_refusals": restore_probe_results,
+            "restore_structure": restore_structure,
+            "terminal_evidence_fields": {
+                "v1_receipt": sorted(terminal_v1_receipt_fields),
+                "v1_row": sorted(terminal_v1_row_fields),
+                "v1_sink": sorted(terminal_v1_sink_fields),
+                "v2_feasibility": sorted(terminal_v2_feasibility_fields),
+                "v2_receipt": sorted(terminal_v2_receipt_fields),
+                "v2_row": sorted(terminal_v2_row_fields),
+                "v2_sink": sorted(terminal_v2_sink_fields),
+            },
+            "workload_invocations": 0,
+        },
+        repair_failures,
+    )
+
+    cases = (
+        authority_case,
+        historical_case,
+        history_case,
+        repair_case,
+    )
+    if len(cases) != DEV0017_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0017 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0017",
+        cases,
+        metadata=(
+            ("executor_invocations", "0"),
+            ("history_rollover_invocations", "0"),
+            ("interrupted_card", "WO40-J"),
+            ("predecessor_commit", predecessor),
+            ("provider_invocations", "0"),
+            ("workload_invocations", "0"),
         ),
     )
 

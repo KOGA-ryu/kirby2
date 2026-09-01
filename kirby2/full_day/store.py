@@ -10,7 +10,7 @@ import re
 import stat
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -75,6 +75,7 @@ FULL_DAY_DIAGNOSTICS_MEDIA_TYPE = (
 _RUN_ID = re.compile(r"run-[0-9a-f]{24}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _WINDOW_POLICY_IDS = frozenset({"OBSERVABLE_CONTEXT_V1"})
+_VERIFIED_FULL_DAY_SESSION_TOKEN = object()
 _SEALED_ARTIFACT_TYPES = frozenset(
     {ArtifactType.FULL_DAY_PLAN, ArtifactType.FULL_DAY_CHECKPOINT}
 )
@@ -447,6 +448,49 @@ class FullDaySeekResultV1:
                 self.uninterrupted_event_prefix_sha256
             ),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedFullDaySessionV1:
+    """One operation-scoped, deeply verified view of an immutable full day."""
+
+    _store: FullDayStore = field(repr=False, compare=False)
+    _loaded: VerifiedFullDayRunV1 = field(repr=False, compare=False)
+    verification: FullDayVerificationReportV1
+    _construction_token: InitVar[object]
+
+    def __post_init__(self, _construction_token: object) -> None:
+        if _construction_token is not _VERIFIED_FULL_DAY_SESSION_TOKEN:
+            raise TypeError("verified full-day sessions require the store verifier")
+        if type(self._store) is not FullDayStore:
+            raise TypeError("verified full-day session requires its verifying store")
+        if type(self._loaded) is not VerifiedFullDayRunV1:
+            raise TypeError("verified full-day session requires a typed loaded run")
+        if (
+            type(self.verification) is not FullDayVerificationReportV1
+            or not self.verification.passed
+            or self.verification.run_id != self._loaded.manifest.run_id
+        ):
+            raise ValueError("verified full-day session requires its passing report")
+
+    @property
+    def run_id(self) -> str:
+        return self._loaded.manifest.run_id
+
+    @property
+    def plan(self) -> FullDayPlanV1:
+        return self._loaded.plan
+
+    def inspection(self) -> dict[str, object]:
+        payload = FullDayStore._inspect_complete(self._loaded)
+        payload["verification"] = self.verification.as_dict()
+        return payload
+
+    def seek(self, target_time_us: int) -> FullDaySeekResultV1:
+        return self._store._seek_loaded(
+            self._loaded,
+            target_time_us,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1264,7 +1308,12 @@ class FullDayStore:
             event.component_local_sequence,
         )
 
-    def _load_complete_run(self, manifest: RunManifest) -> VerifiedFullDayRunV1:
+    def _load_complete_run(
+        self,
+        manifest: RunManifest,
+        *,
+        bundle: tuple[Path, Mapping[str, bytes]] | None = None,
+    ) -> VerifiedFullDayRunV1:
         if manifest.session_objective != "FULL_DAY_GENERATION" or manifest.parent_run_id is not None:
             raise ValueError("run is not a complete generated full day")
         if manifest.schema_version != RUN_MANIFEST_SCHEMA_VERSION or manifest.schema_versions != {
@@ -1275,7 +1324,9 @@ class FullDayStore:
             "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
         }:
             raise ValueError("complete full-day manifest schema inventory is unsupported")
-        _directory, payloads = self._load_bundle_bytes(manifest)
+        _directory, payloads = (
+            self._load_bundle_bytes(manifest) if bundle is None else bundle
+        )
         by_type = self._references_by_type(manifest)
         required_singletons = (
             ArtifactType.FULL_DAY_PLAN,
@@ -1367,11 +1418,9 @@ class FullDayStore:
                 raise ValueError("checkpoint index typed reference differs from manifest")
             raw = payloads[entry.artifact.relative_path]
             runtime = FullDayRuntime.from_canonical_state_bytes(raw)
-            if runtime.canonical_state_bytes() != raw:
-                raise ValueError("checkpoint runtime bytes are not a restore fixed point")
             if runtime.plan != plan or runtime.clock.current_time_us != entry.cut_time_us:
                 raise ValueError("checkpoint runtime plan/time differs from its index entry")
-            if runtime.state_sha256() != entry.checkpoint_semantic_sha256:
+            if _sha256_bytes(raw) != entry.checkpoint_semantic_sha256:
                 raise ValueError("checkpoint semantic digest differs after restore")
             if len(runtime.events) != entry.cut.last_global_event_sequence:
                 raise ValueError("checkpoint event sequence differs from its quiescent cut")
@@ -1396,8 +1445,10 @@ class FullDayStore:
                 raise ValueError(
                     "checkpoint subsystem prefix differs from stored native ledgers"
                 )
-            state = runtime.checkpoint_state()
-            if state["implementation_version"] != entry.runtime_implementation_version:
+            if (
+                entry.runtime_implementation_version
+                != FULL_DAY_RUNTIME_IMPLEMENTATION_VERSION
+            ):
                 raise ValueError("checkpoint runtime implementation metadata differs")
             restored_by_entry.append((entry, runtime))
 
@@ -1418,7 +1469,6 @@ class FullDayStore:
             for key in final_native
         ):
             raise ValueError("final checkpoint does not reproduce subsystem ledgers")
-        final_runtime.assert_invariants()
         if canonical_sha256(final_runtime.result_projection()) != manifest.result_digest:
             raise ValueError("final runtime result digest differs from the manifest")
 
@@ -1500,7 +1550,12 @@ class FullDayStore:
             summary=summary,
         )
 
-    def _load_window_run(self, manifest: RunManifest) -> FullDayWindowV1:
+    def _load_window_run(
+        self,
+        manifest: RunManifest,
+        *,
+        bundle: tuple[Path, Mapping[str, bytes]] | None = None,
+    ) -> FullDayWindowV1:
         if manifest.session_objective != "FULL_DAY_WINDOW_EXTRACTION" or manifest.parent_run_id is None:
             raise ValueError("run is not an extracted full-day window")
         if manifest.schema_version != RUN_MANIFEST_SCHEMA_VERSION or manifest.schema_versions != {
@@ -1508,7 +1563,9 @@ class FullDayStore:
             "run_manifest": RUN_MANIFEST_SCHEMA_VERSION,
         }:
             raise ValueError("full-day window manifest schema inventory is unsupported")
-        _directory, payloads = self._load_bundle_bytes(manifest)
+        _directory, payloads = (
+            self._load_bundle_bytes(manifest) if bundle is None else bundle
+        )
         by_type = self._references_by_type(manifest)
         reference = self._one_reference(by_type, ArtifactType.FULL_DAY_WINDOW)
         if len(manifest.artifacts) != 1:
@@ -1623,22 +1680,19 @@ class FullDayStore:
         try:
             manifest = self.load_manifest(run_id)
             flags["manifest_valid"] = True
-            self._load_bundle_bytes(manifest)
+            bundle = self._load_bundle_bytes(manifest)
             flags["artifact_inventory_valid"] = True
             flags["artifact_digests_valid"] = True
             if manifest.session_objective == "FULL_DAY_GENERATION":
-                loaded = self._load_complete_run(manifest)
+                loaded = self._load_complete_run(manifest, bundle=bundle)
                 flags["canonical_payloads_valid"] = True
                 flags["checkpoints_valid"] = True
                 flags["replay_valid"] = True
                 flags["summary_valid"] = True
-                safe = self._inspect_complete(loaded)
-                forbidden = {"seed_policy", "checkpoint_state", "rng_state", "scheduled_events"}
-                if any(key in json.dumps(safe, sort_keys=True) for key in forbidden):
-                    raise ValueError("ordinary inspection leaks sealed full-day state")
+                self._validate_inspection_privacy(loaded)
                 flags["privacy_contract_valid"] = True
             elif manifest.session_objective == "FULL_DAY_WINDOW_EXTRACTION":
-                self._load_window_run(manifest)
+                self._load_window_run(manifest, bundle=bundle)
                 flags["canonical_payloads_valid"] = True
                 flags["checkpoints_valid"] = True
                 flags["replay_valid"] = True
@@ -1656,7 +1710,9 @@ class FullDayStore:
 
     def _verified_complete(self, run_id: str) -> VerifiedFullDayRunV1:
         try:
-            return self._load_complete_run(self.load_manifest(run_id))
+            manifest = self.load_manifest(run_id)
+            bundle = self._load_bundle_bytes(manifest)
+            return self._load_complete_run(manifest, bundle=bundle)
         except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
             raise ValueError(f"full-day run verification failed: {error}") from error
 
@@ -1699,26 +1755,79 @@ class FullDayStore:
             "summary": loaded.summary.as_dict(),
         }
 
+    @classmethod
+    def _validate_inspection_privacy(cls, loaded: VerifiedFullDayRunV1) -> None:
+        safe = cls._inspect_complete(loaded)
+        forbidden = {
+            "seed_policy",
+            "checkpoint_state",
+            "rng_state",
+            "scheduled_events",
+        }
+        if any(key in json.dumps(safe, sort_keys=True) for key in forbidden):
+            raise ValueError("ordinary inspection leaks sealed full-day state")
+
+    @staticmethod
+    def _passing_verification(run_id: str) -> FullDayVerificationReportV1:
+        return FullDayVerificationReportV1(
+            run_id=run_id,
+            manifest_valid=True,
+            artifact_inventory_valid=True,
+            artifact_digests_valid=True,
+            canonical_payloads_valid=True,
+            checkpoints_valid=True,
+            replay_valid=True,
+            summary_valid=True,
+            privacy_contract_valid=True,
+            failures=(),
+        )
+
+    def _open_verified_complete(
+        self,
+        manifest: RunManifest,
+    ) -> VerifiedFullDaySessionV1:
+        bundle = self._load_bundle_bytes(manifest)
+        loaded = self._load_complete_run(manifest, bundle=bundle)
+        self._validate_inspection_privacy(loaded)
+        return VerifiedFullDaySessionV1(
+            _store=self,
+            _loaded=loaded,
+            verification=self._passing_verification(manifest.run_id),
+            _construction_token=_VERIFIED_FULL_DAY_SESSION_TOKEN,
+        )
+
+    def open_verified_day(self, run_id: str) -> VerifiedFullDaySessionV1:
+        """Load and deeply verify one complete day for related projections."""
+
+        try:
+            return self._open_verified_complete(self.load_manifest(run_id))
+        except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
+            raise ValueError(f"full-day run verification failed: {error}") from error
+
     def inspect_day(self, run_id: str) -> dict[str, object]:
         manifest = self.load_manifest(run_id)
-        report = self.verify_day(run_id)
-        if not report.passed:
-            raise ValueError("full-day run failed inspection verification")
-        if manifest.session_objective == "FULL_DAY_GENERATION":
-            payload = self._inspect_complete(self._load_complete_run(manifest))
-        else:
-            window = self._load_window_run(manifest)
-            payload = {
-                "end_time_us": window.end_time_us,
-                "event_count": len(window.outer_events),
-                "parent_run_id": window.parent_run_id,
-                "reveal_policy": window.reveal_policy,
-                "run_id": manifest.run_id,
-                "run_type": manifest.run_type.value,
-                "start_time_us": window.start_time_us,
-            }
-        payload["verification"] = report.as_dict()
-        return payload
+        try:
+            if manifest.session_objective == "FULL_DAY_GENERATION":
+                return self._open_verified_complete(manifest).inspection()
+            if manifest.session_objective == "FULL_DAY_WINDOW_EXTRACTION":
+                bundle = self._load_bundle_bytes(manifest)
+                window = self._load_window_run(manifest, bundle=bundle)
+                payload: dict[str, object] = {
+                    "end_time_us": window.end_time_us,
+                    "event_count": len(window.outer_events),
+                    "parent_run_id": window.parent_run_id,
+                    "reveal_policy": window.reveal_policy,
+                    "run_id": manifest.run_id,
+                    "run_type": manifest.run_type.value,
+                    "start_time_us": window.start_time_us,
+                }
+                payload["verification"] = self._passing_verification(
+                    manifest.run_id
+                ).as_dict()
+                return payload
+            raise ValueError("unsupported FULL_DAY session objective")
+        except (OSError, TypeError, ValueError, RuntimeError, KeyError) as error:
+            raise ValueError("full-day run failed inspection verification") from error
 
     def _seek_loaded(
         self,
@@ -1763,7 +1872,6 @@ class FullDayStore:
             for key in runtime_native
         ):
             raise ValueError("sought runtime subsystem prefix differs from its parent")
-        runtime.assert_invariants()
         return FullDaySeekResultV1(
             run_id=run_id,
             target_time_us=target,
@@ -1979,4 +2087,5 @@ __all__ = [
     "FullDayVerificationReportV1",
     "FullDayWindowV1",
     "VerifiedFullDayRunV1",
+    "VerifiedFullDaySessionV1",
 ]

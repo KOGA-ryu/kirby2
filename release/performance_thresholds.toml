@@ -108,6 +108,20 @@ start_selector = "CONTINUOUS_START"
 warmup_updates = 100
 measured_updates = 5000
 
+[auxiliary_templates.input_identity.parameters.presentation]
+schema_version = 2
+policy_id = "RELEASE_TERMINAL_PRESENTATION_V2"
+frame_milliseconds = 50
+simulation_speed_milli = 10000
+simulation_step_us = 500000
+boundary_policy_id = "CONTINUOUS_INCLUDE_START_EXCLUDE_END_V1"
+update_ordinal_policy_id = "CONTIGUOUS_VISIBLE_UPDATES_FROM_ZERO_V1"
+causal_source_policy_id = "LATEST_NONREGRESSING_CLIENT_VISIBLE_MARKET_STATE_AT_OR_BEFORE_TICK_V1"
+duplicate_source_policy_id = "ALLOW_REUSE_AND_ASYNC_SEQUENCE_REORDER_V1"
+visible_change_policy_id = "ADJACENT_RENDERED_FRAME_SHA256_DIFFERS_V1"
+clock_source_id = "TIME_PERF_COUNTER_NS_V1"
+latency_boundary_policy_id = "RENDER_HASH_WRITE_AND_DRAIN_V1"
+
 [auxiliary_templates.input_identity.parameters.terminal]
 columns = 120
 rows = 40

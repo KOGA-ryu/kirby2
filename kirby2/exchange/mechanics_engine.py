@@ -988,12 +988,20 @@ class MarketMechanicsEngine:
         return _canonical_json_bytes(self.checkpoint_state())
 
     @classmethod
-    def from_checkpoint_state(
+    def _restore_checkpoint_state(
         cls,
         payload: Mapping[str, object],
+        *,
+        _construction_token: object | None,
     ) -> MarketMechanicsEngine:
         """Validate and detach a checkpoint before returning a restored engine."""
 
+        defer_full_day_fixed_point = _construction_token is not None
+        if defer_full_day_fixed_point:
+            from kirby2.full_day.runtime import _NESTED_RESTORE_CONSTRUCTION_TOKEN
+
+            if _construction_token is not _NESTED_RESTORE_CONSTRUCTION_TOKEN:
+                raise TypeError("mechanics nested-restore construction token differs")
         if not isinstance(payload, Mapping):
             raise TypeError("market-mechanics checkpoint state must be a mapping")
         _validate_strict_checkpoint_json(payload)
@@ -1232,11 +1240,36 @@ class MarketMechanicsEngine:
             engine.assert_invariants()
         finally:
             engine._validating_outer_replay = False
-        if _canonical_json_bytes(engine.checkpoint_state()) != _canonical_json_bytes(
-            payload
+        if (
+            not defer_full_day_fixed_point
+            and _canonical_json_bytes(engine.checkpoint_state())
+            != _canonical_json_bytes(payload)
         ):
             raise ValueError("market-mechanics checkpoint state is not canonical")
         return engine
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+    ) -> MarketMechanicsEngine:
+        """Restore one standalone engine with its own canonical fixed point."""
+
+        return cls._restore_checkpoint_state(payload, _construction_token=None)
+
+    @classmethod
+    def _from_full_day_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        _construction_token: object,
+    ) -> MarketMechanicsEngine:
+        """Restore beneath FullDayRuntime's complete outer fixed point."""
+
+        return cls._restore_checkpoint_state(
+            payload,
+            _construction_token=_construction_token,
+        )
 
     @classmethod
     def from_canonical_state_bytes(

@@ -1160,3 +1160,237 @@ the deviation gate proves the public source seams, execution policy, command rou
 publication/deep-verification surface, and frozen threshold bytes without importing
 the performance executor, starting a worker, opening a provider, or running any
 performance or auxiliary workload.
+
+## DEV-0017 — Repair measured performance failures and restart closeout
+
+- Interrupted canonical card: `WO40-J`; closeout remains interrupted until the
+  immutable failed `WO40-I` result is preserved, its measured failures are repaired,
+  and `WO40-F`, `WO40-G`, `WO40-H`, and `WO40-I` are requalified in that order.
+- Exact first-parent predecessor:
+  `8ee892575372c3e296454ae6c3b2b991e481699e`
+- Historical release: the predecessor is a deeply verified `WO40-I` evidence commit
+  for source candidate `10b0d205ce0efdeff5e4e833c7cbfa808ccaf1cc`.
+  Its `WO40-F`, `WO40-G`, and `WO40-H` evidence is `PASS`; its `WO40-I`
+  evidence is an honest terminal `FAIL`, not an executor, publication, or verifier
+  failure.  Before any repaired candidate replaces the active store, preserve the
+  current `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`, all four F-I evidence
+  documents, and the complete active `.kirby2/release` tree at
+  `.kirby2/release-history/8ee892575372c3e296454ae6c3b2b991e481699e/`.
+  The V3 history manifest records each gate's actual status, inventories every
+  regular file, and binds every size, SHA-256, and historical mode.  It may not
+  reduce the snapshot to the evidence documents' immediate records: the WO40-I
+  activation depends on its aggregate, attempt, auxiliary results, all 10,000
+  work-unit/result/artifact/audit publications, and their content-addressed objects.
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-I`
+- Observed terminal result: `RELEASE_AUDIT FAIL` for a deeply verified, canonically
+  published performance result.  All twelve row cells, exactly 10,000 unique
+  complete work units, full result/artifact/audit accounting, deterministic
+  aggregate, retry policy, interactive ACK, and full-day replay passed.  The
+  terminal-update auxiliary failed its workload invariant; microscope load exceeded
+  its preregistered latency threshold; and full-day generation retained one
+  nonblocking preregistered ledger-growth warning.  The warning remains evidence and
+  is not a DEV-0017 failure or permission to redesign the ledger.
+- Root cause — rerun lifecycle: the canonical WO40-I public root is activation-once
+  and correctly refuses an occupied destination.  The failed result therefore cannot
+  be overwritten, deleted, or reinterpreted as a repaired attempt.  The prior local
+  history process copied selected payloads and had no typed status for a failed gate;
+  applying that process to this approximately 4.5-GiB active store would either omit
+  deep evidence or perform an unnecessary bulk copy.
+- Root cause — terminal contract: the V1 terminal-update input treated each delivered
+  market-state message as a distinct visible terminal update and required 5,100 of
+  them after continuous-session start.  The pinned root-3102000 immutable source has
+  only 592 outer events and 41 client-delivered market-state messages in total.
+  Only 39 eligible messages occur after continuous-session start, so it cannot
+  contain 5,100
+  distinct delivered changes.
+  This is a structurally impossible input/sample contract, not a latency threshold
+  miss and not authority to substitute a different unregistered workload after
+  observing the result.
+- Root cause — microscope context: each fresh-process repetition sought twice and
+  then inspected the same immutable full-day run through independent store calls.
+  Each public call repeated complete verification and reload work, so the measured
+  operation paid several full integrity traversals instead of one verified context
+  followed by bound-plan access, one midpoint seek, pane inspection, and report
+  render.
+- Root cause — measurement clock: the auxiliary executor used
+  `time.monotonic_ns` for measured wall and latency samples even though canonical
+  section 5.7.8 explicitly requires `time.perf_counter_ns` in the measured fresh
+  process.  Coordinator attempt/total deadlines are a different operational
+  authority and correctly remain monotonic.
+- Repair — history lifecycle: add
+  `KIRBY2_RELEASE_HISTORY_ATOMIC_RENAME_V1` and the strict
+  `KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3` manifest.  Under one exclusive local lock,
+  pin and exclusively lock the same no-follow active-store directory inode used by
+  release writers, inventory and hash every active file, independently reparse all
+  five predecessor public evidence documents from the exact Git object, record
+  D1/F/G/H `PASS` and I `FAIL` as typed manifest rows, and verify every immediately
+  referenced active-store anchor.  Execution additionally requires a clean checked-out
+  D1 commit with exact subject `Reverify release resources for DEV-0017`, whose sole
+  first parent has exact subject `Repair measured release performance failures` and
+  whose parent is the failed predecessor; the ordinary candidate verifier must bind
+  that D1 commit, the regenerated source lock, and the source parent's protocol bytes.
+  Stage only those small evidence documents and an exact
+  `clean-providers.toml` for the next active store.  Require the active, history,
+  and next-store parents to share
+  one filesystem; use Darwin's atomic no-replace rename to move the complete old active directory beneath a
+  hidden history stage, atomically activate the config-only next directory, harden
+  and fsync the moved history, deeply verify its exact post-quarantine inventory,
+  and atomically publish and reverify its final commit-named root.  Both parents of
+  every cross-directory rename are fsynced.  There is no recursive copy, overwrite,
+  active-store deletion, history deletion, or partial-history fallback.  Before the
+  active store moves, an interrupted `.building` root may be recovered only by
+  no-follow inspection, unlinking its bounded known small staging files, and removing
+  the now-empty directory; no recursive cleanup exists.  Every
+  interruption has one typed visible state; a missing active root is unavailable,
+  never evidence that two publications are active, and ambiguous staging refuses
+  pending explicit recovery.
+- Repair — terminal contract: retain workload and sample IDs, the exact source
+  artifact, terminal geometry/encoding/drain policy, 100 warmup and 5,000 measured
+  visible updates, and the existing latency reductions and numeric thresholds.
+  Amend the input identity with explicit
+  `RELEASE_TERMINAL_PRESENTATION_POLICY_V2`: a 50-ms production presentation clock
+  advances simulation by 500,000 microseconds per tick at speed-milli 10,000 over
+  the include-start/exclude-end continuous interval.  Under exact causal policy
+  `LATEST_NONREGRESSING_CLIENT_VISIBLE_MARKET_STATE_AT_OR_BEFORE_TICK_V1`, each tick
+  consumes every market-state delivery at or before that tick in nondecreasing
+  delivery order.  A candidate replaces the client-visible cut only when its source
+  market time is at least the currently selected source market time; a later-delivered
+  stale cut remains raw delivery evidence and never rolls presentation backward.
+  Positive raw delivered source message IDs are unique, but asynchronous delivery may
+  expose them out of creation order.  Evidence therefore records the complete raw
+  delivered source-sequence array plus its count and reorder count separately from
+  presented source-sequence reuse and reorder counts.  Tick ordinals are contiguous;
+  visible-update ordinals are contiguous; and only an adjacent rendered-frame SHA-256
+  change becomes a visible sample.  `TerminalFramePresenterV2` owns rendering and
+  synchronous frame flush; release desktop adapters own tick generation and causal
+  snapshot selection.  Exact latency boundary
+  `RENDER_HASH_WRITE_AND_DRAIN_V1` starts immediately before rendering and ends only
+  after the synchronous sink write-and-drain return.  Every V2 update row binds its
+  frame SHA-256 and ordered frame-digest-chain SHA-256; the PTY independently records
+  complete written- and drained-stream SHA-256 values plus the same payload-derived
+  frame chain.  Deep verification recomputes every chain link from the ordered row
+  inventory, requires its tail to equal the PTY chain, requires written and drained
+  byte counts to equal the sum of row bytes, and requires written and drained stream
+  digests to match.  A legacy template without the V2 `presentation` object remains
+  the exact historical V1 branch, including its original `sha256` receipt and verifier
+  grammar, and cannot be silently reinterpreted.  The default release-protocol loader
+  remains closed to that legacy shape and accepts only active V2.  The DEV-0011
+  detached historical audit must explicitly select the private typed
+  `HISTORICAL_TERMINAL_V1` compatibility path, which removes exactly the unique
+  terminal template's generated V2 `presentation` member and leaves every other
+  template, threshold, and protocol field exact.  The active performance executor
+  pins the new exact V2 threshold-manifest SHA-256.  DEV-0016 independently reads the
+  predecessor threshold TOML from its exact Git object, removes only the current
+  production presentation identity, requires that identity to equal
+  `RELEASE_TERMINAL_PRESENTATION_POLICY_V2`, and requires the complete remaining
+  object to equal the predecessor; numeric thresholds, counts, formulas, and all
+  unrelated protocol identities therefore remain frozen.
+- Repair — microscope context: add `VerifiedFullDaySessionV1` and
+  `FullDayStore.open_verified_day(run_id)`.  Each of the unchanged one warmup and
+  twenty measured fresh processes opens exactly one verified immutable session, then
+  derives the continuous bounds from its bound `.plan`, performs one midpoint
+  `.seek(target_time_us)`, and uses `.inspection()` and `.verification` for all
+  supported panes and the complete standalone report.  Existing independent
+  `verify_day`, `seek`, and
+  `inspect_day` contracts remain available, and the repair removes only a duplicate
+  post-restore invariant pass after the store has already established the same
+  verified state.
+- Repair — composed restore fixed point: `FullDayRuntime` is the sole owner of the
+  private identity token `_NESTED_RESTORE_CONSTRUCTION_TOKEN`.  During only its
+  composed `from_checkpoint_state` path, it passes that exact object to private
+  mechanics-engine and agent-scheduler restore entrypoints.  A forged or merely equal
+  token refuses.  The token defers only each child's final canonical reserialization
+  comparison: strict JSON parsing, exact fields, digest checks, and child invariants
+  remain unconditional.  Public standalone child `from_checkpoint_state` entrypoints
+  always pass `None` and retain their own canonical fixed point.  After all children
+  are composed, `FullDayRuntime` retains one complete outer comparison of
+  `canonical_json_bytes(runtime.checkpoint_state())` with the original payload, so no
+  child state escapes the complete runtime fixed point.
+- Repair — clocks and release restart: use `time.perf_counter_ns` only for the five
+  auxiliary workloads' measured wall/latency start and end samples, including
+  terminal frame presentation; retain monotonic clocks for coordinator deadlines,
+  worker lifetime bounds, retry admission, and total qualification timeout.  After
+  the terminal/microscope/clock repair is final, mechanically regenerate
+  `release/performance_runner_sources.lock` from the complete staged source tree.
+  Because the V2 terminal input identity changes
+  `release/performance_thresholds.toml`, source/protocol repair must first commit
+  under the exact subject `Repair measured release performance failures`.  Only
+  after that commit exists, run the exact read-only canonical command
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py release-resource-preflight --platforms release/platforms.toml --lock release/requirements.lock --qualification release/qualification.toml --no-network --output KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`.
+  The regenerated report must bind the new exact protocol-set SHA-256 and resolve
+  that source/protocol commit as the newest first-parent protocol-owning commit;
+  `audit-expansion --gate WO40-D1` must then pass.  Commit only the exact regenerated
+  `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md` under the unique subject
+  `Reverify release resources for DEV-0017`.  That D1 evidence commit, whose parent
+  already contains the mechanically regenerated source lock, becomes the sole clean
+  repaired candidate.  This two-commit order is mandatory: generating the report
+  before the protocol repair is committed would bind the predecessor protocol
+  owner, while changing source after the lock is generated would invalidate the
+  candidate.  Execute the history rollover; rebuild
+  `WO40-F`; requalify `WO40-G` on disposable host-only Tart clones; requalify
+  `WO40-H` on the pinned Fedora SSH provider; execute canonical `WO40-I` into its
+  newly empty public root; and resume `WO40-J` only if the new deeply verified result
+  satisfies its preregistered status contract.
+- Owned repair paths: `kirby2/release/history.py`,
+  `kirby2/agents/ecology.py`, `kirby2/exchange/mechanics_engine.py`,
+  `kirby2/release/build.py`,
+  `kirby2/release/performance.py`, `kirby2/release/performance_execution.py`,
+  `kirby2/release/performance_auxiliary.py`,
+  `kirby2/release/desktop.py`, `kirby2/ui/terminal.py`,
+  `kirby2/full_day/store.py`, `kirby2/full_day/runtime.py`,
+  `kirby2/audit/release.py`, `kirby2/audit/expansion.py`,
+  `release/performance_thresholds.toml`,
+  `release/performance_runner_sources.lock`,
+  `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0017` through K2X-02 immediately after failed `WO40-I`
+  and before resumed `WO40-J`; the deviation inventory extends monotonically through
+  `DEV-0017`.  The failed predecessor remains historical evidence and does not
+  satisfy the new candidate's WO40-I prerequisite.
+- Inherited gates: release targets, artifact IDs and member layout, dependency pins,
+  launchers, documentation, starter content, qualification rows and check order,
+  four-worker/256-FIFO resources, 10,000-row corpus, retry count, attempt/total
+  limits, auxiliary repetition counts, reduction formulas, all numeric performance
+  thresholds, designated installed target, product limitations, and every earlier
+  production contract remain unchanged.  No brokerage, live-market connection,
+  credential creation, telemetry, updater, background service, network download,
+  GPU workload, provider operation, history rollover, build, qualification, or
+  performance workload is executed by the deviation audit.
+- Exact source/protocol repair commit subject:
+  `Repair measured release performance failures`
+- Exact D1 evidence commit subject: `Reverify release resources for DEV-0017`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0013
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0014
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0015
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0016
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0017
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m compileall -q kirby2
+git diff --check
+```
+
+Acceptance: every byte through DEV-0016 is preserved as the exact predecessor
+ledger prefix; the registry contains DEV-0001 through DEV-0017 in release order;
+the predecessor Git evidence reconstructs D1/F/G/H `PASS`, I `FAIL`, both measured
+failures, the retained full-day warning, and all 10,000 complete records; the V3
+history contract binds the complete active store, all five documents, and exact gate
+statuses; its executor uses the shared active-store lock, exclusive no-replace
+renames, exact final re-verification, and only bounded pre-move staging cleanup while
+exposing no bulk copy, recursive deletion, overwrite, provider, or workload surface;
+terminal presentation, raw-delivery versus presented-sequence evidence, ordered
+frame-chain and PTY stream-digest reconciliation, one-context microscope access,
+sole-owner composed-restore deferral with complete public/outer fixed points, and
+auxiliary `perf_counter_ns` samples are explicit production contracts while
+coordinator deadlines remain monotonic; numeric thresholds are unchanged; the
+repaired candidate has a mechanically regenerated source lock and resource preflight;
+F/G/H/I are requalified in order; and no audit, planning call, or history verifier
+mutates the active store or executes the one-time rollover.

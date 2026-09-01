@@ -36,6 +36,10 @@ from kirby2.packs.formats import (
     require_nfc_text,
     require_sha256,
 )
+from kirby2.ui.terminal import (
+    RELEASE_TERMINAL_PRESENTATION_POLICY_V2,
+    advance_terminal_frame_digest_chain_v1,
+)
 
 from .performance import (
     RELEASE_AUXILIARY_THRESHOLDS_V1,
@@ -566,7 +570,7 @@ def _validate_template_contract(
             require_sha256(parameters[field], f"interactive ACK {field}")
         _terminal_identity(parameters)
     elif workload_id == "RELEASE_TERMINAL_UPDATE_V1":
-        if set(parameters) != {
+        legacy_keys = {
             "artifact_selection_policy_id",
             "measured_updates",
             "profile_id",
@@ -577,7 +581,13 @@ def _validate_template_contract(
             "start_selector",
             "terminal",
             "warmup_updates",
-        } or {
+        }
+        parameter_keys = frozenset(parameters)
+        valid_parameter_keys = {
+            frozenset(legacy_keys),
+            frozenset((*legacy_keys, "presentation")),
+        }
+        if parameter_keys not in valid_parameter_keys or {
             "artifact_selection_policy_id": parameters[
                 "artifact_selection_policy_id"
             ],
@@ -599,6 +609,11 @@ def _validate_template_contract(
             "warmup_updates": 100,
         }:
             raise ValueError("terminal-update template contract differs")
+        if (
+            "presentation" in parameters
+            and parameters["presentation"] != RELEASE_TERMINAL_PRESENTATION_POLICY_V2
+        ):
+            raise ValueError("terminal-update presentation contract differs")
         for field in (
             "qualification_evidence_sha256",
             "source_artifact_manifest_sha256",
@@ -741,7 +756,9 @@ class _ContinuouslyDrainedPty:
         self._condition = threading.Condition()
         self._bytes_read = 0
         self._bytes_written = 0
-        self._digest = hashlib.sha256()
+        self._drained_digest = hashlib.sha256()
+        self._written_digest = hashlib.sha256()
+        self._frame_digest_chain_sha256: str | None = None
         self._failure: BaseException | None = None
         self._closed = False
 
@@ -774,7 +791,7 @@ class _ContinuouslyDrainedPty:
                 if not payload:
                     break
                 with self._condition:
-                    self._digest.update(payload)
+                    self._drained_digest.update(payload)
                     self._bytes_read += len(payload)
                     self._condition.notify_all()
         except BaseException as error:  # surfaced synchronously by write_and_flush
@@ -798,6 +815,13 @@ class _ContinuouslyDrainedPty:
         while offset < len(payload):
             offset += os.write(self._slave, payload[offset:])
         with self._condition:
+            self._written_digest.update(payload)
+            self._frame_digest_chain_sha256 = (
+                advance_terminal_frame_digest_chain_v1(
+                    self._frame_digest_chain_sha256,
+                    hashlib.sha256(payload).hexdigest(),
+                )
+            )
             self._bytes_written += len(payload)
             target = self._bytes_written
             deadline = time.monotonic() + 10.0
@@ -810,13 +834,19 @@ class _ContinuouslyDrainedPty:
                 raise RuntimeError("continuous terminal drain failed") from self._failure
         return len(payload)
 
-    def receipt(self) -> dict[str, object]:
+    def _receipt_state(self) -> tuple[dict[str, object], str, str, str]:
         with self._condition:
             if self._failure is not None:
                 raise RuntimeError("continuous terminal drain failed") from self._failure
             if self._bytes_read != self._bytes_written:
                 raise RuntimeError("continuous terminal drain byte counts differ")
-            return {
+            written_sha256 = self._written_digest.hexdigest()
+            drained_sha256 = self._drained_digest.hexdigest()
+            if written_sha256 != drained_sha256:
+                raise RuntimeError("continuous terminal drain byte digests differ")
+            if self._frame_digest_chain_sha256 is None:
+                raise RuntimeError("continuous terminal drain has no complete frame")
+            common = {
                 "bytes_drained": self._bytes_read,
                 "bytes_written": self._bytes_written,
                 "columns": _TERMINAL_COLUMNS,
@@ -824,9 +854,31 @@ class _ContinuouslyDrainedPty:
                 "drain_policy": "CONTINUOUS",
                 "encoding": _TERMINAL_ENCODING,
                 "rows": _TERMINAL_ROWS,
-                "sha256": self._digest.hexdigest(),
                 "term": _TERMINAL_TERM,
             }
+            return (
+                common,
+                written_sha256,
+                drained_sha256,
+                self._frame_digest_chain_sha256,
+            )
+
+    def receipt(self) -> dict[str, object]:
+        """Return the exact historical V1 terminal receipt grammar."""
+
+        common, _written_sha256, drained_sha256, _frame_chain = self._receipt_state()
+        return {**common, "sha256": drained_sha256}
+
+    def receipt_v2(self) -> dict[str, object]:
+        """Bind V2 frame inventory to both written and drained PTY byte streams."""
+
+        common, written_sha256, drained_sha256, frame_chain = self._receipt_state()
+        return {
+            **common,
+            "drained_sha256": drained_sha256,
+            "frame_digest_chain_sha256": frame_chain,
+            "written_sha256": written_sha256,
+        }
 
     def close(self) -> None:
         if self._closed:
@@ -965,7 +1017,7 @@ def _generation_attempt(payload: dict[str, object]) -> dict[str, object]:
 
     ordinal = _nonnegative_integer(payload.get("ordinal"), "generation ordinal")
     store_root = _absolute_path(payload.get("store_root"), "generation store root")
-    started_ns = time.monotonic_ns()
+    started_ns = time.perf_counter_ns()
     plan, _workload, runtime, maximum_initial_pending = (
         build_release_performance_full_day_source_v1()
     )
@@ -1023,7 +1075,7 @@ def _generation_attempt(payload: dict[str, object]) -> dict[str, object]:
     day_duration_us = plan.calendar.end_time_us
     if day_duration_us <= 0:
         raise RuntimeError("generated day duration is zero")
-    ended_ns = time.monotonic_ns()
+    ended_ns = time.perf_counter_ns()
     manifest_path = run_directory / "manifest.toml"
     return {
         "checkpoint_count": len(checkpoints),
@@ -1054,14 +1106,14 @@ def _generation_attempt(payload: dict[str, object]) -> dict[str, object]:
 def _replay_attempt(payload: dict[str, object]) -> dict[str, object]:
     source = ReleaseAuxiliarySourceRunV1.from_dict(payload.get("source"))
     store, manifest = _source_store(source)
-    started_ns = time.monotonic_ns()
+    started_ns = time.perf_counter_ns()
     verification = store.verify_day(source.run_id)
     if not verification.passed:
         raise RuntimeError(
             "replay source failed exact verification: "
             + "; ".join(verification.failures)
         )
-    ended_ns = time.monotonic_ns()
+    ended_ns = time.perf_counter_ns()
     return {
         "fresh_process_policy_id": _FRESH_PROCESS_POLICY_V1,
         "manifest_result_sha256": manifest.result_digest,
@@ -1109,12 +1161,12 @@ def _microscope_attempt(payload: dict[str, object]) -> dict[str, object]:
     if expected_template_panes != list(_TEMPLATE_PANE_IDS):
         raise RuntimeError("microscope template pane inventory differs")
     store, manifest = _source_store(source)
-    started_ns = time.monotonic_ns()
-    initial = store.seek(source.run_id, 0)
-    continuous_start, continuous_end = _continuous_bounds(initial.runtime.plan)
+    started_ns = time.perf_counter_ns()
+    verified_day = store.open_verified_day(source.run_id)
+    continuous_start, continuous_end = _continuous_bounds(verified_day.plan)
     cursor_time_us = continuous_start + (continuous_end - continuous_start) // 2
-    sought = store.seek(source.run_id, cursor_time_us)
-    inspection = store.inspect_day(source.run_id)
+    sought = verified_day.seek(cursor_time_us)
+    inspection = verified_day.inspection()
     assets = load_installed_renderer_assets()
     runtime_panes = tuple(item.value for item in PANE_ORDER)
     if runtime_panes != _RUNTIME_PANE_IDS or tuple(
@@ -1185,7 +1237,7 @@ def _microscope_attempt(payload: dict[str, object]) -> dict[str, object]:
     verification = verify_portable_report_bundle(report_root)
     if verification.get("status") != "PASS":
         raise RuntimeError("portable microscope report did not verify")
-    ended_ns = time.monotonic_ns()
+    ended_ns = time.perf_counter_ns()
     return {
         "asset_inventory": [
             {
@@ -1355,14 +1407,14 @@ def _interactive_ack_workload(
     with _ContinuouslyDrainedPty() as sink:
         for pair_ordinal in range(550):
             expected_order_id = f"perf-{pair_ordinal:04d}"
-            started_ns = time.monotonic_ns()
+            started_ns = time.perf_counter_ns()
             submitted = session.execute(
                 SessionCommand.BUY_BID,
                 quantity_override=1,
                 price_ticks_override=best_bid,
             )
             _render_session_frame(session, sink)
-            submit_latency_ns = time.monotonic_ns() - started_ns
+            submit_latency_ns = time.perf_counter_ns() - started_ns
             snapshot = session.snapshot()
             if (
                 not submitted.accepted
@@ -1382,10 +1434,10 @@ def _interactive_ack_workload(
                     "pair_ordinal": pair_ordinal,
                 }
             )
-            started_ns = time.monotonic_ns()
+            started_ns = time.perf_counter_ns()
             cancelled = session.execute(SessionCommand.CANCEL_NEAREST)
             _render_session_frame(session, sink)
-            cancel_latency_ns = time.monotonic_ns() - started_ns
+            cancel_latency_ns = time.perf_counter_ns() - started_ns
             if (
                 not cancelled.accepted
                 or cancelled.parameters.get("target_order_id") != expected_order_id
@@ -1511,7 +1563,7 @@ def _market_state_snapshot(
     )
 
 
-def _terminal_update_workload(
+def _terminal_update_workload_v1(
     request: ReleaseAuxiliaryExecutionV1,
     workspace: Path,
 ) -> tuple[
@@ -1566,7 +1618,7 @@ def _terminal_update_workload(
     rendered_rows: list[dict[str, object]] = []
     with _ContinuouslyDrainedPty() as sink:
         for ordinal, (sequence, market) in enumerate(selected):
-            started_ns = time.monotonic_ns()
+            started_ns = time.perf_counter_ns()
             snapshot = _market_state_snapshot(
                 market,
                 message_sequence=sequence,
@@ -1579,7 +1631,7 @@ def _terminal_update_workload(
                 width=_TERMINAL_COLUMNS,
             )
             frame_bytes = sink.write_and_flush(frame)
-            latency_ns = time.monotonic_ns() - started_ns
+            latency_ns = time.perf_counter_ns() - started_ns
             (warmup if ordinal < 100 else measured).append(latency_ns)
             rendered_rows.append(
                 {
@@ -1616,6 +1668,107 @@ def _terminal_update_workload(
             "terminal-update/update-inventory.json": inventory_bytes,
         },
     )
+
+
+def _terminal_update_workload_v2(
+    request: ReleaseAuxiliaryExecutionV1,
+    workspace: Path,
+) -> tuple[
+    dict[str, tuple[int, ...]],
+    dict[str, tuple[int, ...]],
+    dict[str, bytes],
+]:
+    """Measure the installed desktop's canonical noninteractive playback seam."""
+
+    from kirby2.release.desktop import present_release_terminal_updates_v2
+
+    parameters = request.template.input_identity["parameters"]
+    assert type(parameters) is dict
+    presentation = parameters.get("presentation")
+    if presentation != RELEASE_TERMINAL_PRESENTATION_POLICY_V2:
+        raise RuntimeError("terminal presentation policy differs from V2")
+    assert type(presentation) is dict
+    warmup_count = _nonnegative_integer(
+        parameters.get("warmup_updates"), "terminal warmup update count"
+    )
+    measured_count = _nonnegative_integer(
+        parameters.get("measured_updates"), "terminal measured update count"
+    )
+    required_count = warmup_count + measured_count
+    if warmup_count != 100 or measured_count != 5_000:
+        raise RuntimeError("terminal update cardinality differs from V1")
+
+    store, manifest, source_receipt = _materialize_terminal_source(
+        request, workspace
+    )
+    sought = store.seek(manifest.run_id, manifest.simulation_end_us)
+    runtime = sought.runtime
+    continuous_start, continuous_end = _continuous_bounds(runtime.plan)
+    delivery = runtime.delivery
+    if delivery is None:
+        raise RuntimeError("terminal source has no client delivery owner")
+    with _ContinuouslyDrainedPty() as sink:
+        updates, feasibility = present_release_terminal_updates_v2(
+            delivery.delivered_messages,
+            continuous_start_us=continuous_start,
+            continuous_end_us=continuous_end,
+            duration_us=manifest.simulation_end_us,
+            presentation=presentation,
+            sink=sink,
+            required_update_count=required_count,
+            width=_TERMINAL_COLUMNS,
+        )
+        sink_receipt = sink.receipt_v2()
+
+    latencies = tuple(item.frame.latency_ns for item in updates)
+    sequences = tuple(item.frame.causal_source_sequence for item in updates)
+    peak_rss = _darwin_peak_rss_bytes()
+    rendered_rows = [item.as_dict() for item in updates]
+    inventory_bytes = canonical_json_bytes(rendered_rows)
+    receipt = {
+        "first_message_sequence": sequences[0],
+        "first_update_ordinal": updates[0].frame.update_ordinal,
+        "last_message_sequence": sequences[-1],
+        "last_update_ordinal": updates[-1].frame.update_ordinal,
+        "peak_rss_bytes": peak_rss,
+        "presentation": presentation,
+        "presentation_feasibility": feasibility,
+        "rendered_update_count": len(updates),
+        "run_id": manifest.run_id,
+        "source_evidence_sha256": manifest.evidence_digest,
+        "source_materialization": source_receipt,
+        "status": "PASS",
+        "terminal": sink_receipt,
+        "update_inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest(),
+    }
+    return (
+        {"update_latency_ns": latencies[:warmup_count]},
+        {
+            "peak_rss_bytes": (peak_rss,),
+            "update_latency_ns": latencies[warmup_count:],
+        },
+        {
+            "terminal-update/receipt.json": canonical_json_bytes(receipt),
+            "terminal-update/update-inventory.json": inventory_bytes,
+        },
+    )
+
+
+def _terminal_update_workload(
+    request: ReleaseAuxiliaryExecutionV1,
+    workspace: Path,
+) -> tuple[
+    dict[str, tuple[int, ...]],
+    dict[str, tuple[int, ...]],
+    dict[str, bytes],
+]:
+    parameters = request.template.input_identity["parameters"]
+    assert type(parameters) is dict
+    if "presentation" not in parameters:
+        # Historical V1 envelopes retain the original sparse-message semantics,
+        # including the exact ``lacks 5100 ordered unique updates`` failure.
+        return _terminal_update_workload_v1(request, workspace)
+    return _terminal_update_workload_v2(request, workspace)
 
 
 def _generation_workload(
@@ -2082,7 +2235,7 @@ def _verify_ack_evidence(
         raise ValueError("interactive evidence does not reconcile to its series")
 
 
-def _verify_terminal_evidence(
+def _verify_terminal_evidence_v1(
     request: ReleaseAuxiliaryExecutionV1,
     evidence_payloads: Mapping[str, bytes],
     warmup: Mapping[str, tuple[int, ...]],
@@ -2160,6 +2313,348 @@ def _verify_terminal_evidence(
         )
     ):
         raise ValueError("terminal evidence does not reconcile to its series")
+
+
+def _verify_terminal_evidence_v2(
+    request: ReleaseAuxiliaryExecutionV1,
+    evidence_payloads: Mapping[str, bytes],
+    warmup: Mapping[str, tuple[int, ...]],
+    measured: Mapping[str, tuple[int, ...]],
+) -> None:
+    rows = _evidence_value(
+        evidence_payloads,
+        "terminal-update/update-inventory.json",
+        "terminal update inventory",
+    )
+    if type(rows) is not list or len(rows) != 5_100:
+        raise ValueError("terminal update evidence count differs")
+    parameters = request.template.input_identity["parameters"]
+    assert type(parameters) is dict
+    presentation = parameters.get("presentation")
+    if presentation != RELEASE_TERMINAL_PRESENTATION_POLICY_V2:
+        raise ValueError("terminal presentation evidence policy differs")
+    assert type(presentation) is dict
+    step = _nonnegative_integer(
+        presentation["simulation_step_us"], "terminal presentation step"
+    )
+
+    latencies: list[int] = []
+    sequences: list[int] = []
+    tick_ordinals: list[int] = []
+    presentation_times: list[int] = []
+    source_delivery_times: list[int] = []
+    source_market_times: list[int] = []
+    frame_digests: list[str] = []
+    frame_bytes: list[int] = []
+    frame_digest_chain_sha256: str | None = None
+    for ordinal, raw in enumerate(rows):
+        row = _exact_object(
+            raw,
+            {
+                "causal_source_sequence",
+                "frame_bytes",
+                "frame_digest_chain_sha256",
+                "frame_sha256",
+                "latency_ns",
+                "market_state_id",
+                "policy_id",
+                "presentation_time_us",
+                "schema_version",
+                "source_delivery_time_us",
+                "source_market_time_us",
+                "tick_ordinal",
+                "update_ordinal",
+            },
+            "terminal V2 update evidence row",
+        )
+        if (
+            row["schema_version"] != 2
+            or row["policy_id"] != presentation["policy_id"]
+            or row["update_ordinal"] != ordinal
+        ):
+            raise ValueError("terminal V2 update identity or ordinal differs")
+        tick = _nonnegative_integer(row["tick_ordinal"], "terminal tick ordinal")
+        presentation_time = _nonnegative_integer(
+            row["presentation_time_us"], "terminal presentation time"
+        )
+        sequence = _nonnegative_integer(
+            row["causal_source_sequence"], "terminal causal source sequence"
+        )
+        delivery_time = _nonnegative_integer(
+            row["source_delivery_time_us"], "terminal source delivery time"
+        )
+        source_market_time = _nonnegative_integer(
+            row["source_market_time_us"], "terminal source market time"
+        )
+        size = _nonnegative_integer(row["frame_bytes"], "terminal frame bytes")
+        if sequence <= 0 or size <= 0:
+            raise ValueError("terminal V2 source sequence or frame is empty")
+        if delivery_time > presentation_time or source_market_time > presentation_time:
+            raise ValueError("terminal V2 frame precedes its causal source")
+        require_sha256(row["market_state_id"], "terminal market-state digest")
+        require_sha256(row["frame_sha256"], "terminal frame digest")
+        require_sha256(
+            row["frame_digest_chain_sha256"], "terminal frame-digest chain"
+        )
+        expected_frame_chain = advance_terminal_frame_digest_chain_v1(
+            frame_digest_chain_sha256,
+            row["frame_sha256"],  # type: ignore[arg-type]
+        )
+        if row["frame_digest_chain_sha256"] != expected_frame_chain:
+            raise ValueError("terminal V2 ordered frame-digest chain differs")
+        frame_digest_chain_sha256 = expected_frame_chain
+        latencies.append(
+            _nonnegative_integer(row["latency_ns"], "terminal update latency")
+        )
+        sequences.append(sequence)
+        tick_ordinals.append(tick)
+        presentation_times.append(presentation_time)
+        source_delivery_times.append(delivery_time)
+        source_market_times.append(source_market_time)
+        frame_digests.append(row["frame_sha256"])  # type: ignore[arg-type]
+        frame_bytes.append(size)
+
+    if (
+        tick_ordinals[0] != 0
+        or any(left >= right for left, right in zip(tick_ordinals, tick_ordinals[1:]))
+        or any(
+            current - presentation_times[0] != tick * step
+            for current, tick in zip(presentation_times, tick_ordinals)
+        )
+        or source_delivery_times != sorted(source_delivery_times)
+        or source_market_times != sorted(source_market_times)
+        or any(
+            left == right
+            for left, right in zip(frame_digests, frame_digests[1:])
+        )
+    ):
+        raise ValueError("terminal V2 cadence, causality, or visible changes differ")
+
+    receipt = _exact_object(
+        _evidence_value(
+            evidence_payloads, "terminal-update/receipt.json", "terminal receipt"
+        ),
+        {
+            "first_message_sequence",
+            "first_update_ordinal",
+            "last_message_sequence",
+            "last_update_ordinal",
+            "peak_rss_bytes",
+            "presentation",
+            "presentation_feasibility",
+            "rendered_update_count",
+            "run_id",
+            "source_evidence_sha256",
+            "source_materialization",
+            "status",
+            "terminal",
+            "update_inventory_sha256",
+        },
+        "terminal V2 receipt evidence",
+    )
+    feasibility = _exact_object(
+        receipt["presentation_feasibility"],
+        {
+            "available_tick_count",
+            "boundary_policy_id",
+            "causal_source_policy_id",
+            "clock_source_id",
+            "consumed_tick_count",
+            "continuous_end_us",
+            "continuous_start_us",
+            "delivered_source_sequence_count",
+            "delivered_source_sequence_reorder_count",
+            "delivered_source_sequences",
+            "duplicate_source_policy_id",
+            "eligible_visible_update_count",
+            "first_causal_source_sequence",
+            "first_presentation_time_us",
+            "frame_milliseconds",
+            "last_causal_source_sequence",
+            "last_presentation_time_us",
+            "latency_boundary_policy_id",
+            "policy_id",
+            "presented_source_sequence_reorder_count",
+            "presented_source_sequence_reuse_count",
+            "required_update_count",
+            "schema_version",
+            "simulation_speed_milli",
+            "simulation_step_us",
+            "skipped_unchanged_tick_count",
+            "status",
+            "update_ordinal_policy_id",
+            "visible_change_policy_id",
+        },
+        "terminal presentation feasibility evidence",
+    )
+    terminal = _exact_object(
+        receipt["terminal"],
+        {
+            "bytes_drained",
+            "bytes_written",
+            "color",
+            "columns",
+            "drained_sha256",
+            "drain_policy",
+            "encoding",
+            "frame_digest_chain_sha256",
+            "rows",
+            "term",
+            "written_sha256",
+        },
+        "terminal sink receipt evidence",
+    )
+    available_ticks = _nonnegative_integer(
+        feasibility["available_tick_count"], "available terminal ticks"
+    )
+    consumed_ticks = _nonnegative_integer(
+        feasibility["consumed_tick_count"], "consumed terminal ticks"
+    )
+    continuous_start = _nonnegative_integer(
+        feasibility["continuous_start_us"], "terminal continuous start"
+    )
+    continuous_end = _nonnegative_integer(
+        feasibility["continuous_end_us"], "terminal continuous end"
+    )
+    skipped_ticks = _nonnegative_integer(
+        feasibility["skipped_unchanged_tick_count"], "skipped terminal ticks"
+    )
+    raw_delivered_sequences = feasibility["delivered_source_sequences"]
+    if type(raw_delivered_sequences) is not list:
+        raise TypeError("terminal delivered source sequences must be an array")
+    delivered_sequences = tuple(
+        _nonnegative_integer(item, "terminal delivered source sequence")
+        for item in raw_delivered_sequences
+    )
+    if (
+        not delivered_sequences
+        or any(item <= 0 for item in delivered_sequences)
+        or len(delivered_sequences) != len(set(delivered_sequences))
+        or not set(sequences).issubset(delivered_sequences)
+    ):
+        raise ValueError(
+            "terminal delivered source sequences are empty, reused, or incomplete"
+        )
+    delivered_reorder_count = sum(
+        right < left
+        for left, right in zip(delivered_sequences, delivered_sequences[1:])
+    )
+    presented_reuse_count = sum(
+        left == right for left, right in zip(sequences, sequences[1:])
+    )
+    presented_reorder_count = sum(
+        right < left for left, right in zip(sequences, sequences[1:])
+    )
+    terminal_bytes = sum(frame_bytes)
+    require_sha256(terminal["written_sha256"], "terminal written-byte digest")
+    require_sha256(terminal["drained_sha256"], "terminal drained-byte digest")
+    require_sha256(
+        terminal["frame_digest_chain_sha256"], "terminal sink frame-digest chain"
+    )
+    inventory_raw = evidence_payloads["terminal-update/update-inventory.json"]
+    source_materialization = receipt["source_materialization"]
+    source_verification = (
+        None
+        if type(source_materialization) is not dict
+        else source_materialization.get("verification")
+    )
+    if (
+        receipt["status"] != "PASS"
+        or receipt["presentation"] != presentation
+        or receipt["rendered_update_count"] != 5_100
+        or receipt["first_update_ordinal"] != 0
+        or receipt["last_update_ordinal"] != 5_099
+        or receipt["first_message_sequence"] != sequences[0]
+        or receipt["last_message_sequence"] != sequences[-1]
+        or receipt["source_evidence_sha256"]
+        != parameters["source_artifact_manifest_sha256"]
+        or type(source_materialization) is not dict
+        or source_materialization.get("candidate_id") != "QUIET_RANGE_PRESSURE"
+        or source_materialization.get("root_seed") != 3_102_000
+        or source_materialization.get("run_id") != receipt["run_id"]
+        or source_materialization.get("evidence_sha256")
+        != parameters["source_artifact_manifest_sha256"]
+        or type(source_verification) is not dict
+        or source_verification.get("status") != "PASS"
+        or receipt["update_inventory_sha256"]
+        != hashlib.sha256(inventory_raw).hexdigest()
+        or feasibility["schema_version"] != 2
+        or feasibility["status"] != "PASS"
+        or feasibility["policy_id"] != presentation["policy_id"]
+        or feasibility["boundary_policy_id"] != presentation["boundary_policy_id"]
+        or feasibility["causal_source_policy_id"]
+        != presentation["causal_source_policy_id"]
+        or feasibility["clock_source_id"] != presentation["clock_source_id"]
+        or feasibility["latency_boundary_policy_id"]
+        != presentation["latency_boundary_policy_id"]
+        or continuous_start != presentation_times[0]
+        or available_ticks != len(range(continuous_start, continuous_end, step))
+        or feasibility["duplicate_source_policy_id"]
+        != presentation["duplicate_source_policy_id"]
+        or feasibility["delivered_source_sequence_count"]
+        != len(delivered_sequences)
+        or feasibility["delivered_source_sequence_reorder_count"]
+        != delivered_reorder_count
+        or feasibility["frame_milliseconds"]
+        != presentation["frame_milliseconds"]
+        or feasibility["simulation_speed_milli"]
+        != presentation["simulation_speed_milli"]
+        or feasibility["simulation_step_us"] != step
+        or feasibility["update_ordinal_policy_id"]
+        != presentation["update_ordinal_policy_id"]
+        or feasibility["visible_change_policy_id"]
+        != presentation["visible_change_policy_id"]
+        or feasibility["required_update_count"] != 5_100
+        or feasibility["eligible_visible_update_count"] != 5_100
+        or feasibility["first_causal_source_sequence"] != sequences[0]
+        or feasibility["last_causal_source_sequence"] != sequences[-1]
+        or feasibility["first_presentation_time_us"] != presentation_times[0]
+        or feasibility["last_presentation_time_us"] != presentation_times[-1]
+        or feasibility["presented_source_sequence_reuse_count"]
+        != presented_reuse_count
+        or feasibility["presented_source_sequence_reorder_count"]
+        != presented_reorder_count
+        or consumed_ticks != tick_ordinals[-1] + 1
+        or skipped_ticks != consumed_ticks - 5_100
+        or available_ticks < consumed_ticks
+        or terminal != {
+            "bytes_drained": terminal_bytes,
+            "bytes_written": terminal_bytes,
+            "color": False,
+            "columns": _TERMINAL_COLUMNS,
+            "drained_sha256": terminal["drained_sha256"],
+            "drain_policy": "CONTINUOUS",
+            "encoding": _TERMINAL_ENCODING,
+            "frame_digest_chain_sha256": terminal[
+                "frame_digest_chain_sha256"
+            ],
+            "rows": _TERMINAL_ROWS,
+            "term": _TERMINAL_TERM,
+            "written_sha256": terminal["written_sha256"],
+        }
+        or terminal["written_sha256"] != terminal["drained_sha256"]
+        or terminal["frame_digest_chain_sha256"]
+        != frame_digest_chain_sha256
+        or warmup["update_latency_ns"] != tuple(latencies[:100])
+        or measured["update_latency_ns"] != tuple(latencies[100:])
+        or measured["peak_rss_bytes"]
+        != (_nonnegative_integer(receipt["peak_rss_bytes"], "terminal peak RSS"),)
+    ):
+        raise ValueError("terminal V2 evidence does not reconcile to its series")
+
+
+def _verify_terminal_evidence(
+    request: ReleaseAuxiliaryExecutionV1,
+    evidence_payloads: Mapping[str, bytes],
+    warmup: Mapping[str, tuple[int, ...]],
+    measured: Mapping[str, tuple[int, ...]],
+) -> None:
+    parameters = request.template.input_identity["parameters"]
+    assert type(parameters) is dict
+    if "presentation" not in parameters:
+        _verify_terminal_evidence_v1(request, evidence_payloads, warmup, measured)
+        return
+    _verify_terminal_evidence_v2(request, evidence_payloads, warmup, measured)
 
 
 def _attempt_rows(

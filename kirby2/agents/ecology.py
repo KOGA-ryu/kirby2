@@ -596,7 +596,7 @@ class AgentScheduler:
         return canonical_sha256(self.checkpoint_state())
 
     @classmethod
-    def from_checkpoint_state(
+    def _restore_checkpoint_state(
         cls,
         payload: Mapping[str, object],
         *,
@@ -604,9 +604,16 @@ class AgentScheduler:
         clock: SimulationClock | None = None,
         order_id_allocator: Callable[[], str] | None = None,
         _prevalidated_engine_state_sha256: str | None = None,
+        _construction_token: object | None,
     ) -> AgentScheduler:
         from kirby2.full_day.models import canonical_json_bytes, validate_strict_json
 
+        defer_full_day_fixed_point = _construction_token is not None
+        if defer_full_day_fixed_point:
+            from kirby2.full_day.runtime import _NESTED_RESTORE_CONSTRUCTION_TOKEN
+
+            if _construction_token is not _NESTED_RESTORE_CONSTRUCTION_TOKEN:
+                raise TypeError("scheduler nested-restore construction token differs")
         if not isinstance(payload, Mapping):
             raise TypeError("agent scheduler checkpoint must be an object")
         validate_strict_json(payload)
@@ -841,11 +848,60 @@ class AgentScheduler:
             raise ValueError("restored starting-book digest is invalid")
         scheduler._starting_book_sha256 = starting_book
         scheduler.assert_invariants()
-        if canonical_json_bytes(scheduler.checkpoint_state()) != canonical_json_bytes(
-            payload
+        if (
+            not defer_full_day_fixed_point
+            and canonical_json_bytes(scheduler.checkpoint_state())
+            != canonical_json_bytes(payload)
         ):
             raise ValueError("agent scheduler checkpoint is not canonical")
         return scheduler
+
+    @classmethod
+    def from_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        engine: MarketMechanicsEngine,
+        clock: SimulationClock | None = None,
+        order_id_allocator: Callable[[], str] | None = None,
+        _prevalidated_engine_state_sha256: str | None = None,
+    ) -> AgentScheduler:
+        """Restore one standalone scheduler with its own canonical fixed point."""
+
+        return cls._restore_checkpoint_state(
+            payload,
+            engine=engine,
+            clock=clock,
+            order_id_allocator=order_id_allocator,
+            _prevalidated_engine_state_sha256=(
+                _prevalidated_engine_state_sha256
+            ),
+            _construction_token=None,
+        )
+
+    @classmethod
+    def _from_full_day_checkpoint_state(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        engine: MarketMechanicsEngine,
+        clock: SimulationClock | None,
+        order_id_allocator: Callable[[], str] | None,
+        _prevalidated_engine_state_sha256: str,
+        _construction_token: object,
+    ) -> AgentScheduler:
+        """Restore beneath FullDayRuntime's complete outer fixed point."""
+
+        return cls._restore_checkpoint_state(
+            payload,
+            engine=engine,
+            clock=clock,
+            order_id_allocator=order_id_allocator,
+            _prevalidated_engine_state_sha256=(
+                _prevalidated_engine_state_sha256
+            ),
+            _construction_token=_construction_token,
+        )
 
     @classmethod
     def from_canonical_state_bytes(
