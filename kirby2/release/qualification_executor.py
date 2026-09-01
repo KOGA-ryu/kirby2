@@ -2476,7 +2476,7 @@ def _publish_immutable_file(directory: int, name: str, raw: bytes) -> None:
     """Publish complete bytes with an atomic, no-overwrite hard-link activation."""
 
     if (
-        re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,127}\.json", name) is None
+        re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}\.json", name) is None
         or type(raw) is not bytes
         or not raw
         or len(raw) > 64 * 1024 * 1024

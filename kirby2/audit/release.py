@@ -4621,6 +4621,30 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
         hostile_failures.append(
             "Linux cleanup is not descriptor-confined with marker-last ownership"
         )
+    publication_node = function_node(executor_tree, "_publish_immutable_file")
+    publication_patterns = (
+        ()
+        if publication_node is None
+        else tuple(
+            item.value
+            for item in ast.walk(publication_node)
+            if isinstance(item, ast.Constant)
+            and isinstance(item.value, str)
+            and "\\.json" in item.value
+        )
+    )
+    frozen_record_names = (
+        "clean-provider-macos-arm64.json",
+        "clean-provider-linux-x86_64.json",
+        "qualification-attempt.json",
+    )
+    if len(publication_patterns) != 1 or any(
+        re.fullmatch(publication_patterns[0], name) is None
+        for name in frozen_record_names
+    ):
+        hostile_failures.append(
+            "immutable publication grammar rejects a frozen qualification record name"
+        )
     refusal_attributes = {
         item.attr
         for item in ast.walk(linux_tree)
@@ -4691,6 +4715,7 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
             "missing_cleanup_contracts": list(missing_cleanup_tokens),
             "missing_refusals": list(missing_refusals),
             "parser_raise_counts": raise_counts,
+            "publication_patterns": list(publication_patterns),
             "pure_helper_remote_calls": pure_helper_remote_calls,
             "ssh_invocations": 0,
         },
