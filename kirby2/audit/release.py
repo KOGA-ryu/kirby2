@@ -3943,12 +3943,15 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         "_GUEST_SHARE_MOUNT_ROOT",
         "(AppleVirtIOFS,",
         "mount.splitlines()",
-        "'/usr/bin/test', '-d', os.fspath(_GUEST_SHARE_ROOT)",
+        "'/bin/test', '-d', os.fspath(_GUEST_SHARE_ROOT)",
     }
     if not all(binding in guest_provider_source for binding in required_share_proof):
         surface_failures.append(
             "guest provider does not separate the VirtioFS mount from its named share"
         )
+    executor_source = ast.unparse(executor_tree)
+    if "/usr/bin/test" in executor_source or executor_source.count("'/bin/test'") != 5:
+        surface_failures.append("macOS guest test executable inventory differs")
 
     host_launch = function_node(executor_tree, "_spawn_host_only_vm")
     run_calls: list[ast.Call] = []

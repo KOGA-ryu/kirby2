@@ -1389,7 +1389,7 @@ def _prove_guest_provider(
         _guest_exec(
             state,
             guest_home,
-            "/usr/bin/test",
+            "/bin/test",
             "-d",
             os.fspath(_GUEST_SHARE_ROOT),
         ),
@@ -1409,7 +1409,7 @@ def _prove_guest_provider(
         _guest_exec(
             state,
             guest_home,
-            "/usr/bin/test",
+            "/bin/test",
             "!",
             "-e",
             os.fspath(sentinel),
@@ -1592,7 +1592,7 @@ def _install_form(
     )
     execute(
         "verify extracted bundle root",
-        "/usr/bin/test",
+        "/bin/test",
         "-d",
         os.fspath(paths["bundle_root"]),
     )
@@ -1637,13 +1637,13 @@ def _install_form(
     launcher = os.fspath(paths["venv"] / "bin" / _INSTALLED_LAUNCHERS[state.form])
     execute(
         "verify installed launcher",
-        "/usr/bin/test",
+        "/bin/test",
         "-x",
         launcher,
     )
     execute(
         "verify worker attempt root is absent",
-        "/usr/bin/test",
+        "/bin/test",
         "!",
         "-e",
         os.fspath(paths["worker_attempt"]),

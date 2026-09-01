@@ -820,6 +820,10 @@ deviation audit.
   predicate: Tart correctly mounts the shared filesystem at `/Volumes/My Shared
   Files` and places the named `release` share beneath it, while the controller
   incorrectly required the child directory to appear as its own mount-table row.
+  After that predicate was repaired, the next pre-install refusal exposed five
+  controller probes pinned to nonexistent macOS path `/usr/bin/test`; an exhaustive
+  guest executable inventory confirmed `/bin/test` as the sole required correction
+  and found every other mandatory absolute command path present.
 - Repair: add strict canonical provider-attestation, command-observation,
   root-observation, session, step, and qualification-attempt records; a closed
   installed guest worker for the exact desktop/headless matrix; and a closed Tart
@@ -846,7 +850,10 @@ deviation audit.
   insufficient evidence for the bytes copied into the qualification guest.  Bind
   the shared-directory proof to the unique parent `AppleVirtIOFS` mount row, then
   independently require the named `release` child directory before proving its
-  `:ro` behavior with a failed write and absent sentinel.
+  `:ro` behavior with a failed write and absent sentinel.  Pin all five directory,
+  sentinel, launcher, and attempt-root predicates to the observed macOS
+  `/bin/test` executable and structurally refuse the nonexistent `/usr/bin/test`
+  spelling.
 - Owned repair paths: `kirby2/packs/builders.py`, `kirby2/release/doctor.py`,
   `kirby2/release/artifacts.py`,
   `kirby2/release/qualification.py`,
@@ -894,5 +901,5 @@ candidate artifacts remain in canonical local release-history snapshots; the
 hardened provider and each preboot clone bind exact configuration capability, NVRAM,
 disk contents, size, and mode; hostile digest inputs fail closed; and the deviation
 audit distinguishes the parent VirtioFS mount from the named read-only child without
-cloning, booting, connecting to, mutating, or deleting a provider or executing the
-one-time qualification workload.
+cloning, booting, connecting to, mutating, or deleting a provider, pins the five
+macOS `test` call sites, and does not execute the one-time qualification workload.
