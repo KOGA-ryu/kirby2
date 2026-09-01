@@ -3662,6 +3662,17 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         surface_failures.append(
             f"qualification concrete Path probe failed: {type(error).__name__}"
         )
+    try:
+        diagnostic = executor_module._diagnostic_excerpt(
+            b"root privilege required\nRuntimeFailed\tSoftnet\r",
+            "DEV-0014 diagnostic fixture",
+        )
+        if diagnostic != "root privilege required RuntimeFailed Softnet":
+            surface_failures.append("qualification diagnostic canonicalization differs")
+    except (TypeError, ValueError) as error:
+        surface_failures.append(
+            f"qualification diagnostic canonicalization failed: {type(error).__name__}"
+        )
 
     try:
         executor_tree = ast.parse(inspect.getsource(executor_module))

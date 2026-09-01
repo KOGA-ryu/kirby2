@@ -509,6 +509,15 @@ def _decode_text(raw: bytes, label: str, *, maximum_bytes: int = 1024 * 1024) ->
     return value
 
 
+def _diagnostic_excerpt(raw: bytes, label: str) -> str:
+    value = _decode_text(raw, label, maximum_bytes=_COMMAND_OUTPUT_MAX_BYTES)
+    printable = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else " "
+        for character in value
+    )
+    return " ".join(printable.split())[:512]
+
+
 def _local_vms() -> dict[str, dict[str, object]]:
     result = _run_tart("list", "--source", "local", "--format", "json", timeout_seconds=30)
     if result.returncode != 0:
@@ -954,11 +963,10 @@ def _wait_for_guest_agent(state: _CloneState) -> None:
         if process.poll() is not None:
             result = process.finish()
             state.run_process = None
-            detail = _decode_text(
+            detail = _diagnostic_excerpt(
                 result.stderr,
                 "host-only Tart launch diagnostics",
-                maximum_bytes=_COMMAND_OUTPUT_MAX_BYTES,
-            ).strip()
+            )
             raise _QualificationRefused(
                 QualificationExecutorRefusalCodeV1.PROVIDER_ISOLATION_UNAVAILABLE,
                 "true Tart --net-host launch is unavailable"
@@ -976,7 +984,9 @@ def _wait_for_guest_agent(state: _CloneState) -> None:
         time.sleep(0.5)
     detail = "guest agent did not become ready under true host-only isolation"
     if last_result is not None and last_result.stderr:
-        detail += ": " + _decode_text(last_result.stderr, "guest-agent diagnostics")[:512]
+        excerpt = _diagnostic_excerpt(last_result.stderr, "guest-agent diagnostics")
+        if excerpt:
+            detail += ": " + excerpt
     raise _QualificationRefused(
         QualificationExecutorRefusalCodeV1.PROVIDER_UNAVAILABLE,
         detail,
