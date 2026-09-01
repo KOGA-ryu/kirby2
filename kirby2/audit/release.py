@@ -3803,6 +3803,26 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         }
         if not {"release:", ":ro", "--dir="}.issubset(host_literals):
             surface_failures.append("Tart qualification share is not AST-bound read-only")
+    guest_wait = function_node(executor_tree, "_wait_for_guest_agent")
+    retryable_boot_timeout_calls = 0
+    if guest_wait is not None:
+        retryable_boot_timeout_calls = sum(
+            1
+            for item in ast.walk(guest_wait)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Name)
+            and item.func.id == "_run_tart"
+            and any(
+                keyword.arg == "timeout_is_result"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in item.keywords
+            )
+        )
+    if retryable_boot_timeout_calls != 1:
+        surface_failures.append(
+            "guest-agent boot polling does not own one retryable probe timeout"
+        )
     environment_node = function_node(executor_tree, "_tart_environment")
     environment_literals = (
         set()
@@ -3859,6 +3879,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
             "executor_invocations": 0,
             "executor_signature": observed_executor_signature,
             "network_tokens": executable_network_tokens,
+            "retryable_boot_timeout_calls": retryable_boot_timeout_calls,
             "tart": tart_constants,
             "verifier_signature": observed_verifier_signature,
             "worker_options": worker_options,

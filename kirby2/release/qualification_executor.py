@@ -447,7 +447,10 @@ def _run_command(
     environment: Mapping[str, str],
     timeout_seconds: int,
     maximum_output_bytes: int = _COMMAND_OUTPUT_MAX_BYTES,
+    timeout_is_result: bool = False,
 ) -> _CommandResult:
+    if type(timeout_is_result) is not bool:
+        raise TypeError("provider timeout policy must be Boolean")
     process = _spawn_command(
         argv,
         environment=environment,
@@ -471,7 +474,7 @@ def _run_command(
             "provider command exceeded its bounded output allowance",
             terminal=True,
         )
-    if result.timed_out:
+    if result.timed_out and not timeout_is_result:
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_EXECUTION_FAILED,
             "provider command exceeded its wall-time allowance",
@@ -488,12 +491,14 @@ def _run_tart(
     *arguments: str,
     timeout_seconds: int = _HOST_COMMAND_TIMEOUT_SECONDS,
     maximum_output_bytes: int = _COMMAND_OUTPUT_MAX_BYTES,
+    timeout_is_result: bool = False,
 ) -> _CommandResult:
     return _run_command(
         _tart_command(*arguments),
         environment=_tart_environment(),
         timeout_seconds=timeout_seconds,
         maximum_output_bytes=maximum_output_bytes,
+        timeout_is_result=timeout_is_result,
     )
 
 
@@ -978,6 +983,7 @@ def _wait_for_guest_agent(state: _CloneState) -> None:
             "/usr/bin/true",
             timeout_seconds=10,
             maximum_output_bytes=1024 * 1024,
+            timeout_is_result=True,
         )
         if last_result.returncode == 0:
             return

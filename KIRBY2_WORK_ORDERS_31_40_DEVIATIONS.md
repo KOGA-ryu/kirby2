@@ -806,7 +806,11 @@ deviation audit.
   correctly forbids Tart from executing its SUID Softnet helper beneath that same
   Seatbelt.  DEV-0014 therefore keeps the network gate on artifact construction,
   removes it only from non-executing verification, and continues to require true
-  guest `--net-host` isolation with no NAT fallback.
+  guest `--net-host` isolation with no NAT fallback.  The first true host-only boot
+  then showed that the 10-second guest-agent probe timeout was incorrectly terminal
+  even though the provider owns a bounded 300-second boot deadline; the repaired
+  poll treats only that fixed probe timeout as retryable and retains terminal
+  timeouts for every qualification workload command.
 - Repair: add strict canonical provider-attestation, command-observation,
   root-observation, session, step, and qualification-attempt records; a closed
   installed guest worker for the exact desktop/headless matrix; and a closed Tart
