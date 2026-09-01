@@ -665,7 +665,10 @@ def _install_form(
     assert artifact_row.embedded_manifest_sha256 is not None
     return _InstalledFormV1(
         form=form,
-        python=python.resolve(strict=True),
+        # Preserve the venv launcher path. Resolving its interpreter symlink to
+        # the base executable bypasses the adjacent pyvenv.cfg and therefore
+        # loses the isolated site-packages that were just verified above.
+        python=python,
         kirby2=kirby2.resolve(strict=True),
         bundle_root=bundle_root.resolve(strict=True),
         wheelhouse=wheelhouse.resolve(strict=True),
@@ -2467,8 +2470,11 @@ def _execute_and_publish_auxiliary(
         (
             os.fspath(installed.python),
             "-I",
-            "-m",
-            "kirby2.release.performance_auxiliary",
+            "-c",
+            (
+                "from kirby2.release.performance_auxiliary import main;"
+                "raise SystemExit(main())"
+            ),
             "--request",
             os.fspath(request_path.resolve(strict=True)),
             "--output-root",

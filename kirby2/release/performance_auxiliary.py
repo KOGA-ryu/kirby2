@@ -685,7 +685,7 @@ def _write_exclusive(path: Path, payload: bytes, *, mode: int = 0o444) -> None:
 
 
 def _prepare_output_root(output_root: Path) -> tuple[Path, Path]:
-    if type(output_root) is not Path or not output_root.is_absolute():
+    if not isinstance(output_root, Path) or not output_root.is_absolute():
         raise ValueError("auxiliary output root must be an absolute Path")
     resolved = output_root.resolve(strict=False)
     if output_root != resolved or resolved == Path(resolved.anchor):
@@ -2455,7 +2455,7 @@ def verify_auxiliary_performance_execution(
         raise TypeError("auxiliary verification requires a typed execution envelope")
     if type(result) is not ReleaseAuxiliaryPerformanceResultV1:
         raise TypeError("auxiliary verification requires a typed result")
-    if type(output_root) is not Path or not output_root.is_absolute():
+    if not isinstance(output_root, Path) or not output_root.is_absolute():
         raise ValueError("auxiliary verification root must be an absolute Path")
     root = output_root.resolve(strict=True)
     if root != output_root or root.is_symlink() or not root.is_dir():
