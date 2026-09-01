@@ -1,4 +1,4 @@
-"""Fail-closed release-history rollover for the DEV-0017 restart.
+"""Fail-closed release-history rollover for the DEV-0017 and DEV-0018 restarts.
 
 The active release store can contain millions of governed relationships and several
 GiB of immutable evidence.  A restart must therefore preserve the directory as one
@@ -8,8 +8,9 @@ same-filesystem directory renames for the bulk store.  It deliberately has no co
 or deletion recovery path.
 
 Planning and state inspection are read-only.  The executor is intentionally not
-registered as a top-level command: DEV-0017 must be audited and committed before an
-operator explicitly invokes the one-time rollover from the repaired candidate.
+registered as a top-level command: each deviation must be audited and committed
+before an operator explicitly invokes its one-time rollover from the repaired
+candidate.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from typing import Final, Iterable, Mapping
 
 
 RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3 = "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3"
+RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4 = "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V4"
 RELEASE_HISTORY_ROLLOVER_POLICY_ID_V1 = (
     "KIRBY2_RELEASE_HISTORY_ATOMIC_RENAME_V1"
 )
@@ -59,6 +61,24 @@ DEV0017_EVIDENCE_PATH_BY_GATE_V1: Mapping[str, str] = {
 DEV0017_RESOURCE_PREFLIGHT_SHA256_V1 = (
     "a4e791a0e401f657448f8bfe6364789d4e2cfcf5032c1344b3a401911d6bb9cc"
 )
+DEV0018_RELEASE_EVIDENCE_COMMIT_V1 = (
+    "901e31c3e7d7a2ce5a423011e36d363440f20cc2"
+)
+DEV0018_SOURCE_CANDIDATE_COMMIT_V1 = (
+    "a198c69426551b8d2f44269cbdc82980a8978b03"
+)
+DEV0018_PROTOCOL_COMMIT_V1 = "020da2c90c0f0000f822aad7c66538fe68c6c6e6"
+DEV0018_EVIDENCE_STATUS_BY_GATE_V1: tuple[tuple[str, str], ...] = (
+    ("WO40-D1", "PASS"),
+    ("WO40-F", "PASS"),
+    ("WO40-G", "PASS"),
+    ("WO40-H", "PASS"),
+    ("WO40-I", "NOT_RUN"),
+)
+DEV0018_EVIDENCE_PATH_BY_GATE_V1: Mapping[str, str] = {
+    gate_id: DEV0017_EVIDENCE_PATH_BY_GATE_V1[gate_id]
+    for gate_id in ("WO40-D1", "WO40-F", "WO40-G", "WO40-H")
+}
 
 _ACTIVE_STORE_RELATIVE = ".kirby2/release"
 _HISTORY_PARENT_RELATIVE = ".kirby2/release-history"
@@ -70,6 +90,12 @@ _HISTORY_STAGE_NAME = (
 _HISTORY_BUILD_NAME = f"{_HISTORY_STAGE_NAME}.building"
 _NEXT_ACTIVE_NAME = ".dev-0017-release-next"
 _NEXT_ACTIVE_BUILD_NAME = f"{_NEXT_ACTIVE_NAME}.building"
+_DEV0018_HISTORY_STAGE_NAME = (
+    f".{DEV0018_RELEASE_EVIDENCE_COMMIT_V1}.dev-0018-history-staging"
+)
+_DEV0018_HISTORY_BUILD_NAME = f"{_DEV0018_HISTORY_STAGE_NAME}.building"
+_DEV0018_NEXT_ACTIVE_NAME = ".dev-0018-release-next"
+_DEV0018_NEXT_ACTIVE_BUILD_NAME = f"{_DEV0018_NEXT_ACTIVE_NAME}.building"
 _LOCK_NAME = "release-history-rollover.lock"
 _MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 _MAX_PROVIDER_CONFIG_BYTES = 1024 * 1024
@@ -298,6 +324,146 @@ class ReleaseHistoryManifestV3:
         if restored.canonical_bytes() != raw:
             raise ValueError("history manifest bytes are noncanonical")
         return restored
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseHistoryGateResultV2:
+    gate_id: str
+    status: str
+
+    def __post_init__(self) -> None:
+        expected = dict(DEV0018_EVIDENCE_STATUS_BY_GATE_V1)
+        if self.gate_id not in expected:
+            raise ValueError("partial-history gate ID is outside the DEV-0018 set")
+        if self.status != expected[self.gate_id]:
+            raise ValueError("partial-history gate status differs")
+
+    def as_dict(self) -> dict[str, str]:
+        return {"gate_id": self.gate_id, "status": self.status}
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseHistoryManifestV4:
+    """Exact snapshot of the incomplete DEV-0018 predecessor candidate."""
+
+    release_evidence_commit: str
+    source_candidate_commit: str
+    gate_results: tuple[ReleaseHistoryGateResultV2, ...]
+    files: tuple[ReleaseHistoryFileV1, ...]
+    history_schema_id: str = RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4
+    schema_version: int = 4
+    rollover_policy_id: str = RELEASE_HISTORY_ROLLOVER_POLICY_ID_V1
+
+    def __post_init__(self) -> None:
+        _require_commit(self.release_evidence_commit, "partial release evidence commit")
+        _require_commit(self.source_candidate_commit, "partial source candidate commit")
+        if self.history_schema_id != RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4:
+            raise ValueError("partial-history manifest schema differs")
+        if self.schema_version != 4:
+            raise ValueError("partial-history manifest version differs")
+        if self.rollover_policy_id != RELEASE_HISTORY_ROLLOVER_POLICY_ID_V1:
+            raise ValueError("partial-history rollover policy differs")
+        expected_results = tuple(
+            ReleaseHistoryGateResultV2(gate_id, status)
+            for gate_id, status in DEV0018_EVIDENCE_STATUS_BY_GATE_V1
+        )
+        if self.gate_results != expected_results:
+            raise ValueError("partial-history gate-result projection differs")
+        paths = tuple(item.path for item in self.files)
+        if paths != tuple(sorted(paths, key=lambda item: item.encode("utf-8"))):
+            raise ValueError("partial-history file inventory must be path sorted")
+        if len(paths) != len(set(paths)) or not paths:
+            raise ValueError("partial-history file inventory is empty or duplicated")
+        public_paths = {
+            item.path
+            for item in self.files
+            if PurePosixPath(item.path).parts[0] != "artifacts"
+        }
+        if public_paths != set(DEV0018_EVIDENCE_PATH_BY_GATE_V1.values()):
+            raise ValueError(
+                "partial-history manifest must contain exactly four public documents"
+            )
+        artifact_paths = {
+            item.path
+            for item in self.files
+            if PurePosixPath(item.path).parts[0] == "artifacts"
+        }
+        if not artifact_paths or f"artifacts/{_CONFIG_RELATIVE}" not in artifact_paths:
+            raise ValueError("partial-history manifest lacks the active-store class")
+        if any(
+            path == "artifacts/gate-evidence/wo40-i"
+            or path.startswith("artifacts/gate-evidence/wo40-i/")
+            for path in artifact_paths
+        ):
+            raise ValueError("partial-history manifest contains a WO40-I publication")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "files": [item.as_dict() for item in self.files],
+            "gate_results": [item.as_dict() for item in self.gate_results],
+            "history_schema_id": self.history_schema_id,
+            "release_evidence_commit": self.release_evidence_commit,
+            "rollover_policy_id": self.rollover_policy_id,
+            "schema_version": self.schema_version,
+            "source_candidate_commit": self.source_candidate_commit,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            self.as_dict(),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, raw: bytes) -> "ReleaseHistoryManifestV4":
+        _require_exact_type(raw, bytes, "partial-history manifest bytes")
+        if len(raw) > _MAX_MANIFEST_BYTES:
+            raise ValueError("partial-history manifest exceeds its byte bound")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("partial-history manifest is not canonical JSON") from error
+        if type(payload) is not dict or set(payload) != {
+            "files",
+            "gate_results",
+            "history_schema_id",
+            "release_evidence_commit",
+            "rollover_policy_id",
+            "schema_version",
+            "source_candidate_commit",
+        }:
+            raise ValueError("partial-history manifest fields differ")
+        raw_files = payload["files"]
+        raw_results = payload["gate_results"]
+        if type(raw_files) is not list or type(raw_results) is not list:
+            raise TypeError("partial-history manifest inventories must be arrays")
+        files: list[ReleaseHistoryFileV1] = []
+        for row in raw_files:
+            if type(row) is not dict or set(row) != {"mode", "path", "sha256", "size"}:
+                raise ValueError("partial-history file record fields differ")
+            files.append(ReleaseHistoryFileV1(**row))
+        results: list[ReleaseHistoryGateResultV2] = []
+        for row in raw_results:
+            if type(row) is not dict or set(row) != {"gate_id", "status"}:
+                raise ValueError("partial-history gate-result fields differ")
+            results.append(ReleaseHistoryGateResultV2(**row))
+        restored = cls(
+            release_evidence_commit=payload["release_evidence_commit"],
+            source_candidate_commit=payload["source_candidate_commit"],
+            gate_results=tuple(results),
+            files=tuple(files),
+            history_schema_id=payload["history_schema_id"],
+            schema_version=payload["schema_version"],
+            rollover_policy_id=payload["rollover_policy_id"],
+        )
+        if restored.canonical_bytes() != raw:
+            raise ValueError("partial-history manifest bytes are noncanonical")
+        return restored
+
+
+_ReleaseHistoryManifest = ReleaseHistoryManifestV3 | ReleaseHistoryManifestV4
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +763,63 @@ def plan_dev0017_release_history_rollover(
         )
     config = plan.active_root / _CONFIG_RELATIVE
     _digest_regular_file(config)
+    return plan
+
+
+def _base_plan_dev0018(
+    repository_root: Path | str,
+) -> ReleaseHistoryRolloverPlanV1:
+    repository = Path(repository_root).absolute()
+    dot_root = repository / ".kirby2"
+    history_parent = repository / _HISTORY_PARENT_RELATIVE
+    return ReleaseHistoryRolloverPlanV1(
+        repository_root=repository,
+        active_root=repository / _ACTIVE_STORE_RELATIVE,
+        history_parent=history_parent,
+        history_build_root=history_parent / _DEV0018_HISTORY_BUILD_NAME,
+        history_staging_root=history_parent / _DEV0018_HISTORY_STAGE_NAME,
+        history_final_root=history_parent / DEV0018_RELEASE_EVIDENCE_COMMIT_V1,
+        next_active_build_root=dot_root / _DEV0018_NEXT_ACTIVE_BUILD_NAME,
+        next_active_root=dot_root / _DEV0018_NEXT_ACTIVE_NAME,
+        lock_path=dot_root / _LOCK_NAME,
+        state=ReleaseHistoryRolloverStateV1.AMBIGUOUS,
+    )
+
+
+def inspect_dev0018_release_history_rollover(
+    repository_root: Path | str,
+) -> ReleaseHistoryRolloverPlanV1:
+    """Return the incomplete-candidate rollover state without reading payloads."""
+
+    plan = _base_plan_dev0018(repository_root)
+    _validate_lifecycle_roots(plan)
+    return _plan_with_current_state(plan)
+
+
+def plan_dev0018_release_history_rollover(
+    repository_root: Path | str,
+) -> ReleaseHistoryRolloverPlanV1:
+    """Preflight a pristine DEV-0018 rollover without enumerating the store."""
+
+    plan = inspect_dev0018_release_history_rollover(repository_root)
+    if plan.state is not ReleaseHistoryRolloverStateV1.READY:
+        code = (
+            ReleaseHistoryRefusalCodeV1.HISTORY_ALREADY_EXISTS
+            if plan.state is ReleaseHistoryRolloverStateV1.COMPLETE
+            else ReleaseHistoryRefusalCodeV1.RECOVERY_REQUIRED
+        )
+        raise ReleaseHistoryRefused(code, f"rollover state is {plan.state.value}")
+    active_metadata = _plain_directory(plan.active_root, "active release root")
+    history_metadata = _plain_directory(plan.history_parent, "release history root")
+    state_metadata = _plain_directory(
+        plan.repository_root / ".kirby2", "release state root"
+    )
+    if len({active_metadata.st_dev, history_metadata.st_dev, state_metadata.st_dev}) != 1:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.CROSS_DEVICE_RENAME,
+            "active, history, and next-active roots are not on one filesystem",
+        )
+    _digest_regular_file(plan.active_root / _CONFIG_RELATIVE)
     return plan
 
 
@@ -1139,7 +1362,14 @@ def _git_commit_metadata(
     return resolved, parents, subject
 
 
-def _git_changed_paths(repository: Path, commit: str) -> tuple[str, ...]:
+def _git_changed_paths(
+    repository: Path,
+    commit: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if type(allow_empty) is not bool:
+        raise TypeError("empty changed-path policy must be Boolean")
     completed = subprocess.run(
         [
             "git",
@@ -1167,7 +1397,7 @@ def _git_changed_paths(repository: Path, commit: str) -> tuple[str, ...]:
             ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
             "release restart changed-path inventory is not UTF-8",
         ) from error
-    if completed.returncode != 0 or not paths:
+    if completed.returncode != 0 or (not paths and not allow_empty):
         raise ReleaseHistoryRefused(
             ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
             "release restart changed-path inventory is unavailable",
@@ -1234,6 +1464,67 @@ def _verify_execution_authority(repository: Path) -> _ExecutionAuthority:
     return _ExecutionAuthority(candidate_commit=head, source_commit=source)
 
 
+def _verify_dev0018_execution_authority(repository: Path) -> _ExecutionAuthority:
+    try:
+        from kirby2.release.build import (
+            load_release_protocol_bundle,
+            verify_release_candidate_inputs,
+        )
+
+        head_result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repository,
+            env=_history_git_environment(),
+            capture_output=True,
+            check=False,
+        )
+        head = head_result.stdout.decode("ascii", errors="replace").strip()
+        if head_result.returncode != 0 or _COMMIT.fullmatch(head) is None:
+            raise ValueError("HEAD does not resolve to one exact commit")
+        resolved, head_parents, head_subject = _git_commit_metadata(repository, head)
+        if (
+            resolved != head
+            or len(head_parents) != 1
+            or head_subject != "Reverify release resources for DEV-0018"
+            or _git_changed_paths(repository, head, allow_empty=True) != ()
+        ):
+            raise ValueError("HEAD is not the exact empty DEV-0018 D1 boundary commit")
+        source = head_parents[0]
+        source_resolved, source_parents, source_subject = _git_commit_metadata(
+            repository, source
+        )
+        if (
+            source_resolved != source
+            or source_parents != (DEV0018_RELEASE_EVIDENCE_COMMIT_V1,)
+            or source_subject != "Repair WO40-I V2 publication verification"
+        ):
+            raise ValueError("D1 does not directly follow the DEV-0018 source repair")
+        bundle = load_release_protocol_bundle(repository)
+        candidate = verify_release_candidate_inputs(
+            bundle,
+            head,
+            require_checkout=True,
+        )
+        if (
+            candidate.candidate_commit != head
+            or candidate.protocol_commit != DEV0018_PROTOCOL_COMMIT_V1
+        ):
+            raise ValueError("candidate protocol ownership differs from DEV-0018 order")
+        runtime_source = _read_regular_file_snapshot(
+            repository / "kirby2/release/history.py",
+            maximum_bytes=_MAX_ROLLOVER_SOURCE_BYTES,
+            label="runtime DEV-0018 rollover source",
+        )
+        if _git_blob(repository, head, "kirby2/release/history.py") != runtime_source.raw:
+            raise ValueError("runtime DEV-0018 rollover source differs from authority")
+    except (OSError, RuntimeError, TypeError, UnicodeDecodeError, ValueError) as error:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "rollover requires the exact clean DEV-0018 source and D1 commits",
+        ) from error
+    return _ExecutionAuthority(candidate_commit=head, source_commit=source)
+
+
 def _parse_evidence_document(raw: bytes) -> dict[str, object]:
     if raw.count(_EVIDENCE_START) != 1 or raw.count(_EVIDENCE_END) != 1:
         raise ValueError("historical evidence marker differs")
@@ -1290,6 +1581,97 @@ def _load_historical_evidence(repository: Path) -> tuple[tuple[str, bytes], ...]
             "historical public-document inventory differs",
         )
     return tuple(documents)
+
+
+def _load_dev0018_historical_evidence(
+    repository: Path,
+) -> tuple[tuple[str, bytes], ...]:
+    documents: list[tuple[str, bytes]] = []
+    for gate_id, expected_status in DEV0018_EVIDENCE_STATUS_BY_GATE_V1:
+        if gate_id == "WO40-I":
+            if expected_status != "NOT_RUN":
+                raise RuntimeError("DEV-0018 WO40-I history status differs")
+            continue
+        relative = DEV0018_EVIDENCE_PATH_BY_GATE_V1[gate_id]
+        raw = _git_blob(repository, DEV0018_RELEASE_EVIDENCE_COMMIT_V1, relative)
+        if gate_id == "WO40-D1":
+            if (
+                b"Status: `PASS`\n" not in raw
+                or b"Protocol set SHA-256: `6ea17041787f54887f6b01304c7ebe250267ff971492bf2970ae893796cd95a1`\n"
+                not in raw
+                or b"WO40-D protocol commit: `020da2c90c0f0000f822aad7c66538fe68c6c6e6`\n"
+                not in raw
+            ):
+                raise ReleaseHistoryRefused(
+                    ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+                    "DEV-0018 predecessor WO40-D1 preflight differs",
+                )
+            documents.append((relative, raw))
+            continue
+        try:
+            payload = _parse_evidence_document(raw)
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+                f"DEV-0018 predecessor {gate_id} evidence cannot be parsed",
+            ) from error
+        if (
+            payload.get("schema_id") != "KIRBY2_RELEASE_GATE_EVIDENCE_V1"
+            or payload.get("schema_version") != 1
+            or payload.get("gate_id") != gate_id
+            or payload.get("status") != expected_status
+            or payload.get("candidate_commit")
+            != DEV0018_SOURCE_CANDIDATE_COMMIT_V1
+        ):
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+                f"DEV-0018 predecessor {gate_id} evidence identity differs",
+            )
+        documents.append((relative, raw))
+    if len(documents) != len(DEV0018_EVIDENCE_PATH_BY_GATE_V1):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "DEV-0018 predecessor public-document inventory differs",
+        )
+    try:
+        prior_performance = _parse_evidence_document(
+            _git_blob(
+                repository,
+                DEV0018_RELEASE_EVIDENCE_COMMIT_V1,
+                DEV0017_EVIDENCE_PATH_BY_GATE_V1["WO40-I"],
+            )
+        )
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "tracked WO40-I document cannot be parsed as historical evidence",
+        ) from error
+    if (
+        prior_performance.get("gate_id") != "WO40-I"
+        or prior_performance.get("status") != "FAIL"
+        or prior_performance.get("candidate_commit")
+        != DEV0017_SOURCE_CANDIDATE_COMMIT_V1
+    ):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "tracked WO40-I document is not the earlier historical failure",
+        )
+    return tuple(documents)
+
+
+def _verify_dev0018_absent_performance_publication(
+    inventory: Iterable[_InventoryEntry],
+) -> None:
+    forbidden = "artifacts/gate-evidence/wo40-i"
+    if any(
+        item.record.path == forbidden
+        or item.record.path.startswith(f"{forbidden}/")
+        for item in inventory
+    ):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "DEV-0018 predecessor unexpectedly contains WO40-I publication bytes",
+        )
 
 
 def _verify_evidence_anchors(
@@ -2089,6 +2471,210 @@ def _stage_rollover(
     return manifest
 
 
+def _stage_dev0018_rollover(
+    plan: ReleaseHistoryRolloverPlanV1,
+    evidence: tuple[tuple[str, bytes], ...],
+    inventory: tuple[_InventoryEntry, ...],
+    config: _RegularFileSnapshot,
+    *,
+    state_descriptor: int,
+    history_parent_descriptor: int,
+) -> ReleaseHistoryManifestV4:
+    document_records = [
+        ReleaseHistoryFileV1(
+            path=relative,
+            size=len(raw),
+            sha256=hashlib.sha256(raw).hexdigest(),
+        )
+        for relative, raw in evidence
+    ]
+    files = tuple(
+        sorted(
+            (*document_records, *(item.record for item in inventory)),
+            key=lambda item: item.path.encode("utf-8"),
+        )
+    )
+    manifest = ReleaseHistoryManifestV4(
+        release_evidence_commit=DEV0018_RELEASE_EVIDENCE_COMMIT_V1,
+        source_candidate_commit=DEV0018_SOURCE_CANDIDATE_COMMIT_V1,
+        gate_results=tuple(
+            ReleaseHistoryGateResultV2(gate_id, status)
+            for gate_id, status in DEV0018_EVIDENCE_STATUS_BY_GATE_V1
+        ),
+        files=files,
+    )
+    manifest_raw = manifest.canonical_bytes()
+    if len(manifest_raw) > _MAX_MANIFEST_BYTES:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.PREPARATION_INCOMPLETE,
+            "history inventory exceeds the V4 manifest byte bound",
+        )
+    config_entry = next(
+        item
+        for item in inventory
+        if item.record.path == f"artifacts/{_CONFIG_RELATIVE}"
+    )
+    config_record = config_entry.record
+    if (
+        config_record.size != config.size
+        or config_record.sha256 != config.sha256
+        or (
+            config_entry.device,
+            config_entry.inode,
+            config_entry.mode,
+            config_entry.nlink,
+            config_entry.uid,
+            config_entry.gid,
+            config_entry.mtime_ns,
+            config_entry.ctime_ns,
+        )
+        != (
+            config.device,
+            config.inode,
+            config.mode,
+            config.nlink,
+            config.uid,
+            config.gid,
+            config.mtime_ns,
+            config.ctime_ns,
+        )
+    ):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.ACTIVE_STORE_CHANGED,
+            "provider configuration differs from the active inventory",
+        )
+
+    if _path_exists_no_follow(plan.next_active_build_root):
+        _remove_preparation_root(
+            state_descriptor,
+            plan.repository_root / ".kirby2",
+            _DEV0018_NEXT_ACTIVE_BUILD_NAME,
+            frozenset({_CONFIG_RELATIVE}),
+        )
+    if not _path_exists_no_follow(plan.next_active_root):
+        try:
+            os.mkdir(_DEV0018_NEXT_ACTIVE_BUILD_NAME, 0o700, dir_fd=state_descriptor)
+            next_build_descriptor, _ = _open_plain_directory(
+                plan.next_active_build_root,
+                "DEV-0018 next-active build root",
+                expected_device=os.fstat(state_descriptor).st_dev,
+            )
+            try:
+                _write_exclusive_at(
+                    next_build_descriptor,
+                    _CONFIG_RELATIVE,
+                    config.raw,
+                    0o444,
+                )
+                os.fsync(next_build_descriptor)
+                _revalidate_pinned_directory(
+                    plan.next_active_build_root,
+                    next_build_descriptor,
+                    "DEV-0018 next-active build root",
+                )
+                _revalidate_pinned_directory(
+                    plan.repository_root / ".kirby2",
+                    state_descriptor,
+                    "release state root",
+                )
+                if not _rename_exclusive_at(
+                    state_descriptor,
+                    os.fsencode(_DEV0018_NEXT_ACTIVE_BUILD_NAME),
+                    state_descriptor,
+                    os.fsencode(_DEV0018_NEXT_ACTIVE_NAME),
+                ):
+                    raise ReleaseHistoryRefused(
+                        ReleaseHistoryRefusalCodeV1.STAGING_CONFLICT,
+                        "DEV-0018 next-active staging destination already exists",
+                    )
+                os.fsync(state_descriptor)
+            finally:
+                os.close(next_build_descriptor)
+        except ReleaseHistoryRefused:
+            raise
+        except OSError as error:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.STAGING_CONFLICT,
+                "DEV-0018 next-active staging could not be completed",
+            ) from error
+    _verify_next_active_root(
+        plan.next_active_root,
+        expected_config=config_record,
+        require_config_only=True,
+    )
+
+    if _path_exists_no_follow(plan.history_build_root):
+        _remove_preparation_root(
+            history_parent_descriptor,
+            plan.history_parent,
+            _DEV0018_HISTORY_BUILD_NAME,
+            frozenset(
+                {*DEV0018_EVIDENCE_PATH_BY_GATE_V1.values(), _MANIFEST_NAME}
+            ),
+        )
+    if not _path_exists_no_follow(plan.history_staging_root):
+        try:
+            os.mkdir(_DEV0018_HISTORY_BUILD_NAME, 0o700, dir_fd=history_parent_descriptor)
+            history_build_descriptor, _ = _open_plain_directory(
+                plan.history_build_root,
+                "DEV-0018 history build root",
+                expected_device=os.fstat(history_parent_descriptor).st_dev,
+            )
+            try:
+                for relative, raw in evidence:
+                    _write_exclusive_at(
+                        history_build_descriptor,
+                        relative,
+                        raw,
+                        0o444,
+                    )
+                _write_exclusive_at(
+                    history_build_descriptor,
+                    _MANIFEST_NAME,
+                    manifest_raw,
+                    0o444,
+                )
+                os.fsync(history_build_descriptor)
+                _revalidate_pinned_directory(
+                    plan.history_build_root,
+                    history_build_descriptor,
+                    "DEV-0018 history build root",
+                )
+                _revalidate_pinned_directory(
+                    plan.history_parent,
+                    history_parent_descriptor,
+                    "release history root",
+                )
+                if not _rename_exclusive_at(
+                    history_parent_descriptor,
+                    os.fsencode(_DEV0018_HISTORY_BUILD_NAME),
+                    history_parent_descriptor,
+                    os.fsencode(_DEV0018_HISTORY_STAGE_NAME),
+                ):
+                    raise ReleaseHistoryRefused(
+                        ReleaseHistoryRefusalCodeV1.STAGING_CONFLICT,
+                        "DEV-0018 history staging destination already exists",
+                    )
+                os.fsync(history_parent_descriptor)
+            finally:
+                os.close(history_build_descriptor)
+        except ReleaseHistoryRefused:
+            raise
+        except OSError as error:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.STAGING_CONFLICT,
+                "DEV-0018 history document staging could not be completed",
+            ) from error
+    staged = _load_staged_manifest_v4(plan.history_staging_root)
+    if staged != manifest:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.PREPARATION_INCOMPLETE,
+            "staged V4 history manifest differs from the active inventory",
+        )
+    _verify_prepared_history_documents(plan.history_staging_root, staged)
+    return manifest
+
+
 def _harden_tree(root: Path) -> None:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -2230,9 +2816,18 @@ def _load_staged_manifest(root: Path) -> ReleaseHistoryManifestV3:
     return ReleaseHistoryManifestV3.from_bytes(snapshot.raw)
 
 
+def _load_staged_manifest_v4(root: Path) -> ReleaseHistoryManifestV4:
+    snapshot = _read_regular_file_snapshot(
+        root / _MANIFEST_NAME,
+        maximum_bytes=_MAX_MANIFEST_BYTES,
+        label="partial-history manifest",
+    )
+    return ReleaseHistoryManifestV4.from_bytes(snapshot.raw)
+
+
 def _verify_prepared_history_documents(
     root: Path,
-    manifest: ReleaseHistoryManifestV3,
+    manifest: _ReleaseHistoryManifest,
 ) -> None:
     descriptor, _ = _open_plain_directory(root, "prepared history root")
     try:
@@ -2273,7 +2868,7 @@ def _verify_prepared_history_documents(
 
 def _verify_complete_snapshot_tree_at(
     root_descriptor: int,
-    manifest: ReleaseHistoryManifestV3,
+    manifest: _ReleaseHistoryManifest,
     *,
     require_historical_modes: bool,
 ) -> None:
@@ -2308,7 +2903,7 @@ def _verify_complete_snapshot_tree_at(
 
 def _verify_complete_snapshot_tree(
     root: Path,
-    manifest: ReleaseHistoryManifestV3,
+    manifest: _ReleaseHistoryManifest,
     *,
     require_historical_modes: bool,
 ) -> None:
@@ -2325,7 +2920,7 @@ def _verify_complete_snapshot_tree(
 
 
 def _provider_config_record(
-    manifest: ReleaseHistoryManifestV3,
+    manifest: _ReleaseHistoryManifest,
 ) -> ReleaseHistoryFileV1:
     selected = tuple(
         item
@@ -2417,7 +3012,7 @@ def _verify_next_active_root(
 
 def _receipt(
     plan: ReleaseHistoryRolloverPlanV1,
-    manifest: ReleaseHistoryManifestV3,
+    manifest: _ReleaseHistoryManifest,
     disposition: str,
 ) -> ReleaseHistoryRolloverReceiptV1:
     raw = manifest.canonical_bytes()
@@ -2491,6 +3086,74 @@ def verify_release_history_snapshot_v3(
             raise ReleaseHistoryRefused(
                 ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
                 f"historical public document differs: {relative}",
+            )
+    _verify_complete_snapshot_tree(
+        root,
+        manifest,
+        require_historical_modes=True,
+    )
+    return manifest
+
+
+def verify_release_history_snapshot_v4(
+    history_root: Path | str,
+) -> ReleaseHistoryManifestV4:
+    """Deeply verify one completed DEV-0018 partial-candidate snapshot."""
+
+    root = Path(history_root).absolute()
+    repository = root.parent.parent.parent
+    expected_root = (
+        repository
+        / _HISTORY_PARENT_RELATIVE
+        / DEV0018_RELEASE_EVIDENCE_COMMIT_V1
+    )
+    if root != expected_root:
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.PATH_IDENTITY_MISMATCH,
+            "partial-history snapshot is outside its canonical repository location",
+        )
+    _plain_directory(repository, "repository root")
+    state_metadata = _plain_directory(
+        repository / ".kirby2",
+        "release state root",
+    )
+    _plain_directory(
+        repository / _HISTORY_PARENT_RELATIVE,
+        "release history root",
+        expected_device=state_metadata.st_dev,
+    )
+    _plain_directory(
+        root,
+        "partial release history snapshot",
+        expected_device=state_metadata.st_dev,
+    )
+    manifest = _load_staged_manifest_v4(root)
+    if (
+        manifest.release_evidence_commit != DEV0018_RELEASE_EVIDENCE_COMMIT_V1
+        or manifest.source_candidate_commit != DEV0018_SOURCE_CANDIDATE_COMMIT_V1
+    ):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "partial-history snapshot is not the DEV-0018 predecessor",
+        )
+    historical_documents = _load_dev0018_historical_evidence(repository)
+    if {relative for relative, _ in historical_documents} != set(
+        DEV0018_EVIDENCE_PATH_BY_GATE_V1.values()
+    ):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+            "partial-history public-document set differs",
+        )
+    for relative, expected_raw in historical_documents:
+        observed = _read_regular_file_snapshot(
+            root / relative,
+            maximum_bytes=max(len(expected_raw), 1),
+            label=f"partial-history {relative}",
+        )
+        if observed.raw != expected_raw:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.HISTORICAL_EVIDENCE_MISMATCH,
+                f"partial-history public document differs: {relative}",
             )
     _verify_complete_snapshot_tree(
         root,
@@ -2876,6 +3539,383 @@ def execute_dev0017_release_history_rollover(
             ) from cleanup_errors[0]
 
 
+def execute_dev0018_release_history_rollover(
+    repository_root: Path | str,
+) -> ReleaseHistoryRolloverReceiptV1:
+    """Prepare and atomically roll the DEV-0018 predecessor into history.
+
+    The active payload directory is never copied or deleted.  An interruption may
+    leave a typed hidden staging state; callers must inspect that state and resume
+    only through this function.  Ambiguous or partially prepared states refuse.
+    """
+
+    if sys.platform != "darwin" or not hasattr(fcntl, "F_GETPATH"):
+        raise ReleaseHistoryRefused(
+            ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+            "DEV-0018 rollover requires Darwin descriptor and rename primitives",
+        )
+    initial = inspect_dev0018_release_history_rollover(repository_root)
+    state_descriptor, state_metadata = _open_plain_directory(
+        initial.repository_root / ".kirby2",
+        "release state root",
+    )
+    history_parent_descriptor: int | None = None
+    lock_descriptor: int | None = None
+    release_descriptors: list[int] = []
+    try:
+        history_parent_descriptor, _ = _open_plain_directory(
+            initial.history_parent,
+            "release history root",
+            expected_device=state_metadata.st_dev,
+        )
+        lock_descriptor = _open_history_lock(state_descriptor, state_metadata.st_dev)
+
+        def revalidate_control_roots() -> None:
+            _revalidate_pinned_directory(
+                initial.repository_root / ".kirby2",
+                state_descriptor,
+                "release state root",
+            )
+            _revalidate_pinned_directory(
+                initial.history_parent,
+                history_parent_descriptor,
+                "release history root",
+            )
+            _revalidate_history_lock(state_descriptor, lock_descriptor)
+
+        def current_plan() -> ReleaseHistoryRolloverPlanV1:
+            revalidate_control_roots()
+            observed = inspect_dev0018_release_history_rollover(repository_root)
+            revalidate_control_roots()
+            return observed
+
+        plan = current_plan()
+        if plan.state is ReleaseHistoryRolloverStateV1.COMPLETE:
+            manifest = verify_release_history_snapshot_v4(plan.history_final_root)
+            _verify_next_active_root(
+                plan.active_root,
+                expected_config=_provider_config_record(manifest),
+                require_config_only=False,
+            )
+            return _receipt(plan, manifest, "ALREADY_COMPLETE")
+        if plan.state is ReleaseHistoryRolloverStateV1.AMBIGUOUS:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.RECOVERY_REQUIRED,
+                "rollover paths do not describe one closed lifecycle state",
+            )
+
+        _verify_dev0018_execution_authority(plan.repository_root)
+
+        inventory: tuple[_InventoryEntry, ...] | None = None
+        manifest: ReleaseHistoryManifestV4
+        old_release_descriptor: int | None = None
+        next_release_descriptor: int | None = None
+        if plan.state in {
+            ReleaseHistoryRolloverStateV1.READY,
+            ReleaseHistoryRolloverStateV1.PREPARATION_INCOMPLETE,
+            ReleaseHistoryRolloverStateV1.PREPARED,
+        }:
+            if plan.state is ReleaseHistoryRolloverStateV1.READY:
+                plan_dev0018_release_history_rollover(repository_root)
+            old_release_descriptor = _lock_release_directory(
+                plan.active_root,
+                "active release root",
+                expected_device=state_metadata.st_dev,
+            )
+            release_descriptors.append(old_release_descriptor)
+            plan = current_plan()
+            if plan.state not in {
+                ReleaseHistoryRolloverStateV1.READY,
+                ReleaseHistoryRolloverStateV1.PREPARATION_INCOMPLETE,
+                ReleaseHistoryRolloverStateV1.PREPARED,
+            }:
+                raise ReleaseHistoryRefused(
+                    ReleaseHistoryRefusalCodeV1.RECOVERY_REQUIRED,
+                    "rollover state changed while the active store was locked",
+                )
+            evidence = _load_dev0018_historical_evidence(plan.repository_root)
+            config = _read_regular_file_snapshot_at(
+                old_release_descriptor,
+                _CONFIG_RELATIVE,
+                maximum_bytes=_MAX_PROVIDER_CONFIG_BYTES,
+                label="active provider configuration",
+            )
+            inventory = _inventory_active_store(old_release_descriptor)
+            _verify_dev0018_absent_performance_publication(inventory)
+            _verify_evidence_anchors(inventory, evidence)
+            manifest = _stage_dev0018_rollover(
+                plan,
+                evidence,
+                inventory,
+                config,
+                state_descriptor=state_descriptor,
+                history_parent_descriptor=history_parent_descriptor,
+            )
+            plan = current_plan()
+        else:
+            manifest = _load_staged_manifest_v4(plan.history_staging_root)
+
+        if plan.state is ReleaseHistoryRolloverStateV1.PREPARED:
+            if inventory is None:  # pragma: no cover - pre-move states share one branch
+                raise RuntimeError("prepared rollover lacks its active inventory")
+            _verify_inventory_identity(old_release_descriptor, inventory)
+            config_record = _provider_config_record(manifest)
+            next_release_descriptor = _lock_release_directory(
+                plan.next_active_root,
+                "next-active staging root",
+                expected_device=state_metadata.st_dev,
+            )
+            release_descriptors.append(next_release_descriptor)
+            _verify_next_active_root_at(
+                next_release_descriptor,
+                expected_config=config_record,
+                require_config_only=True,
+            )
+            _verify_dev0018_execution_authority(plan.repository_root)
+            history_stage_descriptor, _ = _open_plain_directory(
+                plan.history_staging_root,
+                "history staging root",
+                expected_device=state_metadata.st_dev,
+            )
+            try:
+                revalidate_control_roots()
+                _revalidate_pinned_directory(
+                    plan.active_root,
+                    old_release_descriptor,
+                    "active release root",
+                )
+                _revalidate_pinned_directory(
+                    plan.next_active_root,
+                    next_release_descriptor,
+                    "next-active staging root",
+                )
+                _revalidate_pinned_directory(
+                    plan.history_staging_root,
+                    history_stage_descriptor,
+                    "history staging root",
+                )
+                if not _rename_exclusive_at(
+                    state_descriptor,
+                    os.fsencode(Path(_ACTIVE_STORE_RELATIVE).name),
+                    history_stage_descriptor,
+                    b"artifacts",
+                ):
+                    raise ReleaseHistoryRefused(
+                        ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                        "history artifact destination already exists",
+                    )
+                os.fsync(history_stage_descriptor)
+                os.fsync(state_descriptor)
+            except ReleaseHistoryRefused:
+                raise
+            except OSError as error:
+                raise ReleaseHistoryRefused(
+                    ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                    "active release could not be atomically quarantined",
+                ) from error
+            finally:
+                os.close(history_stage_descriptor)
+            plan = current_plan()
+
+        quarantine_verified = False
+        if plan.state is ReleaseHistoryRolloverStateV1.OLD_STORE_QUARANTINED:
+            if old_release_descriptor is None:
+                old_release_descriptor = _lock_release_directory(
+                    plan.history_staging_root / "artifacts",
+                    "quarantined active release root",
+                    expected_device=state_metadata.st_dev,
+                )
+                release_descriptors.append(old_release_descriptor)
+            if next_release_descriptor is None:
+                next_release_descriptor = _lock_release_directory(
+                    plan.next_active_root,
+                    "next-active staging root",
+                    expected_device=state_metadata.st_dev,
+                )
+                release_descriptors.append(next_release_descriptor)
+            _verify_complete_snapshot_tree(
+                plan.history_staging_root,
+                manifest,
+                require_historical_modes=False,
+            )
+            quarantine_verified = True
+            _verify_next_active_root_at(
+                next_release_descriptor,
+                expected_config=_provider_config_record(manifest),
+                require_config_only=True,
+            )
+            _verify_dev0018_execution_authority(plan.repository_root)
+            try:
+                revalidate_control_roots()
+                _revalidate_pinned_directory(
+                    plan.history_staging_root / "artifacts",
+                    old_release_descriptor,
+                    "quarantined active release root",
+                )
+                _revalidate_pinned_directory(
+                    plan.next_active_root,
+                    next_release_descriptor,
+                    "next-active staging root",
+                )
+                if not _rename_exclusive_at(
+                    state_descriptor,
+                    os.fsencode(_DEV0018_NEXT_ACTIVE_NAME),
+                    state_descriptor,
+                    os.fsencode(Path(_ACTIVE_STORE_RELATIVE).name),
+                ):
+                    raise ReleaseHistoryRefused(
+                        ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                        "active release destination already exists",
+                    )
+                os.fsync(state_descriptor)
+            except ReleaseHistoryRefused:
+                raise
+            except OSError as error:
+                raise ReleaseHistoryRefused(
+                    ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                    "the config-only active store could not be activated",
+                ) from error
+            plan = current_plan()
+
+        if plan.state is not ReleaseHistoryRolloverStateV1.ACTIVE_REPLACED_HISTORY_PENDING:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.RECOVERY_REQUIRED,
+                f"rollover stopped in state {plan.state.value}",
+            )
+        if next_release_descriptor is None:
+            next_release_descriptor = _lock_release_directory(
+                plan.active_root,
+                "replacement active release root",
+                expected_device=state_metadata.st_dev,
+            )
+            release_descriptors.append(next_release_descriptor)
+        config_record = _provider_config_record(manifest)
+        _verify_next_active_root_at(
+            next_release_descriptor,
+            expected_config=config_record,
+            require_config_only=True,
+        )
+        if not quarantine_verified:
+            if old_release_descriptor is None:
+                old_release_descriptor = _lock_release_directory(
+                    plan.history_staging_root / "artifacts",
+                    "quarantined active release root",
+                    expected_device=state_metadata.st_dev,
+                )
+                release_descriptors.append(old_release_descriptor)
+            _verify_complete_snapshot_tree(
+                plan.history_staging_root,
+                manifest,
+                require_historical_modes=False,
+            )
+        if old_release_descriptor is None or (
+            os.fstat(old_release_descriptor).st_dev,
+            os.fstat(old_release_descriptor).st_ino,
+        ) == (
+            os.fstat(next_release_descriptor).st_dev,
+            os.fstat(next_release_descriptor).st_ino,
+        ):
+            raise RuntimeError("historical and replacement store locks are not distinct")
+        _harden_tree(plan.history_staging_root)
+        _verify_complete_snapshot_tree(
+            plan.history_staging_root,
+            manifest,
+            require_historical_modes=True,
+        )
+        _verify_dev0018_execution_authority(plan.repository_root)
+        history_stage_descriptor, _ = _open_plain_directory(
+            plan.history_staging_root,
+            "hardened history staging root",
+            expected_device=state_metadata.st_dev,
+        )
+        try:
+            revalidate_control_roots()
+            _revalidate_pinned_directory(
+                plan.active_root,
+                next_release_descriptor,
+                "replacement active release root",
+            )
+            _revalidate_pinned_directory(
+                plan.history_staging_root / "artifacts",
+                old_release_descriptor,
+                "quarantined active release root",
+            )
+            _revalidate_pinned_directory(
+                plan.history_staging_root,
+                history_stage_descriptor,
+                "hardened history staging root",
+            )
+            if not _rename_exclusive_at(
+                history_parent_descriptor,
+                os.fsencode(_DEV0018_HISTORY_STAGE_NAME),
+                history_parent_descriptor,
+                os.fsencode(DEV0018_RELEASE_EVIDENCE_COMMIT_V1),
+            ):
+                raise ReleaseHistoryRefused(
+                    ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                    "final history destination already exists",
+                )
+            os.fsync(history_parent_descriptor)
+        except ReleaseHistoryRefused:
+            raise
+        except OSError as error:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                "verified history could not be atomically published",
+            ) from error
+        finally:
+            os.close(history_stage_descriptor)
+        final_plan = current_plan()
+        if final_plan.state is not ReleaseHistoryRolloverStateV1.COMPLETE:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.RECOVERY_REQUIRED,
+                "rollover did not reach its complete state",
+            )
+        final_manifest = verify_release_history_snapshot_v4(
+            final_plan.history_final_root
+        )
+        _verify_next_active_root_at(
+            next_release_descriptor,
+            expected_config=_provider_config_record(final_manifest),
+            require_config_only=True,
+        )
+        return _receipt(final_plan, final_manifest, "ROLLED_OVER")
+    finally:
+        cleanup_errors: list[OSError] = []
+        for descriptor in reversed(tuple(dict.fromkeys(release_descriptors))):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError as error:
+                cleanup_errors.append(error)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if lock_descriptor is not None:
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+            except OSError as error:
+                cleanup_errors.append(error)
+            try:
+                os.close(lock_descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if history_parent_descriptor is not None:
+            try:
+                os.close(history_parent_descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        try:
+            os.close(state_descriptor)
+        except OSError as error:
+            cleanup_errors.append(error)
+        if cleanup_errors and sys.exception() is None:
+            raise ReleaseHistoryRefused(
+                ReleaseHistoryRefusalCodeV1.ACTIVATION_FAILED,
+                "rollover locks or directory descriptors could not be closed",
+            ) from cleanup_errors[0]
+
+
 __all__ = [
     "DEV0017_EVIDENCE_PATH_BY_GATE_V1",
     "DEV0017_EVIDENCE_STATUS_BY_GATE_V1",
@@ -2883,18 +3923,30 @@ __all__ = [
     "DEV0017_RESOURCE_PREFLIGHT_PATH_V1",
     "DEV0017_RESOURCE_PREFLIGHT_SHA256_V1",
     "DEV0017_SOURCE_CANDIDATE_COMMIT_V1",
+    "DEV0018_EVIDENCE_PATH_BY_GATE_V1",
+    "DEV0018_EVIDENCE_STATUS_BY_GATE_V1",
+    "DEV0018_PROTOCOL_COMMIT_V1",
+    "DEV0018_RELEASE_EVIDENCE_COMMIT_V1",
+    "DEV0018_SOURCE_CANDIDATE_COMMIT_V1",
     "RELEASE_HISTORY_ROLLOVER_POLICY_ID_V1",
     "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3",
+    "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4",
     "ReleaseHistoryFileV1",
     "ReleaseHistoryGateResultV1",
+    "ReleaseHistoryGateResultV2",
     "ReleaseHistoryManifestV3",
+    "ReleaseHistoryManifestV4",
     "ReleaseHistoryRefusalCodeV1",
     "ReleaseHistoryRefused",
     "ReleaseHistoryRolloverPlanV1",
     "ReleaseHistoryRolloverReceiptV1",
     "ReleaseHistoryRolloverStateV1",
     "execute_dev0017_release_history_rollover",
+    "execute_dev0018_release_history_rollover",
     "inspect_dev0017_release_history_rollover",
+    "inspect_dev0018_release_history_rollover",
     "plan_dev0017_release_history_rollover",
+    "plan_dev0018_release_history_rollover",
     "verify_release_history_snapshot_v3",
+    "verify_release_history_snapshot_v4",
 ]

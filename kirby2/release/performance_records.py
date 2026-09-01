@@ -36,6 +36,7 @@ from .performance import (
     RELEASE_PERFORMANCE_ROOTS_V1,
     RELEASE_PERFORMANCE_WORKER_COUNT_V1,
     RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1,
+    RELEASE_TERMINAL_PRESENTATION_POLICY_V2,
     RELEASE_TOTAL_WALL_LIMIT_NS_V1,
     ReleaseAuxiliaryPerformanceResultV1,
     ReleaseAuxiliaryPerformanceTemplateV1,
@@ -2172,6 +2173,140 @@ def _validate_terminal_sink_receipt(value: object) -> None:
         raise ValueError("auxiliary terminal sink receipt differs")
 
 
+def _validate_terminal_sink_receipt_v2(value: object) -> None:
+    row = _exact_object(
+        value,
+        {
+            "bytes_drained", "bytes_written", "color", "columns",
+            "drained_sha256", "drain_policy", "encoding",
+            "frame_digest_chain_sha256", "rows", "term", "written_sha256",
+        },
+        "auxiliary terminal V2 sink receipt",
+    )
+    bytes_drained = _nonnegative(row["bytes_drained"], "terminal drained bytes")
+    bytes_written = _nonnegative(row["bytes_written"], "terminal written bytes")
+    for field in (
+        "drained_sha256",
+        "frame_digest_chain_sha256",
+        "written_sha256",
+    ):
+        require_sha256(row[field], f"terminal {field}")
+    if (
+        bytes_drained == 0
+        or bytes_drained != bytes_written
+        or row["drained_sha256"] != row["written_sha256"]
+        or {
+            "color": row["color"],
+            "columns": row["columns"],
+            "drain_policy": row["drain_policy"],
+            "encoding": row["encoding"],
+            "rows": row["rows"],
+            "term": row["term"],
+        }
+        != {
+            "color": False,
+            "columns": 120,
+            "drain_policy": "CONTINUOUS",
+            "encoding": "UTF-8",
+            "rows": 40,
+            "term": "dumb",
+        }
+    ):
+        raise ValueError("auxiliary terminal V2 sink receipt differs")
+
+
+def _validate_terminal_presentation_feasibility_v2(
+    value: object,
+    presentation: object,
+) -> None:
+    if presentation != RELEASE_TERMINAL_PRESENTATION_POLICY_V2:
+        raise ValueError("auxiliary terminal V2 presentation policy differs")
+    row = _exact_object(
+        value,
+        {
+            "available_tick_count", "boundary_policy_id",
+            "causal_source_policy_id", "clock_source_id", "consumed_tick_count",
+            "continuous_end_us", "continuous_start_us",
+            "delivered_source_sequence_count",
+            "delivered_source_sequence_reorder_count", "delivered_source_sequences",
+            "duplicate_source_policy_id", "eligible_visible_update_count",
+            "first_causal_source_sequence", "first_presentation_time_us",
+            "frame_milliseconds", "last_causal_source_sequence",
+            "last_presentation_time_us", "latency_boundary_policy_id",
+            "policy_id", "presented_source_sequence_reorder_count",
+            "presented_source_sequence_reuse_count", "required_update_count",
+            "schema_version", "simulation_speed_milli", "simulation_step_us",
+            "skipped_unchanged_tick_count", "status",
+            "update_ordinal_policy_id", "visible_change_policy_id",
+        },
+        "auxiliary terminal V2 presentation feasibility",
+    )
+    count_fields = (
+        "available_tick_count",
+        "consumed_tick_count",
+        "continuous_end_us",
+        "continuous_start_us",
+        "delivered_source_sequence_count",
+        "delivered_source_sequence_reorder_count",
+        "eligible_visible_update_count",
+        "first_causal_source_sequence",
+        "first_presentation_time_us",
+        "last_causal_source_sequence",
+        "last_presentation_time_us",
+        "presented_source_sequence_reorder_count",
+        "presented_source_sequence_reuse_count",
+        "required_update_count",
+        "skipped_unchanged_tick_count",
+    )
+    for field in count_fields:
+        _nonnegative(row[field], f"terminal feasibility {field}")
+    delivered = _array(
+        row["delivered_source_sequences"],
+        "terminal feasibility delivered source sequences",
+    )
+    delivered_sequences = tuple(
+        _nonnegative(item, "terminal delivered source sequence")
+        for item in delivered
+    )
+    if (
+        not delivered_sequences
+        or any(item == 0 for item in delivered_sequences)
+        or len(delivered_sequences) != len(set(delivered_sequences))
+        or row["delivered_source_sequence_count"] != len(delivered_sequences)
+        or row["delivered_source_sequence_reorder_count"]
+        != sum(
+            right < left
+            for left, right in zip(
+                delivered_sequences,
+                delivered_sequences[1:],
+            )
+        )
+        or row["schema_version"] != 2
+        or row["status"] != "PASS"
+        or row["required_update_count"] != 5_100
+        or row["eligible_visible_update_count"] != 5_100
+        or row["available_tick_count"] < row["consumed_tick_count"]
+        or row["continuous_start_us"] >= row["continuous_end_us"]
+        or any(
+            row[field] != RELEASE_TERMINAL_PRESENTATION_POLICY_V2[field]
+            for field in (
+                "boundary_policy_id",
+                "causal_source_policy_id",
+                "clock_source_id",
+                "duplicate_source_policy_id",
+                "frame_milliseconds",
+                "latency_boundary_policy_id",
+                "policy_id",
+                "simulation_speed_milli",
+                "simulation_step_us",
+                "update_ordinal_policy_id",
+                "visible_change_policy_id",
+            )
+        )
+    ):
+        raise ValueError("auxiliary terminal V2 presentation feasibility differs")
+
+
 def _validate_auxiliary_attempt_receipts(
     template: ReleaseAuxiliaryPerformanceTemplateV1,
     source_identities: tuple[_AuxiliarySourceIdentity, ...],
@@ -2281,23 +2416,67 @@ def _validate_auxiliary_attempt_receipts(
             raise ValueError("interactive starter installation evidence differs")
         return
     if workload_id == "RELEASE_TERMINAL_UPDATE_V1":
+        terminal_v2 = "presentation" in parameters
+        receipt_fields = {
+            "first_message_sequence", "last_message_sequence", "peak_rss_bytes",
+            "rendered_update_count", "run_id", "source_evidence_sha256",
+            "source_materialization", "status", "terminal",
+            "update_inventory_sha256",
+        }
+        if terminal_v2:
+            receipt_fields.update(
+                {
+                    "first_update_ordinal",
+                    "last_update_ordinal",
+                    "presentation",
+                    "presentation_feasibility",
+                }
+            )
         receipt = _exact_object(
             _canonical_payload(
                 evidence_payloads["terminal-update/receipt.json"],
                 "terminal update receipt",
             ),
-            {
-                "first_message_sequence", "last_message_sequence", "peak_rss_bytes",
-                "rendered_update_count", "run_id", "source_evidence_sha256",
-                "source_materialization", "status", "terminal",
-                "update_inventory_sha256",
-            },
+            receipt_fields,
             "terminal update receipt",
         )
         _nonnegative(receipt["first_message_sequence"], "terminal first sequence")
         _nonnegative(receipt["last_message_sequence"], "terminal last sequence")
         _nonnegative(receipt["peak_rss_bytes"], "terminal peak RSS")
-        _validate_terminal_sink_receipt(receipt["terminal"])
+        if terminal_v2:
+            _validate_terminal_presentation_feasibility_v2(
+                receipt["presentation_feasibility"],
+                parameters["presentation"],
+            )
+            first_ordinal = _nonnegative(
+                receipt["first_update_ordinal"], "terminal first update ordinal"
+            )
+            last_ordinal = _nonnegative(
+                receipt["last_update_ordinal"], "terminal last update ordinal"
+            )
+            rendered_count = _nonnegative(
+                receipt["rendered_update_count"], "terminal rendered update count"
+            )
+            source_digest = receipt["source_evidence_sha256"]
+            inventory_digest = receipt["update_inventory_sha256"]
+            require_sha256(source_digest, "terminal source evidence digest")
+            require_sha256(inventory_digest, "terminal update inventory digest")
+            if (
+                first_ordinal != 0
+                or last_ordinal != 5_099
+                or rendered_count != 5_100
+                or receipt["status"] != "PASS"
+                or receipt["presentation"] != parameters["presentation"]
+                or source_digest != parameters["source_artifact_manifest_sha256"]
+                or inventory_digest
+                != hashlib.sha256(
+                    evidence_payloads["terminal-update/update-inventory.json"]
+                ).hexdigest()
+            ):
+                raise ValueError("terminal V2 receipt identity differs")
+            _validate_terminal_sink_receipt_v2(receipt["terminal"])
+        else:
+            _validate_terminal_sink_receipt(receipt["terminal"])
         materialization = _exact_object(
             receipt["source_materialization"],
             {
@@ -2323,6 +2502,17 @@ def _validate_auxiliary_attempt_receipts(
             )
         ):
             raise ValueError("terminal source verification differs")
+        if terminal_v2:
+            receipt_run_id = _text(receipt["run_id"], "terminal receipt run ID", 64)
+            if (
+                _RUN_ID.fullmatch(receipt_run_id) is None
+                or receipt_run_id != terminal_run_id
+                or materialization["candidate_id"] != "QUIET_RANGE_PRESSURE"
+                or materialization["root_seed"] != 3_102_000
+                or materialization["evidence_sha256"]
+                != parameters["source_artifact_manifest_sha256"]
+            ):
+                raise ValueError("terminal V2 source materialization differs")
         return
     if workload_id == "RELEASE_FULL_DAY_GENERATION_V1":
         rows = _array(

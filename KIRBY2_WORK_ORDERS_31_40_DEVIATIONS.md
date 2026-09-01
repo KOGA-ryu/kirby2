@@ -1394,3 +1394,122 @@ coordinator deadlines remain monotonic; numeric thresholds are unchanged; the
 repaired candidate has a mechanically regenerated source lock and resource preflight;
 F/G/H/I are requalified in order; and no audit, planning call, or history verifier
 mutates the active store or executes the one-time rollover.
+
+## DEV-0018 — Repair V2 performance publication verification and restart qualification
+
+- Interrupted release sequence: the DEV-0017 requalification of `WO40-I` refused
+  before activation; canonical `WO40-J` remains blocked until this verifier repair
+  is committed and `WO40-F`, `WO40-G`, `WO40-H`, and `WO40-I` are requalified in
+  that order.
+- Exact first-parent predecessor:
+  `901e31c3e7d7a2ce5a423011e36d363440f20cc2`
+- Superseded source candidate:
+  `a198c69426551b8d2f44269cbdc82980a8978b03`.  Its current active release store
+  contains the immutable WO40-F artifacts plus passing WO40-G and WO40-H attempt
+  records.  No WO40-I public root, activation, attempt, aggregate, auxiliary result,
+  or performance evidence document for this candidate exists.
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py qualify-performance --manifest release/performance_thresholds.toml --complete-run-work-units 10000 --build-evidence KIRBY2_RELEASE_BUILD_EVIDENCE.md --artifact-store .kirby2/release`
+- Observed terminal result: all four fixed workers completed the preregistered
+  10,000-work-unit corpus on attempt 1 and the coordinator entered aggregate
+  verification, then returned typed refusal `PERFORMANCE_VERIFICATION_FAILED` with
+  detail `terminal update receipt fields differ from the V1 schema`.  The disposable
+  executor root was cleaned, atomic activation left the public WO40-I root absent,
+  and the active D1/F/G/H store and tracked tree remained unchanged.  This is an
+  operational verifier defect, not a measured threshold result, and it grants no
+  authority to synthesize WO40-I evidence or recover unpublished temporary bytes.
+- Root cause: the active terminal template contains the exact committed
+  `RELEASE_TERMINAL_PRESENTATION_POLICY_V2` member.  The workload dispatcher and
+  primary auxiliary verifier therefore correctly select V2, whose top-level receipt
+  additionally carries `first_update_ordinal`, `last_update_ordinal`, `presentation`,
+  and `presentation_feasibility`, and whose PTY receipt carries separate written,
+  drained, and frame-chain SHA-256 values.  The independent release-publication
+  verifier in `performance_records.py` nevertheless exact-matched every terminal
+  receipt and PTY receipt against only the historical V1 shapes.  The already
+  validated V2 bytes were consequently rejected before activation.
+- Repair — receipt verification: select the secondary terminal receipt grammar only
+  from the frozen template parameters.  A template without `presentation` retains
+  the exact historical V1 top-level and `sha256` PTY shapes.  A template whose
+  `presentation` member equals `RELEASE_TERMINAL_PRESENTATION_POLICY_V2` requires the
+  exact V2 top-level, feasibility, and PTY shapes; independently validates nonzero
+  equal written/drained byte counts, all three SHA-256 values, matching written and
+  drained stream digests, fixed terminal geometry/encoding/drain policy, presentation
+  identity, update ordinals/count, status, source materialization, and inventory
+  digest; and continues to rely on the existing primary V2 verifier for complete row,
+  cadence, causality, frame-chain, series, and threshold reconciliation.  Unknown or
+  malformed presentation members refuse.  No producer, public record schema,
+  workload, sample, reduction, threshold, resource, or product behavior changes.
+- Repair — incomplete-candidate history: add the typed
+  `KIRBY2_RELEASE_HISTORY_SNAPSHOT_V4` profile without changing or reinterpreting the
+  existing DEV-0017 V3 snapshot.  The V4 manifest records D1/F/G/H as `PASS` and
+  WO40-I as `NOT_RUN`, inventories the exact four D1/F/G/H evidence documents from
+  the predecessor Git object, and inventories every regular file in the active
+  release store.  It requires WO40-I publication paths to be absent and verifies all
+  immediate F/G/H and build anchors.  Under the existing exclusive global and
+  active-store locks, the executor uses same-filesystem no-replace directory renames
+  to quarantine the complete active store, activate an exact config-only replacement,
+  harden and deeply verify the quarantined snapshot, and publish it at
+  `.kirby2/release-history/901e31c3e7d7a2ce5a423011e36d363440f20cc2/`.
+  Both rename parents are fsynced.  Interruption states are typed and resumable;
+  ambiguous paths refuse; there is no bulk copy, recursive deletion, overwrite, or
+  partial-history fallback.
+- Repair — release restart: regenerate
+  `release/performance_runner_sources.lock` mechanically after the verifier,
+  history, deviation, and audit repairs are final.  Commit the complete source repair
+  under exact subject `Repair WO40-I V2 publication verification`.  Only after that
+  commit exists, run the canonical no-network resource preflight.  This repair changes
+  no release-protocol or resource input, so the renderer must reproduce the tracked D1
+  report byte-for-byte with frozen protocol owner
+  `020da2c90c0f0000f822aad7c66538fe68c6c6e6`; any changed rendering refuses and
+  requires new authority.  Create an intentional empty candidate-boundary commit
+  under exact subject `Reverify release resources for DEV-0018`.  It changes no tree
+  path, directly parents the source repair, and truthfully reuses the still-canonical
+  report rather than fabricating different evidence bytes.  That D1 boundary commit
+  becomes the new candidate.  Execute the V4 rollover, rebuild WO40-F, requalify
+  WO40-G in disposable host-only Tart clones, requalify WO40-H on the pinned Fedora
+  SSH provider, and rerun canonical WO40-I into the empty public root.  Resume WO40-J
+  only after the new WO40-I publication deeply verifies and its preregistered status
+  satisfies closeout.
+- Owned repair paths: `kirby2/release/performance_records.py`,
+  `kirby2/release/history.py`, `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `release/performance_runner_sources.lock`,
+  `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0018` appears immediately after `DEV-0017` and before
+  resumed `WO40-J`; the deviation inventory extends monotonically through
+  `DEV-0018`.  The superseded candidate's D1/F/G/H evidence remains historical and
+  does not satisfy the new candidate's prerequisites.
+- Inherited gates: every DEV-0017 production, terminal-presentation, history,
+  qualification, performance, safety, and product-limitation contract remains in
+  force.  Release targets, artifact/member layout, dependency pins, launchers,
+  documentation, starter content, qualification rows/check order, four-worker and
+  256-FIFO resources, 10,000-row corpus, retry/timeout limits, auxiliary repetitions,
+  reductions, numeric thresholds, and designated installed target are unchanged.
+  No brokerage, live-market connection, credential creation, telemetry, updater,
+  background service, network download, GPU workload, provider operation, history
+  rollover, build, qualification, or performance workload is executed by the
+  deviation audit.
+- Exact source repair commit subject:
+  `Repair WO40-I V2 publication verification`
+- Exact D1 evidence commit subject: `Reverify release resources for DEV-0018`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0017
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0018
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m compileall -q kirby2
+git diff --check
+```
+
+Acceptance: the ledger prefix through DEV-0017 is byte-preserved; DEV-0018 is the
+only appended authority record; active V2 and detached historical V1 terminal
+receipts both receive exact independent deep verification; malformed or cross-version
+receipts refuse; the V4 snapshot truthfully distinguishes absent WO40-I from a
+measured `FAIL` and preserves the complete superseded active store by atomic rename;
+the repaired source lock and D1 report bind the new candidate; F/G/H/I are
+requalified in order; and no audit or planning call mutates the active store or runs
+the one-time rollover.

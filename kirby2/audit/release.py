@@ -46,6 +46,7 @@ DEV0013_AUDIT_CASE_COUNT = 3
 DEV0014_AUDIT_CASE_COUNT = 3
 DEV0015_AUDIT_CASE_COUNT = 4
 DEV0017_AUDIT_CASE_COUNT = 4
+DEV0018_AUDIT_CASE_COUNT = 4
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -74,7 +75,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 18)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 19)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -4884,6 +4885,16 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
     except UnicodeDecodeError:
         suffix_text = ""
         authority_failures.append("DEV-0017 suffix is not UTF-8")
+    dev0018_heading = (
+        "## DEV-0018 — Repair V2 performance publication verification and "
+        "restart qualification"
+    )
+    dev0018_heading_count = suffix_text.count(dev0018_heading)
+    dev0017_section = (
+        suffix_text.split(dev0018_heading, 1)[0]
+        if dev0018_heading_count == 1
+        else ""
+    )
     required_authority_tokens = {
         "## DEV-0017 — Repair measured performance failures and restart closeout",
         "Interrupted canonical card: `WO40-J`",
@@ -4909,11 +4920,11 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
         "WO40-F`, `WO40-G`, `WO40-H`, and `WO40-I`",
     }
     missing_authority_tokens = sorted(
-        token for token in required_authority_tokens if token not in suffix_text
+        token for token in required_authority_tokens if token not in dev0017_section
     )
     if (
-        suffix_text.count("## DEV-0017") != 1
-        or "## DEV-0018" in suffix_text
+        dev0017_section.count("## DEV-0017") != 1
+        or dev0018_heading_count != 1
         or missing_authority_tokens
     ):
         authority_failures.append("DEV-0017 authority record is missing or differs")
@@ -4938,7 +4949,7 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
     )
     owned_match = re.search(
         r"(?ms)^- Owned repair paths:(.*?)(?=^- Gate registration:)",
-        suffix_text,
+        dev0017_section,
     )
     owned_paths = (
         ()
@@ -4953,7 +4964,7 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
         (match.group(1), match.group(2))
         for match in re.finditer(
             r"(?m)^- Exact ([^:\n]+) commit subject:\s*`([^`\n]+)`$",
-            suffix_text,
+            dev0017_section,
         )
     )
     expected_commit_subjects = (
@@ -5191,12 +5202,6 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
         and item.func.value.id == "os"
         and item.func.attr == "rename"
     )
-    exclusive_rename_calls = sum(
-        1
-        for item in calls
-        if isinstance(item.func, ast.Name)
-        and item.func.id == "_rename_exclusive_at"
-    )
     imports_shutil = any(
         (
             isinstance(item, ast.Import)
@@ -5207,6 +5212,16 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
     )
     execute_node = top_level_function(
         history_tree, "execute_dev0017_release_history_rollover"
+    )
+    stage_node = top_level_function(history_tree, "_stage_rollover")
+    exclusive_rename_calls = sum(
+        1
+        for node in (stage_node, execute_node)
+        if node is not None
+        for item in ast.walk(node)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Name)
+        and item.func.id == "_rename_exclusive_at"
     )
     execute_calls = {
         item.func.id
@@ -6763,6 +6778,904 @@ def audit_release_performance_failure_restart() -> ReleaseAuditSuite:
         raise RuntimeError("DEV-0017 release audit inventory changed")
     return ReleaseAuditSuite(
         "DEV-0017",
+        cases,
+        metadata=(
+            ("executor_invocations", "0"),
+            ("history_rollover_invocations", "0"),
+            ("interrupted_card", "WO40-J"),
+            ("predecessor_commit", predecessor),
+            ("provider_invocations", "0"),
+            ("workload_invocations", "0"),
+        ),
+    )
+
+
+def audit_release_performance_verifier_restart() -> ReleaseAuditSuite:
+    """Prove DEV-0018 receipt and partial-history repairs without executing them."""
+
+    repository = _repository_root()
+    predecessor = "901e31c3e7d7a2ce5a423011e36d363440f20cc2"
+    candidate = "a198c69426551b8d2f44269cbdc82980a8978b03"
+
+    def parse_source(
+        relative: str,
+        failures: list[str],
+    ) -> tuple[str, ast.Module]:
+        path = repository / relative
+        try:
+            source = path.read_text(encoding="utf-8")
+            return source, ast.parse(source, filename=os.fspath(path))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            failures.append(
+                f"{relative} source failed: {type(error).__name__}"
+            )
+            return "", ast.Module(body=[], type_ignores=[])
+
+    def top_level_function(
+        tree: ast.Module,
+        name: str,
+    ) -> ast.FunctionDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            ),
+            None,
+        )
+
+    def top_level_class(tree: ast.Module, name: str) -> ast.ClassDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.ClassDef) and item.name == name
+            ),
+            None,
+        )
+
+    def called_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            item.func.id
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
+        }
+
+    def exact_object_fields(
+        node: ast.AST | None,
+        label: str,
+    ) -> tuple[frozenset[str], ...]:
+        if node is None:
+            return ()
+        output: list[frozenset[str]] = []
+        for item in ast.walk(node):
+            if (
+                not isinstance(item, ast.Call)
+                or not isinstance(item.func, ast.Name)
+                or item.func.id != "_exact_object"
+                or len(item.args) < 3
+            ):
+                continue
+            try:
+                observed_label = ast.literal_eval(item.args[2])
+                observed_fields = ast.literal_eval(item.args[1])
+            except (TypeError, ValueError):
+                continue
+            if observed_label == label and isinstance(
+                observed_fields, (set, frozenset)
+            ):
+                output.append(frozenset(observed_fields))
+        return tuple(output)
+
+    receipt_failures: list[str] = []
+    ledger_path = repository / "KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md"
+    try:
+        ledger = ledger_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        ledger = ""
+        receipt_failures.append(
+            f"DEV-0018 deviation ledger failed: {type(error).__name__}"
+        )
+    dev0018_heading = (
+        "## DEV-0018 — Repair V2 performance publication verification and "
+        "restart qualification"
+    )
+    section = ledger.split(dev0018_heading, 1)[1] if dev0018_heading in ledger else ""
+    required_authority_tokens = {
+        predecessor,
+        candidate,
+        "PERFORMANCE_VERIFICATION_FAILED",
+        "terminal update receipt fields differ from the V1 schema",
+        "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V4",
+        "WO40-I as `NOT_RUN`",
+        "intentional empty candidate-boundary commit",
+        "020da2c90c0f0000f822aad7c66538fe68c6c6e6",
+        "Repair WO40-I V2 publication verification",
+        "Reverify release resources for DEV-0018",
+    }
+    missing_authority_tokens = sorted(
+        token for token in required_authority_tokens if token not in section
+    )
+    expected_owned_paths = (
+        "kirby2/release/performance_records.py",
+        "kirby2/release/history.py",
+        "kirby2/audit/release.py",
+        "kirby2/audit/expansion.py",
+        "release/performance_runner_sources.lock",
+        "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md",
+    )
+    owned_match = re.search(
+        r"(?ms)^- Owned repair paths:(.*?)(?=^- Gate registration:)",
+        section,
+    )
+    owned_paths = (
+        ()
+        if owned_match is None
+        else tuple(re.findall(r"`([^`]+)`", owned_match.group(1)))
+    )
+    observed_commit_subjects = tuple(
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"(?m)^- Exact ([^:\n]+) commit subject:\s*`([^`\n]+)`$",
+            section,
+        )
+    )
+    expected_commit_subjects = (
+        ("source repair", "Repair WO40-I V2 publication verification"),
+        ("D1 evidence", "Reverify release resources for DEV-0018"),
+    )
+    if (
+        ledger.count(dev0018_heading) != 1
+        or "## DEV-0019" in section
+        or missing_authority_tokens
+        or owned_paths != expected_owned_paths
+        or observed_commit_subjects != expected_commit_subjects
+    ):
+        receipt_failures.append("DEV-0018 authority record is missing or differs")
+
+    records_source, records_tree = parse_source(
+        "kirby2/release/performance_records.py",
+        receipt_failures,
+    )
+    terminal_validator = top_level_function(
+        records_tree, "_validate_auxiliary_attempt_receipts"
+    )
+    sink_v1 = top_level_function(records_tree, "_validate_terminal_sink_receipt")
+    sink_v2 = top_level_function(records_tree, "_validate_terminal_sink_receipt_v2")
+    feasibility_v2 = top_level_function(
+        records_tree, "_validate_terminal_presentation_feasibility_v2"
+    )
+    terminal_source = "" if terminal_validator is None else ast.unparse(terminal_validator)
+    common_sink_fields = frozenset(
+        {
+            "bytes_drained",
+            "bytes_written",
+            "color",
+            "columns",
+            "drain_policy",
+            "encoding",
+            "rows",
+            "term",
+        }
+    )
+    v1_sink_fields = frozenset({*common_sink_fields, "sha256"})
+    v2_sink_fields = frozenset(
+        {
+            *common_sink_fields,
+            "drained_sha256",
+            "frame_digest_chain_sha256",
+            "written_sha256",
+        }
+    )
+    v1_receipt_fields = frozenset(
+        {
+            "first_message_sequence",
+            "last_message_sequence",
+            "peak_rss_bytes",
+            "rendered_update_count",
+            "run_id",
+            "source_evidence_sha256",
+            "source_materialization",
+            "status",
+            "terminal",
+            "update_inventory_sha256",
+        }
+    )
+    v2_extra_receipt_fields = frozenset(
+        {
+            "first_update_ordinal",
+            "last_update_ordinal",
+            "presentation",
+            "presentation_feasibility",
+        }
+    )
+    v2_feasibility_fields = frozenset(
+        {
+            "available_tick_count",
+            "boundary_policy_id",
+            "causal_source_policy_id",
+            "clock_source_id",
+            "consumed_tick_count",
+            "continuous_end_us",
+            "continuous_start_us",
+            "delivered_source_sequence_count",
+            "delivered_source_sequence_reorder_count",
+            "delivered_source_sequences",
+            "duplicate_source_policy_id",
+            "eligible_visible_update_count",
+            "first_causal_source_sequence",
+            "first_presentation_time_us",
+            "frame_milliseconds",
+            "last_causal_source_sequence",
+            "last_presentation_time_us",
+            "latency_boundary_policy_id",
+            "policy_id",
+            "presented_source_sequence_reorder_count",
+            "presented_source_sequence_reuse_count",
+            "required_update_count",
+            "schema_version",
+            "simulation_speed_milli",
+            "simulation_step_us",
+            "skipped_unchanged_tick_count",
+            "status",
+            "update_ordinal_policy_id",
+            "visible_change_policy_id",
+        }
+    )
+
+    receipt_assignment_fields: tuple[frozenset[str], ...] = ()
+    receipt_update_fields: tuple[frozenset[str], ...] = ()
+    if terminal_validator is not None:
+        assignments: list[frozenset[str]] = []
+        updates: list[frozenset[str]] = []
+        for item in ast.walk(terminal_validator):
+            if (
+                isinstance(item, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "receipt_fields"
+                    for target in item.targets
+                )
+                and isinstance(item.value, ast.Set)
+            ):
+                try:
+                    assignments.append(frozenset(ast.literal_eval(item.value)))
+                except (TypeError, ValueError):
+                    pass
+            if (
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and isinstance(item.func.value, ast.Name)
+                and item.func.value.id == "receipt_fields"
+                and item.func.attr == "update"
+                and len(item.args) == 1
+                and isinstance(item.args[0], ast.Set)
+            ):
+                try:
+                    updates.append(frozenset(ast.literal_eval(item.args[0])))
+                except (TypeError, ValueError):
+                    pass
+        receipt_assignment_fields = tuple(assignments)
+        receipt_update_fields = tuple(updates)
+    routing_tokens = {
+        "terminal_v2 = 'presentation' in parameters",
+        "_validate_terminal_presentation_feasibility_v2",
+        "_validate_terminal_sink_receipt_v2(receipt['terminal'])",
+        "_validate_terminal_sink_receipt(receipt['terminal'])",
+        "materialization = _exact_object",
+    }
+    missing_routing_tokens = sorted(
+        token for token in routing_tokens if token not in terminal_source
+    )
+    if (
+        exact_object_fields(sink_v1, "auxiliary terminal sink receipt")
+        != (v1_sink_fields,)
+        or exact_object_fields(sink_v2, "auxiliary terminal V2 sink receipt")
+        != (v2_sink_fields,)
+        or exact_object_fields(
+            feasibility_v2,
+            "auxiliary terminal V2 presentation feasibility",
+        )
+        != (v2_feasibility_fields,)
+        or receipt_assignment_fields != (v1_receipt_fields,)
+        or receipt_update_fields != (v2_extra_receipt_fields,)
+        or missing_routing_tokens
+        or terminal_source.find("materialization = _exact_object")
+        < terminal_source.find("_validate_terminal_sink_receipt_v2")
+    ):
+        receipt_failures.append("secondary terminal V1/V2 routing structure differs")
+
+    receipt_probe_results: dict[str, str] = {}
+    try:
+        from kirby2.release.performance import ReleaseAuxiliaryPerformanceTemplateV1
+        from kirby2.release.performance_records import (
+            _validate_auxiliary_attempt_receipts,
+        )
+        from kirby2.ui.terminal import RELEASE_TERMINAL_PRESENTATION_POLICY_V2
+
+        digest = hashlib.sha256(b"DEV-0018 terminal receipt probe").hexdigest()
+        inventory_raw = canonical_json_bytes([])
+        inventory_digest = hashlib.sha256(inventory_raw).hexdigest()
+        run_id = "run-" + "1" * 24
+        verification = {
+            "artifact_digests_valid": True,
+            "artifact_inventory_valid": True,
+            "canonical_payloads_valid": True,
+            "checkpoints_valid": True,
+            "failures": [],
+            "manifest_valid": True,
+            "privacy_contract_valid": True,
+            "replay_valid": True,
+            "run_id": run_id,
+            "status": "PASS",
+            "summary_valid": True,
+        }
+        materialization = {
+            "candidate_id": "QUIET_RANGE_PRESSURE",
+            "evidence_sha256": digest,
+            "maximum_initial_pending": 0,
+            "plan_sha256": digest,
+            "root_seed": 3_102_000,
+            "run_id": run_id,
+            "verification": verification,
+            "workload_sha256": digest,
+        }
+        sink_common = {
+            "bytes_drained": 1,
+            "bytes_written": 1,
+            "color": False,
+            "columns": 120,
+            "drain_policy": "CONTINUOUS",
+            "encoding": "UTF-8",
+            "rows": 40,
+            "term": "dumb",
+        }
+        receipt_common = {
+            "first_message_sequence": 1,
+            "last_message_sequence": 2,
+            "peak_rss_bytes": 1,
+            "rendered_update_count": 5_100,
+            "run_id": run_id,
+            "source_evidence_sha256": digest,
+            "source_materialization": materialization,
+            "status": "PASS",
+            "update_inventory_sha256": inventory_digest,
+        }
+        presentation = dict(RELEASE_TERMINAL_PRESENTATION_POLICY_V2)
+        presentation_feasibility = {
+            "available_tick_count": 5_100,
+            "boundary_policy_id": presentation["boundary_policy_id"],
+            "causal_source_policy_id": presentation["causal_source_policy_id"],
+            "clock_source_id": presentation["clock_source_id"],
+            "consumed_tick_count": 5_100,
+            "continuous_end_us": 2,
+            "continuous_start_us": 1,
+            "delivered_source_sequence_count": 2,
+            "delivered_source_sequence_reorder_count": 0,
+            "delivered_source_sequences": [1, 2],
+            "duplicate_source_policy_id": presentation[
+                "duplicate_source_policy_id"
+            ],
+            "eligible_visible_update_count": 5_100,
+            "first_causal_source_sequence": 1,
+            "first_presentation_time_us": 1,
+            "frame_milliseconds": presentation["frame_milliseconds"],
+            "last_causal_source_sequence": 2,
+            "last_presentation_time_us": 2,
+            "latency_boundary_policy_id": presentation[
+                "latency_boundary_policy_id"
+            ],
+            "policy_id": presentation["policy_id"],
+            "presented_source_sequence_reorder_count": 0,
+            "presented_source_sequence_reuse_count": 5_098,
+            "required_update_count": 5_100,
+            "schema_version": presentation["schema_version"],
+            "simulation_speed_milli": presentation["simulation_speed_milli"],
+            "simulation_step_us": presentation["simulation_step_us"],
+            "skipped_unchanged_tick_count": 0,
+            "status": "PASS",
+            "update_ordinal_policy_id": presentation[
+                "update_ordinal_policy_id"
+            ],
+            "visible_change_policy_id": presentation["visible_change_policy_id"],
+        }
+        v1_receipt = {
+            **receipt_common,
+            "terminal": {**sink_common, "sha256": digest},
+        }
+        v2_receipt = {
+            **receipt_common,
+            "first_update_ordinal": 0,
+            "last_update_ordinal": 5_099,
+            "presentation": presentation,
+            "presentation_feasibility": presentation_feasibility,
+            "terminal": {
+                **sink_common,
+                "drained_sha256": digest,
+                "frame_digest_chain_sha256": digest,
+                "written_sha256": digest,
+            },
+        }
+
+        def terminal_template(*, v2: bool) -> ReleaseAuxiliaryPerformanceTemplateV1:
+            parameters: dict[str, object] = {
+                "source_artifact_manifest_sha256": digest,
+            }
+            if v2:
+                parameters["presentation"] = presentation
+            return ReleaseAuxiliaryPerformanceTemplateV1(
+                workload_id="RELEASE_TERMINAL_UPDATE_V1",
+                entrypoint_paths=("kirby2/release/desktop.py",),
+                artifact_selector="macos-arm64/desktop",
+                input_identity={
+                    "schema_version": 1,
+                    "kind": "TERMINAL_UPDATE",
+                    "parameters": parameters,
+                },
+            )
+
+        def probe_receipt(
+            probe_id: str,
+            *,
+            template_v2: bool,
+            receipt: dict[str, object],
+            expected: str,
+        ) -> None:
+            try:
+                _validate_auxiliary_attempt_receipts(
+                    terminal_template(v2=template_v2),
+                    (),
+                    {
+                        "terminal-update/receipt.json": canonical_json_bytes(receipt),
+                        "terminal-update/update-inventory.json": inventory_raw,
+                    },
+                )
+            except (TypeError, ValueError) as error:
+                receipt_probe_results[probe_id] = type(error).__name__
+            else:
+                receipt_probe_results[probe_id] = "PASS"
+            if receipt_probe_results[probe_id] != expected:
+                receipt_failures.append(f"terminal receipt probe differs: {probe_id}")
+
+        probe_receipt(
+            "historical_v1",
+            template_v2=False,
+            receipt=v1_receipt,
+            expected="PASS",
+        )
+        probe_receipt(
+            "active_v2",
+            template_v2=True,
+            receipt=v2_receipt,
+            expected="PASS",
+        )
+        probe_receipt(
+            "v1_rejects_v2",
+            template_v2=False,
+            receipt=v2_receipt,
+            expected="ValueError",
+        )
+        probe_receipt(
+            "v2_rejects_v1",
+            template_v2=True,
+            receipt=v1_receipt,
+            expected="ValueError",
+        )
+        hostile_v2 = dict(v2_receipt)
+        hostile_v2["terminal"] = {**sink_common, "sha256": digest}
+        probe_receipt(
+            "v2_rejects_v1_sink",
+            template_v2=True,
+            receipt=hostile_v2,
+            expected="ValueError",
+        )
+        missing_feasibility_field = dict(v2_receipt)
+        missing_feasibility_field["presentation_feasibility"] = {
+            key: value
+            for key, value in presentation_feasibility.items()
+            if key != "status"
+        }
+        probe_receipt(
+            "v2_rejects_incomplete_feasibility",
+            template_v2=True,
+            receipt=missing_feasibility_field,
+            expected="ValueError",
+        )
+        mismatched_stream = dict(v2_receipt)
+        mismatched_stream["terminal"] = {
+            **v2_receipt["terminal"],  # type: ignore[arg-type]
+            "drained_sha256": hashlib.sha256(b"mismatch").hexdigest(),
+        }
+        probe_receipt(
+            "v2_rejects_mismatched_stream_digests",
+            template_v2=True,
+            receipt=mismatched_stream,
+            expected="ValueError",
+        )
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+        receipt_failures.append(
+            f"terminal receipt probes failed: {type(error).__name__}"
+        )
+
+    receipt_case = _case(
+        "performance_publication_verifier_routes_exact_v1_and_v2_receipts",
+        "Template presentation presence alone selects exact historical V1 or active V2 receipt grammar.",
+        {
+            "commit_subjects": [list(item) for item in observed_commit_subjects],
+            "missing_authority_tokens": missing_authority_tokens,
+            "missing_routing_tokens": missing_routing_tokens,
+            "owned_repair_paths": list(owned_paths),
+            "probe_results": receipt_probe_results,
+            "v1_receipt_fields": sorted(v1_receipt_fields),
+            "v1_sink_fields": sorted(v1_sink_fields),
+            "v2_receipt_fields": sorted(v1_receipt_fields | v2_extra_receipt_fields),
+            "v2_feasibility_fields": sorted(v2_feasibility_fields),
+            "v2_sink_fields": sorted(v2_sink_fields),
+            "workload_invocations": 0,
+        },
+        receipt_failures,
+    )
+
+    history_failures: list[str] = []
+    history_source, history_tree = parse_source(
+        "kirby2/release/history.py",
+        history_failures,
+    )
+    v4_probe_results: dict[str, str] = {}
+    v3_probe_results: dict[str, str] = {}
+    v4_statuses: tuple[tuple[str, str], ...] = ()
+    v4_paths: dict[str, str] = {}
+    v4_protocol_commit: str | None = None
+    history_exports: set[str] = set()
+    try:
+        from kirby2.release import history as release_history
+
+        v4_statuses = release_history.DEV0018_EVIDENCE_STATUS_BY_GATE_V1
+        v4_paths = dict(release_history.DEV0018_EVIDENCE_PATH_BY_GATE_V1)
+        v4_protocol_commit = release_history.DEV0018_PROTOCOL_COMMIT_V1
+        history_exports = set(release_history.__all__)
+        digest = hashlib.sha256(b"").hexdigest()
+
+        def files_for(paths: Iterable[str]) -> tuple[object, ...]:
+            return tuple(
+                sorted(
+                    (
+                        *(
+                            release_history.ReleaseHistoryFileV1(path, 0, digest)
+                            for path in paths
+                        ),
+                        release_history.ReleaseHistoryFileV1(
+                            "artifacts/clean-providers.toml", 0, digest
+                        ),
+                    ),
+                    key=lambda item: item.path.encode("utf-8"),
+                )
+            )
+
+        v4_results = tuple(
+            release_history.ReleaseHistoryGateResultV2(gate_id, status)
+            for gate_id, status in v4_statuses
+        )
+        v4_manifest = release_history.ReleaseHistoryManifestV4(
+            release_evidence_commit=predecessor,
+            source_candidate_commit=candidate,
+            gate_results=v4_results,
+            files=files_for(v4_paths.values()),
+        )
+        if (
+            release_history.ReleaseHistoryManifestV4.from_bytes(
+                v4_manifest.canonical_bytes()
+            )
+            != v4_manifest
+        ):
+            raise ValueError("V4 manifest did not round-trip")
+        v4_probe_results["canonical_round_trip"] = "PASS"
+
+        for probe_id, probe in (
+            (
+                "rejects_measured_wo40i_status",
+                lambda: release_history.ReleaseHistoryGateResultV2(
+                    "WO40-I", "FAIL"
+                ),
+            ),
+            (
+                "rejects_missing_public_document",
+                lambda: release_history.ReleaseHistoryManifestV4(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=v4_results,
+                    files=files_for(tuple(v4_paths.values())[1:]),
+                ),
+            ),
+            (
+                "rejects_wo40i_publication",
+                lambda: release_history.ReleaseHistoryManifestV4(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=v4_results,
+                    files=tuple(
+                        sorted(
+                            (
+                                *files_for(v4_paths.values()),
+                                release_history.ReleaseHistoryFileV1(
+                                    "artifacts/gate-evidence/wo40-i/performance-attempt.json",
+                                    0,
+                                    digest,
+                                ),
+                            ),
+                            key=lambda item: item.path.encode("utf-8"),
+                        )
+                    ),
+                ),
+            ),
+        ):
+            try:
+                probe()
+            except ValueError:
+                v4_probe_results[probe_id] = "ValueError"
+            else:
+                v4_probe_results[probe_id] = "NO_EXCEPTION"
+
+        v3_statuses = release_history.DEV0017_EVIDENCE_STATUS_BY_GATE_V1
+        v3_paths = dict(release_history.DEV0017_EVIDENCE_PATH_BY_GATE_V1)
+        v3_results = tuple(
+            release_history.ReleaseHistoryGateResultV1(gate_id, status)
+            for gate_id, status in v3_statuses
+        )
+        v3_manifest = release_history.ReleaseHistoryManifestV3(
+            release_evidence_commit=(
+                release_history.DEV0017_RELEASE_EVIDENCE_COMMIT_V1
+            ),
+            source_candidate_commit=(
+                release_history.DEV0017_SOURCE_CANDIDATE_COMMIT_V1
+            ),
+            gate_results=v3_results,
+            files=files_for(v3_paths.values()),
+        )
+        if (
+            release_history.ReleaseHistoryManifestV3.from_bytes(
+                v3_manifest.canonical_bytes()
+            )
+            != v3_manifest
+        ):
+            raise ValueError("V3 manifest did not round-trip")
+        v3_probe_results["canonical_round_trip"] = "PASS"
+        try:
+            release_history.ReleaseHistoryGateResultV1("WO40-I", "NOT_RUN")
+        except ValueError:
+            v3_probe_results["rejects_not_run"] = "ValueError"
+        else:
+            v3_probe_results["rejects_not_run"] = "NO_EXCEPTION"
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+        history_failures.append(
+            f"release-history model probes failed: {type(error).__name__}"
+        )
+
+    expected_v4_statuses = (
+        ("WO40-D1", "PASS"),
+        ("WO40-F", "PASS"),
+        ("WO40-G", "PASS"),
+        ("WO40-H", "PASS"),
+        ("WO40-I", "NOT_RUN"),
+    )
+    expected_v4_paths = {
+        "WO40-D1": "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "WO40-F": "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+        "WO40-G": "KIRBY2_RELEASE_MACOS_EVIDENCE.md",
+        "WO40-H": "KIRBY2_RELEASE_LINUX_EVIDENCE.md",
+    }
+    required_v4_classes = (
+        "ReleaseHistoryGateResultV2",
+        "ReleaseHistoryManifestV4",
+    )
+    required_v4_functions = (
+        "inspect_dev0018_release_history_rollover",
+        "plan_dev0018_release_history_rollover",
+        "execute_dev0018_release_history_rollover",
+        "verify_release_history_snapshot_v4",
+    )
+    v4_authority = top_level_function(
+        history_tree, "_verify_dev0018_execution_authority"
+    )
+    v4_authority_source = "" if v4_authority is None else ast.unparse(v4_authority)
+    required_v4_exports = {
+        "DEV0018_EVIDENCE_PATH_BY_GATE_V1",
+        "DEV0018_EVIDENCE_STATUS_BY_GATE_V1",
+        "DEV0018_PROTOCOL_COMMIT_V1",
+        "DEV0018_RELEASE_EVIDENCE_COMMIT_V1",
+        "DEV0018_SOURCE_CANDIDATE_COMMIT_V1",
+        "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4",
+        *required_v4_classes,
+        *required_v4_functions,
+    }
+    v4_failures = list(history_failures)
+    if (
+        v4_statuses != expected_v4_statuses
+        or v4_paths != expected_v4_paths
+        or v4_protocol_commit != "020da2c90c0f0000f822aad7c66538fe68c6c6e6"
+        or any(top_level_class(history_tree, name) is None for name in required_v4_classes)
+        or any(
+            top_level_function(history_tree, name) is None
+            for name in required_v4_functions
+        )
+        or "_git_changed_paths(repository, head, allow_empty=True) != ()"
+        not in v4_authority_source
+        or "candidate.protocol_commit != DEV0018_PROTOCOL_COMMIT_V1"
+        not in v4_authority_source
+        or not required_v4_exports.issubset(history_exports)
+        or v4_probe_results
+        != {
+            "canonical_round_trip": "PASS",
+            "rejects_measured_wo40i_status": "ValueError",
+            "rejects_missing_public_document": "ValueError",
+            "rejects_wo40i_publication": "ValueError",
+        }
+    ):
+        v4_failures.append("DEV-0018 V4 partial-history contract differs")
+    v4_case = _case(
+        "partial_candidate_v4_records_not_run_and_excludes_wo40i",
+        "V4 binds four public documents and the complete active store while recording WO40-I only as NOT_RUN.",
+        {
+            "evidence_paths": v4_paths,
+            "gate_statuses": [list(item) for item in v4_statuses],
+            "history_schema": "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V4",
+            "probe_results": v4_probe_results,
+            "public_document_count": len(v4_paths),
+            "wo40i_publication_allowed": False,
+        },
+        v4_failures,
+    )
+
+    v3_failures: list[str] = []
+    expected_v3_statuses = (
+        ("WO40-D1", "PASS"),
+        ("WO40-F", "PASS"),
+        ("WO40-G", "PASS"),
+        ("WO40-H", "PASS"),
+        ("WO40-I", "FAIL"),
+    )
+    expected_v3_paths = {
+        "WO40-D1": "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "WO40-F": "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+        "WO40-G": "KIRBY2_RELEASE_MACOS_EVIDENCE.md",
+        "WO40-H": "KIRBY2_RELEASE_LINUX_EVIDENCE.md",
+        "WO40-I": "KIRBY2_RELEASE_PERFORMANCE_EVIDENCE.md",
+    }
+    required_v3_classes = (
+        "ReleaseHistoryGateResultV1",
+        "ReleaseHistoryManifestV3",
+    )
+    required_v3_functions = (
+        "inspect_dev0017_release_history_rollover",
+        "plan_dev0017_release_history_rollover",
+        "execute_dev0017_release_history_rollover",
+        "verify_release_history_snapshot_v3",
+    )
+    required_v3_exports = {
+        "DEV0017_EVIDENCE_PATH_BY_GATE_V1",
+        "DEV0017_EVIDENCE_STATUS_BY_GATE_V1",
+        "DEV0017_RELEASE_EVIDENCE_COMMIT_V1",
+        "DEV0017_SOURCE_CANDIDATE_COMMIT_V1",
+        "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3",
+        *required_v3_classes,
+        *required_v3_functions,
+    }
+    try:
+        from kirby2.release import history as release_history
+
+        observed_v3_statuses = release_history.DEV0017_EVIDENCE_STATUS_BY_GATE_V1
+        observed_v3_paths = dict(release_history.DEV0017_EVIDENCE_PATH_BY_GATE_V1)
+        observed_v3_schema = release_history.RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3
+    except (ImportError, AttributeError) as error:
+        observed_v3_statuses = ()
+        observed_v3_paths = {}
+        observed_v3_schema = None
+        v3_failures.append(f"V3 history surface failed: {type(error).__name__}")
+    if (
+        observed_v3_statuses != expected_v3_statuses
+        or observed_v3_paths != expected_v3_paths
+        or observed_v3_schema != "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3"
+        or any(top_level_class(history_tree, name) is None for name in required_v3_classes)
+        or any(
+            top_level_function(history_tree, name) is None
+            for name in required_v3_functions
+        )
+        or not required_v3_exports.issubset(history_exports)
+        or v3_probe_results
+        != {
+            "canonical_round_trip": "PASS",
+            "rejects_not_run": "ValueError",
+        }
+    ):
+        v3_failures.append("DEV-0017 V3 history surface changed under DEV-0018")
+    v3_case = _case(
+        "historical_v3_snapshot_surface_remains_exact",
+        "DEV-0017 remains a five-document V3 snapshot with measured WO40-I FAIL and no NOT_RUN reinterpretation.",
+        {
+            "gate_statuses": [list(item) for item in observed_v3_statuses],
+            "history_schema": observed_v3_schema,
+            "probe_results": v3_probe_results,
+            "public_document_count": len(observed_v3_paths),
+        },
+        v3_failures,
+    )
+
+    explicit_failures: list[str] = []
+    executor = top_level_function(
+        history_tree, "execute_dev0018_release_history_rollover"
+    )
+    required_executor_calls = {
+        "inspect_dev0018_release_history_rollover",
+        "plan_dev0018_release_history_rollover",
+        "_verify_dev0018_execution_authority",
+        "_load_dev0018_historical_evidence",
+        "_verify_dev0018_absent_performance_publication",
+        "_stage_dev0018_rollover",
+        "_rename_exclusive_at",
+        "_harden_tree",
+        "verify_release_history_snapshot_v4",
+    }
+    executor_calls = called_names(executor)
+    command_surfaces = (
+        "kirby2/__main__.py",
+        "kirby2/cli/expansion.py",
+        "kirby2/cli/registry.py",
+        "kirby2/release/__init__.py",
+        "kirby2/release/commands.py",
+    )
+    registered_mentions: list[str] = []
+    executor_name = "execute_dev0018_release_history_rollover"
+    for relative in command_surfaces:
+        try:
+            if executor_name in (repository / relative).read_text(encoding="utf-8"):
+                registered_mentions.append(relative)
+        except (OSError, UnicodeDecodeError) as error:
+            explicit_failures.append(
+                f"explicit-only command surface failed: {relative}: {type(error).__name__}"
+            )
+    audit_node = top_level_function(
+        ast.parse(
+            (repository / "kirby2/audit/release.py").read_text(encoding="utf-8")
+        ),
+        "audit_release_performance_verifier_restart",
+    )
+    audit_executor_calls = sum(
+        1
+        for item in ast.walk(audit_node)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Name)
+        and item.func.id == executor_name
+    ) if audit_node is not None else -1
+    if (
+        executor is None
+        or not required_executor_calls.issubset(executor_calls)
+        or registered_mentions
+        or audit_executor_calls != 0
+        or "argparse" in ("" if executor is None else ast.unparse(executor))
+    ):
+        explicit_failures.append(
+            "DEV-0018 rollover is missing or reachable outside explicit invocation"
+        )
+    explicit_case = _case(
+        "dev0018_rollover_is_explicit_only_and_never_audit_invoked",
+        "The one-time V4 executor is present but absent from every command surface and never called by this audit.",
+        {
+            "audit_executor_calls": audit_executor_calls,
+            "executor_calls": sorted(executor_calls & required_executor_calls),
+            "executor_invocations": 0,
+            "history_rollover_invocations": 0,
+            "registered_command_mentions": registered_mentions,
+        },
+        explicit_failures,
+    )
+
+    cases = (receipt_case, v4_case, v3_case, explicit_case)
+    if len(cases) != DEV0018_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0018 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0018",
         cases,
         metadata=(
             ("executor_invocations", "0"),
