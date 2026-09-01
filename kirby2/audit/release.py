@@ -3642,6 +3642,25 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         surface_failures.append("fixed Tart provider constants differ")
 
     try:
+        concrete_path = Path(executor_module.__file__).resolve(strict=True)
+        if (
+            executor_module._absolute_input(concrete_path, "executor source")
+            != concrete_path
+        ):
+            surface_failures.append("qualification path normalization differs")
+        path_snapshot = executor_module._stable_read(
+            concrete_path,
+            maximum_bytes=4 * 1024 * 1024,
+            require_read_only=False,
+        )
+        if not path_snapshot.raw:
+            surface_failures.append("qualification concrete Path probe is empty")
+    except (OSError, TypeError, ValueError) as error:
+        surface_failures.append(
+            f"qualification concrete Path probe failed: {type(error).__name__}"
+        )
+
+    try:
         executor_tree = ast.parse(inspect.getsource(executor_module))
         worker_tree = ast.parse(inspect.getsource(worker_module))
     except (OSError, TypeError, SyntaxError) as error:

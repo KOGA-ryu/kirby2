@@ -301,7 +301,7 @@ def _identity(metadata: os.stat_result) -> tuple[int, ...]:
 
 
 def _stable_read(path: Path, *, maximum_bytes: int, require_read_only: bool) -> _FileSnapshot:
-    if type(path) is not Path or not path.is_absolute():
+    if not isinstance(path, Path) or not path.is_absolute():
         raise ValueError("qualification input path must be absolute")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -663,7 +663,7 @@ def _require_tart_provider() -> dict[str, object]:
 
 
 def _absolute_input(path: Path, label: str) -> Path:
-    if type(path) is not Path or not path.is_absolute():
+    if not isinstance(path, Path) or not path.is_absolute():
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.INPUT_INVALID,
             f"{label} must be an absolute Path",
