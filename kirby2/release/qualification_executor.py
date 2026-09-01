@@ -120,6 +120,7 @@ _INSTALLED_LAUNCHERS: Final[Mapping[str, str]] = {
 _GUEST_SHARE_ROOT: Final[PurePosixPath] = PurePosixPath(
     "/Volumes/My Shared Files/release"
 )
+_GUEST_SHARE_MOUNT_ROOT: Final[PurePosixPath] = _GUEST_SHARE_ROOT.parent
 _GUEST_PYTHON_CANDIDATES: Final[tuple[str, ...]] = (
     "/opt/homebrew/bin/python3.14",
     "/usr/local/bin/python3.14",
@@ -1375,12 +1376,27 @@ def _prove_guest_provider(
         )
 
     mount = capture("mount inventory", "/sbin/mount")
-    if os.fspath(_GUEST_SHARE_ROOT) not in mount:
+    mount_marker = (
+        f" on {os.fspath(_GUEST_SHARE_MOUNT_ROOT)} (AppleVirtIOFS,"
+    )
+    if len([line for line in mount.splitlines() if mount_marker in line]) != 1:
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_EXECUTION_FAILED,
             "read-only qualification input share is not mounted",
             terminal=phase != "BEFORE_INSTALL",
         )
+    share_directory = _require_guest_success(
+        _guest_exec(
+            state,
+            guest_home,
+            "/usr/bin/test",
+            "-d",
+            os.fspath(_GUEST_SHARE_ROOT),
+        ),
+        "named qualification share directory",
+        terminal=phase != "BEFORE_INSTALL",
+    )
+    commands["named qualification share directory"] = share_directory
     sentinel = _GUEST_SHARE_ROOT / ".kirby2-write-probe"
     write_probe = _guest_exec(
         state,

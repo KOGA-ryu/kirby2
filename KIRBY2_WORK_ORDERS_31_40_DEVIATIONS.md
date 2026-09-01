@@ -816,7 +816,10 @@ deviation audit.
   Preparing a derived base exposed one further identity gap: the fixed provider
   bound its configuration, NVRAM, disk size, owner, link count, and writable-mode
   restrictions, but not the 80 GB disk contents that actually carry the guest
-  policy.
+  policy.  The first hardened-provider attempt then exposed an incorrect VirtioFS
+  predicate: Tart correctly mounts the shared filesystem at `/Volumes/My Shared
+  Files` and places the named `release` share beneath it, while the controller
+  incorrectly required the child directory to appear as its own mount-table row.
 - Repair: add strict canonical provider-attestation, command-observation,
   root-observation, session, step, and qualification-attempt records; a closed
   installed guest worker for the exact desktop/headless matrix; and a closed Tart
@@ -840,7 +843,10 @@ deviation audit.
   path metadata alone.  Each randomized disposable clone must then reproduce the
   fixed hardware/ECID projection, NVRAM digest, disk digest, and exact disk mode
   immediately before its sequential boot; hashing only the named base is
-  insufficient evidence for the bytes copied into the qualification guest.
+  insufficient evidence for the bytes copied into the qualification guest.  Bind
+  the shared-directory proof to the unique parent `AppleVirtIOFS` mount row, then
+  independently require the named `release` child directory before proving its
+  `:ro` behavior with a failed write and absent sentinel.
 - Owned repair paths: `kirby2/packs/builders.py`, `kirby2/release/doctor.py`,
   `kirby2/release/artifacts.py`,
   `kirby2/release/qualification.py`,
@@ -887,5 +893,6 @@ provider-free read-only verification does not forge that ambient marker; previou
 candidate artifacts remain in canonical local release-history snapshots; the
 hardened provider and each preboot clone bind exact configuration capability, NVRAM,
 disk contents, size, and mode; hostile digest inputs fail closed; and the deviation
-audit does not clone, boot, connect to, mutate, or delete a provider or execute the
+audit distinguishes the parent VirtioFS mount from the named read-only child without
+cloning, booting, connecting to, mutating, or deleting a provider or executing the
 one-time qualification workload.

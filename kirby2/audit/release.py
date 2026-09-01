@@ -3826,6 +3826,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         )
 
     provider_node = function_node(executor_tree, "_require_tart_provider")
+    guest_provider_node = function_node(executor_tree, "_prove_guest_provider")
     digest_node = function_node(executor_tree, "_stable_file_digest")
     clone_node = function_node(executor_tree, "_create_clone")
     executor_node = function_node(executor_tree, "execute_release_qualification")
@@ -3933,6 +3934,20 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     if sequential_clone_loops != 1:
         surface_failures.append(
             "clone verification and workload are not one sequential lifecycle"
+        )
+
+    guest_provider_source = (
+        "" if guest_provider_node is None else ast.unparse(guest_provider_node)
+    )
+    required_share_proof = {
+        "_GUEST_SHARE_MOUNT_ROOT",
+        "(AppleVirtIOFS,",
+        "mount.splitlines()",
+        "'/usr/bin/test', '-d', os.fspath(_GUEST_SHARE_ROOT)",
+    }
+    if not all(binding in guest_provider_source for binding in required_share_proof):
+        surface_failures.append(
+            "guest provider does not separate the VirtioFS mount from its named share"
         )
 
     host_launch = function_node(executor_tree, "_spawn_host_only_vm")
