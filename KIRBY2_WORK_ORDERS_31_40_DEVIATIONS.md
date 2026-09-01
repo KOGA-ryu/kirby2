@@ -903,3 +903,125 @@ disk contents, size, and mode; hostile digest inputs fail closed; and the deviat
 audit distinguishes the parent VirtioFS mount from the named read-only child without
 cloning, booting, connecting to, mutating, or deleting a provider, pins the five
 macOS `test` call sites, and does not execute the one-time qualification workload.
+
+## DEV-0015 — Execute Linux clean-environment qualification
+
+- Interrupted canonical card: `WO40-H`
+- Exact first-parent predecessor:
+  `df2d63ef15766c5edc71b28091f696db97e3fd32`
+- Historical release: the predecessor is the completed WO40-G evidence commit for
+  source candidate `3111727d2ee6a411e07242ed4c4e34c9b8bfed27`.  Before this
+  repair changes candidate source, its immutable history snapshot is preserved at
+  `.kirby2/release-history/df2d63ef15766c5edc71b28091f696db97e3fd32/`.
+  Its V2 manifest binds exactly thirteen payloads: WO40-F and WO40-G evidence;
+  macOS provider attestation; provider inventory; WO40-G attempt; six release
+  transports; artifact index; and build record.  The history manifest itself binds
+  the release-evidence commit and source candidate and remains outside the governed
+  active artifact store.
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py qualify-release --platform linux-x86_64 --build-evidence KIRBY2_RELEASE_BUILD_EVIDENCE.md --artifact-store .kirby2/release`
+- Observed terminal result: `REFUSED` with exit status two and typed code
+  `QUALIFICATION_TARGET_UNSUPPORTED`; the closed Tart implementation reported that
+  it supported only `macos-arm64`.  The command did not connect to the Fedora host,
+  stage an artifact, create a remote attempt root, enter a network namespace, run
+  the installed matrix, clean a provider path, or publish WO40-H evidence.
+- Root cause: DEV-0014 intentionally authorized and closed only the macOS Tart
+  provider while preserving Linux as out of scope.  The public command, typed
+  records, and deep verifier already named `linux-x86_64`, but the public executor
+  was the macOS implementation rather than a target-neutral dispatcher and no
+  controller owned Linux provider identity, transport, isolation, cleanup, or
+  cross-platform-baseline reconstruction.
+- Repair: retain one public `execute_release_qualification` contract and route its
+  exact target IDs through a fixed declarative dispatcher to private macOS and Linux
+  implementations.  Add one closed Linux executor for the pinned Fedora SSH
+  provider: existing identity file only; exact user, address, port, host-key
+  algorithm, public key, and fingerprint; batch-only SSH/SFTP with forwarding,
+  password, keyboard-interactive, local-command, proxy-command, ambient config, and
+  unpinned-host-key behavior disabled.  Permit macOS Keychain to unlock only that
+  explicitly pinned passphrase-protected identity while keeping identity-agent use
+  disabled and refusing to add the key to an agent.  Attest the remote machine and
+  required executables before accepting it; create only a nonce-bearing owner root
+  beneath the fixed remote qualification prefix; stage only the immutable WO40-F
+  inputs; install without network; and execute the same desktop and headless forms
+  sequentially inside a fresh user and network namespace.  Count only non-loopback
+  IPv6 defaults so the kernel's unreachable loopback sentinel routes do not forge
+  external reachability; independently require `lo` as the sole interface, no IPv4
+  default, and a failed TEST-NET connection.  Recreate the same logical installed
+  worker attempt root between forms, require the worker's common
+  target-neutral execution policy, parse every probe and result canonically, and
+  publish an attempt only after all proof and cleanup obligations pass.  Put the
+  installed runtime and worker behind `setpriv --no-new-privs`, prove the inherited
+  kernel bit inside that same user/network/PID namespace, and use only an owned
+  root-local home and temporary directory for candidate-controlled processes; this
+  prevents setuid or file-capability elevation and keeps normal candidate state
+  inside the marker-bound root even if the account's sudo policy or real home
+  changes.  Cleanup
+  revalidates the owned remote-root grammar and marker, runs from `finally`, and
+  turns ambiguous or failed cleanup into a typed refusal.  Bound every isolated
+  command with a shorter remote timeout and a kill-on-parent-exit PID namespace;
+  require the owned root in every lifetime leader's command line, scan every
+  same-account command line for the fixed qualification prefix, and rely on PID-
+  namespace ownership to make descendants unable to outlive that leader.  Also
+  refuse deletion while any non-ancestor same-account SFTP server or non-TTY SSH
+  transport session remains, covering an ambiguously closed transfer channel.
+  Arm a process-quarantine flag before the final root-absence command and clear it
+  only after the exact global empty-process receipt.  Retain the fixed provider
+  lock as a quarantine marker whenever process or root cleanup remains ambiguous
+  rather than admitting a later controller.  A passing
+  Linux record must use `GUEST_NETWORK_DISABLED_VERIFIED` and the
+  `SSH_EPHEMERAL_HOST_V1` adapter.  Before Linux publication and again during deep
+  WO40-H verification, independently open, parse, and pure-verify the preserved
+  WO40-G provider and attempt records, require their exact `PASS`, candidate,
+  protocol, source-manifest, artifact-index, build-evidence, selected-artifact, and
+  integer-core bindings, and recheck their no-follow directory/file identities at
+  the end.  Retire local projections and temporary SSH trust material, then run the
+  full deep verifier against the candidate provider/attempt bytes before publishing
+  the provider first and activating the attempt last.  Keep
+  `release/qualification.toml` byte unchanged.
+- Owned repair paths: `kirby2/release/qualification_executor.py`,
+  `kirby2/release/qualification_linux_executor.py`,
+  `kirby2/release/qualification_worker.py`,
+  `kirby2/release/qualification_records.py`,
+  `kirby2/release/qualification.py`, `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0015` through K2X-02 immediately after completed
+  `WO40-G` and before resumed `WO40-H`; the release sequence is exactly
+  `DEV-0013`, `WO40-F`, `DEV-0014`, `WO40-G`, `DEV-0015`, `WO40-H`, and the
+  deviation inventory extends monotonically through `DEV-0015`.
+- Inherited gates: candidate and history immutability, five frozen protocol files,
+  target/artifact/member identities, dependency wheels, launchers, documentation,
+  starter content, performance thresholds, retry count, step and check order,
+  product limitations, and all earlier production contracts remain unchanged.  No
+  brokerage, live-market connection, credential creation, telemetry, updater,
+  background service, network download, GPU workload, performance run, or final
+  closeout is authorized.  After repair source and the mechanically regenerated
+  source lock commit cleanly, that commit is the sole repaired candidate; WO40-F is
+  rebuilt from it, WO40-G is requalified against it, and only then may WO40-H run on
+  the pinned Fedora provider.
+- Exact commit subject: `Execute Linux clean-environment qualification`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0013
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0014
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0015
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the public wrapper and exact two-target dispatch remain one stable
+contract; the Linux executor owns a pinned provider, closed transport grammar,
+fresh user/network namespace, canonical results, typed refusals, and finally-owned
+cleanup; passing Linux evidence is bound to the independently reparsed passing
+macOS baseline and exact shared integer core; the installed worker policy is
+target-neutral; the complete registry contains DEV-0001 through DEV-0015 in the
+required release order; the `df2d63e` historical snapshot remains immutable; and
+the four-case deviation audit proves dispatch, transport/isolation, hostile-result
+cleanup, and cross-platform-baseline structure without importing the executor,
+opening SSH/SFTP, touching a provider, or executing a qualification workload.

@@ -135,7 +135,7 @@ _WORKER_SCHEMA_ID_V1: Final[str] = (
     "KIRBY2_RELEASE_QUALIFICATION_WORKER_RESULT_V1"
 )
 _WORKER_EXECUTION_POLICY_ID_V1: Final[str] = (
-    "KIRBY2_WO40_G_GUEST_EXECUTION_POLICY_V1"
+    "KIRBY2_WO40_GH_INSTALLED_EXECUTION_POLICY_V1"
 )
 _PROJECT_WHEEL_V1: Final[str] = f"kirby2-{RELEASE_VERSION_V1}-py3-none-any.whl"
 
@@ -821,9 +821,9 @@ def _record_target_path(root: Path, relative: str) -> Path:
     return root.joinpath(*path.parts)
 
 
-def _require_no_prior_records(root: Path) -> tuple[Path, Path]:
+def _require_no_prior_records(root: Path, target_id: str) -> tuple[Path, Path]:
     provider_relative, attempt_relative = release_qualification_record_paths(
-        TART_TARGET_ID_V1
+        target_id
     )
     provider = _record_target_path(root, provider_relative)
     attempt = _record_target_path(root, attempt_relative)
@@ -831,7 +831,8 @@ def _require_no_prior_records(root: Path) -> tuple[Path, Path]:
         if path.exists() or path.is_symlink():
             raise _QualificationRefused(
                 QualificationExecutorRefusalCodeV1.PRIOR_ATTEMPT_EXISTS,
-                "immutable macOS provider or qualification-attempt evidence already exists",
+                "immutable provider or qualification-attempt evidence already exists "
+                f"for {target_id}",
             )
     return provider, attempt
 
@@ -2457,6 +2458,9 @@ def _publish_immutable_file(directory: int, name: str, raw: bytes) -> None:
         raise OSError("platform lacks no-follow publication support")
     staging = f".kirby2-qualification-{secrets.token_hex(16)}.tmp"
     descriptor = -1
+    verification_descriptor = -1
+    linked = False
+    staging_retired = False
     activated = False
     try:
         descriptor = os.open(
@@ -2475,10 +2479,38 @@ def _publish_immutable_file(directory: int, name: str, raw: bytes) -> None:
             if count <= 0:
                 raise OSError("short qualification publication write")
             view = view[count:]
-        os.fsync(descriptor)
         os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
+        verification_descriptor = os.open(
+            staging,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+            dir_fd=directory,
+        )
+        metadata = os.fstat(verification_descriptor)
+        chunks: list[bytes] = []
+        remaining = len(raw) + 1
+        while remaining:
+            chunk = os.read(
+                verification_descriptor,
+                min(1024 * 1024, remaining),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or b"".join(chunks) != raw
+        ):
+            raise _QualificationRefused(
+                QualificationExecutorRefusalCodeV1.PUBLICATION_CONFLICT,
+                "qualification staging verification failed",
+                terminal=True,
+            )
         try:
             os.link(
                 staging,
@@ -2493,69 +2525,48 @@ def _publish_immutable_file(directory: int, name: str, raw: bytes) -> None:
                 "immutable qualification publication lost its exclusive activation",
                 terminal=True,
             ) from error
-        activated = True
+        linked = True
+        os.unlink(staging, dir_fd=directory)
+        staging_retired = True
         os.fsync(directory)
+        activated = True
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if not linked and not staging_retired:
+            try:
+                os.unlink(staging, dir_fd=directory)
+                os.fsync(directory)
+            except FileNotFoundError:
+                pass
         try:
-            os.unlink(staging, dir_fd=directory)
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            if activated:
-                raise _QualificationRefused(
-                    QualificationExecutorRefusalCodeV1.PUBLICATION_CONFLICT,
-                    "qualification staging link could not be retired",
-                    terminal=True,
-                ) from error
-        os.fsync(directory)
-    final = os.open(
-        name,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
-        dir_fd=directory,
-    )
-    try:
-        metadata = os.fstat(final)
-        chunks: list[bytes] = []
-        remaining = len(raw) + 1
-        while remaining:
-            chunk = os.read(final, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o444
-            or b"".join(chunks) != raw
-        ):
-            raise _QualificationRefused(
-                QualificationExecutorRefusalCodeV1.PUBLICATION_CONFLICT,
-                "immutable qualification publication verification failed",
-                terminal=True,
-            )
-    finally:
-        os.close(final)
+            if verification_descriptor >= 0:
+                os.close(verification_descriptor)
+        except OSError:
+            if not activated:
+                raise
 
 
 def _publish_records(
     *,
     root_descriptor: int,
+    target_id: str,
     provider: ReleaseCleanProviderAttestationV1,
     attempt: ReleaseQualificationAttemptV1,
 ) -> tuple[str, str]:
     provider_relative, attempt_relative = release_qualification_record_paths(
-        TART_TARGET_ID_V1
+        target_id
     )
     provider_path = PurePosixPath(provider_relative)
     attempt_path = PurePosixPath(attempt_relative)
+    expected_gate = "wo40-g" if target_id == "macos-arm64" else "wo40-h"
     if (
-        provider_path.parent != PurePosixPath(".")
-        or attempt_path.parent.parts != ("gate-evidence", "wo40-g")
+        provider.target_id != target_id
+        or attempt.target_id != target_id
+        or provider_path.parent != PurePosixPath(".")
+        or attempt_path.parent.parts != ("gate-evidence", expected_gate)
     ):
-        raise RuntimeError("macOS qualification record paths differ from the closed policy")
+        raise RuntimeError("qualification record paths differ from the closed target policy")
     provider_raw = provider.canonical_bytes()
     attempt_raw = attempt.canonical_bytes()
     ReleaseCleanProviderAttestationV1.from_bytes(provider_raw)
@@ -2578,8 +2589,13 @@ def _publish_records(
         _publish_immutable_file(provider_directory, provider_path.name, provider_raw)
         _publish_immutable_file(attempt_directory, attempt_path.name, attempt_raw)
     finally:
-        os.close(provider_directory)
-        os.close(attempt_directory)
+        for descriptor in (provider_directory, attempt_directory):
+            try:
+                os.close(descriptor)
+            except OSError:
+                # Directory retirement cannot invalidate an already activated,
+                # fsynced, byte-verified attempt. The process owns no later work.
+                pass
     return provider_relative, attempt_relative
 
 
@@ -2610,10 +2626,9 @@ def _executor_outcome(
     )
 
 
-def execute_release_qualification(
+def _execute_macos_release_qualification(
     bundle: ReleaseProtocolBundleV1,
     *,
-    target_id: str,
     build_evidence: Path,
     artifact_root: Path,
 ) -> ReleaseCommandOutcomeV1:
@@ -2635,11 +2650,6 @@ def execute_release_qualification(
     failure: Exception | None = None
     cleanup_failures: list[str] = []
     try:
-        if type(target_id) is not str or target_id != TART_TARGET_ID_V1:
-            raise _QualificationRefused(
-                QualificationExecutorRefusalCodeV1.TARGET_UNSUPPORTED,
-                "closed Tart qualification supports only macos-arm64",
-            )
         root = _absolute_input(artifact_root, "release artifact root")
         evidence_path = _absolute_input(build_evidence, "WO40-F build evidence")
         try:
@@ -2660,7 +2670,7 @@ def execute_release_qualification(
                 QualificationExecutorRefusalCodeV1.PUBLICATION_CONFLICT,
                 "release artifact store is locked by another operation",
             ) from error
-        _require_no_prior_records(root)
+        _require_no_prior_records(root, TART_TARGET_ID_V1)
 
         evidence_snapshot = _stable_read(
             evidence_path,
@@ -2829,9 +2839,10 @@ def execute_release_qualification(
             duration_ns=duration_ns,
         )
         _require_store_anchor(root, store_descriptor, opened_identity)
-        _require_no_prior_records(root)
+        _require_no_prior_records(root, TART_TARGET_ID_V1)
         provider_relative, attempt_relative = _publish_records(
             root_descriptor=store_descriptor,
+            target_id=TART_TARGET_ID_V1,
             provider=provider,
             attempt=attempt,
         )
@@ -2905,7 +2916,7 @@ def execute_release_qualification(
 
     payload: dict[str, object] = {
         "candidate_commit": candidate_commit,
-        "target_id": target_id if type(target_id) is str else None,
+        "target_id": TART_TARGET_ID_V1,
     }
     if cleanup_failures:
         payload["cleanup_failures"] = cleanup_failures
@@ -2945,6 +2956,64 @@ def execute_release_qualification(
     if result is None:  # pragma: no cover - total control-flow guard
         raise RuntimeError("qualification executor omitted its terminal outcome")
     return result
+
+
+def _execute_linux_release_qualification(
+    bundle: ReleaseProtocolBundleV1,
+    *,
+    build_evidence: Path,
+    artifact_root: Path,
+) -> ReleaseCommandOutcomeV1:
+    # Keep the SSH provider out of the macOS/Tart import and execution path.  The
+    # Linux module imports shared hardened record/publication helpers from here,
+    # so this target-local lazy import also avoids a module-initialization cycle.
+    from .qualification_linux_executor import execute_linux_release_qualification
+
+    return execute_linux_release_qualification(
+        bundle,
+        build_evidence=build_evidence,
+        artifact_root=artifact_root,
+    )
+
+
+_QUALIFICATION_EXECUTORS_BY_TARGET_V1 = {
+    TART_TARGET_ID_V1: _execute_macos_release_qualification,
+    "linux-x86_64": _execute_linux_release_qualification,
+}
+
+
+def execute_release_qualification(
+    bundle: ReleaseProtocolBundleV1,
+    *,
+    target_id: str,
+    build_evidence: Path,
+    artifact_root: Path,
+) -> ReleaseCommandOutcomeV1:
+    """Dispatch one closed qualification controller for its exact target."""
+
+    if type(bundle) is not ReleaseProtocolBundleV1:
+        raise TypeError("qualification execution requires the exact protocol bundle")
+    executor = (
+        _QUALIFICATION_EXECUTORS_BY_TARGET_V1.get(target_id)
+        if type(target_id) is str
+        else None
+    )
+    if executor is None:
+        return _executor_outcome(
+            bundle,
+            status=ReleaseCommandStatusV1.REFUSED,
+            detail="closed qualification supports only macos-arm64 and linux-x86_64",
+            refusal_code=QualificationExecutorRefusalCodeV1.TARGET_UNSUPPORTED,
+            payload={
+                "candidate_commit": None,
+                "target_id": target_id if type(target_id) is str else None,
+            },
+        )
+    return executor(
+        bundle,
+        build_evidence=build_evidence,
+        artifact_root=artifact_root,
+    )
 
 
 __all__ = [

@@ -40,6 +40,7 @@ DEV0011_AUDIT_CASE_COUNT = 5
 DEV0012_AUDIT_CASE_COUNT = 4
 DEV0013_AUDIT_CASE_COUNT = 3
 DEV0014_AUDIT_CASE_COUNT = 3
+DEV0015_AUDIT_CASE_COUNT = 4
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -68,7 +69,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 15)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 16)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -3829,7 +3830,9 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     guest_provider_node = function_node(executor_tree, "_prove_guest_provider")
     digest_node = function_node(executor_tree, "_stable_file_digest")
     clone_node = function_node(executor_tree, "_create_clone")
-    executor_node = function_node(executor_tree, "execute_release_qualification")
+    executor_node = function_node(
+        executor_tree, "_execute_macos_release_qualification"
+    )
     digest_names = (
         set()
         if digest_node is None
@@ -4069,7 +4072,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         getattr(worker_module, "WORKER_SCHEMA_ID", None)
         != "KIRBY2_RELEASE_QUALIFICATION_WORKER_RESULT_V1"
         or getattr(worker_module, "EXECUTION_POLICY_ID", None)
-        != "KIRBY2_WO40_G_GUEST_EXECUTION_POLICY_V1"
+        != "KIRBY2_WO40_GH_INSTALLED_EXECUTION_POLICY_V1"
     ):
         surface_failures.append("installed worker schema or execution policy differs")
     surface_case = _case(
@@ -4099,6 +4102,627 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         metadata=(
             ("executor_invocations", "0"),
             ("interrupted_card", "WO40-G"),
+        ),
+    )
+
+
+def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
+    """Prove the WO40-H SSH executor is closed without invoking SSH."""
+
+    repository = _repository_root()
+    source_paths = {
+        "commands": repository / "kirby2/release/commands.py",
+        "executor": repository / "kirby2/release/qualification_executor.py",
+        "linux": repository / "kirby2/release/qualification_linux_executor.py",
+        "package": repository / "kirby2/release/__init__.py",
+        "qualification": repository / "kirby2/release/qualification.py",
+        "records": repository / "kirby2/release/qualification_records.py",
+        "worker": repository / "kirby2/release/qualification_worker.py",
+    }
+    sources: dict[str, str] = {}
+    trees: dict[str, ast.Module] = {}
+    source_failures: list[str] = []
+    for source_id, path in source_paths.items():
+        try:
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
+            tree = ast.parse(text, filename=os.fspath(path))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            source_failures.append(
+                f"{source_id} source is unavailable: {type(error).__name__}"
+            )
+            text = ""
+            tree = ast.Module(body=[], type_ignores=[])
+        sources[source_id] = text
+        trees[source_id] = tree
+
+    def function_node(tree: ast.AST, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                item
+                for item in ast.walk(tree)
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            ),
+            None,
+        )
+
+    def function_signature(node: ast.FunctionDef | None) -> list[list[object]]:
+        if node is None:
+            return []
+        positional = (*node.args.posonlyargs, *node.args.args)
+        optional_start = len(positional) - len(node.args.defaults)
+        result = [
+            [
+                argument.arg,
+                (
+                    "POSITIONAL_ONLY"
+                    if argument in node.args.posonlyargs
+                    else "POSITIONAL_OR_KEYWORD"
+                ),
+                index < optional_start,
+            ]
+            for index, argument in enumerate(positional)
+        ]
+        result.extend(
+            [argument.arg, "KEYWORD_ONLY", default is None]
+            for argument, default in zip(
+                node.args.kwonlyargs,
+                node.args.kw_defaults,
+                strict=True,
+            )
+        )
+        return result
+
+    def assigned_value(tree: ast.Module, name: str) -> ast.expr | None:
+        for item in tree.body:
+            if isinstance(item, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    item.targets if isinstance(item, ast.Assign) else (item.target,)
+                )
+                if any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in targets
+                ):
+                    return item.value
+        return None
+
+    def called_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            (
+                item.func.id
+                if isinstance(item.func, ast.Name)
+                else item.func.attr
+            )
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, (ast.Name, ast.Attribute))
+        }
+
+    expected_public_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["target_id", "KEYWORD_ONLY", True],
+        ["build_evidence", "KEYWORD_ONLY", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+    ]
+    expected_controller_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["build_evidence", "KEYWORD_ONLY", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+    ]
+
+    dispatch_failures = list(source_failures)
+    executor_tree = trees["executor"]
+    linux_tree = trees["linux"]
+    public_executor = function_node(executor_tree, "execute_release_qualification")
+    mac_executor = function_node(
+        executor_tree, "_execute_macos_release_qualification"
+    )
+    linux_delegate = function_node(
+        executor_tree, "_execute_linux_release_qualification"
+    )
+    linux_executor = function_node(linux_tree, "execute_linux_release_qualification")
+    observed_signatures = {
+        "linux": function_signature(linux_executor),
+        "linux_delegate": function_signature(linux_delegate),
+        "macos": function_signature(mac_executor),
+        "public": function_signature(public_executor),
+    }
+    if (
+        observed_signatures["public"] != expected_public_signature
+        or any(
+            observed_signatures[name] != expected_controller_signature
+            for name in ("linux", "linux_delegate", "macos")
+        )
+    ):
+        dispatch_failures.append("qualification executor signatures differ")
+
+    dispatch_value = assigned_value(
+        executor_tree, "_QUALIFICATION_EXECUTORS_BY_TARGET_V1"
+    )
+    dispatch_projection: dict[str, str] = {}
+    if isinstance(dispatch_value, ast.Dict):
+        for key, value in zip(dispatch_value.keys, dispatch_value.values, strict=True):
+            key_value: object = None
+            if isinstance(key, ast.Constant):
+                key_value = key.value
+            elif isinstance(key, ast.Name):
+                key_assignment = assigned_value(executor_tree, key.id)
+                if isinstance(key_assignment, ast.Constant):
+                    key_value = key_assignment.value
+            if (
+                isinstance(key_value, str)
+                and isinstance(value, ast.Name)
+            ):
+                dispatch_projection[key_value] = value.id
+    expected_dispatch = {
+        "linux-x86_64": "_execute_linux_release_qualification",
+        "macos-arm64": "_execute_macos_release_qualification",
+    }
+    if dispatch_projection != expected_dispatch:
+        dispatch_failures.append("qualification target dispatcher differs")
+    public_calls = called_names(public_executor)
+    if (
+        public_executor is None
+        or "_QUALIFICATION_EXECUTORS_BY_TARGET_V1" not in {
+            item.id
+            for item in ast.walk(public_executor)
+            if isinstance(item, ast.Name)
+        }
+        or "_create_clone" in public_calls
+        or "_run_form" in public_calls
+    ):
+        dispatch_failures.append("public qualification wrapper is not dispatch-only")
+    if (
+        linux_delegate is None
+        or "execute_linux_release_qualification" not in called_names(linux_delegate)
+    ):
+        dispatch_failures.append("Linux dispatcher does not lazily call its closed executor")
+
+    configure = function_node(trees["commands"], "_configure_qualify_release")
+    platform_choices: tuple[str, ...] = ()
+    if configure is not None:
+        for item in ast.walk(configure):
+            if not isinstance(item, ast.Call) or not item.args:
+                continue
+            if not (
+                isinstance(item.func, ast.Attribute)
+                and item.func.attr == "add_argument"
+                and isinstance(item.args[0], ast.Constant)
+                and item.args[0].value == "--platform"
+            ):
+                continue
+            choice = next(
+                (keyword.value for keyword in item.keywords if keyword.arg == "choices"),
+                None,
+            )
+            if isinstance(choice, (ast.Tuple, ast.List)) and all(
+                isinstance(value, ast.Constant) and isinstance(value.value, str)
+                for value in choice.elts
+            ):
+                platform_choices = tuple(value.value for value in choice.elts)  # type: ignore[misc]
+    if platform_choices != ("macos-arm64", "linux-x86_64"):
+        dispatch_failures.append("qualify-release platform choices differ")
+    package_all = assigned_value(trees["package"], "__all__")
+    package_exports = (
+        tuple(
+            item.value
+            for item in package_all.elts
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        )
+        if isinstance(package_all, (ast.List, ast.Tuple))
+        else ()
+    )
+    if (
+        package_exports.count("execute_release_qualification") != 1
+        or "execute_linux_release_qualification" in package_exports
+    ):
+        dispatch_failures.append("release package executor exports differ")
+    worker_policy = assigned_value(trees["worker"], "EXECUTION_POLICY_ID")
+    worker_policy_value = (
+        worker_policy.value
+        if isinstance(worker_policy, ast.Constant)
+        and isinstance(worker_policy.value, str)
+        else None
+    )
+    if worker_policy_value != "KIRBY2_WO40_GH_INSTALLED_EXECUTION_POLICY_V1":
+        dispatch_failures.append("installed worker policy is not target-neutral")
+    dispatch_case = _case(
+        "linux_qualification_dispatch_and_contract_are_exact",
+        "One public command dispatches exact macOS and Linux executors under one installed-worker policy.",
+        {
+            "dispatcher": dispatch_projection,
+            "executor_invocations": 0,
+            "platform_choices": list(platform_choices),
+            "signatures": observed_signatures,
+            "ssh_invocations": 0,
+            "worker_policy": worker_policy_value,
+        },
+        dispatch_failures,
+    )
+
+    transport_failures: list[str] = []
+    required_constants = (
+        "LINUX_GATE_ID_V1",
+        "LINUX_PROVIDER_POLICY_ID_V1",
+        "LINUX_TARGET_ID_V1",
+        "SFTP_EXECUTABLE_V1",
+        "SSH_EXECUTABLE_V1",
+        "SSH_HOST_KEY_ALGORITHM_V1",
+        "SSH_HOST_KEY_FINGERPRINT_V1",
+        "SSH_HOST_KEY_PUBLIC_V1",
+        "SSH_HOST_V1",
+        "SSH_IDENTITY_FILE_V1",
+        "SSH_PORT_V1",
+        "SSH_USER_V1",
+        "_UNSHARE_PREFIX_V1",
+    )
+    missing_constants = tuple(
+        name for name in required_constants if assigned_value(linux_tree, name) is None
+    )
+    if missing_constants:
+        transport_failures.append("Linux provider constants are incomplete")
+    literal_expectations = {
+        "LINUX_GATE_ID_V1": "WO40-H",
+        "LINUX_PROVIDER_POLICY_ID_V1": "KIRBY2_SSH_EPHEMERAL_HOST_PROVIDER_V1",
+        "LINUX_TARGET_ID_V1": "linux-x86_64",
+        "SSH_PORT_V1": 22,
+    }
+    observed_literals: dict[str, object] = {}
+    for name, expected in literal_expectations.items():
+        value = assigned_value(linux_tree, name)
+        observed = value.value if isinstance(value, ast.Constant) else None
+        observed_literals[name] = observed
+        if observed != expected:
+            transport_failures.append(f"Linux provider constant differs: {name}")
+    required_helpers = (
+        "_remote_cleanup_argv",
+        "_remote_root",
+        "_remove_local_tree",
+        "_require_remote_root",
+        "_sftp_argv",
+        "_sftp_put",
+        "_ssh_argv",
+        "_ssh_common_options",
+        "_ssh_exec",
+    )
+    missing_helpers = tuple(
+        name for name in required_helpers if function_node(linux_tree, name) is None
+    )
+    if missing_helpers:
+        transport_failures.append("Linux SSH helper inventory is incomplete")
+    linux_literals = {
+        item.value
+        for item in ast.walk(linux_tree)
+        if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    }
+    required_ssh_literals = {
+        "-F",
+        "/dev/null",
+        "BatchMode=yes",
+        "ClearAllForwardings=yes",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "IdentityAgent=none",
+        "IdentitiesOnly=yes",
+        "KbdInteractiveAuthentication=no",
+        "PasswordAuthentication=no",
+        "PermitLocalCommand=no",
+        "ProxyCommand=none",
+        "StrictHostKeyChecking=yes",
+        "UseKeychain=yes",
+        "AddKeysToAgent=no",
+    }
+    missing_ssh_literals = tuple(sorted(required_ssh_literals - linux_literals))
+    if missing_ssh_literals:
+        transport_failures.append("Linux SSH option grammar is incomplete")
+    linux_source = sources["linux"]
+    if (
+        "UserKnownHostsFile=" not in linux_source
+        or "GUEST_NETWORK_DISABLED_VERIFIED" not in linux_source
+        or "SSH_EPHEMERAL_HOST_V1" not in linux_source
+    ):
+        transport_failures.append("Linux host key, adapter, or network scope is unbound")
+    unshare = assigned_value(linux_tree, "_UNSHARE_PREFIX_V1")
+    unshare_literals = (
+        {
+            item.value
+            for item in ast.walk(unshare)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        if unshare is not None
+        else set()
+    )
+    if not {
+        "--fork",
+        "--kill-child=KILL",
+        "--map-root-user",
+        "--net",
+        "--pid",
+        "--user",
+    }.issubset(unshare_literals):
+        transport_failures.append("Linux workload lacks its fixed user/network namespace")
+    no_new_privileges = assigned_value(
+        linux_tree, "_NO_NEW_PRIVILEGES_PREFIX_V1"
+    )
+    no_new_privileges_literals = (
+        {
+            item.value
+            for item in ast.walk(no_new_privileges)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        if no_new_privileges is not None
+        else set()
+    )
+    if not {"/usr/bin/setpriv", "--no-new-privs"}.issubset(
+        no_new_privileges_literals
+    ):
+        transport_failures.append("Linux workload can acquire new process privileges")
+    if (
+        '"no_new_privileges"' not in linux_source
+        or '"home": selected / "home"' not in linux_source
+        or '"PIP_NO_CACHE_DIR=1"' not in linux_source
+    ):
+        transport_failures.append(
+            "Linux workload does not prove no-new-privileges or owned HOME confinement"
+        )
+    if (
+        "_PROCESS_ABSENCE_SCRIPT" not in linux_source
+        or "/usr/bin/timeout" not in linux_literals
+        or "remote provider lock retained" not in linux_source
+        or "provider_process_quarantine" not in linux_source
+    ):
+        transport_failures.append(
+            "Linux remote lifetime, process-absence, or quarantine policy is incomplete"
+        )
+    shell_true_calls = sum(
+        1
+        for item in ast.walk(linux_tree)
+        if isinstance(item, ast.Call)
+        and any(
+            keyword.arg == "shell"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in item.keywords
+        )
+    )
+    if shell_true_calls:
+        transport_failures.append("Linux qualification enables shell execution")
+    forbidden_executables = ("curl", "dnf", "nvidia-smi", "wget", "yum")
+    observed_forbidden = tuple(
+        sorted(
+            executable
+            for executable in forbidden_executables
+            if any(
+                value == executable or value.endswith(f"/{executable}")
+                for value in linux_literals
+            )
+        )
+    )
+    if observed_forbidden:
+        transport_failures.append("Linux qualification exposes download or GPU tools")
+    transport_case = _case(
+        "linux_provider_transport_and_network_isolation_are_closed",
+        "Pinned SSH/SFTP transport stages one provider and executes inside a verified network namespace.",
+        {
+            "executor_invocations": 0,
+            "missing_constants": list(missing_constants),
+            "missing_helpers": list(missing_helpers),
+            "missing_ssh_options": list(missing_ssh_literals),
+            "provider_constants": observed_literals,
+            "shell_true_calls": shell_true_calls,
+            "ssh_invocations": 0,
+        },
+        transport_failures,
+    )
+
+    hostile_failures: list[str] = []
+    hostile_helpers = (
+        "_parse_canonical_object_line",
+        "_parse_network_probe",
+        "_parse_provider_probe",
+        "_parse_worker_result",
+        "_remote_cleanup_argv",
+        "_remote_root",
+        "_require_remote_root",
+    )
+    helper_nodes = {
+        name: function_node(linux_tree, name) for name in hostile_helpers
+    }
+    raise_counts = {
+        name: (
+            0
+            if node is None
+            else sum(1 for item in ast.walk(node) if isinstance(item, ast.Raise))
+        )
+        for name, node in helper_nodes.items()
+    }
+    required_direct_raises = {
+        "_parse_canonical_object_line",
+        "_parse_network_probe",
+        "_parse_provider_probe",
+        "_parse_worker_result",
+        "_require_remote_root",
+    }
+    if any(raise_counts[name] == 0 for name in required_direct_raises):
+        hostile_failures.append("Linux hostile parsers omit a direct refusal")
+    pure_helper_remote_calls = {
+        name: sorted(called_names(node) & {"_sftp_put", "_ssh_exec"})
+        for name, node in helper_nodes.items()
+    }
+    if any(pure_helper_remote_calls.values()):
+        hostile_failures.append("Linux hostile parser or path helper invokes a provider")
+    cleanup_node = helper_nodes["_remote_cleanup_argv"]
+    if "_require_remote_root" not in called_names(cleanup_node):
+        hostile_failures.append("Linux cleanup argv does not revalidate its owned root")
+    refusal_attributes = {
+        item.attr
+        for item in ast.walk(linux_tree)
+        if isinstance(item, ast.Attribute)
+    }
+    required_refusals = {
+        "PROVIDER_CLEANUP_FAILED",
+        "PROVIDER_IDENTITY_MISMATCH",
+        "PROVIDER_ISOLATION_UNAVAILABLE",
+        "PROVIDER_NOT_CLEAN",
+        "RESULT_INVALID",
+    }
+    missing_refusals = tuple(sorted(required_refusals - refusal_attributes))
+    if missing_refusals:
+        hostile_failures.append("Linux typed refusal inventory is incomplete")
+    linux_entry = function_node(linux_tree, "execute_linux_release_qualification")
+    final_cleanup_calls: set[str] = set()
+    if linux_entry is not None:
+        for item in ast.walk(linux_entry):
+            if not isinstance(item, ast.Try) or not item.finalbody:
+                continue
+            final_cleanup_calls.update(
+                called_names(ast.Module(body=item.finalbody, type_ignores=[]))
+            )
+    if not any("cleanup" in name for name in final_cleanup_calls):
+        hostile_failures.append("Linux executor lacks a finally-owned cleanup call")
+    if "_remote_cleanup_argv" not in called_names(linux_tree):
+        hostile_failures.append("Linux executor never uses the closed cleanup grammar")
+    entry_call_lines: dict[str, list[int]] = {}
+    if linux_entry is not None:
+        for item in ast.walk(linux_entry):
+            if not isinstance(item, ast.Call) or not isinstance(
+                item.func, (ast.Name, ast.Attribute)
+            ):
+                continue
+            name = (
+                item.func.id
+                if isinstance(item.func, ast.Name)
+                else item.func.attr
+            )
+            entry_call_lines.setdefault(name, []).append(item.lineno)
+    cleanup_lines = entry_call_lines.get("_cleanup_remote_root", [])
+    publication_lines = entry_call_lines.get("_publish_records", [])
+    if (
+        not cleanup_lines
+        or not publication_lines
+        or min(cleanup_lines) >= min(publication_lines)
+    ):
+        hostile_failures.append("Linux evidence publication can precede remote cleanup")
+    local_retirement_offset = linux_source.find("provider_local_retired = True")
+    candidate_verification_offset = linux_source.find(
+        "candidate_provider_raw=provider_record.canonical_bytes()"
+    )
+    publication_offset = linux_source.find("        _publish_records(")
+    if not (
+        0 <= local_retirement_offset
+        < candidate_verification_offset
+        < publication_offset
+    ):
+        hostile_failures.append(
+            "Linux immutable publication precedes local retirement or candidate verification"
+        )
+    hostile_case = _case(
+        "linux_hostile_results_and_cleanup_fail_closed",
+        "Canonical parsers, owned-root validation, typed refusals, and finally cleanup remain provider-free under audit.",
+        {
+            "executor_invocations": 0,
+            "missing_refusals": list(missing_refusals),
+            "parser_raise_counts": raise_counts,
+            "pure_helper_remote_calls": pure_helper_remote_calls,
+            "ssh_invocations": 0,
+        },
+        hostile_failures,
+    )
+
+    baseline_failures: list[str] = []
+    baseline_node = function_node(
+        trees["qualification"], "_require_macos_integer_core_baseline"
+    )
+    baseline_source = "" if baseline_node is None else ast.unparse(baseline_node)
+    required_baseline_tokens = {
+        "artifact_index_sha256",
+        "build_evidence_sha256",
+        "candidate_commit",
+        "cross_platform_integer_core_sha256",
+        "protocol_set_sha256",
+        "source_manifest_sha256",
+    }
+    missing_baseline_tokens = tuple(
+        sorted(token for token in required_baseline_tokens if token not in baseline_source)
+    )
+    baseline_calls = called_names(baseline_node)
+    if baseline_node is None:
+        baseline_failures.append("macOS integer-core baseline helper is missing")
+    if missing_baseline_tokens:
+        baseline_failures.append("macOS baseline identity binding is incomplete")
+    if not {
+        "release_qualification_record_paths",
+        "verify_release_qualification_record",
+    }.issubset(baseline_calls):
+        baseline_failures.append("macOS baseline does not reparse and verify qualification records")
+    from_bytes_calls = sum(
+        1
+        for item in ast.walk(baseline_node)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Attribute)
+        and item.func.attr == "from_bytes"
+    ) if baseline_node is not None else 0
+    if from_bytes_calls < 2 or "PASS" not in baseline_source:
+        baseline_failures.append("macOS baseline does not require two passing typed records")
+    forbidden_baseline_calls = baseline_calls & {
+        "_run_tart",
+        "_ssh_exec",
+        "execute_release_qualification",
+    }
+    if forbidden_baseline_calls:
+        baseline_failures.append("macOS baseline helper invokes a provider")
+    deep_node = function_node(
+        trees["qualification"], "_verify_release_qualification_records"
+    )
+    deep_source = "" if deep_node is None else ast.unparse(deep_node)
+    if (
+        "_require_macos_integer_core_baseline" not in called_names(deep_node)
+        or "linux-x86_64" not in deep_source
+        or "candidate_provider_raw" not in deep_source
+        or "candidate_attempt_raw" not in deep_source
+    ):
+        baseline_failures.append(
+            "deep Linux verification omits the macOS baseline or candidate mode"
+        )
+    baseline_lines = entry_call_lines.get(
+        "_require_macos_integer_core_baseline", []
+    )
+    if (
+        not baseline_lines
+        or not publication_lines
+        or min(baseline_lines) >= min(publication_lines)
+    ):
+        baseline_failures.append("Linux executor does not bind the baseline before publication")
+    baseline_case = _case(
+        "linux_cross_platform_baseline_is_independently_bound",
+        "Provider-free verification reparses WO40-G and binds every shared identity before Linux publication.",
+        {
+            "baseline_from_bytes_calls": from_bytes_calls,
+            "baseline_tokens": sorted(required_baseline_tokens - set(missing_baseline_tokens)),
+            "executor_invocations": 0,
+            "forbidden_provider_calls": sorted(forbidden_baseline_calls),
+            "ssh_invocations": 0,
+        },
+        baseline_failures,
+    )
+
+    cases = (
+        dispatch_case,
+        transport_case,
+        hostile_case,
+        baseline_case,
+    )
+    if len(cases) != DEV0015_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0015 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0015",
+        cases,
+        metadata=(
+            ("executor_invocations", "0"),
+            ("interrupted_card", "WO40-H"),
+            ("ssh_invocations", "0"),
         ),
     )
 

@@ -1,4 +1,4 @@
-"""Closed installed-artifact worker for WO40-G clean-environment qualification.
+"""Closed installed-artifact worker for WO40-G/H clean-environment qualification.
 
 The worker deliberately accepts no command payload.  Its three CLI arguments select
 one frozen product form, one already-installed launcher, and one new disposable
@@ -42,7 +42,7 @@ from kirby2.packs.formats import canonical_json_bytes, load_canonical_json_bytes
 WORKER_SCHEMA_ID: Final = "KIRBY2_RELEASE_QUALIFICATION_WORKER_RESULT_V1"
 STEP_SCHEMA_ID: Final = "KIRBY2_RELEASE_QUALIFICATION_STEP_RESULT_V1"
 OBSERVATION_SCHEMA_ID: Final = "KIRBY2_RELEASE_COMMAND_OBSERVATION_V1"
-EXECUTION_POLICY_ID: Final = "KIRBY2_WO40_G_GUEST_EXECUTION_POLICY_V1"
+EXECUTION_POLICY_ID: Final = "KIRBY2_WO40_GH_INSTALLED_EXECUTION_POLICY_V1"
 OFFLINE_POLICY_ID: Final = "KIRBY2_RELEASE_OFFLINE_SUBPROCESS_POLICY_V1"
 MICROSCOPE_RECEIPT_ID: Final = "KIRBY2_SAVED_RUN_MICROSCOPE_RECEIPT_V1"
 IMPORTED_REPLAY_RECEIPT_ID: Final = "KIRBY2_IMPORTED_REPLAY_EXECUTION_RECEIPT_V1"

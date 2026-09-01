@@ -451,6 +451,19 @@ class ReleaseQualificationVerificationV1:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _MacosIntegerCoreBaselineSnapshotV1:
+    provider_name: str
+    provider_raw: bytes
+    provider_identity: tuple[int, ...]
+    attempt_name: str
+    attempt_raw: bytes
+    attempt_identity: tuple[int, ...]
+    attempt_directory_fd: int
+    attempt_directory_identity: tuple[int, ...]
+    artifact_ids: tuple[str, ...]
+
+
 def _stable_release_record_bytes(
     path: Path | str,
     *,
@@ -649,12 +662,189 @@ def _require_canonical_tracked_build_evidence(
             raise ValueError(detail)
 
 
-def verify_release_qualification(
+def _require_macos_integer_core_baseline(
+    *,
+    bundle: object,
+    root_fd: int,
+    gate_fd: int,
+    inventory: object,
+    inventory_raw: bytes,
+    index: object,
+    binding: ReleaseBuildEvidenceBindingV1,
+    linux_attempt: object,
+) -> _MacosIntegerCoreBaselineSnapshotV1:
+    """Load and bind the immutable WO40-G baseline without provider access."""
+
+    from .build import ReleaseCleanProviderInventoryV1, ReleaseProtocolBundleV1
+    from .manifest import ReleaseArtifactIndexV1
+    from .qualification_records import (
+        RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1,
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationAttemptV1,
+        release_qualification_record_paths,
+        verify_release_qualification_record,
+    )
+
+    if type(bundle) is not ReleaseProtocolBundleV1:
+        raise TypeError("macOS baseline verification requires the exact protocol bundle")
+    if type(inventory) is not ReleaseCleanProviderInventoryV1:
+        raise TypeError("macOS baseline verification requires a typed provider inventory")
+    if type(inventory_raw) is not bytes:
+        raise TypeError("macOS baseline verification requires exact inventory bytes")
+    if type(index) is not ReleaseArtifactIndexV1:
+        raise TypeError("macOS baseline verification requires a typed artifact index")
+    if type(binding) is not ReleaseBuildEvidenceBindingV1:
+        raise TypeError("macOS baseline verification requires a typed build binding")
+    if type(linux_attempt) is not ReleaseQualificationAttemptV1:
+        raise TypeError("macOS baseline verification requires a typed Linux attempt")
+    if linux_attempt.target_id != "linux-x86_64":
+        raise ValueError("macOS baseline comparison requires a Linux attempt")
+
+    provider_relative, attempt_relative = release_qualification_record_paths(
+        "macos-arm64"
+    )
+    provider_parts = Path(provider_relative).parts
+    attempt_parts = Path(attempt_relative).parts
+    if (
+        len(provider_parts) != 1
+        or len(attempt_parts) != 3
+        or attempt_parts[0] != "gate-evidence"
+    ):
+        raise RuntimeError("macOS qualification record path layout differs")
+    attempt_directory_fd, attempt_directory_identity = _open_owned_release_directory(
+        attempt_parts[1], parent_fd=gate_fd
+    )
+    try:
+        provider_identities: list[tuple[int, ...]] = []
+        provider_raw = _stable_release_record_bytes(
+            provider_parts[0],
+            maximum_bytes=4 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=root_fd,
+            identity_out=provider_identities,
+        )
+        attempt_identities: list[tuple[int, ...]] = []
+        attempt_raw = _stable_release_record_bytes(
+            attempt_parts[2],
+            maximum_bytes=64 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=attempt_directory_fd,
+            identity_out=attempt_identities,
+        )
+        if len(provider_identities) != 1 or len(attempt_identities) != 1:
+            raise RuntimeError("WO40-G baseline record identity capture failed")
+        provider = ReleaseCleanProviderAttestationV1.from_bytes(provider_raw)
+        baseline_attempt = ReleaseQualificationAttemptV1.from_bytes(attempt_raw)
+        pure = verify_release_qualification_record(
+            provider,
+            baseline_attempt,
+            bundle.qualification_protocol,
+        )
+        if pure.status != "PASS" or baseline_attempt.status != "PASS":
+            raise ValueError("WO40-G macOS baseline is not a passing qualification")
+
+        capability = inventory.by_target().get("macos-arm64")
+        platform = next(
+            (
+                item
+                for item in bundle.platform_protocol.targets
+                if item.target_id == "macos-arm64"
+            ),
+            None,
+        )
+        if (
+            capability is None
+            or platform is None
+            or capability.readiness(platform)[0] != "PASS"
+        ):
+            raise ValueError("WO40-G macOS provider capability is not ready")
+        inventory_sha256 = hashlib.sha256(inventory_raw).hexdigest()
+        if (
+            provider.provider_inventory_sha256 != inventory_sha256
+            or provider.provider_capability_sha256 != capability.fingerprint
+        ):
+            raise ValueError("WO40-G macOS provider differs from its inventory")
+
+        expected_ids = RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1["macos-arm64"]
+        if (
+            tuple(
+                item.artifact_id
+                for item in baseline_attempt.session.artifact_bindings
+            )
+            != expected_ids
+        ):
+            raise ValueError("WO40-G macOS artifact-binding order differs")
+        indexed = {item.artifact_id: item for item in index.artifacts}
+        for observed in baseline_attempt.session.artifact_bindings:
+            expected = indexed.get(observed.artifact_id)
+            if expected is None or (
+                observed.size != expected.size
+                or observed.release_store_sha256 != expected.transport_sha256
+                or observed.provider_copy_sha256 != expected.transport_sha256
+            ):
+                raise ValueError("WO40-G macOS artifact transfer binding differs")
+
+        baseline_build_identity = (
+            baseline_attempt.candidate_commit,
+            baseline_attempt.protocol_set_sha256,
+            baseline_attempt.source_manifest_sha256,
+            baseline_attempt.artifact_index_sha256,
+            baseline_attempt.build_evidence_sha256,
+        )
+        linux_build_identity = (
+            linux_attempt.candidate_commit,
+            linux_attempt.protocol_set_sha256,
+            linux_attempt.source_manifest_sha256,
+            linux_attempt.artifact_index_sha256,
+            linux_attempt.build_evidence_sha256,
+        )
+        frozen_build_identity = (
+            binding.candidate_commit,
+            binding.protocol_set_sha256,
+            binding.source_manifest_sha256,
+            binding.artifact_index_sha256,
+            binding.build_evidence_sha256,
+        )
+        if (
+            baseline_build_identity != linux_build_identity
+            or baseline_build_identity != frozen_build_identity
+            or baseline_attempt.protocol_set_sha256 != bundle.protocol_set_sha256
+            or baseline_attempt.artifact_index_sha256 != index.sha256
+        ):
+            raise ValueError(
+                "Linux qualification and WO40-G baseline build identities differ"
+            )
+        if (
+            linux_attempt.facts.cross_platform_integer_core_sha256
+            != baseline_attempt.facts.cross_platform_integer_core_sha256
+        ):
+            raise ValueError(
+                "Linux qualification integer core differs from the WO40-G baseline"
+            )
+        return _MacosIntegerCoreBaselineSnapshotV1(
+            provider_name=provider_parts[0],
+            provider_raw=provider_raw,
+            provider_identity=provider_identities[0],
+            attempt_name=attempt_parts[2],
+            attempt_raw=attempt_raw,
+            attempt_identity=attempt_identities[0],
+            attempt_directory_fd=attempt_directory_fd,
+            attempt_directory_identity=attempt_directory_identity,
+            artifact_ids=expected_ids,
+        )
+    except Exception:
+        os.close(attempt_directory_fd)
+        raise
+
+
+def _verify_release_qualification_records(
     bundle: object,
     *,
     target_id: str,
     build_evidence: Path,
     artifact_root: Path,
+    candidate_provider_raw: bytes | None = None,
+    candidate_attempt_raw: bytes | None = None,
 ) -> ReleaseQualificationVerificationV1:
     """Deeply verify the two qualification records and all immutable inputs.
 
@@ -688,6 +878,16 @@ def verify_release_qualification(
         raise TypeError("qualification verification requires the exact protocol bundle")
     if target_id not in _TARGET_IDS:
         raise ValueError("qualification verification target is invalid")
+    candidate_records = (
+        candidate_provider_raw is not None or candidate_attempt_raw is not None
+    )
+    if candidate_records and (
+        type(candidate_provider_raw) is not bytes
+        or type(candidate_attempt_raw) is not bytes
+        or not candidate_provider_raw
+        or not candidate_attempt_raw
+    ):
+        raise TypeError("qualification candidate records require two exact byte strings")
     if (
         not isinstance(artifact_root, Path)
         or not artifact_root.is_absolute()
@@ -709,6 +909,7 @@ def verify_release_qualification(
     root_fd, root_identity = _open_owned_release_directory(artifact_root)
     gate_fd: int | None = None
     attempt_directory_fd: int | None = None
+    macos_baseline: _MacosIntegerCoreBaselineSnapshotV1 | None = None
     try:
         index_raw = _stable_release_record_bytes(
             "release-artifact-index.json",
@@ -758,21 +959,26 @@ def verify_release_qualification(
         gate_fd, gate_identity = _open_owned_release_directory(
             attempt_parts[0], parent_fd=root_fd
         )
-        attempt_directory_fd, attempt_directory_identity = (
-            _open_owned_release_directory(attempt_parts[1], parent_fd=gate_fd)
-        )
-        provider_raw = _stable_release_record_bytes(
-            provider_parts[0],
-            maximum_bytes=4 * 1024 * 1024,
-            require_read_only=True,
-            directory_fd=root_fd,
-        )
-        attempt_raw = _stable_release_record_bytes(
-            attempt_parts[2],
-            maximum_bytes=64 * 1024 * 1024,
-            require_read_only=True,
-            directory_fd=attempt_directory_fd,
-        )
+        attempt_directory_identity: tuple[int, ...] | None = None
+        if candidate_records:
+            provider_raw = candidate_provider_raw
+            attempt_raw = candidate_attempt_raw
+        else:
+            attempt_directory_fd, attempt_directory_identity = (
+                _open_owned_release_directory(attempt_parts[1], parent_fd=gate_fd)
+            )
+            provider_raw = _stable_release_record_bytes(
+                provider_parts[0],
+                maximum_bytes=4 * 1024 * 1024,
+                require_read_only=True,
+                directory_fd=root_fd,
+            )
+            attempt_raw = _stable_release_record_bytes(
+                attempt_parts[2],
+                maximum_bytes=64 * 1024 * 1024,
+                require_read_only=True,
+                directory_fd=attempt_directory_fd,
+            )
         inventory_raw = _stable_release_record_bytes(
             "clean-providers.toml",
             maximum_bytes=4 * 1024 * 1024,
@@ -834,6 +1040,18 @@ def verify_release_qualification(
                 "qualification attempt differs from immutable WO40-F inputs"
             )
 
+        if target_id == "linux-x86_64":
+            macos_baseline = _require_macos_integer_core_baseline(
+                bundle=bundle,
+                root_fd=root_fd,
+                gate_fd=gate_fd,
+                inventory=inventory,
+                inventory_raw=inventory_raw,
+                index=index,
+                binding=binding,
+                linux_attempt=attempt,
+            )
+
         artifact_verification = verify_release_artifacts(
             bundle,
             artifact_root,
@@ -843,7 +1061,12 @@ def verify_release_qualification(
             raise ValueError(
                 "deep immutable release-artifact verification did not pass"
             )
-        for artifact_id in expected_ids:
+        verified_artifact_ids = expected_ids
+        if macos_baseline is not None:
+            verified_artifact_ids = tuple(
+                dict.fromkeys((*expected_ids, *macos_baseline.artifact_ids))
+            )
+        for artifact_id in verified_artifact_ids:
             artifact_raw = _stable_release_record_bytes(
                 artifact_id,
                 maximum_bytes=RELEASE_ARTIFACT_MAX_BYTES_V1,
@@ -858,7 +1081,7 @@ def verify_release_qualification(
             ):
                 raise ValueError("qualification selected artifact bytes changed")
 
-        final_small_records = (
+        final_small_records: list[tuple[str, int, bytes, int, bool]] = [
             (
                 "release-artifact-index.json",
                 root_fd,
@@ -873,14 +1096,6 @@ def verify_release_qualification(
                 64 * 1024 * 1024,
                 True,
             ),
-            (provider_parts[0], root_fd, provider_raw, 4 * 1024 * 1024, True),
-            (
-                attempt_parts[2],
-                attempt_directory_fd,
-                attempt_raw,
-                64 * 1024 * 1024,
-                True,
-            ),
             (
                 "clean-providers.toml",
                 root_fd,
@@ -888,7 +1103,28 @@ def verify_release_qualification(
                 4 * 1024 * 1024,
                 False,
             ),
-        )
+        ]
+        if not candidate_records:
+            if attempt_directory_fd is None:
+                raise RuntimeError("qualification attempt directory was not opened")
+            final_small_records.extend(
+                (
+                    (
+                        provider_parts[0],
+                        root_fd,
+                        provider_raw,
+                        4 * 1024 * 1024,
+                        True,
+                    ),
+                    (
+                        attempt_parts[2],
+                        attempt_directory_fd,
+                        attempt_raw,
+                        64 * 1024 * 1024,
+                        True,
+                    ),
+                )
+            )
         for name, directory, original, bound, read_only in final_small_records:
             if _stable_release_record_bytes(
                 name,
@@ -899,9 +1135,42 @@ def verify_release_qualification(
                 raise ValueError("qualification input changed before verification ended")
         if load_release_build_evidence_binding(build_evidence) != binding:
             raise ValueError("WO40-F evidence changed before verification ended")
-        _require_release_directory_identity(
-            attempt_directory_fd, attempt_directory_identity
-        )
+        if macos_baseline is not None:
+            provider_identities = []
+            provider_raw = _stable_release_record_bytes(
+                macos_baseline.provider_name,
+                maximum_bytes=4 * 1024 * 1024,
+                require_read_only=True,
+                directory_fd=root_fd,
+                identity_out=provider_identities,
+            )
+            attempt_identities = []
+            attempt_raw = _stable_release_record_bytes(
+                macos_baseline.attempt_name,
+                maximum_bytes=64 * 1024 * 1024,
+                require_read_only=True,
+                directory_fd=macos_baseline.attempt_directory_fd,
+                identity_out=attempt_identities,
+            )
+            if (
+                provider_raw != macos_baseline.provider_raw
+                or provider_identities != [macos_baseline.provider_identity]
+                or attempt_raw != macos_baseline.attempt_raw
+                or attempt_identities != [macos_baseline.attempt_identity]
+            ):
+                raise ValueError(
+                    "WO40-G baseline file identity changed during Linux verification"
+                )
+            _require_release_directory_identity(
+                macos_baseline.attempt_directory_fd,
+                macos_baseline.attempt_directory_identity,
+            )
+        if attempt_directory_fd is not None:
+            if attempt_directory_identity is None:
+                raise RuntimeError("qualification attempt directory identity is absent")
+            _require_release_directory_identity(
+                attempt_directory_fd, attempt_directory_identity
+            )
         _require_release_directory_identity(gate_fd, gate_identity)
         _require_release_directory_identity(root_fd, root_identity)
         return ReleaseQualificationVerificationV1(
@@ -918,11 +1187,30 @@ def verify_release_qualification(
             check_count=pure.check_count,
         )
     finally:
+        if macos_baseline is not None:
+            os.close(macos_baseline.attempt_directory_fd)
         if attempt_directory_fd is not None:
             os.close(attempt_directory_fd)
         if gate_fd is not None:
             os.close(gate_fd)
         os.close(root_fd)
+
+
+def verify_release_qualification(
+    bundle: object,
+    *,
+    target_id: str,
+    build_evidence: Path,
+    artifact_root: Path,
+) -> ReleaseQualificationVerificationV1:
+    """Deeply verify one published, immutable qualification record pair."""
+
+    return _verify_release_qualification_records(
+        bundle,
+        target_id=target_id,
+        build_evidence=build_evidence,
+        artifact_root=artifact_root,
+    )
 
 
 def _text(value: object, label: str, maximum_bytes: int = 4096) -> str:

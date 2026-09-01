@@ -140,6 +140,29 @@ class ReleaseQualificationNetworkScopeV1(str, Enum):
     GUEST_NETWORK_DISABLED_VERIFIED = "GUEST_NETWORK_DISABLED_VERIFIED"
 
 
+def _require_passing_network_scope(
+    *,
+    target_id: str,
+    status: str,
+    network_scope: ReleaseQualificationNetworkScopeV1,
+) -> None:
+    if status not in {"PASS", "PASS_WITH_WARNINGS"}:
+        return
+    expected = {
+        "macos-arm64": ReleaseQualificationNetworkScopeV1.HOST_ONLY,
+        "linux-x86_64": (
+            ReleaseQualificationNetworkScopeV1.GUEST_NETWORK_DISABLED_VERIFIED
+        ),
+    }[target_id]
+    if network_scope is expected:
+        return
+    if target_id == "macos-arm64":
+        raise ValueError("passing macOS qualification currently requires HOST_ONLY")
+    raise ValueError(
+        "passing Linux qualification requires GUEST_NETWORK_DISABLED_VERIFIED"
+    )
+
+
 def _text(value: object, label: str, maximum_bytes: int = 4096) -> str:
     return require_nfc_text(value, label, maximum_bytes=maximum_bytes)
 
@@ -1901,12 +1924,11 @@ class ReleaseQualificationAttemptV1:
                 raise ValueError("passing qualification must use a clean environment")
             if self.facts.desktop_run_sha256 != self.facts.headless_run_sha256:
                 raise ValueError("passing desktop/headless run identities differ")
-            if (
-                self.target_id == "macos-arm64"
-                and self.session.network_scope
-                is not ReleaseQualificationNetworkScopeV1.HOST_ONLY
-            ):
-                raise ValueError("passing macOS qualification currently requires HOST_ONLY")
+            _require_passing_network_scope(
+                target_id=self.target_id,
+                status=self.status,
+                network_scope=self.session.network_scope,
+            )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -2101,6 +2123,11 @@ def verify_release_qualification_record(
         raise ValueError("qualification session provider-attestation digest differs")
     if attempt.session.network_scope is not provider.network_scope:
         raise ValueError("provider and session network scopes differ")
+    _require_passing_network_scope(
+        target_id=attempt.target_id,
+        status=attempt.status,
+        network_scope=attempt.session.network_scope,
+    )
     protocol_rows = tuple(
         (
             step.step_id,
