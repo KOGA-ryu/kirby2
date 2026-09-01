@@ -800,7 +800,13 @@ deviation audit.
   store encodings as K2PACK-canonical direct payloads.  The headless protocol lists
   uninstall before its four extra rows; DEV-0014 therefore keeps canonical evidence
   order unchanged but records an explicit execution index and requires headless
-  extras to run before the physical uninstall lifecycle action.
+  extras to run before the physical uninstall lifecycle action.  First provider
+  launch also exposed an ambient-policy coupling: provider-free, read-only artifact
+  verification inherited WO40-F's build-only Codex Seatbelt check, while macOS
+  correctly forbids Tart from executing its SUID Softnet helper beneath that same
+  Seatbelt.  DEV-0014 therefore keeps the network gate on artifact construction,
+  removes it only from non-executing verification, and continues to require true
+  guest `--net-host` isolation with no NAT fallback.
 - Repair: add strict canonical provider-attestation, command-observation,
   root-observation, session, step, and qualification-attempt records; a closed
   installed guest worker for the exact desktop/headless matrix; and a closed Tart
@@ -817,6 +823,7 @@ deviation audit.
   pack/doctor blockers reproduced above.  Keep `release/qualification.toml` byte
   unchanged.
 - Owned repair paths: `kirby2/packs/builders.py`, `kirby2/release/doctor.py`,
+  `kirby2/release/artifacts.py`,
   `kirby2/release/qualification.py`,
   `kirby2/release/qualification_records.py`,
   `kirby2/release/qualification_worker.py`,
@@ -856,6 +863,8 @@ reconstructs exactly 38 matrix observations and 42 gate checks; the command owns
 real executor rather than a `READY` dispatcher; the controller has no generic
 command, VM, network, or cleanup surface and contains no NAT fallback; the installed
 worker refuses checkout execution; the complete registry contains DEV-0001 through
-DEV-0014; the previous candidate is retained as history; and the deviation audit
-does not clone, boot, connect to, mutate, or delete a provider or execute the one-time
-qualification workload.
+DEV-0014; artifact construction still requires the recorded Codex network gate while
+provider-free read-only verification does not forge that ambient marker; the previous
+candidate is retained as history; and the deviation audit does not clone, boot,
+connect to, mutate, or delete a provider or execute the one-time qualification
+workload.

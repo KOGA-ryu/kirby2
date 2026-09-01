@@ -2302,13 +2302,19 @@ def verify_release_artifacts(
     artifact_root: Path,
     candidate_commit: str | None = None,
 ) -> ReleaseCommandOutcomeV1:
-    """Deeply reconstruct and verify a published six-artifact release set."""
+    """Deeply reconstruct one published six-artifact set without executing it.
+
+    The active Codex network-denial requirement belongs to artifact construction,
+    where build frontends run. Verification is a provider-free, read-only parser
+    and must also remain usable by a Tart controller whose SUID Softnet helper cannot
+    execute beneath macOS Seatbelt. The immutable build record still proves the
+    exact network policy under which the artifacts were constructed.
+    """
 
     try:
         root = _absolute_root(artifact_root, "release artifact root")
         _require_governed_store(bundle, root)
         identity = _require_safe_store(root, create=False)
-        _require_codex_network_seatbelt()
         inventory = _store_inventory(root, identity)
         public_names = {
             *_PUBLIC_ARTIFACT_FILENAMES_V1,

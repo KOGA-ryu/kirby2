@@ -2847,6 +2847,8 @@ def audit_release_resource_fingerprint_restart() -> ReleaseAuditSuite:
 def audit_release_artifact_executor_restart() -> ReleaseAuditSuite:
     """Prove the restarted WO40-F executor owns a strict, bounded public seam."""
 
+    import kirby2.release.artifacts as artifacts_module
+
     from kirby2.release.artifacts import (
         RELEASE_ARTIFACT_BUILD_POLICY_ID_V1,
         RELEASE_BUILD_ATTEMPT_COUNT_V1,
@@ -3021,13 +3023,59 @@ def audit_release_artifact_executor_restart() -> ReleaseAuditSuite:
     ):
         if getattr(target, "__module__", None) != "kirby2.release.artifacts":
             surface_failures.append(f"public {label} surface is not owned by artifacts")
+    build_network_gate_calls = 0
+    verify_network_gate_calls = 0
+    try:
+        artifact_tree = ast.parse(inspect.getsource(artifacts_module))
+
+        def artifact_function(name: str) -> ast.FunctionDef | None:
+            return next(
+                (
+                    item
+                    for item in ast.walk(artifact_tree)
+                    if isinstance(item, ast.FunctionDef) and item.name == name
+                ),
+                None,
+            )
+
+        def network_gate_calls(node: ast.FunctionDef | None) -> int:
+            if node is None:
+                return 0
+            return sum(
+                1
+                for item in ast.walk(node)
+                if isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Name)
+                and item.func.id == "_require_codex_network_seatbelt"
+            )
+
+        build_network_gate_calls = network_gate_calls(
+            artifact_function("build_release_artifacts")
+        )
+        verify_network_gate_calls = network_gate_calls(
+            artifact_function("verify_release_artifacts")
+        )
+        if build_network_gate_calls != 1:
+            surface_failures.append(
+                "artifact construction does not own exactly one Codex network gate"
+            )
+        if verify_network_gate_calls != 0:
+            surface_failures.append(
+                "provider-free artifact verification retained a build-only network gate"
+            )
+    except (OSError, TypeError, SyntaxError) as error:
+        surface_failures.append(
+            f"artifact network-boundary AST failed: {type(error).__name__}"
+        )
     surface_case = _case(
         "artifact_build_and_verification_surfaces_are_bounded",
-        "The preregistered CLI can call exact keyword-bounded builder and verifier seams.",
+        "The bounded builder retains network denial while read-only verification remains provider-free.",
         {
             "build_signature": observed_build_signature,
+            "build_network_gate_calls": build_network_gate_calls,
             "executor_invocations": 0,
             "verify_signature": observed_verify_signature,
+            "verify_network_gate_calls": verify_network_gate_calls,
         },
         surface_failures,
     )
