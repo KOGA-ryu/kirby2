@@ -1291,7 +1291,7 @@ class _DiskRecordSource:
             raise ValueError("performance artifact root ownership or mode is unsafe")
         self._owner = metadata.st_uid
         self._device = metadata.st_dev
-        self._root_identity = self._identity(metadata)
+        self._root_identity = self._directory_identity(metadata)
         self._seen: set[str] = set()
         self._file_identities: dict[str, tuple[int, ...]] = {}
         self._directory_identities: dict[str, tuple[int, ...]] = {}
@@ -1305,6 +1305,28 @@ class _DiskRecordSource:
             metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
             metadata.st_uid, metadata.st_gid, metadata.st_size,
             metadata.st_mtime_ns,
+        )
+
+    @staticmethod
+    def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        """Return replacement-relevant identity for a verified directory.
+
+        Directory size and timestamps are filesystem metadata rather than a
+        portable inventory identity.  macOS File Provider can update them while
+        attaching provenance metadata even though the directory inode, ownership,
+        permissions, links, descendants, and every descendant byte remain exact.
+        The verifier separately walks the complete bounded inventory and reopens
+        every referenced immutable file, so retaining the stable replacement and
+        access-control fields is both stricter and portable.
+        """
+
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
         )
 
     def read(self, path: str) -> bytes:
@@ -1330,7 +1352,7 @@ class _DiskRecordSource:
                     or metadata.st_mode & 0o022
                 ):
                     raise ValueError("performance publication directory is unsafe")
-                identity = self._identity(metadata)
+                identity = self._directory_identity(metadata)
                 selected_directory = PurePosixPath(*walked).as_posix()
                 prior = self._directory_identities.setdefault(
                     selected_directory, identity
@@ -1397,7 +1419,7 @@ class _DiskRecordSource:
                     or metadata.st_mode & 0o022
                 ):
                     raise ValueError("performance publication directory is unsafe")
-                identity = self._identity(metadata)
+                identity = self._directory_identity(metadata)
                 selected_directory = PurePosixPath(*walked).as_posix()
                 prior = self._directory_identities.setdefault(
                     selected_directory, identity
@@ -1451,11 +1473,11 @@ class _DiskRecordSource:
             raise ValueError("performance publication directory is unsafe")
         selected_directory = relative.as_posix()
         prior = self._directory_identities.setdefault(
-            selected_directory, self._identity(metadata)
+            selected_directory, self._directory_identity(metadata)
         )
-        if prior != self._identity(metadata):
+        if prior != self._directory_identity(metadata):
             raise ValueError("performance publication directory changed before inventory scan")
-        observed_directories[selected_directory] = self._identity(metadata)
+        observed_directories[selected_directory] = self._directory_identity(metadata)
         if len(observed_directories) > _MAX_PUBLICATION_FILES:
             raise ValueError("performance publication contains too many directories")
 
@@ -1473,7 +1495,9 @@ class _DiskRecordSource:
             if stat.S_ISDIR(child_metadata.st_mode):
                 child = os.open(entry.name, directory_flags, dir_fd=directory)
                 try:
-                    if self._identity(os.fstat(child)) != self._identity(child_metadata):
+                    if self._directory_identity(
+                        os.fstat(child)
+                    ) != self._directory_identity(child_metadata):
                         raise ValueError("performance publication directory changed during scan")
                     self._scan_publication(
                         child,
@@ -1501,7 +1525,7 @@ class _DiskRecordSource:
                 raise ValueError("performance publication contains a non-regular descendant")
 
     def finish(self) -> None:
-        if self._identity(os.fstat(self._root_fd)) != self._root_identity:
+        if self._directory_identity(os.fstat(self._root_fd)) != self._root_identity:
             raise ValueError("performance artifact root changed during verification")
         publication_parts = PurePosixPath(RELEASE_PERFORMANCE_PUBLICATION_ROOT_V1).parts
         publication = self._open_directory(publication_parts)
@@ -1545,11 +1569,11 @@ class _DiskRecordSource:
         for selected, identity in observed_directories.items():
             descriptor = self._open_directory(PurePosixPath(selected).parts)
             try:
-                if self._identity(os.fstat(descriptor)) != identity:
+                if self._directory_identity(os.fstat(descriptor)) != identity:
                     raise ValueError("performance publication directory changed during verification")
             finally:
                 os.close(descriptor)
-        if self._identity(os.fstat(self._root_fd)) != self._root_identity:
+        if self._directory_identity(os.fstat(self._root_fd)) != self._root_identity:
             raise ValueError("performance artifact root changed during verification")
 
     def close(self) -> None:
