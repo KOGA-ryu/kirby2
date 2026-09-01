@@ -286,7 +286,11 @@ class _Worker:
         if timed_out:
             raise QualificationFailure("COMMAND_TIMEOUT", step_id)
         if process.returncode != expected_exit:
-            detail = stderr.decode("utf-8", errors="replace").strip()[:2048]
+            diagnostic = stderr if stderr.strip() else stdout
+            detail = (
+                diagnostic.decode("utf-8", errors="replace").strip()[:2048].strip()
+                or "no command diagnostic output"
+            )
             raise QualificationFailure(
                 "PRODUCT_COMMAND_FAILED",
                 f"{step_id} exited {process.returncode}: {detail}",

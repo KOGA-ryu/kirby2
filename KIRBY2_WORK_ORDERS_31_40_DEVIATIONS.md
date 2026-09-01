@@ -955,7 +955,10 @@ macOS `test` call sites, and does not execute the one-time qualification workloa
   root-local home and temporary directory for candidate-controlled processes; this
   prevents setuid or file-capability elevation and keeps normal candidate state
   inside the marker-bound root even if the account's sudo policy or real home
-  changes.  Cleanup
+  changes.  Rewind every pinned descriptor-backed pack-stage directory before its
+  exact scan because Linux shares directory cursors across duplicates, and prefer
+  bounded stdout diagnostics when a product command fails without stderr so a
+  typed refusal cannot be masked by edge whitespace.  Cleanup
   revalidates the owned remote-root grammar and marker, runs from `finally`, and
   turns ambiguous or failed cleanup into a typed refusal.  Bound every isolated
   command with a shorter remote timeout and a kill-on-parent-exit PID namespace;
@@ -981,6 +984,7 @@ macOS `test` call sites, and does not execute the one-time qualification workloa
 - Owned repair paths: `kirby2/release/qualification_executor.py`,
   `kirby2/release/qualification_linux_executor.py`,
   `kirby2/release/qualification_worker.py`,
+  `kirby2/packs/staging.py`,
   `kirby2/release/qualification_records.py`,
   `kirby2/release/qualification.py`, `kirby2/audit/release.py`,
   `kirby2/audit/expansion.py`, `release/performance_runner_sources.lock`, and

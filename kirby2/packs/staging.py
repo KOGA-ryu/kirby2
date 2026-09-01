@@ -1403,6 +1403,7 @@ def _scan_closed_tree(
 
     def visit(directory: int, prefix: str, parent_depth: int) -> None:
         nonlocal entry_count
+        _rewind_directory_descriptor(directory, "staged directory scan")
         with os.scandir(directory) as entries:
             for entry in entries:
                 entry_count += 1
@@ -2018,8 +2019,40 @@ def _rmdir_owned_partial(
 
 
 def _directory_is_empty(directory_descriptor: int) -> bool:
+    _rewind_directory_descriptor(directory_descriptor, "directory emptiness scan")
     with os.scandir(directory_descriptor) as entries:
         return next(entries, None) is None
+
+
+def _rewind_directory_descriptor(descriptor: int, label: str) -> None:
+    """Reset a pinned directory stream before a descriptor-based scan.
+
+    Linux shares directory cursors across duplicated descriptors.  The stage
+    writer intentionally uses descriptor-relative duplicates, so every scan must
+    explicitly start at offset zero instead of inheriting an exhausted cursor.
+    """
+
+    try:
+        before = os.fstat(descriptor)
+        offset = os.lseek(descriptor, 0, os.SEEK_SET)
+        after = os.fstat(descriptor)
+    except OSError:
+        refuse(
+            PackRefusalCodeV1.STAGING_TREE_MISMATCH,
+            PackValidationPhaseV1.STAGE_REVALIDATION,
+            f"{label} could not reset its pinned directory cursor",
+        )
+    if (
+        offset != 0
+        or not stat.S_ISDIR(before.st_mode)
+        or (before.st_dev, before.st_ino, before.st_mode)
+        != (after.st_dev, after.st_ino, after.st_mode)
+    ):
+        refuse(
+            PackRefusalCodeV1.STAGING_ENTRY_REBOUND,
+            PackValidationPhaseV1.STAGE_REVALIDATION,
+            f"{label} changed identity while resetting its cursor",
+        )
 
 
 def _utf8_key(value: str) -> bytes:

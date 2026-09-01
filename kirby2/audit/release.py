@@ -4117,6 +4117,7 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
         "package": repository / "kirby2/release/__init__.py",
         "qualification": repository / "kirby2/release/qualification.py",
         "records": repository / "kirby2/release/qualification_records.py",
+        "staging": repository / "kirby2/packs/staging.py",
         "worker": repository / "kirby2/release/qualification_worker.py",
     }
     sources: dict[str, str] = {}
@@ -4466,6 +4467,23 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
     ):
         transport_failures.append(
             "Linux workload does not prove no-new-privileges or owned HOME confinement"
+        )
+    staging_source = sources["staging"]
+    worker_source = sources["worker"]
+    if (
+        "_rewind_directory_descriptor" not in staging_source
+        or "os.lseek(descriptor, 0, os.SEEK_SET)" not in staging_source
+        or staging_source.count("_rewind_directory_descriptor(") < 3
+    ):
+        transport_failures.append(
+            "Linux pack staging can inherit an exhausted duplicated directory cursor"
+        )
+    if (
+        "diagnostic = stderr if stderr.strip() else stdout" not in worker_source
+        or "no command diagnostic output" not in worker_source
+    ):
+        transport_failures.append(
+            "Linux stdout-only product failures can escape the typed outcome grammar"
         )
     if (
         "_PROCESS_ABSENCE_SCRIPT" not in linux_source
