@@ -1298,10 +1298,13 @@ class _DiskRecordSource:
 
     @staticmethod
     def _identity(metadata: os.stat_result) -> tuple[int, ...]:
+        # macOS File Provider may attach provenance xattrs after publication.
+        # That changes ctime only; complete bytes, inventory, and every other
+        # content-relevant identity field are verified independently here.
         return (
             metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
             metadata.st_uid, metadata.st_gid, metadata.st_size,
-            metadata.st_mtime_ns, metadata.st_ctime_ns,
+            metadata.st_mtime_ns,
         )
 
     def read(self, path: str) -> bytes:
