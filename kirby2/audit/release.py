@@ -3060,6 +3060,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         TART_BASE_DISK_BYTES_V1,
         TART_BASE_NVRAM_SHA256_V1,
         TART_BASE_VM_V1,
+        TART_EXECUTABLE_MODE_V1,
         TART_EXECUTABLE_SHA256_V1,
         TART_EXECUTABLE_V1,
         TART_PROVIDER_POLICY_ID_V1,
@@ -3616,6 +3617,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         "base_nvram_sha256": TART_BASE_NVRAM_SHA256_V1,
         "base_vm": TART_BASE_VM_V1,
         "executable": os.fspath(TART_EXECUTABLE_V1),
+        "executable_mode": TART_EXECUTABLE_MODE_V1,
         "executable_sha256": TART_EXECUTABLE_SHA256_V1,
         "provider_policy": TART_PROVIDER_POLICY_ID_V1,
         "target": TART_TARGET_ID_V1,
@@ -3631,6 +3633,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         ),
         "base_vm": "kirby2-dev0014-macos-offline-base",
         "executable": "/opt/homebrew/Cellar/tart/2.32.1/bin/tart",
+        "executable_mode": 0o555,
         "executable_sha256": (
             "44137d8dba251d4a4f9a113ecc8619d821ea7ea0f28217a88f57dde894d83d76"
         ),
@@ -3677,6 +3680,19 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
             ),
             None,
         )
+
+    provider_node = function_node(executor_tree, "_require_tart_provider")
+    provider_names = (
+        set()
+        if provider_node is None
+        else {
+            item.id
+            for item in ast.walk(provider_node)
+            if isinstance(item, ast.Name)
+        }
+    )
+    if "TART_EXECUTABLE_MODE_V1" not in provider_names:
+        surface_failures.append("Tart provider omits its executable-mode binding")
 
     host_launch = function_node(executor_tree, "_spawn_host_only_vm")
     run_calls: list[ast.Call] = []

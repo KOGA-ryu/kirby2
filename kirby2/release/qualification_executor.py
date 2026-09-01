@@ -82,6 +82,7 @@ TART_VERSION_V1: Final[str] = "2.32.1"
 TART_EXECUTABLE_SHA256_V1: Final[str] = (
     "44137d8dba251d4a4f9a113ecc8619d821ea7ea0f28217a88f57dde894d83d76"
 )
+TART_EXECUTABLE_MODE_V1: Final[int] = 0o555
 TART_BASE_VM_V1: Final[str] = "kirby2-dev0014-macos-offline-base"
 TART_BASE_CONFIG_SHA256_V1: Final[str] = (
     "7049c4f9d0bb1901fc8fa77965f8543e7dc62e513bfa885e16c84a82e653a97b"
@@ -594,15 +595,24 @@ def _redacted_vm_projection(config: Mapping[str, object]) -> dict[str, object]:
 
 
 def _require_tart_provider() -> dict[str, object]:
-    executable = _stable_read(
-        TART_EXECUTABLE_V1,
-        maximum_bytes=256 * 1024 * 1024,
-        require_read_only=True,
-    )
-    if executable.sha256 != TART_EXECUTABLE_SHA256_V1:
+    try:
+        executable = _stable_read(
+            TART_EXECUTABLE_V1,
+            maximum_bytes=256 * 1024 * 1024,
+            require_read_only=False,
+        )
+    except (OSError, ValueError) as error:
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
-            "Tart executable digest differs from the fixed provider",
+            "Tart executable could not be verified as one pinned regular file",
+        ) from error
+    if (
+        executable.sha256 != TART_EXECUTABLE_SHA256_V1
+        or stat.S_IMODE(executable.identity[2]) != TART_EXECUTABLE_MODE_V1
+    ):
+        raise _QualificationRefused(
+            QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
+            "Tart executable digest or non-writable executable mode differs from the fixed provider",
         )
     version = _run_tart("--version", timeout_seconds=30)
     if version.returncode != 0 or _decode_text(version.stdout, "Tart version").strip() != TART_VERSION_V1:
