@@ -961,8 +961,14 @@ macOS `test` call sites, and does not execute the one-time qualification workloa
   bytes when a product command fails without stderr.  Both host controllers
   independently validate the closed failure-code grammar and diagnostic byte budget
   so a typed refusal cannot be masked by malformed worker output.  Cleanup
-  revalidates the owned remote-root grammar and marker, runs from `finally`, and
-  turns ambiguous or failed cleanup into a typed refusal.  Bound every isolated
+  revalidates the owned remote-root grammar and marker, preflights same-UID and
+  same-device descendants, makes only owned sealed directories removable, and
+  deletes them through no-follow descriptors before revalidating and deleting the
+  ownership marker last.  Deletion relies on the immediately preceding global
+  process/SFTP absence proof while the retained provider lock excludes another
+  controller.  Cleanup runs from `finally` and turns any ambiguity into a typed
+  refusal with the marker and lock retained whenever deletion did not complete.
+  Bound every isolated
   command with a shorter remote timeout and a kill-on-parent-exit PID namespace;
   require the owned root in every lifetime leader's command line, scan every
   same-account command line for the fixed qualification prefix, and rely on PID-

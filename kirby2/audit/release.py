@@ -4581,6 +4581,46 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
     cleanup_node = helper_nodes["_remote_cleanup_argv"]
     if "_require_remote_root" not in called_names(cleanup_node):
         hostile_failures.append("Linux cleanup argv does not revalidate its owned root")
+    cleanup_value = assigned_value(linux_tree, "_CLEANUP_SCRIPT")
+    cleanup_script = (
+        cleanup_value.value
+        if isinstance(cleanup_value, ast.Constant)
+        and isinstance(cleanup_value.value, str)
+        else ""
+    )
+    cleanup_tokens = {
+        "descriptor rewind": "os.lseek(descriptor,0,os.SEEK_SET)",
+        "directory no-follow open": 'getattr(os,"O_NOFOLLOW",0)',
+        "marker descriptor revalidation": "file_identity(os.fstat(marker_fd))",
+        "marker-only root proof": "directory_entries(directory)!=[marker_name]",
+        "owned directory opening": "def open_owned_directory(parent_fd,child)",
+        "owned directory permission repair": "os.fchmod(descriptor,0o700)",
+        "same-device confinement": "metadata.st_dev!=root_device",
+        "same-owner confinement": "metadata.st_uid!=owner",
+        "symlink-safe stat": "follow_symlinks=False",
+    }
+    missing_cleanup_tokens = tuple(
+        sorted(
+            label
+            for label, token in cleanup_tokens.items()
+            if token not in cleanup_script
+        )
+    )
+    child_delete = cleanup_script.find("if child!=marker_name: delete_node")
+    marker_revalidation = cleanup_script.find("named_marker=os.stat(marker_name")
+    marker_delete = cleanup_script.find(
+        "os.unlink(marker_name,dir_fd=directory)"
+    )
+    marker_close = cleanup_script.find("os.close(marker_fd)")
+    if (
+        missing_cleanup_tokens
+        or min(child_delete, marker_revalidation, marker_delete, marker_close) < 0
+        or not child_delete < marker_revalidation < marker_delete < marker_close
+        or "shutil.rmtree" in cleanup_script
+    ):
+        hostile_failures.append(
+            "Linux cleanup is not descriptor-confined with marker-last ownership"
+        )
     refusal_attributes = {
         item.attr
         for item in ast.walk(linux_tree)
@@ -4648,6 +4688,7 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
         "Canonical parsers, owned-root validation, typed refusals, and finally cleanup remain provider-free under audit.",
         {
             "executor_invocations": 0,
+            "missing_cleanup_contracts": list(missing_cleanup_tokens),
             "missing_refusals": list(missing_refusals),
             "parser_raise_counts": raise_counts,
             "pure_helper_remote_calls": pure_helper_remote_calls,

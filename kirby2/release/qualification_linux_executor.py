@@ -359,53 +359,101 @@ payload={
 }
 print(json.dumps(payload,sort_keys=True,separators=(",",":")))'''
 
-_CLEANUP_SCRIPT: Final[str] = r'''import hashlib,json,os,re,shutil,stat,sys
+_CLEANUP_SCRIPT: Final[str] = r'''import hashlib,json,os,re,stat,sys
 root=sys.argv[1]; expected=sys.argv[2]
 pattern=re.compile(r"/var/tmp/kirby2-wo40h-[0-9a-f]{12}-[0-9a-f]{32}\Z")
 if pattern.fullmatch(root) is None or os.path.realpath(root)!=root: raise SystemExit(70)
 name=os.path.basename(root)
 options=os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0)
-parent=os.open("/var/tmp",options); directory=None
+parent=os.open("/var/tmp",options); directory=None; marker_fd=None
+owner=os.getuid(); node_count=0; root_device=None
+directory_identity=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_nlink,item.st_uid,item.st_gid)
+file_identity=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_nlink,item.st_uid,item.st_gid,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+def directory_entries(descriptor):
+    before=os.fstat(descriptor); os.lseek(descriptor,0,os.SEEK_SET); after=os.fstat(descriptor)
+    if directory_identity(before)!=directory_identity(after): raise SystemExit(75)
+    return sorted(os.listdir(descriptor))
+def open_owned_directory(parent_fd,child):
+    before=os.stat(child,dir_fd=parent_fd,follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode) or before.st_uid!=owner or before.st_dev!=root_device: raise SystemExit(76)
+    descriptor=os.open(child,options,dir_fd=parent_fd); after=os.fstat(descriptor)
+    if directory_identity(before)!=directory_identity(after): os.close(descriptor); raise SystemExit(77)
+    return descriptor
+def scan_node(parent_fd,child,depth):
+    global node_count
+    if depth>64: raise SystemExit(78)
+    metadata=os.stat(child,dir_fd=parent_fd,follow_symlinks=False); node_count+=1
+    if node_count>1000000 or metadata.st_uid!=owner or metadata.st_dev!=root_device: raise SystemExit(79)
+    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+        descriptor=open_owned_directory(parent_fd,child)
+        try:
+            for nested in directory_entries(descriptor): scan_node(descriptor,nested,depth+1)
+        finally: os.close(descriptor)
+def delete_node(parent_fd,child,depth):
+    if depth>64: raise SystemExit(80)
+    metadata=os.stat(child,dir_fd=parent_fd,follow_symlinks=False)
+    if metadata.st_uid!=owner or metadata.st_dev!=root_device: raise SystemExit(81)
+    if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+        descriptor=open_owned_directory(parent_fd,child)
+        try:
+            os.fchmod(descriptor,0o700); pinned=os.fstat(descriptor)
+            if (not stat.S_ISDIR(pinned.st_mode) or pinned.st_dev!=root_device
+                    or pinned.st_uid!=owner or stat.S_IMODE(pinned.st_mode)!=0o700): raise SystemExit(82)
+            for nested in directory_entries(descriptor): delete_node(descriptor,nested,depth+1)
+            os.fsync(descriptor); current=os.stat(child,dir_fd=parent_fd,follow_symlinks=False)
+            if (current.st_dev,current.st_ino,current.st_uid)!=(pinned.st_dev,pinned.st_ino,pinned.st_uid) or directory_entries(descriptor): raise SystemExit(83)
+        finally: os.close(descriptor)
+        os.rmdir(child,dir_fd=parent_fd); os.fsync(parent_fd)
+    else:
+        os.unlink(child,dir_fd=parent_fd); os.fsync(parent_fd)
 try:
     directory=os.open(name,options,dir_fd=parent)
     metadata=os.fstat(directory)
-    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=os.getuid()
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=owner
             or stat.S_IMODE(metadata.st_mode)!=0o700): raise SystemExit(71)
+    root_device=metadata.st_dev
     marker_name=".kirby2-owner.json"
     flags=os.O_RDONLY|getattr(os,"O_CLOEXEC",0)|getattr(os,"O_NOFOLLOW",0)
     marker_fd=os.open(marker_name,flags,dir_fd=directory)
-    try:
-        before=os.fstat(marker_fd)
-        if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1
-                or before.st_uid!=os.getuid() or stat.S_IMODE(before.st_mode)!=0o400
-                or before.st_size<=0 or before.st_size>65536): raise SystemExit(72)
-        raw=b""
-        while len(raw)<before.st_size:
-            chunk=os.read(marker_fd,min(65536,before.st_size-len(raw)))
-            if not chunk: break
-            raw+=chunk
-        after=os.fstat(marker_fd)
-        identity=lambda item:(item.st_dev,item.st_ino,item.st_mode,item.st_nlink,item.st_uid,item.st_gid,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
-        if len(raw)!=before.st_size or identity(before)!=identity(after): raise SystemExit(73)
-    finally:
-        os.close(marker_fd)
+    before=os.fstat(marker_fd)
+    if (not stat.S_ISREG(before.st_mode) or before.st_nlink!=1
+            or before.st_uid!=owner or before.st_dev!=root_device
+            or stat.S_IMODE(before.st_mode)!=0o400
+            or before.st_size<=0 or before.st_size>65536): raise SystemExit(72)
+    raw=b""
+    while len(raw)<before.st_size:
+        chunk=os.read(marker_fd,min(65536,before.st_size-len(raw)))
+        if not chunk: break
+        raw+=chunk
+    after=os.fstat(marker_fd)
+    if len(raw)!=before.st_size or file_identity(before)!=file_identity(after): raise SystemExit(73)
     if hashlib.sha256(raw).hexdigest()!=expected: raise SystemExit(74)
-    if not getattr(shutil.rmtree,"avoids_symlink_attacks",False): raise SystemExit(75)
-    for child in os.listdir(directory):
-        child_metadata=os.stat(child,dir_fd=directory,follow_symlinks=False)
-        if stat.S_ISDIR(child_metadata.st_mode) and not stat.S_ISLNK(child_metadata.st_mode):
-            shutil.rmtree(child,dir_fd=directory)
-        else:
-            os.unlink(child,dir_fd=directory)
+    initial=directory_entries(directory)
+    if marker_name not in initial: raise SystemExit(84)
+    for child in initial:
+        if child!=marker_name: scan_node(directory,child,1)
+    for child in initial:
+        if child!=marker_name: delete_node(directory,child,1)
     os.fsync(directory)
     current=os.stat(name,dir_fd=parent,follow_symlinks=False)
-    if ((current.st_dev,current.st_ino)!=(metadata.st_dev,metadata.st_ino)
-            or not stat.S_ISDIR(current.st_mode) or os.listdir(directory)): raise SystemExit(76)
+    if ((current.st_dev,current.st_ino,current.st_uid,stat.S_IMODE(current.st_mode))
+            !=(metadata.st_dev,metadata.st_ino,metadata.st_uid,stat.S_IMODE(metadata.st_mode))
+            or not stat.S_ISDIR(current.st_mode)
+            or directory_entries(directory)!=[marker_name]): raise SystemExit(85)
+    named_marker=os.stat(marker_name,dir_fd=directory,follow_symlinks=False)
+    if file_identity(named_marker)!=file_identity(before) or file_identity(os.fstat(marker_fd))!=file_identity(before): raise SystemExit(86)
+    os.unlink(marker_name,dir_fd=directory); os.fsync(directory)
+    if directory_entries(directory): raise SystemExit(87)
+    current=os.stat(name,dir_fd=parent,follow_symlinks=False)
+    if ((current.st_dev,current.st_ino,current.st_uid,stat.S_IMODE(current.st_mode))
+            !=(metadata.st_dev,metadata.st_ino,metadata.st_uid,stat.S_IMODE(metadata.st_mode))
+            or not stat.S_ISDIR(current.st_mode)): raise SystemExit(88)
     os.rmdir(name,dir_fd=parent); os.fsync(parent)
     try: os.stat(name,dir_fd=parent,follow_symlinks=False)
     except FileNotFoundError: pass
-    else: raise SystemExit(77)
+    else: raise SystemExit(89)
 finally:
+    if marker_fd is not None: os.close(marker_fd)
     if directory is not None: os.close(directory)
     os.close(parent)
 print(json.dumps({"deleted":True,"root":root},sort_keys=True,separators=(",",":")))'''
