@@ -8,6 +8,10 @@ qualification evidence or silently rerun a completed attempt.
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +32,22 @@ RELEASE_QUALIFICATION_ATTEMPT_SCHEMA_ID_V1 = (
 )
 RELEASE_EVIDENCE_REFERENCE_SCHEMA_ID_V1 = "KIRBY2_RELEASE_EVIDENCE_REFERENCE_V1"
 WO40_J_PREREQUISITES_ID_V1 = "WO40_J_PREREQUISITES_V1"
+
+_RELEASE_GATE_EVIDENCE_SCHEMA_ID_V1 = "KIRBY2_RELEASE_GATE_EVIDENCE_V1"
+_RELEASE_EVIDENCE_MARKER_START_V1 = "<!-- KIRBY2_RELEASE_GATE_EVIDENCE_V1\n"
+_RELEASE_EVIDENCE_MARKER_END_V1 = "\nKIRBY2_RELEASE_GATE_EVIDENCE_V1 -->"
+_WO40F_CHECK_IDS_V1 = (
+    "CANDIDATE_SOURCE_LOCK",
+    "HEADLESS_ARTIFACTS",
+    "DESKTOP_ARTIFACTS",
+    "REPEAT_BUILD_REPRODUCIBILITY",
+    "MANIFEST_LICENSE_PACK_ASSET_INVENTORY",
+    "OFFLINE_INSTALLABILITY",
+    "NO_DEVELOPER_DATA",
+)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_MAX_BUILD_EVIDENCE_BYTES_V1 = 4 * 1024 * 1024
 
 RELEASE_FUNCTIONAL_STEP_ORDER_V1 = (
     "CLEAN_INSTALL",
@@ -171,6 +191,738 @@ class ReleaseQualificationRefused(ValueError):
         self.code = code
         self.detail = detail
         super().__init__(f"{code.value}: {detail}")
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseBuildEvidenceBindingV1:
+    """Strict WO40-F identity projection consumed before qualification begins."""
+
+    candidate_commit: str
+    protocol_set_sha256: str
+    source_manifest_sha256: str
+    artifact_index_sha256: str
+    build_evidence_sha256: str
+    artifact_index_record_sha256: str
+    artifact_index_record_size: int
+    build_record_sha256: str
+    build_record_size: int
+    check_rows: tuple[tuple[str, str, str], ...]
+
+    def __post_init__(self) -> None:
+        if _COMMIT.fullmatch(self.candidate_commit) is None:
+            raise ValueError("WO40-F evidence candidate commit is invalid")
+        for value, label in (
+            (self.protocol_set_sha256, "WO40-F protocol-set digest"),
+            (self.source_manifest_sha256, "WO40-F source-manifest digest"),
+            (self.artifact_index_sha256, "WO40-F artifact-index digest"),
+            (self.build_evidence_sha256, "WO40-F document digest"),
+            (self.artifact_index_record_sha256, "WO40-F index-record digest"),
+            (self.build_record_sha256, "WO40-F build-record digest"),
+        ):
+            require_sha256(value, label)
+        if self.artifact_index_sha256 != self.artifact_index_record_sha256:
+            raise ValueError("WO40-F index evidence identities differ")
+        for value, label in (
+            (self.artifact_index_record_size, "WO40-F index-record size"),
+            (self.build_record_size, "WO40-F build-record size"),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{label} must be positive")
+        if type(self.check_rows) is not tuple or any(
+                type(item) is not tuple
+                or len(item) != 3
+                or type(item[0]) is not str
+                or type(item[1]) is not str
+                or _SHA256.fullmatch(item[1]) is None
+                or item[2] != "PASS"
+                for item in self.check_rows
+            ):
+            raise ValueError("WO40-F check proof rows differ")
+        if tuple(item[0] for item in self.check_rows) != _WO40F_CHECK_IDS_V1:
+            raise ValueError("WO40-F check proof rows differ")
+
+    @classmethod
+    def from_markdown_bytes(cls, raw: bytes) -> "ReleaseBuildEvidenceBindingV1":
+        if type(raw) is not bytes or not raw or len(raw) > _MAX_BUILD_EVIDENCE_BYTES_V1:
+            raise ValueError("WO40-F build evidence size is outside the V1 bound")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("WO40-F build evidence is not UTF-8") from error
+        start = text.find(_RELEASE_EVIDENCE_MARKER_START_V1)
+        end = text.find(
+            _RELEASE_EVIDENCE_MARKER_END_V1,
+            start + len(_RELEASE_EVIDENCE_MARKER_START_V1),
+        )
+        if (
+            start < 0
+            or end < 0
+            or text.find(_RELEASE_EVIDENCE_MARKER_START_V1, start + 1) >= 0
+            or text.find(_RELEASE_EVIDENCE_MARKER_END_V1, end + 1) >= 0
+        ):
+            raise ValueError("WO40-F build evidence canonical marker differs")
+        try:
+            payload_raw = text[
+                start + len(_RELEASE_EVIDENCE_MARKER_START_V1) : end
+            ].encode("ascii")
+        except UnicodeEncodeError as error:
+            raise ValueError("WO40-F canonical payload is not ASCII JSON") from error
+        from kirby2.packs.formats import load_canonical_json_bytes
+
+        payload = load_canonical_json_bytes(payload_raw, "WO40-F build evidence")
+        fields = {
+            "artifact_index_sha256",
+            "candidate_commit",
+            "checks",
+            "evidence_records",
+            "facts",
+            "gate_id",
+            "protocol_set_sha256",
+            "schema_id",
+            "schema_version",
+            "source_manifest_sha256",
+            "status",
+        }
+        row = _exact(payload, fields, "WO40-F build evidence")
+        if (
+            row["schema_id"] != _RELEASE_GATE_EVIDENCE_SCHEMA_ID_V1
+            or type(row["schema_version"]) is not int
+            or row["schema_version"] != 1
+            or row["gate_id"] != "WO40-F"
+            or row["status"] != "PASS"
+            or row["facts"] != {"artifact_count": 6, "build_repetitions": 2}
+        ):
+            raise ValueError("WO40-F build evidence identity or terminal facts differ")
+        checks = _array(row["checks"], "WO40-F checks")
+        observed_check_ids: list[str] = []
+        observed_check_rows: list[tuple[str, str, str]] = []
+        for item in checks:
+            check = _exact(
+                item,
+                {"check_id", "evidence_sha256", "status"},
+                "WO40-F check",
+            )
+            if (
+                type(check["check_id"]) is not str
+                or type(check["evidence_sha256"]) is not str
+                or _SHA256.fullmatch(check["evidence_sha256"]) is None
+                or check["status"] != "PASS"
+            ):
+                raise ValueError("WO40-F check identity or status differs")
+            observed_check_ids.append(check["check_id"])
+            observed_check_rows.append(
+                (check["check_id"], check["evidence_sha256"], check["status"])
+            )
+        if tuple(observed_check_ids) != _WO40F_CHECK_IDS_V1:
+            raise ValueError("WO40-F check inventory or order differs")
+        records = _array(row["evidence_records"], "WO40-F evidence records")
+        by_id: dict[str, dict[str, object]] = {}
+        for item in records:
+            record = _exact(
+                item,
+                {"evidence_id", "path", "sha256", "size"},
+                "WO40-F evidence record",
+            )
+            evidence_id = record["evidence_id"]
+            if type(evidence_id) is not str or evidence_id in by_id:
+                raise ValueError("WO40-F evidence record IDs differ")
+            by_id[evidence_id] = record
+        expected_paths = {
+            "artifact-index": ".kirby2/release/release-artifact-index.json",
+            "release-build-record": ".kirby2/release/release-build-record.json",
+        }
+        if tuple(by_id) != tuple(sorted(expected_paths)) or any(
+            by_id[key]["path"] != path for key, path in expected_paths.items()
+        ):
+            raise ValueError("WO40-F evidence record inventory differs")
+        for record in by_id.values():
+            if (
+                type(record["sha256"]) is not str
+                or _SHA256.fullmatch(record["sha256"]) is None
+                or type(record["size"]) is not int
+                or record["size"] <= 0
+            ):
+                raise ValueError("WO40-F evidence record identity is invalid")
+        scalar_names = (
+            "candidate_commit",
+            "protocol_set_sha256",
+            "source_manifest_sha256",
+            "artifact_index_sha256",
+        )
+        if any(type(row[name]) is not str for name in scalar_names):
+            raise TypeError("WO40-F evidence identity fields must be text")
+        return cls(
+            candidate_commit=row["candidate_commit"],
+            protocol_set_sha256=row["protocol_set_sha256"],
+            source_manifest_sha256=row["source_manifest_sha256"],
+            artifact_index_sha256=row["artifact_index_sha256"],
+            build_evidence_sha256=hashlib.sha256(raw).hexdigest(),
+            artifact_index_record_sha256=by_id["artifact-index"]["sha256"],
+            artifact_index_record_size=by_id["artifact-index"]["size"],
+            build_record_sha256=by_id["release-build-record"]["sha256"],
+            build_record_size=by_id["release-build-record"]["size"],
+            check_rows=tuple(observed_check_rows),
+        )
+
+
+def load_release_build_evidence_binding(
+    path: Path,
+) -> ReleaseBuildEvidenceBindingV1:
+    """Read one tracked WO40-F document without symlink following or drift."""
+
+    if not isinstance(path, Path) or not path.is_absolute() or path.resolve(False) != path:
+        raise ValueError("WO40-F evidence path must be an absolute resolved Path")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("platform lacks O_NOFOLLOW evidence-read support")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size <= 0
+            or before.st_size > _MAX_BUILD_EVIDENCE_BYTES_V1
+        ):
+            raise ValueError("WO40-F evidence file is linked, special, empty, or oversized")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_nlink,
+            item.st_uid,
+            item.st_gid,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if len(raw) != before.st_size or identity(before) != identity(after):
+            raise ValueError("WO40-F evidence changed during read")
+    finally:
+        os.close(descriptor)
+    return ReleaseBuildEvidenceBindingV1.from_markdown_bytes(raw)
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseQualificationVerificationV1:
+    target_id: str
+    gate_id: str
+    status: str
+    candidate_commit: str
+    provider_attestation_sha256: str
+    qualification_attempt_sha256: str
+    artifact_index_sha256: str
+    build_record_sha256: str
+    build_evidence_sha256: str
+    session_id: str
+    check_count: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "artifact_index_sha256": self.artifact_index_sha256,
+            "build_evidence_sha256": self.build_evidence_sha256,
+            "build_record_sha256": self.build_record_sha256,
+            "candidate_commit": self.candidate_commit,
+            "check_count": self.check_count,
+            "gate_id": self.gate_id,
+            "provider_attestation_sha256": self.provider_attestation_sha256,
+            "qualification_attempt_sha256": self.qualification_attempt_sha256,
+            "session_id": self.session_id,
+            "status": self.status,
+            "target_id": self.target_id,
+        }
+
+
+def _stable_release_record_bytes(
+    path: Path | str,
+    *,
+    maximum_bytes: int,
+    require_read_only: bool,
+    directory_fd: int | None = None,
+    identity_out: list[tuple[int, ...]] | None = None,
+) -> bytes:
+    if (
+        not isinstance(path, (Path, str))
+        or type(maximum_bytes) is not int
+        or maximum_bytes <= 0
+    ):
+        raise ValueError("release record path or bound is invalid")
+    if directory_fd is None:
+        selected = Path(path)
+        if not selected.is_absolute() or selected.resolve(strict=False) != selected:
+            raise ValueError("release record path must be absolute and resolved")
+    else:
+        selected_text = os.fspath(path)
+        selected_path = Path(selected_text)
+        if (
+            selected_path.is_absolute()
+            or not selected_path.parts
+            or ".." in selected_path.parts
+        ):
+            raise ValueError("release record relative path is not confined")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("platform lacks O_NOFOLLOW release-record support")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size <= 0
+            or before.st_size > maximum_bytes
+            or (require_read_only and stat.S_IMODE(before.st_mode) != 0o444)
+        ):
+            raise ValueError("release record is linked, special, writable, empty, or oversized")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_nlink,
+            item.st_uid,
+            item.st_gid,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        extra = os.read(descriptor, 1)
+        final = os.fstat(descriptor)
+        if (
+            len(raw) != before.st_size
+            or extra
+            or identity(before) != identity(after)
+            or identity(before) != identity(final)
+        ):
+            raise ValueError("release record grew during stable read")
+        if identity_out is not None:
+            identity_out.append(identity(before))
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _open_owned_release_directory(
+    path: Path | str,
+    *,
+    parent_fd: int | None = None,
+) -> tuple[int, tuple[int, ...]]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("platform lacks O_NOFOLLOW release-directory support")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=parent_fd,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise ValueError("release directory ownership or permissions are unsafe")
+    identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    return descriptor, identity
+
+
+def _require_release_directory_identity(
+    descriptor: int,
+    expected: tuple[int, ...],
+) -> None:
+    metadata = os.fstat(descriptor)
+    observed = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if observed != expected:
+        raise ValueError("release directory changed during qualification verification")
+
+
+def _require_canonical_tracked_build_evidence(
+    repository: Path,
+    supplied: Path,
+) -> None:
+    canonical = (repository / "KIRBY2_RELEASE_BUILD_EVIDENCE.md").resolve(
+        strict=True
+    )
+    if supplied != canonical:
+        raise ValueError("qualification requires the canonical WO40-F evidence path")
+    for arguments, detail in (
+        (
+            (
+                "git",
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+            ),
+            "WO40-F evidence is not tracked",
+        ),
+        (
+            (
+                "git",
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--",
+                "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+            ),
+            "WO40-F evidence has unstaged drift",
+        ),
+        (
+            (
+                "git",
+                "diff",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--",
+                "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+            ),
+            "WO40-F evidence has uncommitted index drift",
+        ),
+    ):
+        result = subprocess.run(
+            arguments,
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(detail)
+
+
+def verify_release_qualification(
+    bundle: object,
+    *,
+    target_id: str,
+    build_evidence: Path,
+    artifact_root: Path,
+) -> ReleaseQualificationVerificationV1:
+    """Deeply verify the two qualification records and all immutable inputs.
+
+    This verifier is deliberately provider-free: it never boots, connects to, or
+    mutates a machine.  It reparses every canonical record, reconstructs the exact
+    42 checks, verifies the selected WO40-F artifacts, and binds the provider
+    capability to the original clean-provider inventory.
+    """
+
+    from .artifacts import (
+        RELEASE_ARTIFACT_MAX_BYTES_V1,
+        ReleaseArtifactBuildRecordV1,
+    )
+    from .build import (
+        ReleaseCleanProviderInventoryV1,
+        ReleaseCommandStatusV1,
+        ReleaseProtocolBundleV1,
+        verify_release_artifacts,
+    )
+    from .manifest import ReleaseArtifactIndexV1
+    from .qualification_records import (
+        RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1,
+        RELEASE_QUALIFICATION_CHECK_COUNT_V1,
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationAttemptV1,
+        release_qualification_record_paths,
+        verify_release_qualification_record,
+    )
+
+    if type(bundle) is not ReleaseProtocolBundleV1:
+        raise TypeError("qualification verification requires the exact protocol bundle")
+    if target_id not in _TARGET_IDS:
+        raise ValueError("qualification verification target is invalid")
+    if (
+        not isinstance(artifact_root, Path)
+        or not artifact_root.is_absolute()
+        or artifact_root.resolve(strict=True) != artifact_root
+    ):
+        raise ValueError("qualification artifact root must be absolute and resolved")
+    if (
+        not isinstance(build_evidence, Path)
+        or not build_evidence.is_absolute()
+        or build_evidence.resolve(strict=True) != build_evidence
+    ):
+        raise ValueError("WO40-F evidence path must be absolute and resolved")
+    repository = bundle.repository_root.resolve(strict=True)
+    _require_canonical_tracked_build_evidence(repository, build_evidence)
+    binding = load_release_build_evidence_binding(build_evidence)
+    if binding.protocol_set_sha256 != bundle.protocol_set_sha256:
+        raise ValueError("WO40-F evidence protocol set differs from the live frozen bundle")
+
+    root_fd, root_identity = _open_owned_release_directory(artifact_root)
+    gate_fd: int | None = None
+    attempt_directory_fd: int | None = None
+    try:
+        index_raw = _stable_release_record_bytes(
+            "release-artifact-index.json",
+            maximum_bytes=16 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=root_fd,
+        )
+        build_record_raw = _stable_release_record_bytes(
+            "release-build-record.json",
+            maximum_bytes=64 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=root_fd,
+        )
+        if (
+            len(index_raw) != binding.artifact_index_record_size
+            or hashlib.sha256(index_raw).hexdigest()
+            != binding.artifact_index_record_sha256
+            or len(build_record_raw) != binding.build_record_size
+            or hashlib.sha256(build_record_raw).hexdigest()
+            != binding.build_record_sha256
+        ):
+            raise ValueError("WO40-F referenced record bytes differ")
+        index = ReleaseArtifactIndexV1.from_bytes(index_raw)
+        build_record = ReleaseArtifactBuildRecordV1.from_bytes(build_record_raw)
+        build_check_rows = tuple(
+            (item.check_id, item.evidence_sha256, item.status)
+            for item in build_record.checks
+        )
+        if (
+            index.candidate_commit != binding.candidate_commit
+            or index.sha256 != binding.artifact_index_sha256
+            or build_record.candidate_commit != binding.candidate_commit
+            or build_record.protocol_set_sha256 != binding.protocol_set_sha256
+            or build_record.source_manifest_sha256 != binding.source_manifest_sha256
+            or build_record.artifact_index_sha256 != binding.artifact_index_sha256
+            or build_check_rows != binding.check_rows
+        ):
+            raise ValueError("WO40-F evidence, artifact index, and build record differ")
+
+        provider_relative, attempt_relative = release_qualification_record_paths(
+            target_id
+        )
+        provider_parts = Path(provider_relative).parts
+        attempt_parts = Path(attempt_relative).parts
+        if len(provider_parts) != 1 or len(attempt_parts) != 3:
+            raise RuntimeError("qualification record path layout differs")
+        gate_fd, gate_identity = _open_owned_release_directory(
+            attempt_parts[0], parent_fd=root_fd
+        )
+        attempt_directory_fd, attempt_directory_identity = (
+            _open_owned_release_directory(attempt_parts[1], parent_fd=gate_fd)
+        )
+        provider_raw = _stable_release_record_bytes(
+            provider_parts[0],
+            maximum_bytes=4 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=root_fd,
+        )
+        attempt_raw = _stable_release_record_bytes(
+            attempt_parts[2],
+            maximum_bytes=64 * 1024 * 1024,
+            require_read_only=True,
+            directory_fd=attempt_directory_fd,
+        )
+        inventory_raw = _stable_release_record_bytes(
+            "clean-providers.toml",
+            maximum_bytes=4 * 1024 * 1024,
+            require_read_only=False,
+            directory_fd=root_fd,
+        )
+        provider = ReleaseCleanProviderAttestationV1.from_bytes(provider_raw)
+        attempt = ReleaseQualificationAttemptV1.from_bytes(attempt_raw)
+        pure = verify_release_qualification_record(
+            provider,
+            attempt,
+            bundle.qualification_protocol,
+        )
+
+        inventory = ReleaseCleanProviderInventoryV1.from_bytes(inventory_raw)
+        capability = inventory.by_target().get(target_id)
+        platform = next(
+            item
+            for item in bundle.platform_protocol.targets
+            if item.target_id == target_id
+        )
+        if capability is None or capability.readiness(platform)[0] != "PASS":
+            raise ValueError("qualification provider inventory capability is not ready")
+        if (
+            provider.provider_inventory_sha256
+            != hashlib.sha256(inventory_raw).hexdigest()
+            or provider.provider_capability_sha256 != capability.fingerprint
+        ):
+            raise ValueError(
+                "qualification provider attestation differs from its inventory"
+            )
+
+        indexed = {item.artifact_id: item for item in index.artifacts}
+        expected_ids = RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1[target_id]
+        if (
+            tuple(
+                item.artifact_id for item in attempt.session.artifact_bindings
+            )
+            != expected_ids
+        ):
+            raise ValueError("qualification artifact-binding order differs")
+        for observed in attempt.session.artifact_bindings:
+            expected = indexed[observed.artifact_id]
+            if (
+                observed.size != expected.size
+                or observed.release_store_sha256 != expected.transport_sha256
+                or observed.provider_copy_sha256 != expected.transport_sha256
+            ):
+                raise ValueError("qualification artifact transfer binding differs")
+        if (
+            attempt.candidate_commit != binding.candidate_commit
+            or attempt.protocol_set_sha256 != binding.protocol_set_sha256
+            or attempt.source_manifest_sha256 != binding.source_manifest_sha256
+            or attempt.artifact_index_sha256 != binding.artifact_index_sha256
+            or attempt.build_evidence_sha256 != binding.build_evidence_sha256
+            or pure.check_count != RELEASE_QUALIFICATION_CHECK_COUNT_V1
+        ):
+            raise ValueError(
+                "qualification attempt differs from immutable WO40-F inputs"
+            )
+
+        artifact_verification = verify_release_artifacts(
+            bundle,
+            artifact_root,
+            candidate_commit=binding.candidate_commit,
+        )
+        if artifact_verification.status is not ReleaseCommandStatusV1.PASS:
+            raise ValueError(
+                "deep immutable release-artifact verification did not pass"
+            )
+        for artifact_id in expected_ids:
+            artifact_raw = _stable_release_record_bytes(
+                artifact_id,
+                maximum_bytes=RELEASE_ARTIFACT_MAX_BYTES_V1,
+                require_read_only=True,
+                directory_fd=root_fd,
+            )
+            expected = indexed[artifact_id]
+            if (
+                len(artifact_raw) != expected.size
+                or hashlib.sha256(artifact_raw).hexdigest()
+                != expected.transport_sha256
+            ):
+                raise ValueError("qualification selected artifact bytes changed")
+
+        final_small_records = (
+            (
+                "release-artifact-index.json",
+                root_fd,
+                index_raw,
+                16 * 1024 * 1024,
+                True,
+            ),
+            (
+                "release-build-record.json",
+                root_fd,
+                build_record_raw,
+                64 * 1024 * 1024,
+                True,
+            ),
+            (provider_parts[0], root_fd, provider_raw, 4 * 1024 * 1024, True),
+            (
+                attempt_parts[2],
+                attempt_directory_fd,
+                attempt_raw,
+                64 * 1024 * 1024,
+                True,
+            ),
+            (
+                "clean-providers.toml",
+                root_fd,
+                inventory_raw,
+                4 * 1024 * 1024,
+                False,
+            ),
+        )
+        for name, directory, original, bound, read_only in final_small_records:
+            if _stable_release_record_bytes(
+                name,
+                maximum_bytes=bound,
+                require_read_only=read_only,
+                directory_fd=directory,
+            ) != original:
+                raise ValueError("qualification input changed before verification ended")
+        if load_release_build_evidence_binding(build_evidence) != binding:
+            raise ValueError("WO40-F evidence changed before verification ended")
+        _require_release_directory_identity(
+            attempt_directory_fd, attempt_directory_identity
+        )
+        _require_release_directory_identity(gate_fd, gate_identity)
+        _require_release_directory_identity(root_fd, root_identity)
+        return ReleaseQualificationVerificationV1(
+            target_id=target_id,
+            gate_id=pure.gate_id,
+            status=pure.status,
+            candidate_commit=binding.candidate_commit,
+            provider_attestation_sha256=provider.sha256,
+            qualification_attempt_sha256=attempt.sha256,
+            artifact_index_sha256=index.sha256,
+            build_record_sha256=build_record.sha256,
+            build_evidence_sha256=binding.build_evidence_sha256,
+            session_id=pure.session_id,
+            check_count=pure.check_count,
+        )
+    finally:
+        if attempt_directory_fd is not None:
+            os.close(attempt_directory_fd)
+        if gate_fd is not None:
+            os.close(gate_fd)
+        os.close(root_fd)
 
 
 def _text(value: object, label: str, maximum_bytes: int = 4096) -> str:
@@ -682,10 +1434,12 @@ __all__ = [
     "RELEASE_FUNCTIONAL_STEP_ORDER_V1",
     "RELEASE_HEADLESS_EXTRA_STEP_ORDER_V1",
     "RELEASE_PLATFORMS_SCHEMA_ID_V1",
+    "RELEASE_QUALIFICATION_ATTEMPT_SCHEMA_ID_V1",
     "RELEASE_QUALIFICATION_PROTOCOL_SCHEMA_ID_V1",
     "WO40_J_PREREQUISITES_ID_V1",
     "WO40_J_REQUIRED_PRIOR_GATES_V1",
     "ReleaseEvidenceReferenceV1",
+    "ReleaseBuildEvidenceBindingV1",
     "ReleaseFunctionalStepV1",
     "ReleasePlatformTargetV1",
     "ReleasePlatformsV1",
@@ -694,8 +1448,11 @@ __all__ = [
     "ReleaseQualificationRefusalCodeV1",
     "ReleaseQualificationRefused",
     "ReleaseQualificationStatusV1",
+    "ReleaseQualificationVerificationV1",
+    "load_release_build_evidence_binding",
     "load_release_platforms",
     "load_release_qualification_protocol",
     "qualification_dispatch",
     "verify_closeout_prerequisites",
+    "verify_release_qualification",
 ]

@@ -41,10 +41,9 @@ from .performance import (
 )
 from .qualification import (
     ReleaseEvidenceReferenceV1,
-    ReleaseQualificationRefused,
-    qualification_dispatch,
     verify_closeout_prerequisites,
 )
+from .qualification_executor import execute_release_qualification
 
 
 def _absolute_path(value: str) -> Path:
@@ -428,59 +427,21 @@ def _configure_qualify_release(parser: argparse.ArgumentParser) -> None:
 
 def _handle_qualify_release(args: argparse.Namespace) -> int:
     bundle = _release_protocol_bundle()
-    build_evidence = _resolved_path(args.build_evidence)
-    artifact_store = _resolved_path(args.artifact_store)
-    missing = [
-        os.fspath(path)
-        for path in (build_evidence, artifact_store / "release-artifact-index.json")
-        if not path.is_file()
-    ]
-    provider_path = artifact_store / f"clean-provider-{args.platform}.json"
-    if not provider_path.is_file():
-        missing.append(os.fspath(provider_path))
-    if missing:
-        return _not_exercised(
-            "QUALIFY_RELEASE",
-            "Qualification dispatch awaits immutable build artifacts and a real clean provider.",
-            missing,
-        )
-    provider = json.loads(provider_path.read_text("utf-8"))
-    provider_id = provider.get("provider_id") if type(provider) is dict else None
-    dispatches = []
-    try:
-        for form in ("desktop", "headless"):
-            dispatches.append(
-                qualification_dispatch(
-                    bundle.qualification_protocol,
-                    target_id=args.platform,
-                    artifact_selector=f"{args.platform}/{form}",
-                    clean_provider_id=(provider_id if type(provider_id) is str else None),
-                    clean_root_role="PRIMARY_CLEAN_ROOT",
-                    prior_attempt_exists=(artifact_store / "qualification" / args.platform).exists(),
-                ).as_dict()
-            )
-    except ReleaseQualificationRefused as error:
-        _print_json(
-            {
-                "command_id": "QUALIFY_RELEASE",
-                "detail": error.detail,
-                "refusal_code": error.code.value,
-                "schema_version": 1,
-                "status": "REFUSED",
-            }
-        )
-        return 2
-    _print_json(
-        {
-            "build_evidence_sha256": hashlib.sha256(build_evidence.read_bytes()).hexdigest(),
-            "command_id": "QUALIFY_RELEASE",
-            "dispatches": dispatches,
-            "protocol_set_sha256": bundle.protocol_set_sha256,
-            "schema_version": 1,
-            "status": "READY",
-        }
+    outcome = execute_release_qualification(
+        bundle,
+        target_id=args.platform,
+        build_evidence=_resolved_path(args.build_evidence),
+        artifact_root=_resolved_path(args.artifact_store),
     )
-    return 0
+    _print_json(outcome.as_dict())
+    if outcome.status in {
+        ReleaseCommandStatusV1.PASS,
+        ReleaseCommandStatusV1.PASS_WITH_WARNINGS,
+    }:
+        return 0
+    if outcome.status is ReleaseCommandStatusV1.FAIL:
+        return 1
+    return 2
 
 
 def _configure_qualify_performance(parser: argparse.ArgumentParser) -> None:
@@ -859,7 +820,7 @@ RELEASE_DATA_COMMAND_MODULE = CommandModule(
         CommandSpec(
             command_id="QUALIFY_RELEASE",
             name="qualify-release",
-            help="dispatch the frozen clean-environment functional matrix for one target",
+            help="execute and deeply verify the frozen clean-environment matrix",
             handler=_handle_qualify_release,
             configure=_configure_qualify_release,
         ),

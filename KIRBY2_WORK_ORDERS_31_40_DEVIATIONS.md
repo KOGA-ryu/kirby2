@@ -773,3 +773,89 @@ points are public; the complete registry contains DEV-0001 through DEV-0013; the
 prior candidate/resource gates remain passing; and no artifact, provider operation,
 qualification workload, or performance workload is created or executed by the
 deviation audit.
+
+## DEV-0014 — Execute clean-environment release qualification
+
+- Interrupted canonical card: `WO40-G`
+- Exact first-parent predecessor: `5132c54f24c705641b217e8c4314a173e83bb4db`
+- Historical candidate: `71f98c06f9b878fad3a165b0275c87e59fce6409`; its
+  six immutable artifacts, artifact index, build record, build-evidence document,
+  provider inventory, and a canonical snapshot manifest remain preserved under the
+  untracked local release-history root before this repair changes candidate source.
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py qualify-release --platform macos-arm64 --build-evidence KIRBY2_RELEASE_BUILD_EVIDENCE.md --artifact-store .kirby2/release`
+- Observed terminal result: `READY` with exit status zero after only checking that
+  the WO40-F evidence, artifact index, and an untyped provider sidecar existed.  The
+  command did not create a clean environment, install either selected artifact,
+  execute any of the 38 functional rows, compare desktop/headless or cross-platform
+  identities, publish an attempt, or verify returned evidence.  The generic WO40-G
+  audit accepted caller-supplied SHA-256 strings without parsing a qualification
+  attempt or reconstructing the 42 preregistered checks.
+- Root cause: WO40-D deliberately owned dispatch and refusal semantics only, while
+  the canonical WO40-G card assumed a later operational executor.  The freeze began
+  before that executor and its evidence contract existed.  The first installed-path
+  smoke also exposed two latent blockers: strict starter-pack verification passed a
+  mapping to a sequence-only archive normalizer, and registered-run export treated
+  the run's source `manifest.toml` as the reserved K2PACK manifest path and treated
+  store encodings as K2PACK-canonical direct payloads.  The headless protocol lists
+  uninstall before its four extra rows; DEV-0014 therefore keeps canonical evidence
+  order unchanged but records an explicit execution index and requires headless
+  extras to run before the physical uninstall lifecycle action.
+- Repair: add strict canonical provider-attestation, command-observation,
+  root-observation, session, step, and qualification-attempt records; a closed
+  installed guest worker for the exact desktop/headless matrix; and a closed Tart
+  controller that accepts only the declared macOS arm64 provider, stages only
+  immutable WO40-F inputs, creates owned disposable clones, uses true Tart
+  `--net-host`, installs offline, captures bounded output through the guest agent,
+  publishes the attempt last, and never falls back to NAT.  Add saved-run microscope,
+  imported-pack replay, crash-recovery, calibration-roundtrip, and one-work-unit
+  distributed receipts inside the installed worker.  Reconstruct all 38 step proofs
+  and the exact 42-check gate projection from typed observations.  Deep WO40-G/H
+  verification must independently reparse the provider, attempt, WO40-F build
+  evidence, artifact index, build record, and selected transports; it cannot trust
+  check digests supplied by the attempt or evidence document.  Repair only the two
+  pack/doctor blockers reproduced above.  Keep `release/qualification.toml` byte
+  unchanged.
+- Owned repair paths: `kirby2/packs/builders.py`, `kirby2/release/doctor.py`,
+  `kirby2/release/qualification.py`,
+  `kirby2/release/qualification_records.py`,
+  `kirby2/release/qualification_worker.py`,
+  `kirby2/release/qualification_executor.py`, `kirby2/release/commands.py`,
+  `kirby2/release/__init__.py`, `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0014` through K2X-02 immediately after rebuilt `WO40-F`
+  and before resumed `WO40-G`; the deviation inventory extends monotonically
+  through `DEV-0014`.
+- Inherited gates: release targets, artifact IDs and member layout, dependency pins,
+  launchers, documentation, starter content, performance thresholds, retry count,
+  functional row identities, product limitations, and every earlier accepted
+  production contract remain unchanged.  No brokerage, live-market connection,
+  credential creation, telemetry, updater, background service, network download,
+  Linux qualification, performance run, or final closeout is authorized.  After the
+  repair and mechanically regenerated source lock commit cleanly, that commit is the
+  sole repaired candidate.  WO40-F is rebuilt from it before any WO40-G attempt.
+- Exact commit subject: `Execute clean-environment release qualification`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0013
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0014
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+git diff --check
+```
+
+Acceptance: the attempt parser refuses noncanonical, wrong-schema, wrong-order,
+wrong-count, wrong-target, and caller-forged check projections; the deep verifier
+reconstructs exactly 38 matrix observations and 42 gate checks; the command owns a
+real executor rather than a `READY` dispatcher; the controller has no generic
+command, VM, network, or cleanup surface and contains no NAT fallback; the installed
+worker refuses checkout execution; the complete registry contains DEV-0001 through
+DEV-0014; the previous candidate is retained as history; and the deviation audit
+does not clone, boot, connect to, mutate, or delete a provider or execute the one-time
+qualification workload.

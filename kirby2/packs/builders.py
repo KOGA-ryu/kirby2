@@ -41,6 +41,7 @@ from .formats import (
     canonical_manifest_bytes,
     inspect_payload_format_claim,
     load_canonical_json_bytes,
+    load_canonical_toml_bytes,
     normalized_archive_paths,
     normalized_zip_info,
     require_relative_pack_path,
@@ -399,9 +400,8 @@ def build_registered_run_pack(
         )
 
     run_directory = _trusted_source_directory(store.run_directory(run_id))
-    manifest_raw = _read_confined_regular_file(
+    manifest_raw = _read_confined_run_manifest(
         run_directory,
-        "manifest.toml",
         maximum_bytes=PACK_BUILD_MAX_SOURCE_DEFINITION_BYTES_V1,
     )
     if (
@@ -515,7 +515,10 @@ def _replay_run_export_inputs(
         PackSourceArtifactV1(
             artifact_id="run-manifest",
             role=PackArtifactRoleV1.REPLAY_RUN_MANIFEST,
-            source_path="manifest.toml",
+            # This declaration records provenance inside the data-only pack.  A
+            # top-level ``manifest.toml`` is reserved for the K2PACK manifest,
+            # so preserve the registered run's distinct source namespace.
+            source_path="registered-run/manifest.toml",
             original_schema_id=REPLAY_RUN_MANIFEST_SCHEMA_ID_V1,
             original_schema_version=manifest.schema_version,
             original_media_type="application/toml",
@@ -532,7 +535,14 @@ def _replay_run_export_inputs(
         if type(reference) is not ArtifactReference or type(raw) is not bytes:
             raise TypeError("registered replay inputs must retain typed references")
         artifact_id = _registered_artifact_id(ordinal, reference.sha256)
-        storage_mode, content_format = _registered_storage(reference, raw)
+        # A replay export preserves the exact verified run artifacts.  The
+        # research store's Parquet/TOML encodings are not K2PACK's canonical
+        # direct-content encodings, so keep them in the format's typed exact-byte
+        # envelope and let the replay adapter recheck the original SHA-256.
+        storage_mode, content_format = (
+            PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE,
+            None,
+        )
         originals[artifact_id] = raw
         declarations.append(
             PackSourceArtifactV1(
@@ -709,6 +719,10 @@ def _registered_storage(
     if type(reference) is not ArtifactReference or type(raw) is not bytes:
         raise TypeError("registered artifact storage selection requires exact inputs")
     if reference.media_type == "application/toml":
+        try:
+            load_canonical_toml_bytes(raw, "registered TOML artifact")
+        except (TypeError, ValueError):
+            return PackArtifactStorageModeV1.EXACT_BYTES_ENVELOPE, None
         return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.TOML
     if reference.media_type == "application/vnd.apache.parquet":
         return PackArtifactStorageModeV1.DIRECT, PackContentFormatV1.PARQUET
@@ -1680,6 +1694,39 @@ def _read_confined_regular_file(
             DomainPackRefusalCodeV1.SOURCE_PATH_UNSAFE,
             "pack source path is not confined canonical POSIX text",
         ) from error
+    return _read_confined_canonical_source_file(
+        root,
+        canonical,
+        maximum_bytes=maximum_bytes,
+    )
+
+
+def _read_confined_run_manifest(
+    root: Path,
+    *,
+    maximum_bytes: int,
+) -> bytes:
+    """Capture a registered run's manifest without treating it as a pack payload.
+
+    ``manifest.toml`` is intentionally forbidden as a K2PACK payload path, but a
+    registered run owns a source manifest with that exact name.  Keep that one
+    source-file exception outside the general pack-path validator; the no-follow
+    capture below still applies the same confinement and stable-file rules.
+    """
+
+    return _read_confined_canonical_source_file(
+        root,
+        "manifest.toml",
+        maximum_bytes=maximum_bytes,
+    )
+
+
+def _read_confined_canonical_source_file(
+    root: Path,
+    canonical: str,
+    *,
+    maximum_bytes: int,
+) -> bytes:
     candidate = root.joinpath(*PurePosixPath(canonical).parts)
     current = root
     try:

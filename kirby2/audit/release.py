@@ -39,6 +39,7 @@ DEV0010_AUDIT_CASE_COUNT = 2
 DEV0011_AUDIT_CASE_COUNT = 5
 DEV0012_AUDIT_CASE_COUNT = 4
 DEV0013_AUDIT_CASE_COUNT = 3
+DEV0014_AUDIT_CASE_COUNT = 3
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -67,7 +68,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 14)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 15)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -3041,6 +3042,750 @@ def audit_release_artifact_executor_restart() -> ReleaseAuditSuite:
     )
 
 
+def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
+    """Prove the restarted WO40-G executor is strict without running a provider."""
+
+    import kirby2.release.qualification as qualification_module
+    import kirby2.release.qualification_executor as executor_module
+    import kirby2.release.qualification_worker as worker_module
+    from kirby2.release.qualification import (
+        RELEASE_FUNCTIONAL_STEP_ORDER_V1,
+        RELEASE_HEADLESS_EXTRA_STEP_ORDER_V1,
+        RELEASE_QUALIFICATION_ATTEMPT_SCHEMA_ID_V1,
+        load_release_qualification_protocol,
+        verify_release_qualification,
+    )
+    from kirby2.release.qualification_executor import (
+        TART_BASE_CONFIG_SHA256_V1,
+        TART_BASE_DISK_BYTES_V1,
+        TART_BASE_NVRAM_SHA256_V1,
+        TART_BASE_VM_V1,
+        TART_EXECUTABLE_SHA256_V1,
+        TART_EXECUTABLE_V1,
+        TART_PROVIDER_POLICY_ID_V1,
+        TART_TARGET_ID_V1,
+        TART_VERSION_V1,
+        execute_release_qualification,
+    )
+    from kirby2.release.qualification_records import (
+        RELEASE_CLEAN_PROVIDER_ATTESTATION_SCHEMA_ID_V1,
+        RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1,
+        RELEASE_QUALIFICATION_ATTESTATION_METHOD_V1,
+        RELEASE_QUALIFICATION_CHECK_COUNT_V1,
+        RELEASE_QUALIFICATION_CHECK_PROOF_SCHEMA_ID_V1,
+        RELEASE_QUALIFICATION_EXECUTION_POLICY_ID_V1,
+        RELEASE_QUALIFICATION_INSTALLATION_SOURCE_V1,
+        RELEASE_QUALIFICATION_RECORD_SCHEMA_VERSION_V1,
+        RELEASE_QUALIFICATION_ROOT_ROLE_ORDER_V1,
+        RELEASE_QUALIFICATION_STEP_COUNT_V1,
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationArtifactBindingV1,
+        ReleaseQualificationAttemptV1,
+        ReleaseQualificationCommandObservationV1,
+        ReleaseQualificationFactsV1,
+        ReleaseQualificationNetworkScopeV1,
+        ReleaseQualificationRootObservationV1,
+        ReleaseQualificationSessionV1,
+        ReleaseQualificationStepObservationV1,
+        ReleaseQualificationStepResultV1,
+        build_release_qualification_attempt_record,
+        required_release_qualification_check_ids,
+        verify_release_qualification_record,
+    )
+
+    record_failures: list[str] = []
+    record_types = (
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationAttemptV1,
+        ReleaseQualificationStepResultV1,
+    )
+    for record_type in record_types:
+        if not is_dataclass(record_type):
+            record_failures.append(f"{record_type.__name__} is not a dataclass")
+            continue
+        parameters = getattr(record_type, "__dataclass_params__", None)
+        if parameters is None or not parameters.frozen:
+            record_failures.append(f"{record_type.__name__} is not immutable")
+        if not hasattr(record_type, "__slots__"):
+            record_failures.append(f"{record_type.__name__} is not slot-bounded")
+    exact_identities = {
+        "attempt_schema": (
+            RELEASE_QUALIFICATION_ATTEMPT_SCHEMA_ID_V1,
+            "KIRBY2_RELEASE_QUALIFICATION_ATTEMPT_V1",
+        ),
+        "check_proof_schema": (
+            RELEASE_QUALIFICATION_CHECK_PROOF_SCHEMA_ID_V1,
+            "KIRBY2_RELEASE_QUALIFICATION_CHECK_PROOF_V1",
+        ),
+        "execution_policy": (
+            RELEASE_QUALIFICATION_EXECUTION_POLICY_ID_V1,
+            "KIRBY2_RELEASE_QUALIFICATION_EXECUTION_POLICY_V1",
+        ),
+        "provider_schema": (
+            RELEASE_CLEAN_PROVIDER_ATTESTATION_SCHEMA_ID_V1,
+            "KIRBY2_RELEASE_CLEAN_PROVIDER_ATTESTATION_V1",
+        ),
+    }
+    for label, (observed, expected) in exact_identities.items():
+        if type(observed) is not str or observed != expected:
+            record_failures.append(f"qualification {label} identity differs")
+    if (
+        type(RELEASE_QUALIFICATION_RECORD_SCHEMA_VERSION_V1) is not int
+        or RELEASE_QUALIFICATION_RECORD_SCHEMA_VERSION_V1 != 1
+    ):
+        record_failures.append("qualification record schema version differs")
+    if (
+        type(RELEASE_QUALIFICATION_STEP_COUNT_V1) is not int
+        or RELEASE_QUALIFICATION_STEP_COUNT_V1 != 38
+        or RELEASE_QUALIFICATION_STEP_COUNT_V1
+        != 2 * len(RELEASE_FUNCTIONAL_STEP_ORDER_V1)
+        + len(RELEASE_HEADLESS_EXTRA_STEP_ORDER_V1)
+    ):
+        record_failures.append("qualification matrix does not contain exactly 38 rows")
+    check_ids = required_release_qualification_check_ids("macos-arm64")
+    if (
+        type(RELEASE_QUALIFICATION_CHECK_COUNT_V1) is not int
+        or RELEASE_QUALIFICATION_CHECK_COUNT_V1 != 42
+        or len(check_ids) != RELEASE_QUALIFICATION_CHECK_COUNT_V1
+        or len(check_ids) != len(set(check_ids))
+    ):
+        record_failures.append("qualification proof does not contain 42 unique checks")
+    provider_fields = tuple(
+        item.name for item in fields(ReleaseCleanProviderAttestationV1)
+    )
+    attempt_fields = tuple(item.name for item in fields(ReleaseQualificationAttemptV1))
+    result_fields = tuple(item.name for item in fields(ReleaseQualificationStepResultV1))
+    expected_provider_fields = (
+        "provider_id",
+        "target_id",
+        "provider_inventory_sha256",
+        "provider_capability_sha256",
+        "provider_adapter_id",
+        "attestation_method",
+        "system",
+        "os_version",
+        "kernel_release",
+        "machine",
+        "machine_model",
+        "python_implementation",
+        "python_version",
+        "cpu_count",
+        "memory_bytes",
+        "available_disk_bytes",
+        "offline_install",
+        "network_scope",
+        "observed_at_utc",
+    )
+    expected_attempt_fields = (
+        "gate_id",
+        "target_id",
+        "candidate_commit",
+        "protocol_set_sha256",
+        "source_manifest_sha256",
+        "artifact_index_sha256",
+        "build_evidence_sha256",
+        "session",
+        "commands",
+        "steps",
+        "facts",
+        "checks",
+        "warnings",
+        "status",
+    )
+    if provider_fields != expected_provider_fields:
+        record_failures.append("provider-attestation public fields differ")
+    if attempt_fields != expected_attempt_fields:
+        record_failures.append("qualification-attempt public fields differ")
+    if result_fields != ("result_id", "size", "sha256", "payload"):
+        record_failures.append("step result does not embed its canonical payload")
+    if not callable(getattr(ReleaseQualificationStepResultV1, "from_payload", None)):
+        record_failures.append("step result omits its payload-derived constructor")
+    for record_type in (
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationAttemptV1,
+    ):
+        for member in ("from_bytes", "canonical_bytes"):
+            if not callable(getattr(record_type, member, None)):
+                record_failures.append(f"{record_type.__name__} omits {member}")
+        if not isinstance(getattr(record_type, "sha256", None), property):
+            record_failures.append(f"{record_type.__name__} omits canonical SHA-256")
+    records_case = _case(
+        "qualification_records_and_reconstruction_are_versioned",
+        "Immutable provider/attempt records embed step payloads and own 38 rows plus 42 checks.",
+        {
+            "attempt_fields": list(attempt_fields),
+            "check_count": RELEASE_QUALIFICATION_CHECK_COUNT_V1,
+            "executor_invocations": 0,
+            "provider_fields": list(provider_fields),
+            "record_schema_version": RELEASE_QUALIFICATION_RECORD_SCHEMA_VERSION_V1,
+            "step_count": RELEASE_QUALIFICATION_STEP_COUNT_V1,
+            "step_result_fields": list(result_fields),
+        },
+        record_failures,
+    )
+
+    parser_failures: list[str] = []
+    refused: list[str] = []
+    unexpected: list[list[str]] = []
+    valid_attempt_sha256: str | None = None
+    verification_projection: dict[str, object] | None = None
+
+    def synthetic_records() -> tuple[
+        ReleaseCleanProviderAttestationV1,
+        ReleaseQualificationAttemptV1,
+    ]:
+        digest = _sha256(b"DEV-0014 synthetic qualification fixture")
+        empty_inventory = _sha256(canonical_json_bytes([]))
+        provider = ReleaseCleanProviderAttestationV1(
+            provider_id=f"kirby2-clean-provider-macos-arm64-{digest[:16]}",
+            target_id="macos-arm64",
+            provider_inventory_sha256=digest,
+            provider_capability_sha256=digest,
+            provider_adapter_id="TART_LOCAL_VM_V1",
+            attestation_method=RELEASE_QUALIFICATION_ATTESTATION_METHOD_V1,
+            system="Darwin",
+            os_version="synthetic-1",
+            kernel_release="synthetic-1",
+            machine="arm64",
+            machine_model="SyntheticMac",
+            python_implementation="CPython",
+            python_version="3.14.0",
+            cpu_count=4,
+            memory_bytes=8 * 1024**3,
+            available_disk_bytes=20 * 1024**3,
+            offline_install=True,
+            network_scope=ReleaseQualificationNetworkScopeV1.HOST_ONLY,
+            observed_at_utc="2026-08-31T00:00:00Z",
+        )
+        bindings = tuple(
+            ReleaseQualificationArtifactBindingV1(
+                artifact_id=artifact_id,
+                size=1,
+                release_store_sha256=digest,
+                provider_copy_sha256=digest,
+            )
+            for artifact_id in RELEASE_QUALIFICATION_ARTIFACT_IDS_BY_TARGET_V1[
+                "macos-arm64"
+            ]
+        )
+        roots = tuple(
+            ReleaseQualificationRootObservationV1(
+                root_role=root_role,
+                root_id=f"fixture-{index}",
+                data_root=f"/tmp/kirby2-dev0014-fixture-{index}",
+                initial_state="ABSENT",
+                initial_inventory_sha256=empty_inventory,
+            )
+            for index, root_role in enumerate(
+                RELEASE_QUALIFICATION_ROOT_ROLE_ORDER_V1,
+                start=1,
+            )
+        )
+        session = ReleaseQualificationSessionV1(
+            session_id="wo40g-synthetic-fixture",
+            provider_id=provider.provider_id,
+            provider_attestation_sha256=provider.sha256,
+            provider_instance_id="tart-instance-synthetic",
+            target_id="macos-arm64",
+            attempt_number=1,
+            started_at_utc="2026-08-31T00:00:00Z",
+            finished_at_utc="2026-08-31T00:00:01Z",
+            duration_ns=1_000_000_000,
+            network_scope=ReleaseQualificationNetworkScopeV1.HOST_ONLY,
+            installation_source=RELEASE_QUALIFICATION_INSTALLATION_SOURCE_V1,
+            source_checkout_present=False,
+            artifact_bindings=bindings,
+            roots=roots,
+        )
+        functional_roles = (
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "SECONDARY_CLEAN_ROOT",
+            "SECONDARY_CLEAN_ROOT",
+            "BOTH_CLEAN_ROOTS",
+            "RESTORE_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+            "PRIMARY_CLEAN_ROOT",
+        )
+        functional = tuple(zip(RELEASE_FUNCTIONAL_STEP_ORDER_V1, functional_roles))
+        rows = (
+            *(("macos-arm64/desktop", step_id, root_role) for step_id, root_role in functional),
+            *(("macos-arm64/headless", step_id, root_role) for step_id, root_role in functional),
+            *(
+                ("macos-arm64/headless", step_id, "PRIMARY_CLEAN_ROOT")
+                for step_id in RELEASE_HEADLESS_EXTRA_STEP_ORDER_V1
+            ),
+        )
+        command = ReleaseQualificationCommandObservationV1(
+            command_id="fixture-command-1",
+            sequence=1,
+            artifact_selector="macos-arm64/desktop",
+            root_role="PRIMARY_CLEAN_ROOT",
+            argv=("kirby2-fixture", "CLEAN_INSTALL"),
+            environment_sha256=digest,
+            started_at_utc="2026-08-31T00:00:00Z",
+            duration_ns=1,
+            returncode=0,
+            timed_out=False,
+            stdout_size=0,
+            stdout_sha256=_sha256(b""),
+            stderr_size=0,
+            stderr_sha256=_sha256(b""),
+        )
+        embedded = ReleaseQualificationStepResultV1.from_payload(
+            "macos-arm64/desktop:CLEAN_INSTALL",
+            {
+                "distributions": [
+                    {
+                        "name": "duckdb",
+                        "origin": "LOCKED_DEPENDENCY_WHEEL",
+                        "version": "1.5.5",
+                    },
+                    {
+                        "name": "kirby2",
+                        "origin": "CANDIDATE_PROJECT_WHEEL",
+                        "version": "0.1.0",
+                    },
+                ],
+                "execution_index": 1,
+                "offline_install": True,
+                "source_checkout_present": False,
+            },
+        )
+        steps = tuple(
+            ReleaseQualificationStepObservationV1(
+                artifact_selector=selector,
+                step_id=step_id,
+                root_role=root_role,
+                command_ids=("fixture-command-1",) if position == 0 else (),
+                duration_ns=1 if position == 0 else 0,
+                status="PASS" if position == 0 else "NOT_EXERCISED",
+                warning_codes=(),
+                result=embedded if position == 0 else None,
+            )
+            for position, (selector, step_id, root_role) in enumerate(rows)
+        )
+        facts = ReleaseQualificationFactsV1(
+            clean_environment=False,
+            cross_platform_integer_core_sha256=digest,
+            desktop_run_sha256=digest,
+            headless_run_sha256=digest,
+            platform_id="macos-arm64",
+            replay_sha256=digest,
+        )
+        attempt = build_release_qualification_attempt_record(
+            gate_id="WO40-G",
+            target_id="macos-arm64",
+            candidate_commit="1" * 40,
+            protocol_set_sha256=digest,
+            source_manifest_sha256=digest,
+            artifact_index_sha256=digest,
+            build_evidence_sha256=digest,
+            session=session,
+            commands=(command,),
+            steps=steps,
+            facts=facts,
+        )
+        return provider, attempt
+
+    try:
+        fixture_provider, fixture_attempt = synthetic_records()
+        fixture_provider_raw = fixture_provider.canonical_bytes()
+        fixture_attempt_raw = fixture_attempt.canonical_bytes()
+        restored_provider = ReleaseCleanProviderAttestationV1.from_bytes(
+            fixture_provider_raw
+        )
+        restored_attempt = ReleaseQualificationAttemptV1.from_bytes(fixture_attempt_raw)
+        protocol = load_release_qualification_protocol(
+            (_repository_root() / "release/qualification.toml").resolve(strict=True)
+        )
+        verified = verify_release_qualification_record(
+            restored_provider,
+            restored_attempt,
+            protocol,
+        )
+        verification_projection = verified.as_dict()
+        valid_attempt_sha256 = restored_attempt.sha256
+        if (
+            restored_provider.canonical_bytes() != fixture_provider_raw
+            or restored_attempt.canonical_bytes() != fixture_attempt_raw
+            or len(restored_attempt.steps) != 38
+            or len(restored_attempt.checks) != 42
+            or verified.check_count != 42
+        ):
+            parser_failures.append("valid canonical qualification fixture did not round-trip")
+
+        def fresh_attempt() -> dict[str, object]:
+            value = load_canonical_json_bytes(
+                fixture_attempt_raw,
+                "DEV-0014 synthetic qualification attempt",
+            )
+            if type(value) is not dict:
+                raise TypeError("synthetic qualification attempt is not an object")
+            return value
+
+        hostile_records: list[tuple[str, object, bytes]] = []
+        hostile_records.append(
+            (
+                "attempt_noncanonical",
+                ReleaseQualificationAttemptV1.from_bytes,
+                b" " + fixture_attempt_raw,
+            )
+        )
+        wrong_schema = fresh_attempt()
+        wrong_schema["schema_id"] = "KIRBY2_RELEASE_QUALIFICATION_ATTEMPT_HOSTILE"
+        hostile_records.append(
+            (
+                "attempt_wrong_schema",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(wrong_schema),
+            )
+        )
+        wrong_order = fresh_attempt()
+        ordered_steps = wrong_order["steps"]
+        if type(ordered_steps) is not list:
+            raise TypeError("synthetic step inventory is not an array")
+        ordered_steps[0], ordered_steps[1] = ordered_steps[1], ordered_steps[0]
+        hostile_records.append(
+            (
+                "attempt_wrong_order",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(wrong_order),
+            )
+        )
+        wrong_count = fresh_attempt()
+        counted_steps = wrong_count["steps"]
+        if type(counted_steps) is not list:
+            raise TypeError("synthetic step inventory is not an array")
+        counted_steps.pop()
+        hostile_records.append(
+            (
+                "attempt_wrong_count",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(wrong_count),
+            )
+        )
+        wrong_target = fresh_attempt()
+        wrong_target["target_id"] = "linux-x86_64"
+        hostile_records.append(
+            (
+                "attempt_wrong_target",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(wrong_target),
+            )
+        )
+        forged_checks = fresh_attempt()
+        checks = forged_checks["checks"]
+        if type(checks) is not list or not checks or type(checks[0]) is not dict:
+            raise TypeError("synthetic check inventory is malformed")
+        observed_check_digest = checks[0]["evidence_sha256"]
+        checks[0]["evidence_sha256"] = (
+            "f" * 64 if observed_check_digest != "f" * 64 else "e" * 64
+        )
+        hostile_records.append(
+            (
+                "attempt_forged_checks",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(forged_checks),
+            )
+        )
+        forged_result = fresh_attempt()
+        result_steps = forged_result["steps"]
+        if type(result_steps) is not list or not result_steps or type(result_steps[0]) is not dict:
+            raise TypeError("synthetic result step is malformed")
+        result = result_steps[0]["result"]
+        if type(result) is not dict or type(result.get("payload")) is not dict:
+            raise TypeError("synthetic embedded result is malformed")
+        result["payload"]["offline_install"] = False
+        forged_payload_raw = canonical_json_bytes(result["payload"])
+        result["size"] = len(forged_payload_raw)
+        result["sha256"] = _sha256(forged_payload_raw)
+        hostile_records.append(
+            (
+                "attempt_forged_embedded_result",
+                ReleaseQualificationAttemptV1.from_bytes,
+                canonical_json_bytes(forged_result),
+            )
+        )
+        provider_wrong_schema = load_canonical_json_bytes(
+            fixture_provider_raw,
+            "DEV-0014 synthetic provider attestation",
+        )
+        if type(provider_wrong_schema) is not dict:
+            raise TypeError("synthetic provider attestation is not an object")
+        provider_wrong_schema["schema_id"] = (
+            "KIRBY2_RELEASE_CLEAN_PROVIDER_ATTESTATION_HOSTILE"
+        )
+        hostile_records.append(
+            (
+                "provider_wrong_schema",
+                ReleaseCleanProviderAttestationV1.from_bytes,
+                canonical_json_bytes(provider_wrong_schema),
+            )
+        )
+        for fixture_id, parser, raw in hostile_records:
+            try:
+                parser(raw)  # type: ignore[operator]
+            except (TypeError, ValueError):
+                refused.append(fixture_id)
+            except Exception as error:  # pragma: no cover - surfaced as audit evidence
+                unexpected.append([fixture_id, type(error).__name__])
+                parser_failures.append(
+                    f"{fixture_id} produced untyped parser failure {type(error).__name__}"
+                )
+            else:
+                parser_failures.append(f"{fixture_id} was accepted")
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        parser_failures.append(
+            f"canonical qualification fixture failed: {type(error).__name__}"
+        )
+    parser_case = _case(
+        "qualification_parsers_reconstruct_and_refuse_forgery",
+        "Canonical records round-trip while order, count, target, schema, result, and checks fail closed.",
+        {
+            "executor_invocations": 0,
+            "fixture_count": len(refused) + len(unexpected),
+            "refused": refused,
+            "unexpected": unexpected,
+            "valid_attempt_sha256": valid_attempt_sha256,
+            "verification": verification_projection,
+        },
+        parser_failures,
+    )
+
+    surface_failures: list[str] = []
+
+    def signature_projection(target: object) -> list[list[object]]:
+        signature = inspect.signature(target)
+        return [
+            [
+                name,
+                parameter.kind.name,
+                parameter.default is inspect.Parameter.empty,
+            ]
+            for name, parameter in signature.parameters.items()
+        ]
+
+    expected_executor_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["target_id", "KEYWORD_ONLY", True],
+        ["build_evidence", "KEYWORD_ONLY", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+    ]
+    expected_verifier_signature = [
+        ["bundle", "POSITIONAL_OR_KEYWORD", True],
+        ["target_id", "KEYWORD_ONLY", True],
+        ["build_evidence", "KEYWORD_ONLY", True],
+        ["artifact_root", "KEYWORD_ONLY", True],
+    ]
+    observed_executor_signature = signature_projection(execute_release_qualification)
+    observed_verifier_signature = signature_projection(verify_release_qualification)
+    observed_worker_signature = signature_projection(worker_module.main)
+    if observed_executor_signature != expected_executor_signature:
+        surface_failures.append("public qualification executor signature differs")
+    if observed_verifier_signature != expected_verifier_signature:
+        surface_failures.append("public qualification verifier signature differs")
+    if observed_worker_signature != [["argv", "POSITIONAL_OR_KEYWORD", False]]:
+        surface_failures.append("installed qualification worker main signature differs")
+    if (
+        getattr(execute_release_qualification, "__module__", None)
+        != "kirby2.release.qualification_executor"
+        or "execute_release_qualification"
+        not in getattr(executor_module, "__all__", ())
+    ):
+        surface_failures.append("qualification executor is not owned by its closed module")
+    if (
+        getattr(verify_release_qualification, "__module__", None)
+        != "kirby2.release.qualification"
+        or "verify_release_qualification"
+        not in getattr(qualification_module, "__all__", ())
+    ):
+        surface_failures.append("qualification verifier is not public from qualification")
+    tart_constants = {
+        "base_config_sha256": TART_BASE_CONFIG_SHA256_V1,
+        "base_disk_bytes": TART_BASE_DISK_BYTES_V1,
+        "base_nvram_sha256": TART_BASE_NVRAM_SHA256_V1,
+        "base_vm": TART_BASE_VM_V1,
+        "executable": os.fspath(TART_EXECUTABLE_V1),
+        "executable_sha256": TART_EXECUTABLE_SHA256_V1,
+        "provider_policy": TART_PROVIDER_POLICY_ID_V1,
+        "target": TART_TARGET_ID_V1,
+        "version": TART_VERSION_V1,
+    }
+    expected_tart_constants = {
+        "base_config_sha256": (
+            "7049c4f9d0bb1901fc8fa77965f8543e7dc62e513bfa885e16c84a82e653a97b"
+        ),
+        "base_disk_bytes": 80_000_000_000,
+        "base_nvram_sha256": (
+            "67f21de21c4643f79cb1ee1e0597ea21f0f4d94c54e0b96468db19f8b3517f56"
+        ),
+        "base_vm": "kirby2-dev0014-macos-offline-base",
+        "executable": "/opt/homebrew/Cellar/tart/2.32.1/bin/tart",
+        "executable_sha256": (
+            "44137d8dba251d4a4f9a113ecc8619d821ea7ea0f28217a88f57dde894d83d76"
+        ),
+        "provider_policy": "KIRBY2_TART_HOST_ONLY_PROVIDER_V1",
+        "target": "macos-arm64",
+        "version": "2.32.1",
+    }
+    if tart_constants != expected_tart_constants:
+        surface_failures.append("fixed Tart provider constants differ")
+
+    try:
+        executor_tree = ast.parse(inspect.getsource(executor_module))
+        worker_tree = ast.parse(inspect.getsource(worker_module))
+    except (OSError, TypeError, SyntaxError) as error:
+        surface_failures.append(f"qualification module AST failed: {type(error).__name__}")
+        executor_tree = ast.Module(body=[], type_ignores=[])
+        worker_tree = ast.Module(body=[], type_ignores=[])
+
+    def function_node(tree: ast.AST, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                item
+                for item in ast.walk(tree)
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            ),
+            None,
+        )
+
+    host_launch = function_node(executor_tree, "_spawn_host_only_vm")
+    run_calls: list[ast.Call] = []
+    for node in ast.walk(executor_tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        function_name = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr if isinstance(node.func, ast.Attribute) else None
+        )
+        first = node.args[0]
+        if (
+            function_name in {"_tart_command", "_run_tart"}
+            and isinstance(first, ast.Constant)
+            and first.value == "run"
+        ):
+            run_calls.append(node)
+    if host_launch is None or len(run_calls) != 1 or run_calls[0] not in set(ast.walk(host_launch)):
+        surface_failures.append("Tart has more than one or an unowned VM run path")
+    elif [
+        item.value for item in run_calls[0].args[:6] if isinstance(item, ast.Constant)
+    ] != [
+        "run",
+        "--no-graphics",
+        "--no-audio",
+        "--no-clipboard",
+        "--net-host",
+        "--root-disk-opts=sync=full",
+    ]:
+        surface_failures.append("Tart run argv differs from strict host-only launch")
+    executable_network_tokens = sorted(
+        {
+            node.value
+            for call in run_calls
+            for node in call.args
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("--net")
+        }
+    )
+    if executable_network_tokens != ["--net-host"]:
+        surface_failures.append("Tart run exposes a non-host-only network token")
+    if host_launch is not None:
+        host_literals = {
+            item.value
+            for item in ast.walk(host_launch)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+        if not {"release:", ":ro", "--dir="}.issubset(host_literals):
+            surface_failures.append("Tart qualification share is not AST-bound read-only")
+    environment_node = function_node(executor_tree, "_tart_environment")
+    environment_literals = (
+        set()
+        if environment_node is None
+        else {
+            item.value
+            for item in ast.walk(environment_node)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    )
+    if not {"TART_NO_AUTO_PRUNE", "1"}.issubset(environment_literals):
+        surface_failures.append("Tart environment does not disable automatic pruning")
+
+    worker_parser = function_node(worker_tree, "_parser")
+    worker_options: list[str] = []
+    if worker_parser is not None:
+        for node in ast.walk(worker_parser):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                worker_options.append(node.args[0].value)
+    if worker_options != ["--form", "--launcher", "--attempt-root"]:
+        surface_failures.append("installed worker exposes arguments beyond its closed grammar")
+    installed_identity = function_node(worker_tree, "_installed_identity")
+    installed_literals = (
+        set()
+        if installed_identity is None
+        else {
+            item.value
+            for item in ast.walk(installed_identity)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    )
+    if not {".git", "pyproject.toml", "SOURCE_CHECKOUT_REFUSED"}.issubset(
+        installed_literals
+    ):
+        surface_failures.append("installed worker omits its source-checkout refusal")
+    if (
+        getattr(worker_module, "WORKER_SCHEMA_ID", None)
+        != "KIRBY2_RELEASE_QUALIFICATION_WORKER_RESULT_V1"
+        or getattr(worker_module, "EXECUTION_POLICY_ID", None)
+        != "KIRBY2_WO40_G_GUEST_EXECUTION_POLICY_V1"
+    ):
+        surface_failures.append("installed worker schema or execution policy differs")
+    surface_case = _case(
+        "qualification_executor_and_worker_surfaces_are_closed",
+        "The public seams bind one host-only Tart target and one installed-worker grammar.",
+        {
+            "executor_invocations": 0,
+            "executor_signature": observed_executor_signature,
+            "network_tokens": executable_network_tokens,
+            "tart": tart_constants,
+            "verifier_signature": observed_verifier_signature,
+            "worker_options": worker_options,
+            "worker_signature": observed_worker_signature,
+        },
+        surface_failures,
+    )
+
+    cases = (records_case, parser_case, surface_case)
+    if len(cases) != DEV0014_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0014 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0014",
+        cases,
+        metadata=(
+            ("executor_invocations", "0"),
+            ("interrupted_card", "WO40-G"),
+        ),
+    )
+
+
 def _git_tracks_clean_working_file(repository: Path, relative: str) -> tuple[bool, str]:
     tracked = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", relative],
@@ -3209,6 +3954,81 @@ def audit_release_frozen_evidence(gate_id: str) -> ReleaseAuditSuite:
                 != build_evidence.source_manifest_sha256
             ):
                 failures.append("evidence identity differs from immutable build evidence")
+
+        if gate_id in {"WO40-G", "WO40-H"} and build_path.is_file():
+            from kirby2.release.qualification import verify_release_qualification
+            from kirby2.release.qualification_records import (
+                ReleaseQualificationAttemptV1,
+                release_qualification_record_paths,
+            )
+
+            target_id = "macos-arm64" if gate_id == "WO40-G" else "linux-x86_64"
+            provider_relative, attempt_relative = release_qualification_record_paths(
+                target_id
+            )
+            expected_records = {
+                "provider-attestation": f".kirby2/release/{provider_relative}",
+                "qualification-attempt": f".kirby2/release/{attempt_relative}",
+            }
+            records_by_id = {
+                str(row["evidence_id"]): row for row in evidence.evidence_records
+            }
+            if set(records_by_id) != set(expected_records) or any(
+                records_by_id[evidence_id]["path"] != path
+                for evidence_id, path in expected_records.items()
+                if evidence_id in records_by_id
+            ):
+                failures.append(
+                    "platform evidence must reference exactly the provider and attempt"
+                )
+            try:
+                deep = verify_release_qualification(
+                    bundle,
+                    target_id=target_id,
+                    build_evidence=build_path.resolve(strict=True),
+                    artifact_root=(repository / ".kirby2/release").resolve(strict=True),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                failures.append(
+                    f"deep qualification verification failed: {type(error).__name__}"
+                )
+            else:
+                attempt_path = repository / ".kirby2/release" / attempt_relative
+                try:
+                    attempt = ReleaseQualificationAttemptV1.from_bytes(
+                        attempt_path.read_bytes()
+                    )
+                except (OSError, TypeError, ValueError) as error:
+                    failures.append(
+                        f"qualification attempt failed parsing: {type(error).__name__}"
+                    )
+                else:
+                    if tuple(
+                        item.as_dict() for item in attempt.checks
+                    ) != evidence.checks:
+                        failures.append(
+                            "platform evidence checks differ from the reconstructed attempt"
+                        )
+                    if attempt.facts.as_dict() != evidence.facts:
+                        failures.append(
+                            "platform evidence facts differ from the reconstructed attempt"
+                        )
+                    if deep.status != evidence.status:
+                        failures.append(
+                            "platform evidence status differs from the deep verification"
+                        )
+                    expected_digests = {
+                        "provider-attestation": deep.provider_attestation_sha256,
+                        "qualification-attempt": deep.qualification_attempt_sha256,
+                    }
+                    if any(
+                        records_by_id[evidence_id]["sha256"] != digest
+                        for evidence_id, digest in expected_digests.items()
+                        if evidence_id in records_by_id
+                    ):
+                        failures.append(
+                            "platform evidence record digests differ from deep verification"
+                        )
 
     if gate_id == "WO40-H":
         macos_path = repository / RELEASE_FUTURE_EVIDENCE_PATHS_V1["WO40-G"]

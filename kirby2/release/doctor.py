@@ -622,7 +622,7 @@ def _normalized_archive(
     output = io.BytesIO()
     values = {K2PACK_MANIFEST_PATH: manifest_raw, **payloads}
     with zipfile.ZipFile(output, mode="w") as archive:
-        for path in normalized_archive_paths(values):
+        for path in normalized_archive_paths(tuple(values)):
             archive.writestr(normalized_zip_info(path), values[path])
     return output.getvalue()
 

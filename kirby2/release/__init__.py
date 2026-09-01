@@ -183,12 +183,28 @@ from .probes import (
     run_release_queue_reactive_probe,
 )
 from .qualification import (
+    ReleaseBuildEvidenceBindingV1,
     ReleaseEvidenceReferenceV1,
     ReleasePlatformsV1,
     ReleaseQualificationDispatchV1,
     ReleaseQualificationProtocolV1,
+    ReleaseQualificationVerificationV1,
+    load_release_build_evidence_binding,
     qualification_dispatch,
     verify_closeout_prerequisites,
+    verify_release_qualification,
+)
+from .qualification_executor import (
+    QualificationExecutorRefusalCodeV1,
+    execute_release_qualification,
+)
+from .qualification_records import (
+    ReleaseCleanProviderAttestationV1,
+    ReleaseQualificationAttemptV1,
+    ReleaseQualificationRecordVerificationV1,
+    ReleaseQualificationStepObservationV1,
+    ReleaseQualificationStepResultV1,
+    verify_release_qualification_record,
 )
 
 
@@ -256,6 +272,8 @@ __all__ = [
     "ReleaseCleanProviderV1",
     "ReleaseCommandOutcomeV1",
     "ReleaseCommandStatusV1",
+    "ReleaseBuildEvidenceBindingV1",
+    "ReleaseCleanProviderAttestationV1",
     "ReleaseEvidenceReferenceV1",
     "ReleaseLogicalBuildProjectionV1",
     "ReleaseManifestV1",
@@ -268,7 +286,13 @@ __all__ = [
     "ReleasePlatformsV1",
     "ReleaseProtocolBundleV1",
     "ReleaseQualificationDispatchV1",
+    "ReleaseQualificationAttemptV1",
     "ReleaseQualificationProtocolV1",
+    "ReleaseQualificationRecordVerificationV1",
+    "ReleaseQualificationStepObservationV1",
+    "ReleaseQualificationStepResultV1",
+    "ReleaseQualificationVerificationV1",
+    "QualificationExecutorRefusalCodeV1",
     "ReleaseQueueReactiveRecordingV1",
     "ReleaseQueueReactiveResultV1",
     "ReleaseRequirementsLockV1",
@@ -332,8 +356,10 @@ __all__ = [
     "preview_release_diagnostics",
     "iter_performance_row_templates",
     "load_release_protocol_bundle",
+    "load_release_build_evidence_binding",
     "plan_release_build",
     "qualification_dispatch",
+    "execute_release_qualification",
     "release_license_inventory",
     "release_notices_bytes",
     "release_resource_preflight",
@@ -349,6 +375,8 @@ __all__ = [
     "verify_installation",
     "verify_release_candidate_inputs",
     "verify_release_artifacts",
+    "verify_release_qualification",
+    "verify_release_qualification_record",
     "validate_performance_attempt_sequence",
     "verify_performance_cell_artifacts",
 ]
