@@ -27,6 +27,7 @@ from .doctor import HealthStatusV1, release_identity, run_doctor, verify_install
 from .first_run import run_first_run
 from .platform_paths import select_release_paths
 from .build import (
+    ReleasePerformanceProtocolHeaderV1,
     ReleaseCommandStatusV1,
     build_release_artifacts,
     load_release_protocol_bundle,
@@ -36,8 +37,12 @@ from .build import (
 from .performance import (
     RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1,
     RunnerSourceTreeV1,
-    bind_performance_row_template,
     build_performance_row_template,
+)
+from .performance_execution import execute_release_performance_qualification
+from .performance_worker import (
+    ReleasePerformanceRowExecutionError,
+    execute_performance_row,
 )
 from .qualification import (
     ReleaseEvidenceReferenceV1,
@@ -299,6 +304,35 @@ def _resolved_path(value: Path) -> Path:
     return Path(os.path.abspath(os.fspath(value))).resolve(strict=False)
 
 
+def _plain_resolved_file(value: Path, label: str) -> Path:
+    if not value.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    try:
+        resolved = value.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} is missing or unsafe") from error
+    if value != resolved or value.is_symlink() or not value.is_file():
+        raise ValueError(f"{label} is missing or unsafe")
+    return value
+
+
+def _plain_resolved_directory(value: Path, label: str) -> Path:
+    if not value.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    try:
+        resolved = value.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} is missing or unsafe") from error
+    if (
+        value != resolved
+        or value == Path(value.anchor)
+        or value.is_symlink()
+        or not value.is_dir()
+    ):
+        raise ValueError(f"{label} is missing or unsafe")
+    return value
+
+
 def _release_protocol_bundle():
     return load_release_protocol_bundle(_repository_root())
 
@@ -455,41 +489,22 @@ def _handle_qualify_performance(args: argparse.Namespace) -> int:
     manifest = _require_protocol_path(args.manifest, "release/performance_thresholds.toml")
     if args.complete_run_work_units != RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1:
         raise ValueError("release performance requires exactly 10,000 complete work units")
-    bundle = _release_protocol_bundle()
-    build_evidence = _resolved_path(args.build_evidence)
-    artifact_store = _resolved_path(args.artifact_store)
-    source_lock = _repository_root() / "release/performance_runner_sources.lock"
-    missing = [
-        os.fspath(path)
-        for path in (
-            build_evidence,
-            artifact_store / "release-artifact-index.json",
-            source_lock,
-        )
-        if not path.is_file()
-    ]
-    if missing:
-        return _not_exercised(
-            "QUALIFY_PERFORMANCE",
-            "Performance dispatch awaits the frozen candidate, artifact index, and runner-source lock.",
-            missing,
-        )
-    _print_json(
-        {
-            "artifact_store": os.fspath(artifact_store),
-            "build_evidence_sha256": hashlib.sha256(build_evidence.read_bytes()).hexdigest(),
-            "command_id": "QUALIFY_PERFORMANCE",
-            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
-            "protocol_set_sha256": bundle.protocol_set_sha256,
-            "queue_size": bundle.performance_protocol.queue_size,
-            "row_corpus_sha256": bundle.performance_protocol.row_corpus_sha256,
-            "row_count": bundle.performance_protocol.row_count,
-            "schema_version": 1,
-            "status": "READY",
-            "worker_count": bundle.performance_protocol.worker_count,
-        }
+    outcome = execute_release_performance_qualification(
+        _release_protocol_bundle(),
+        manifest=manifest,
+        complete_run_work_units=args.complete_run_work_units,
+        build_evidence=_resolved_path(args.build_evidence),
+        artifact_root=_resolved_path(args.artifact_store),
     )
-    return 0
+    _print_json(outcome.as_dict())
+    if outcome.status in {
+        ReleaseCommandStatusV1.PASS,
+        ReleaseCommandStatusV1.PASS_WITH_WARNINGS,
+    }:
+        return 0
+    if outcome.status is ReleaseCommandStatusV1.FAIL:
+        return 1
+    return 2
 
 
 def _configure_qualify_performance_row(parser: argparse.ArgumentParser) -> None:
@@ -499,7 +514,22 @@ def _configure_qualify_performance_row(parser: argparse.ArgumentParser) -> None:
 
 
 def _handle_qualify_performance_row(args: argparse.Namespace) -> int:
-    _require_protocol_path(args.protocol, "release/performance_thresholds.toml")
+    if args.protocol != Path("release/performance_thresholds.toml"):
+        raise ValueError(
+            "row protocol must use the frozen release/performance_thresholds.toml path"
+        )
+    protocol = _plain_resolved_file(
+        Path.cwd() / args.protocol,
+        "frozen performance protocol",
+    )
+    header = ReleasePerformanceProtocolHeaderV1.from_bytes(protocol.read_bytes())
+    if (
+        header.row_count != RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1
+        or header.worker_count != 4
+        or header.queue_size != 256
+        or header.designated_target != "macos-arm64"
+    ):
+        raise ValueError("installed performance protocol header differs")
     parts = args.work_unit_id.split("/")
     if len(parts) != 3 or parts[0] != "release-perf":
         raise ValueError("performance work-unit ID is invalid")
@@ -510,24 +540,75 @@ def _handle_qualify_performance_row(args: argparse.Namespace) -> int:
     template = build_performance_row_template(parts[1], root_seed)
     if template.work_unit_id != args.work_unit_id:
         raise ValueError("performance work-unit ID is noncanonical")
-    source_lock_path = _repository_root() / "release/performance_runner_sources.lock"
-    if not source_lock_path.is_file():
-        return _not_exercised(
-            "QUALIFY_PERFORMANCE_ROW",
-            "Row binding awaits the mechanically frozen runner-source tree.",
-            [os.fspath(source_lock_path)],
-        )
+    source_lock_path = _plain_resolved_file(
+        protocol.with_name("performance_runner_sources.lock"),
+        "installed runner-source lock",
+    )
     source_tree = RunnerSourceTreeV1.from_bytes(source_lock_path.read_bytes())
+    prior = None
+    prior_path_text = os.environ.get("KIRBY2_PERFORMANCE_PRIOR_RESULT")
+    retry_reason = os.environ.get("KIRBY2_PERFORMANCE_RETRY_REASON")
+    if args.attempt == 1 and (
+        prior_path_text is not None or retry_reason is not None
+    ):
+        raise ValueError("performance attempt one cannot carry retry authorization")
+    if args.attempt == 2:
+        if prior_path_text is None or retry_reason is None:
+            raise ValueError("performance retry lacks its attempt-one authorization")
+        prior_path = _plain_resolved_file(
+            Path(prior_path_text),
+            "performance retry authorization path",
+        )
+        from .performance import ReleasePerformanceCellResultV1
+
+        prior = ReleasePerformanceCellResultV1.from_bytes(prior_path.read_bytes())
+    output_root_text = os.environ.get("KIRBY2_PERFORMANCE_ATTEMPT_ROOT")
+    if output_root_text is None:
+        raise ValueError("performance attempt output root is not configured")
+    output_root = _plain_resolved_directory(
+        Path(output_root_text),
+        "performance attempt output root",
+    )
+    if any(output_root.iterdir()):
+        raise ValueError("performance attempt output root is unsafe or nonempty")
+    try:
+        attempt = execute_performance_row(
+            template,
+            source_tree,
+            attempt=args.attempt,
+            prior_attempt=prior,
+            retry_reason=retry_reason,
+        )
+    except ReleasePerformanceRowExecutionError as error:
+        _print_json(
+            {
+                "attempt": args.attempt,
+                "command_id": "QUALIFY_PERFORMANCE_ROW",
+                "failure_code": error.failure_code,
+                "schema_version": 1,
+                "status": "FAILED",
+                "work_unit_id": template.work_unit_id,
+            }
+        )
+        return 1
+    for name, raw in attempt.files():
+        path = output_root / name
+        with path.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        path.chmod(0o444)
     _print_json(
         {
             "attempt": args.attempt,
-            "bound_row": bind_performance_row_template(template, source_tree),
             "command_id": "QUALIFY_PERFORMANCE_ROW",
+            "result_sha256": hashlib.sha256(attempt.result_bytes).hexdigest(),
             "schema_version": 1,
-            "status": "READY",
+            "status": attempt.result.status,
+            "work_unit_id": attempt.result.work_unit_id,
         }
     )
-    return 0
+    return 0 if attempt.result.status == "COMPLETE" else 1
 
 
 _CLOSEOUT_MARKER_START = "<!-- KIRBY2_RELEASE_CLOSEOUT_V1\n"
@@ -834,7 +915,7 @@ RELEASE_DATA_COMMAND_MODULE = CommandModule(
         CommandSpec(
             command_id="QUALIFY_PERFORMANCE_ROW",
             name="qualify-performance-row",
-            help="bind one preregistered performance row to the frozen runner-source tree",
+            help="execute and verify one preregistered row against the frozen runner-source tree",
             handler=_handle_qualify_performance_row,
             configure=_configure_qualify_performance_row,
         ),

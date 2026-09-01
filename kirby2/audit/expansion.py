@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import io
@@ -106,6 +107,7 @@ RECORDED_DEVIATIONS = (
     ("DEV-0013", "WO40-F"),
     ("DEV-0014", "WO40-G"),
     ("DEV-0015", "WO40-H"),
+    ("DEV-0016", "WO40-I"),
 )
 REGISTERABLE_GATE_IDS = (
     "DEV-0001",
@@ -193,6 +195,7 @@ REGISTERABLE_GATE_IDS = (
     "WO40-G",
     "DEV-0015",
     "WO40-H",
+    "DEV-0016",
     "WO40-I",
     "WO40-J",
 )
@@ -5432,6 +5435,313 @@ def _audit_wo40h() -> ExpansionGateReport:
     return _release_suite_report("WO40-H", audit_release_linux_evidence())
 
 
+def _audit_dev0016() -> ExpansionGateReport:
+    """Prove the performance execution surface without importing or invoking it."""
+
+    repository = Path(__file__).resolve().parents[2]
+    source_paths = {
+        "audit": repository / "kirby2/audit/release.py",
+        "commands": repository / "kirby2/release/commands.py",
+        "execution": repository / "kirby2/release/performance_execution.py",
+        "performance": repository / "kirby2/release/performance.py",
+        "records": repository / "kirby2/release/performance_records.py",
+        "worker": repository / "kirby2/release/performance_worker.py",
+    }
+    trees: dict[str, ast.Module] = {}
+    source_errors: dict[str, str] = {}
+    for source_id, path in source_paths.items():
+        try:
+            source = path.read_bytes().decode("utf-8")
+            trees[source_id] = ast.parse(source, filename=os.fspath(path))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            source_errors[source_id] = type(error).__name__
+            trees[source_id] = ast.Module(body=[], type_ignores=[])
+
+    def definition_node(
+        tree: ast.Module,
+        name: str,
+        kinds: tuple[type[ast.AST], ...],
+    ) -> ast.AST | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, kinds) and getattr(item, "name", None) == name
+            ),
+            None,
+        )
+
+    function_kinds: tuple[type[ast.AST], ...] = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+    )
+
+    def function_node(tree: ast.Module, name: str) -> ast.AST | None:
+        return definition_node(tree, name, function_kinds)
+
+    def class_node(tree: ast.Module, name: str) -> ast.AST | None:
+        return definition_node(tree, name, (ast.ClassDef,))
+
+    def assigned_expression(tree: ast.Module, name: str) -> ast.expr | None:
+        for item in tree.body:
+            if isinstance(item, ast.Assign):
+                if any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in item.targets
+                ):
+                    return item.value
+            elif (
+                isinstance(item, ast.AnnAssign)
+                and isinstance(item.target, ast.Name)
+                and item.target.id == name
+            ):
+                return item.value
+        return None
+
+    def assigned_literal(tree: ast.Module, name: str) -> object:
+        expression = assigned_expression(tree, name)
+        if expression is None:
+            return None
+        try:
+            return ast.literal_eval(expression)
+        except (TypeError, ValueError):
+            return None
+
+    def assigned_name(tree: ast.Module, name: str) -> str | None:
+        expression = assigned_expression(tree, name)
+        if isinstance(expression, ast.Name):
+            return expression.id
+        if isinstance(expression, ast.Attribute):
+            return expression.attr
+        return None
+
+    def called_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            (
+                item.func.id
+                if isinstance(item.func, ast.Name)
+                else item.func.attr
+            )
+            for item in ast.walk(node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, (ast.Name, ast.Attribute))
+        }
+
+    def string_literals(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        return {
+            item.value
+            for item in ast.walk(node)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+
+    protocol_failures: list[str] = []
+    thresholds = repository / "release/performance_thresholds.toml"
+    try:
+        threshold_sha256 = hashlib.sha256(thresholds.read_bytes()).hexdigest()
+    except OSError as error:
+        threshold_sha256 = "UNAVAILABLE"
+        protocol_failures.append(
+            f"performance threshold bytes are unavailable: {type(error).__name__}"
+        )
+    expected_threshold_sha256 = (
+        "9dc132220e48813c842d9f8a76381abe72db60f0efbfac2e0f83d7702c12aff4"
+    )
+    if threshold_sha256 != expected_threshold_sha256:
+        protocol_failures.append("performance threshold bytes differ from WO40-D")
+    for source_id in ("execution", "performance"):
+        if source_id in source_errors:
+            protocol_failures.append(
+                f"{source_id} source is unavailable: {source_errors[source_id]}"
+            )
+    execution_tree = trees["execution"]
+    performance_tree = trees["performance"]
+    execution_policy = assigned_literal(
+        execution_tree, "PERFORMANCE_EXECUTION_POLICY_V1"
+    )
+    if execution_policy != "KIRBY2_RELEASE_PERFORMANCE_EXECUTION_V1":
+        protocol_failures.append("performance execution policy differs")
+    frozen_counts = {
+        "RELEASE_PERFORMANCE_QUEUE_SIZE_V1": 256,
+        "RELEASE_PERFORMANCE_WORKER_COUNT_V1": 4,
+        "RELEASE_PERFORMANCE_WORK_UNIT_COUNT_V1": 10_000,
+    }
+    observed_counts = {
+        name: assigned_literal(performance_tree, name) for name in frozen_counts
+    }
+    if observed_counts != frozen_counts:
+        protocol_failures.append("performance worker, queue, or work-unit count differs")
+
+    execution_failures: list[str] = []
+    for source_id in ("execution", "worker"):
+        if source_id in source_errors:
+            execution_failures.append(
+                f"{source_id} source is unavailable: {source_errors[source_id]}"
+            )
+    required_execution_functions = {
+        "execution": ("execute_release_performance_qualification",),
+        "worker": ("execute_performance_row", "verify_performance_row_execution"),
+    }
+    missing_execution_functions = {
+        source_id: [
+            name
+            for name in names
+            if function_node(trees[source_id], name) is None
+        ]
+        for source_id, names in required_execution_functions.items()
+    }
+    if any(missing_execution_functions.values()):
+        execution_failures.append("performance execution public seam is incomplete")
+    worker_verifier = function_node(
+        trees["worker"], "verify_performance_row_execution"
+    )
+    forbidden_worker_calls = called_names(worker_verifier) & {
+        "execute_performance_row",
+        "execute_release_performance_qualification",
+    }
+    if forbidden_worker_calls:
+        execution_failures.append("row verifier invokes a performance workload")
+
+    records_failures: list[str] = []
+    if "records" in source_errors:
+        records_failures.append(
+            f"records source is unavailable: {source_errors['records']}"
+        )
+    records_tree = trees["records"]
+    required_record_classes = (
+        "ReleasePerformanceAggregateV1",
+        "ReleasePerformanceActivationV1",
+    )
+    missing_record_classes = [
+        name for name in required_record_classes if class_node(records_tree, name) is None
+    ]
+    concrete_unit = class_node(
+        records_tree, "ReleasePerformanceWorkUnitPublicationV1"
+    )
+    public_unit = class_node(records_tree, "ReleasePerformanceUnitPublicationV1")
+    public_unit_alias = assigned_name(
+        records_tree, "ReleasePerformanceUnitPublicationV1"
+    )
+    unit_surface_present = public_unit is not None or (
+        concrete_unit is not None
+        and public_unit_alias == "ReleasePerformanceWorkUnitPublicationV1"
+    )
+    if missing_record_classes or not unit_surface_present:
+        records_failures.append("typed performance publication records are incomplete")
+    required_record_functions = (
+        "performance_publication_paths",
+        "verify_release_performance_records",
+    )
+    missing_record_functions = [
+        name
+        for name in required_record_functions
+        if function_node(records_tree, name) is None
+    ]
+    if missing_record_functions:
+        records_failures.append("performance publication or deep-verification seam is missing")
+    deep_verifier = function_node(records_tree, "verify_release_performance_records")
+    forbidden_verifier_calls = called_names(deep_verifier) & {
+        "execute_performance_row",
+        "execute_release_performance_qualification",
+    }
+    if forbidden_verifier_calls:
+        records_failures.append("deep performance verifier invokes a workload")
+
+    routing_failures: list[str] = []
+    for source_id in ("audit", "commands"):
+        if source_id in source_errors:
+            routing_failures.append(
+                f"{source_id} source is unavailable: {source_errors[source_id]}"
+            )
+    commands_tree = trees["commands"]
+    qualification_handler = function_node(
+        commands_tree, "_handle_qualify_performance"
+    )
+    row_handler = function_node(commands_tree, "_handle_qualify_performance_row")
+    qualification_calls = called_names(qualification_handler)
+    row_calls = called_names(row_handler)
+    if "execute_release_performance_qualification" not in qualification_calls:
+        routing_failures.append("qualify-performance does not call its executor")
+    if "execute_performance_row" not in row_calls:
+        routing_failures.append("qualify-performance-row does not call its worker")
+    if "READY" in string_literals(qualification_handler) | string_literals(row_handler):
+        routing_failures.append("a canonical performance command still terminates at READY")
+    audit_tree = trees["audit"]
+    audit_nodes = [
+        item
+        for item in audit_tree.body
+        if isinstance(item, function_kinds)
+        and (
+            "performance" in item.name
+            or item.name == "audit_release_frozen_evidence"
+        )
+    ]
+    audit_calls = set().union(*(called_names(item) for item in audit_nodes))
+    if "verify_release_performance_records" not in audit_calls:
+        routing_failures.append("WO40-I audit does not call the deep record verifier")
+
+    cases = (
+        (
+            "frozen_performance_protocol_and_execution_policy_are_bound",
+            "Frozen threshold bytes, 10,000/4/256 counts, and one execution policy remain exact.",
+            protocol_failures,
+        ),
+        (
+            "installed_performance_executor_and_row_worker_are_declared",
+            "The public qualification and independently verified row seams exist "
+            "without audit invocation.",
+            execution_failures,
+        ),
+        (
+            "immutable_performance_records_and_deep_verifier_are_declared",
+            "Typed work-unit, aggregate, activation, path, and provider-free "
+            "verification seams exist.",
+            records_failures,
+        ),
+        (
+            "performance_commands_and_wo40i_audit_route_past_readiness",
+            "Canonical commands route to execution and WO40-I routes to deep verification.",
+            routing_failures,
+        ),
+    )
+    checks = tuple(
+        ExpansionGateCheck(
+            code=code,
+            status=(
+                ExpansionGateStatus.FAIL
+                if failures
+                else ExpansionGateStatus.PASS
+            ),
+            detail=detail,
+            required=True,
+        )
+        for code, detail, failures in cases
+    )
+    failures = tuple(
+        f"{code}: {failure}"
+        for code, _, case_failures in cases
+        for failure in case_failures
+    )
+    return ExpansionGateReport(
+        card_id="DEV-0016",
+        status=(ExpansionGateStatus.FAIL if failures else ExpansionGateStatus.PASS),
+        checks=checks,
+        failures=failures,
+        metadata=(
+            ("audit_case_count", str(len(cases))),
+            ("execution_policy", "KIRBY2_RELEASE_PERFORMANCE_EXECUTION_V1"),
+            ("executor_invocations", "0"),
+            ("interrupted_card", "WO40-I"),
+            ("provider_invocations", "0"),
+            ("threshold_manifest_sha256", threshold_sha256),
+            ("workload_invocations", "0"),
+        ),
+    )
+
+
 def _audit_wo40i() -> ExpansionGateReport:
     from kirby2.audit.release import audit_release_performance_evidence
 
@@ -5533,6 +5843,7 @@ GATE_SPECS: tuple[tuple[str, ExpansionGate], ...] = (
     ("WO40-G", _audit_wo40g),
     ("DEV-0015", _audit_dev0015),
     ("WO40-H", _audit_wo40h),
+    ("DEV-0016", _audit_dev0016),
     ("WO40-I", _audit_wo40i),
     ("WO40-J", _audit_wo40j),
 )

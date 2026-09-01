@@ -270,6 +270,8 @@ class StateResponseTerm:
 
     def evaluate(self, state: QueueReactiveState) -> tuple[float, float]:
         input_value = self.direction * state.value(self.variable)
+        if input_value == 0.0:
+            input_value = 0.0
         return input_value, self.response.evaluate(input_value)
 
     def as_dict(self) -> dict[str, object]:

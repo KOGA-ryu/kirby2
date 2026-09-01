@@ -18,6 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -69,7 +70,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 16)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 17)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -4842,6 +4843,226 @@ def _load_future_evidence(repository: Path, gate_id: str) -> ReleaseGateEvidence
     return parse_release_gate_evidence_markdown((repository / relative).read_bytes())
 
 
+def _selected_macos_desktop_assets_sha256(
+    artifact_root: Path,
+    artifact_index,
+    *,
+    candidate_commit: str,
+) -> str:
+    """Read the exact indexed desktop manifest without installing its archive."""
+
+    from kirby2.release.manifest import RELEASE_VERSION_V1, ReleaseManifestV1
+    from kirby2.release.packaging import desktop_archive_root
+
+    selected = artifact_index.select("macos-arm64/desktop")
+    if len(selected) != 1:
+        raise ValueError("performance desktop selector does not identify one artifact")
+    artifact = selected[0]
+    if (
+        artifact.artifact_id != "macos-arm64-desktop-bundle"
+        or artifact.artifact_form != "DESKTOP_TAR_GZ"
+        or artifact.target != "macos-arm64"
+        or artifact.embedded_manifest_sha256 is None
+    ):
+        raise ValueError("performance desktop artifact binding differs")
+    archive_path = artifact_root / artifact.artifact_id
+    if not archive_path.is_file() or archive_path.is_symlink():
+        raise ValueError("performance desktop artifact is missing or unsafe")
+    archive_raw = archive_path.read_bytes()
+    if (
+        len(archive_raw) != artifact.size
+        or _sha256(archive_raw) != artifact.transport_sha256
+    ):
+        raise ValueError("performance desktop artifact bytes differ from the index")
+
+    manifest_path = (
+        f"{desktop_archive_root(RELEASE_VERSION_V1, 'macos-arm64')}"
+        "/RELEASE_MANIFEST.json"
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive_raw), mode="r:gz") as archive:
+        matching = tuple(
+            member for member in archive.getmembers() if member.name == manifest_path
+        )
+        if (
+            len(matching) != 1
+            or not matching[0].isfile()
+            or not 0 < matching[0].size <= 16 * 1024 * 1024
+        ):
+            raise ValueError("performance desktop embedded manifest inventory differs")
+        stream = archive.extractfile(matching[0])
+        if stream is None:
+            raise ValueError("performance desktop embedded manifest is unavailable")
+        manifest_raw = stream.read(16 * 1024 * 1024 + 1)
+    if (
+        len(manifest_raw) != matching[0].size
+        or _sha256(manifest_raw) != artifact.embedded_manifest_sha256
+    ):
+        raise ValueError("performance desktop embedded manifest bytes differ")
+    manifest = ReleaseManifestV1.from_bytes(manifest_raw)
+    if (
+        manifest.candidate_commit != candidate_commit
+        or manifest.logical_build_id != artifact_index.logical_build_id
+        or manifest.target.as_dict()
+        != {
+            "artifact_form": "DESKTOP_TAR_GZ",
+            "machine": "arm64",
+            "system": "Darwin",
+        }
+    ):
+        raise ValueError("performance desktop embedded manifest identity differs")
+    return _sha256(canonical_json_bytes([item.as_dict() for item in manifest.assets]))
+
+
+def _release_performance_verification_inputs(
+    repository: Path,
+    bundle,
+    build_evidence: ReleaseGateEvidenceV1,
+):
+    """Independently derive the complete provider-free WO40-I verifier input."""
+
+    from kirby2.release.artifacts import ReleaseArtifactBuildRecordV1
+    from kirby2.release.build import (
+        _release_performance_source_identities,
+    )
+    from kirby2.release.manifest import ReleaseArtifactIndexV1
+    from kirby2.release.performance import (
+        RunnerSourceTreeV1,
+        auxiliary_performance_templates,
+    )
+    from kirby2.release.performance_records import (
+        ReleasePerformanceVerificationInputsV1,
+    )
+    from kirby2.release.qualification import load_release_build_evidence_binding
+
+    build_relative = RELEASE_FUTURE_EVIDENCE_PATHS_V1["WO40-F"]
+    tracked, tracked_detail = _git_tracks_clean_working_file(repository, build_relative)
+    if not tracked:
+        raise ValueError(f"tracked WO40-F evidence is unavailable: {tracked_detail}")
+    build_path = (repository / build_relative).resolve(strict=True)
+    build_raw = build_path.read_bytes()
+    binding = load_release_build_evidence_binding(build_path)
+    if (
+        build_evidence.status != "PASS"
+        or build_evidence.candidate_commit != binding.candidate_commit
+        or build_evidence.protocol_set_sha256 != binding.protocol_set_sha256
+        or build_evidence.source_manifest_sha256 != binding.source_manifest_sha256
+        or build_evidence.artifact_index_sha256 != binding.artifact_index_sha256
+        or _sha256(build_raw) != binding.build_evidence_sha256
+        or bundle.protocol_set_sha256 != binding.protocol_set_sha256
+    ):
+        raise ValueError("tracked WO40-F evidence differs from the frozen release inputs")
+
+    artifact_root = (repository / ".kirby2/release").resolve(strict=True)
+    index_path = artifact_root / "release-artifact-index.json"
+    build_record_path = artifact_root / "release-build-record.json"
+    index_raw = index_path.read_bytes()
+    build_record_raw = build_record_path.read_bytes()
+    artifact_index = ReleaseArtifactIndexV1.from_bytes(index_raw)
+    build_record = ReleaseArtifactBuildRecordV1.from_bytes(build_record_raw)
+    if (
+        len(index_raw) != binding.artifact_index_record_size
+        or _sha256(index_raw) != binding.artifact_index_record_sha256
+        or len(build_record_raw) != binding.build_record_size
+        or _sha256(build_record_raw) != binding.build_record_sha256
+        or artifact_index.candidate_commit != binding.candidate_commit
+        or artifact_index.sha256 != binding.artifact_index_sha256
+        or build_record.candidate_commit != binding.candidate_commit
+        or build_record.protocol_set_sha256 != binding.protocol_set_sha256
+        or build_record.source_manifest_sha256 != binding.source_manifest_sha256
+        or build_record.artifact_index_sha256 != binding.artifact_index_sha256
+    ):
+        raise ValueError("WO40-F index or build record differs from its evidence")
+    for artifact in artifact_index.artifacts:
+        path = artifact_root / artifact.artifact_id
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise OSError("platform lacks O_NOFOLLOW artifact-read support")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        )
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_mode,
+            item.st_nlink,
+            item.st_uid,
+            item.st_gid,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o222
+                or before.st_size != artifact.size
+            ):
+                raise ValueError(
+                    "WO40-F indexed artifact is mutable, linked, or unsafe"
+                )
+            digest = hashlib.sha256()
+            remaining = artifact.size
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        final = path.lstat()
+        if (
+            remaining != 0
+            or digest.hexdigest() != artifact.transport_sha256
+            or identity(before) != identity(after)
+            or identity(after) != identity(final)
+        ):
+            raise ValueError("WO40-F indexed artifact bytes or identity changed")
+
+    source_lock_path = repository / "release/performance_runner_sources.lock"
+    source_lock_raw = source_lock_path.read_bytes()
+    source_tree = RunnerSourceTreeV1.from_bytes(source_lock_raw)
+    if source_tree.source_manifest_sha256 != binding.source_manifest_sha256:
+        raise ValueError("performance runner-source lock differs from WO40-F")
+    (
+        qualification_evidence_sha256,
+        source_artifact_manifest_sha256,
+        profile_manifest_sha256,
+        selected_plan_sha256,
+    ) = _release_performance_source_identities(repository)
+    auxiliary_templates = auxiliary_performance_templates(
+        starter_layout=bundle.artifact_layout.starter_set,
+        qualification_evidence_sha256=qualification_evidence_sha256,
+        source_artifact_manifest_sha256=source_artifact_manifest_sha256,
+        profile_manifest_sha256=profile_manifest_sha256,
+        selected_plan_sha256=selected_plan_sha256,
+    )
+    threshold_raw = (repository / "release/performance_thresholds.toml").read_bytes()
+    asset_manifest_sha256 = _selected_macos_desktop_assets_sha256(
+        artifact_root,
+        artifact_index,
+        candidate_commit=binding.candidate_commit,
+    )
+    return ReleasePerformanceVerificationInputsV1(
+        candidate_commit=binding.candidate_commit,
+        source_manifest_sha256=binding.source_manifest_sha256,
+        protocol_set_sha256=binding.protocol_set_sha256,
+        artifact_index_sha256=binding.artifact_index_sha256,
+        build_evidence_sha256=binding.build_evidence_sha256,
+        threshold_manifest_sha256=_sha256(threshold_raw),
+        runner_source_lock_sha256=_sha256(source_lock_raw),
+        row_corpus_sha256=bundle.performance_protocol.row_corpus_sha256,
+        source_tree=source_tree,
+        auxiliary_templates=auxiliary_templates,
+        microscope_asset_manifest_sha256=asset_manifest_sha256,
+    )
+
+
 def audit_release_frozen_evidence(gate_id: str) -> ReleaseAuditSuite:
     """Verify one predeclared F-I document without executing its one-time work."""
 
@@ -5061,6 +5282,190 @@ def audit_release_frozen_evidence(gate_id: str) -> ReleaseAuditSuite:
                         failures.append(
                             "platform evidence record digests differ from deep verification"
                         )
+
+        if (
+            gate_id == "WO40-I"
+            and build_path.is_file()
+            and build_evidence is not None
+        ):
+            from kirby2.release.performance import (
+                ReleaseAuxiliaryPerformanceResultV1,
+            )
+            from kirby2.release.performance_records import (
+                ReleasePerformanceAggregateV1,
+                ReleasePerformanceAttemptRecordV1,
+                release_performance_record_paths,
+                verify_release_performance_records,
+            )
+
+            artifact_root = repository / ".kirby2/release"
+            try:
+                inputs = _release_performance_verification_inputs(
+                    repository,
+                    bundle,
+                    build_evidence,
+                )
+                deep = verify_release_performance_records(
+                    artifact_root,
+                    inputs=inputs,
+                )
+                (
+                    aggregate_relative,
+                    attempt_relative,
+                    activation_relative,
+                ) = release_performance_record_paths()
+                aggregate_raw = (artifact_root / aggregate_relative).read_bytes()
+                attempt_raw = (artifact_root / attempt_relative).read_bytes()
+                activation_raw = (artifact_root / activation_relative).read_bytes()
+                aggregate = ReleasePerformanceAggregateV1.from_bytes(aggregate_raw)
+                attempt = ReleasePerformanceAttemptRecordV1.from_bytes(attempt_raw)
+                auxiliary_results = tuple(
+                    ReleaseAuxiliaryPerformanceResultV1.from_bytes(
+                        (artifact_root / item.result_record.path).read_bytes()
+                    )
+                    for item in attempt.auxiliaries
+                )
+            except (
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                tarfile.TarError,
+            ) as error:
+                failures.append(
+                    "deep performance verification failed: "
+                    f"{type(error).__name__}"
+                )
+            else:
+                if (
+                    evidence.status != deep.status
+                    or evidence.candidate_commit != deep.candidate_commit
+                    or evidence.source_manifest_sha256
+                    != deep.source_manifest_sha256
+                    or evidence.protocol_set_sha256 != deep.protocol_set_sha256
+                    or evidence.artifact_index_sha256
+                    != deep.artifact_index_sha256
+                    or aggregate.status != deep.status
+                    or attempt.status != deep.status
+                ):
+                    failures.append(
+                        "performance evidence status or upstream identity differs "
+                        "from deep verification"
+                    )
+
+                record_rows = (
+                    (
+                        "performance-activation",
+                        activation_relative,
+                        activation_raw,
+                        deep.activation_sha256,
+                    ),
+                    (
+                        "performance-aggregate",
+                        aggregate_relative,
+                        aggregate_raw,
+                        deep.aggregate_sha256,
+                    ),
+                    (
+                        "performance-attempt",
+                        attempt_relative,
+                        attempt_raw,
+                        deep.attempt_sha256,
+                    ),
+                )
+                expected_records = tuple(
+                    {
+                        "evidence_id": evidence_id,
+                        "path": f".kirby2/release/{record_path}",
+                        "sha256": expected_sha256,
+                        "size": len(raw),
+                    }
+                    for evidence_id, record_path, raw, expected_sha256 in record_rows
+                )
+                if any(
+                    _sha256(raw) != expected_sha256
+                    for _, _, raw, expected_sha256 in record_rows
+                ):
+                    failures.append(
+                        "performance deep-verification record digests changed on reread"
+                    )
+                if evidence.evidence_records != expected_records:
+                    failures.append(
+                        "performance evidence records differ from the three deep records"
+                    )
+
+                auxiliary_statuses = {
+                    result.workload_id: result.status
+                    for result in auxiliary_results
+                }
+                auxiliary_failed = "FAIL" in auxiliary_statuses.values()
+                auxiliary_warned = "WARNING" in auxiliary_statuses.values()
+                aggregate_check_status = (
+                    "FAIL"
+                    if aggregate.status == "FAIL" and not auxiliary_failed
+                    else (
+                        "WARNING"
+                        if aggregate.status == "PASS_WITH_WARNINGS"
+                        and not auxiliary_warned
+                        else "PASS"
+                    )
+                )
+                expected_checks: list[dict[str, object]] = []
+                for check_id in _required_future_check_ids("WO40-I"):
+                    if check_id.startswith("AUXILIARY:"):
+                        check_status = auxiliary_statuses.get(
+                            check_id.removeprefix("AUXILIARY:")
+                        )
+                        if check_status not in {"PASS", "WARNING", "FAIL"}:
+                            failures.append(
+                                "performance auxiliary check inventory differs"
+                            )
+                            check_status = "FAIL"
+                    elif check_id == "DETERMINISTIC_AGGREGATE":
+                        check_status = aggregate_check_status
+                    else:
+                        check_status = "PASS"
+                    expected_checks.append(
+                        {
+                            "check_id": check_id,
+                            "evidence_sha256": deep.aggregate_sha256,
+                            "status": check_status,
+                        }
+                    )
+                if evidence.checks != tuple(expected_checks):
+                    failures.append(
+                        "performance evidence checks differ from reconstructed "
+                        "cell, auxiliary, and aggregate results"
+                    )
+
+                reconstructed_facts = {
+                    "auxiliary_result_count": aggregate.auxiliary_result_count,
+                    "complete_artifact_records": aggregate.complete_artifact_records,
+                    "complete_audit_records": aggregate.complete_audit_records,
+                    "complete_result_records": aggregate.complete_result_records,
+                    "complete_run_work_units": aggregate.complete_work_unit_count,
+                    "unique_complete_run_ids": aggregate.unique_complete_run_ids,
+                }
+                expected_facts = {
+                    "auxiliary_result_count": 5,
+                    "complete_artifact_records": 10_000,
+                    "complete_audit_records": 10_000,
+                    "complete_result_records": 10_000,
+                    "complete_run_work_units": 10_000,
+                    "unique_complete_run_ids": 10_000,
+                }
+                if (
+                    reconstructed_facts != expected_facts
+                    or evidence.facts != reconstructed_facts
+                    or deep.work_unit_count != 10_000
+                    or deep.complete_work_unit_count != 10_000
+                    or deep.auxiliary_result_count != 5
+                    or any(item.status != "COMPLETE" for item in attempt.work_units)
+                ):
+                    failures.append(
+                        "performance evidence facts differ from the reconstructed "
+                        "10,000-unit publication"
+                    )
 
     if gate_id == "WO40-H":
         macos_path = repository / RELEASE_FUTURE_EVIDENCE_PATHS_V1["WO40-G"]

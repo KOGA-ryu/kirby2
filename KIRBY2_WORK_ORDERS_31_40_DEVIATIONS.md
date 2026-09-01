@@ -1037,3 +1037,126 @@ required release order; the `df2d63e` historical snapshot remains immutable; and
 the four-case deviation audit proves dispatch, transport/isolation, hostile-result
 cleanup, and cross-platform-baseline structure without importing the executor,
 opening SSH/SFTP, touching a provider, or executing a qualification workload.
+
+## DEV-0016 — Execute release performance qualification
+
+- Interrupted canonical card: `WO40-I`
+- Exact first-parent predecessor:
+  `627d6a446ac56f5f60623f75823845805a70aeeb`
+- Historical release: the predecessor is the completed WO40-H evidence commit for
+  source candidate `674d3094764622e34d88f1df7095a8f7db9e5bdc`.  Before this
+  repair changes candidate source, its immutable history snapshot is preserved at
+  `.kirby2/release-history/627d6a446ac56f5f60623f75823845805a70aeeb/`.
+  Its V2 manifest binds exactly sixteen payloads: WO40-F, WO40-G, and WO40-H
+  evidence; the provider inventory; both provider attestations; both qualification
+  attempts; six release transports; the artifact index; and the build record.  The
+  history manifest separately binds the release-evidence commit and source candidate
+  and remains outside the governed active artifact store.
+- Reproducer:
+  `PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py qualify-performance --manifest release/performance_thresholds.toml --complete-run-work-units 10000 --build-evidence KIRBY2_RELEASE_BUILD_EVIDENCE.md --artifact-store .kirby2/release`
+- Observed terminal result: `READY` with exit status zero after validating only the
+  manifest path, requested count, build-evidence path, artifact-index path, and
+  runner-source-lock path.  The command did not execute an installed artifact,
+  dispatch a row, start four workers, admit a FIFO item, measure an auxiliary
+  workload, enforce an attempt limit, retry a failure, write an immutable performance
+  record, activate an aggregate, create WO40-I evidence, or deeply verify a result.
+- Root cause: WO40-D preregistered the complete row/auxiliary schemas, templates,
+  thresholds, command names, and generic evidence envelope, but its production
+  command handlers deliberately stopped at source binding and readiness.  No closed
+  installed-artifact row executor consumes a bound row, no coordinator owns the
+  four-worker/256-row FIFO and retry/resource protocol, no measurement adapter owns
+  the five auxiliary workloads, no immutable performance-record/activation grammar
+  exists, and the generic WO40-I audit trusts declared counts and opaque referenced
+  bytes instead of reconstructing them through a deep verifier.
+- Repair: retain the canonical `qualify-performance` and
+  `qualify-performance-row` command names, but replace their `READY` endpoints with
+  one closed execution policy `KIRBY2_RELEASE_PERFORMANCE_EXECUTION_V1`.  Add an
+  installed-artifact row worker that consumes only the committed protocol, bound
+  source projection, immutable WO40-F artifacts, exact work-unit ID, and authorized
+  attempt; executes the row's named production runner; materializes the six semantic
+  members and permitted operational/legacy sidecars; and independently reparses and
+  verifies the result before returning it.  Normalize the mathematically zero input
+  produced by a negatively directed queue-reactive rule to positive zero at the
+  production term boundary so the frozen float-free release projection cannot be
+  defeated by an IEEE-754 sign bit with no numerical meaning.  Attempt two is admitted only after
+  attempt one records `PROCESS_FAILURE` or `RESOURCE_LIMIT`, and it never creates a
+  second logical work unit.  Add one coordinator with exactly four ready worker
+  processes, at most four concurrent attempts, and a FIFO capacity of 256; it enforces the
+  committed per-attempt and 36-hour limits, records every attempt, refuses duplicate
+  or missing IDs, verifies every completed tuple before admission, and derives the
+  deterministic 10,000-unit aggregate without allowing operational timing to alter
+  semantic identity.  Execute the five committed auxiliary templates against their
+  selected installed desktop/headless artifact, retain exact warmup and measured
+  series, apply the preregistered reductions and thresholds, and preserve every
+  honest warning, failure, and unavailable reduction.  Add typed immutable work-unit,
+  aggregate, and activation records beneath one closed release-store path grammar;
+  publish content-addressed records first, the verified aggregate next, and the
+  activation record plus `KIRBY2_RELEASE_PERFORMANCE_EVIDENCE.md` last.  Existing
+  identical bytes are idempotent and any conflicting path, digest, candidate,
+  protocol, source, artifact, count, status, or activation fails closed.  Add a deep
+  provider-free verifier that never executes a workload: it reparses every referenced
+  typed record, reconstructs the five auxiliary results and 10,000 unique complete
+  work-unit/result/artifact/audit tuples, re-evaluates attempts, resource/retry rules,
+  semantic/CAS identities, thresholds, throughput, artifact accounting, aggregate,
+  and evidence checks, and rereads the activation and immutable identities at the
+  end.  Keep `release/performance_thresholds.toml` byte unchanged and mechanically
+  regenerate only `release/performance_runner_sources.lock` after the repair source
+  is final.
+- Owned repair paths: `kirby2/release/performance_execution.py`,
+  `kirby2/release/performance_worker.py`, `kirby2/release/performance_records.py`,
+  `kirby2/release/performance_auxiliary.py`,
+  `kirby2/simulation/queue_reactive.py`,
+  `kirby2/release/commands.py`, `kirby2/release/__init__.py`,
+  `kirby2/audit/release.py`, `kirby2/audit/expansion.py`,
+  `release/performance_runner_sources.lock`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0016` through K2X-02 immediately after completed
+  `WO40-H` and before resumed `WO40-I`; the release sequence is exactly
+  `DEV-0014`, `WO40-G`, `DEV-0015`, `WO40-H`, `DEV-0016`, `WO40-I`, and
+  `WO40-J`, and the deviation inventory extends monotonically through
+  `DEV-0016`.
+- Inherited gates: candidate/history immutability; five frozen protocol files;
+  exact performance manifest bytes; row corpus, cell/root/order, generated
+  configurations, native fixtures, runner sources, capability/check arrays, semantic
+  artifact tuple, four-worker/256-FIFO resources, retry count, attempt/total limits,
+  auxiliary sample counts, reduction formulas, thresholds, aggregate accounting,
+  designated installed target, artifact identities, product limitations, and every
+  earlier production contract remain unchanged.  This amendment authorizes only the
+  closed qualification executor, immutable publication, and provider-free verifier;
+  it does not authorize a performance workload, threshold observation, threshold
+  change, brokerage, live-market connection, credential creation, telemetry,
+  updater, background service, network download, GPU workload, or final closeout.
+  After repair source and the mechanically regenerated source lock commit cleanly,
+  that commit is the sole repaired candidate; WO40-F is rebuilt from it, WO40-G and
+  WO40-H are requalified against it in order, and only then may canonical WO40-I
+  execute the already committed performance protocol.
+- Exact commit subject: `Execute release performance qualification`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0011
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0012
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0013
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0014
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0015
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0016
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m compileall -q kirby2
+git diff --check
+```
+
+Acceptance: the canonical commands route to the installed-artifact qualification
+policy instead of reporting readiness; one verified row executor, exact
+four-worker/256-FIFO coordinator, and five auxiliary adapters produce immutable typed
+records and publish a single activation only after a fully reconstructed aggregate;
+the deep verifier reconstructs all counts, identities, attempts, thresholds, and
+evidence without executing a workload; the performance-threshold manifest remains
+byte identical; the complete registry contains DEV-0001 through DEV-0016 in the
+required release order; the `627d6a4` V2 historical snapshot remains immutable; and
+the deviation gate proves the public source seams, execution policy, command routing,
+publication/deep-verification surface, and frozen threshold bytes without importing
+the performance executor, starting a worker, opening a provider, or running any
+performance or auxiliary workload.
