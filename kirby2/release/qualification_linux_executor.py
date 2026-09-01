@@ -77,6 +77,7 @@ from .qualification_executor import (
     _same_snapshot,
     _sha256,
     _stable_read,
+    _validated_worker_failure_fields,
     _write_private,
 )
 from .qualification_records import (
@@ -2151,14 +2152,10 @@ def _parse_worker_result(
             terminal=True,
         )
     if status != "PASS":
-        code = payload.get("failure_code")
-        detail = payload.get("detail")
-        if type(code) is not str or type(detail) is not str:
-            raise _QualificationRefused(
-                QualificationExecutorRefusalCodeV1.RESULT_INVALID,
-                "failed Linux worker result omitted its closed failure fields",
-                terminal=True,
-            )
+        code, detail = _validated_worker_failure_fields(
+            payload,
+            label="failed Linux qualification worker result",
+        )
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_EXECUTION_FAILED,
             f"installed Linux qualification worker {status.lower()}: {code}: {detail}",

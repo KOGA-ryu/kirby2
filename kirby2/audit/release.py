@@ -4478,12 +4478,19 @@ def audit_release_linux_qualification_executor_restart() -> ReleaseAuditSuite:
         transport_failures.append(
             "Linux pack staging can inherit an exhausted duplicated directory cursor"
         )
+    executor_source = sources["executor"]
     if (
         "diagnostic = stderr if stderr.strip() else stdout" not in worker_source
-        or "no command diagnostic output" not in worker_source
+        or "_COMMAND_DIAGNOSTIC_MAX_BYTES" not in worker_source
+        or "encoded_size + required > maximum_bytes" not in worker_source
+        or "encoded[:maximum_bytes].decode(\"utf-8\", errors=\"ignore\")"
+        not in worker_source
+        or "_validated_worker_failure_fields" not in executor_source
+        or "_validated_worker_failure_fields" not in linux_source
+        or "_WORKER_FAILURE_DETAIL_MAX_BYTES_V1" not in executor_source
     ):
         transport_failures.append(
-            "Linux stdout-only product failures can escape the typed outcome grammar"
+            "worker failures can escape the bounded typed outcome grammar"
         )
     if (
         "_PROCESS_ABSENCE_SCRIPT" not in linux_source

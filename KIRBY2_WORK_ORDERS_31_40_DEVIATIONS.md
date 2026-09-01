@@ -957,8 +957,10 @@ macOS `test` call sites, and does not execute the one-time qualification workloa
   inside the marker-bound root even if the account's sudo policy or real home
   changes.  Rewind every pinned descriptor-backed pack-stage directory before its
   exact scan because Linux shares directory cursors across duplicates, and prefer
-  bounded stdout diagnostics when a product command fails without stderr so a
-  typed refusal cannot be masked by edge whitespace.  Cleanup
+  bounded-memory, NFC-normalized, control-free stdout diagnostics capped by UTF-8
+  bytes when a product command fails without stderr.  Both host controllers
+  independently validate the closed failure-code grammar and diagnostic byte budget
+  so a typed refusal cannot be masked by malformed worker output.  Cleanup
   revalidates the owned remote-root grammar and marker, runs from `finally`, and
   turns ambiguous or failed cleanup into a typed refusal.  Bound every isolated
   command with a shorter remote timeout and a kill-on-parent-exit PID namespace;

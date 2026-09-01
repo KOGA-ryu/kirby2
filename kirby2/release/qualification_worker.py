@@ -100,6 +100,9 @@ _ROOT_ROLE_BY_STEP: Final = {
 }
 _MAX_CAPTURE_BYTES: Final = 16 * 1024 * 1024
 _COMMAND_TIMEOUT_SECONDS: Final = 240
+_COMMAND_DIAGNOSTIC_MAX_BYTES: Final = 2048
+_FAILURE_CODE_MAX_BYTES: Final = 128
+_FAILURE_DETAIL_MAX_BYTES: Final = 3072
 _SHA256_EMPTY: Final = hashlib.sha256(b"").hexdigest()
 
 
@@ -107,8 +110,8 @@ class QualificationFailure(RuntimeError):
     """One closed worker refusal or failed product expectation."""
 
     def __init__(self, code: str, detail: str) -> None:
-        self.code = _safe_text(code, 128)
-        self.detail = _safe_text(detail, 4096)
+        self.code = _safe_text(code, _FAILURE_CODE_MAX_BYTES)
+        self.detail = _safe_text(detail, _FAILURE_DETAIL_MAX_BYTES)
         super().__init__(f"{self.code}: {self.detail}")
 
 
@@ -287,9 +290,9 @@ class _Worker:
             raise QualificationFailure("COMMAND_TIMEOUT", step_id)
         if process.returncode != expected_exit:
             diagnostic = stderr if stderr.strip() else stdout
-            detail = (
-                diagnostic.decode("utf-8", errors="replace").strip()[:2048].strip()
-                or "no command diagnostic output"
+            detail = _safe_text(
+                diagnostic.decode("utf-8", errors="replace"),
+                _COMMAND_DIAGNOSTIC_MAX_BYTES,
             )
             raise QualificationFailure(
                 "PRODUCT_COMMAND_FAILED",
@@ -876,10 +879,38 @@ class _Worker:
         )
 
 
-def _safe_text(value: object, limit: int) -> str:
-    text = str(value)
-    text = unicodedata.normalize("NFC", text).replace("\x00", "?")
-    return text[:limit]
+def _safe_text(value: object, maximum_bytes: int) -> str:
+    """Return one outcome-safe diagnostic bounded by canonical UTF-8 bytes."""
+
+    if type(maximum_bytes) is not int or maximum_bytes < len("unavailable"):
+        raise ValueError("safe-text byte limit is invalid")
+    characters: list[str] = []
+    encoded_size = 0
+    pending_space = False
+    for character in str(value):
+        if character.isspace() or unicodedata.category(character).startswith("C"):
+            pending_space = bool(characters)
+            continue
+        encoded_character = character.encode("utf-8")
+        required = len(encoded_character) + (1 if pending_space else 0)
+        if encoded_size + required > maximum_bytes:
+            break
+        if pending_space:
+            characters.append(" ")
+            encoded_size += 1
+            pending_space = False
+        characters.append(character)
+        encoded_size += len(encoded_character)
+    text = unicodedata.normalize("NFC", "".join(characters))
+    if not text:
+        text = "unavailable"
+    encoded = text.encode("utf-8")
+    if len(encoded) > maximum_bytes:
+        text = unicodedata.normalize(
+            "NFC",
+            encoded[:maximum_bytes].decode("utf-8", errors="ignore").rstrip(),
+        )
+    return text or "unavailable"
 
 
 def _utc_second_now() -> str:
@@ -1807,9 +1838,9 @@ def _failure_result(
     body = {
         "attempt_root": None if attempt_root is None else os.fspath(attempt_root),
         "command_observations": [],
-        "detail": _safe_text(detail, 4096),
+        "detail": _safe_text(detail, _FAILURE_DETAIL_MAX_BYTES),
         "execution_policy_id": EXECUTION_POLICY_ID,
-        "failure_code": _safe_text(code, 128),
+        "failure_code": _safe_text(code, _FAILURE_CODE_MAX_BYTES),
         "form": form,
         "offline": True,
         "schema_id": WORKER_SCHEMA_ID,

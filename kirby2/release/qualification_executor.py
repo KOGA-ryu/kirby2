@@ -33,7 +33,11 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Final, Mapping, Sequence
 
-from kirby2.packs.formats import canonical_json_bytes, load_canonical_json_bytes
+from kirby2.packs.formats import (
+    canonical_json_bytes,
+    load_canonical_json_bytes,
+    require_nfc_text,
+)
 
 from .artifacts import (
     RELEASE_ARTIFACT_INDEX_FILENAME_V1,
@@ -131,6 +135,8 @@ _CLONE_NAME = re.compile(
 )
 _GUEST_HOME = re.compile(r"/Users/[A-Za-z0-9._-]{1,128}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_WORKER_FAILURE_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
+_WORKER_FAILURE_DETAIL_MAX_BYTES_V1: Final = 3072
 _WORKER_SCHEMA_ID_V1: Final[str] = (
     "KIRBY2_RELEASE_QUALIFICATION_WORKER_RESULT_V1"
 )
@@ -1724,6 +1730,39 @@ def _install_form(
     return installed_python, launcher, tuple(commands)
 
 
+def _validated_worker_failure_fields(
+    payload: Mapping[str, object],
+    *,
+    label: str,
+) -> tuple[str, str]:
+    code = payload.get("failure_code")
+    detail = payload.get("detail")
+    try:
+        canonical_code = require_nfc_text(
+            code,
+            f"{label} failure code",
+            maximum_bytes=128,
+        )
+        canonical_detail = require_nfc_text(
+            detail,
+            f"{label} detail",
+            maximum_bytes=_WORKER_FAILURE_DETAIL_MAX_BYTES_V1,
+        )
+    except (TypeError, ValueError) as error:
+        raise _QualificationRefused(
+            QualificationExecutorRefusalCodeV1.RESULT_INVALID,
+            f"{label} has noncanonical failure fields",
+            terminal=True,
+        ) from error
+    if _WORKER_FAILURE_CODE.fullmatch(canonical_code) is None:
+        raise _QualificationRefused(
+            QualificationExecutorRefusalCodeV1.RESULT_INVALID,
+            f"{label} has an invalid failure code",
+            terminal=True,
+        )
+    return canonical_code, canonical_detail
+
+
 def _parse_worker_result(
     *,
     form: str,
@@ -1796,14 +1835,10 @@ def _parse_worker_result(
             terminal=True,
         )
     if status != "PASS":
-        code = payload.get("failure_code")
-        detail = payload.get("detail")
-        if type(code) is not str or type(detail) is not str:
-            raise _QualificationRefused(
-                QualificationExecutorRefusalCodeV1.RESULT_INVALID,
-                "failed qualification worker result omitted its closed failure fields",
-                terminal=True,
-            )
+        code, detail = _validated_worker_failure_fields(
+            payload,
+            label="failed qualification worker result",
+        )
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_EXECUTION_FAILED,
             f"installed qualification worker {status.lower()}: {code}: {detail}",
