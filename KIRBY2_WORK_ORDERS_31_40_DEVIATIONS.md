@@ -810,7 +810,13 @@ deviation audit.
   then showed that the 10-second guest-agent probe timeout was incorrectly terminal
   even though the provider owns a bounded 300-second boot deadline; the repaired
   poll treats only that fixed probe timeout as retryable and retains terminal
-  timeouts for every qualification workload command.
+  timeouts for every qualification workload command.  The repaired boot then
+  reached the cleanliness proof and correctly refused the stock Tart image because
+  its `admin-nopasswd` sudo drop-in grants unrestricted passwordless root authority.
+  Preparing a derived base exposed one further identity gap: the fixed provider
+  bound its configuration, NVRAM, disk size, owner, link count, and writable-mode
+  restrictions, but not the 80 GB disk contents that actually carry the guest
+  policy.
 - Repair: add strict canonical provider-attestation, command-observation,
   root-observation, session, step, and qualification-attempt records; a closed
   installed guest worker for the exact desktop/headless matrix; and a closed Tart
@@ -825,7 +831,16 @@ deviation audit.
   evidence, artifact index, build record, and selected transports; it cannot trust
   check digests supplied by the attempt or evidence document.  Repair only the two
   pack/doctor blockers reproduced above.  Keep `release/qualification.toml` byte
-  unchanged.
+  unchanged.  Preserve the stock VM and every superseded WO40-F artifact set;
+  derive a separately named offline base, remove only its exact passwordless-sudo
+  drop-in while retaining a root-only recovery copy, and pin its new configuration,
+  NVRAM, and streamed whole-disk SHA-256 under a distinct hardened-provider policy.
+  The disk verifier must use a no-follow descriptor, bounded streaming memory, and
+  stable before/after file identity rather than loading the image or trusting its
+  path metadata alone.  Each randomized disposable clone must then reproduce the
+  fixed hardware/ECID projection, NVRAM digest, disk digest, and exact disk mode
+  immediately before its sequential boot; hashing only the named base is
+  insufficient evidence for the bytes copied into the qualification guest.
 - Owned repair paths: `kirby2/packs/builders.py`, `kirby2/release/doctor.py`,
   `kirby2/release/artifacts.py`,
   `kirby2/release/qualification.py`,
@@ -868,7 +883,9 @@ real executor rather than a `READY` dispatcher; the controller has no generic
 command, VM, network, or cleanup surface and contains no NAT fallback; the installed
 worker refuses checkout execution; the complete registry contains DEV-0001 through
 DEV-0014; artifact construction still requires the recorded Codex network gate while
-provider-free read-only verification does not forge that ambient marker; the previous
-candidate is retained as history; and the deviation audit does not clone, boot,
-connect to, mutate, or delete a provider or execute the one-time qualification
-workload.
+provider-free read-only verification does not forge that ambient marker; previous
+candidate artifacts remain in canonical local release-history snapshots; the
+hardened provider and each preboot clone bind exact configuration capability, NVRAM,
+disk contents, size, and mode; hostile digest inputs fail closed; and the deviation
+audit does not clone, boot, connect to, mutate, or delete a provider or execute the
+one-time qualification workload.

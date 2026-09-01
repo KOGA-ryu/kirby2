@@ -3106,6 +3106,8 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     from kirby2.release.qualification_executor import (
         TART_BASE_CONFIG_SHA256_V1,
         TART_BASE_DISK_BYTES_V1,
+        TART_BASE_DISK_MODE_V1,
+        TART_BASE_DISK_SHA256_V1,
         TART_BASE_NVRAM_SHA256_V1,
         TART_BASE_VM_V1,
         TART_EXECUTABLE_MODE_V1,
@@ -3612,6 +3614,7 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     )
 
     surface_failures: list[str] = []
+    digest_refusals: list[str] = []
 
     def signature_projection(target: object) -> list[list[object]]:
         signature = inspect.signature(target)
@@ -3662,6 +3665,8 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     tart_constants = {
         "base_config_sha256": TART_BASE_CONFIG_SHA256_V1,
         "base_disk_bytes": TART_BASE_DISK_BYTES_V1,
+        "base_disk_mode": TART_BASE_DISK_MODE_V1,
+        "base_disk_sha256": TART_BASE_DISK_SHA256_V1,
         "base_nvram_sha256": TART_BASE_NVRAM_SHA256_V1,
         "base_vm": TART_BASE_VM_V1,
         "executable": os.fspath(TART_EXECUTABLE_V1),
@@ -3673,19 +3678,23 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     }
     expected_tart_constants = {
         "base_config_sha256": (
-            "7049c4f9d0bb1901fc8fa77965f8543e7dc62e513bfa885e16c84a82e653a97b"
+            "1f1175a3731ab4fbb1beff6990775fdbfb00931a10c7d43be87915a766699d8c"
         ),
         "base_disk_bytes": 80_000_000_000,
-        "base_nvram_sha256": (
-            "67f21de21c4643f79cb1ee1e0597ea21f0f4d94c54e0b96468db19f8b3517f56"
+        "base_disk_mode": 0o644,
+        "base_disk_sha256": (
+            "fa88c6aae58badcf38943ee2c85cf9070d0a79ceff801c2114a9767f82f572a3"
         ),
-        "base_vm": "kirby2-dev0014-macos-offline-base",
+        "base_nvram_sha256": (
+            "69078eae7ddf3193411d98f27931674a6abfd75fca229f082591525eddea8387"
+        ),
+        "base_vm": "kirby2-dev0014-macos-offline-base-hardened",
         "executable": "/opt/homebrew/Cellar/tart/2.32.1/bin/tart",
         "executable_mode": 0o555,
         "executable_sha256": (
             "44137d8dba251d4a4f9a113ecc8619d821ea7ea0f28217a88f57dde894d83d76"
         ),
-        "provider_policy": "KIRBY2_TART_HOST_ONLY_PROVIDER_V1",
+        "provider_policy": "KIRBY2_TART_HOST_ONLY_HARDENED_PROVIDER_V1",
         "target": "macos-arm64",
         "version": "2.32.1",
     }
@@ -3706,10 +3715,86 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         )
         if not path_snapshot.raw:
             surface_failures.append("qualification concrete Path probe is empty")
+        path_digest = executor_module._stable_file_digest(
+            concrete_path,
+            expected_bytes=len(path_snapshot.raw),
+        )
+        if (
+            path_digest.sha256 != path_snapshot.sha256
+            or path_digest.identity != path_snapshot.identity
+        ):
+            surface_failures.append("streamed provider digest differs from stable read")
     except (OSError, TypeError, ValueError) as error:
         surface_failures.append(
             f"qualification concrete Path probe failed: {type(error).__name__}"
         )
+    try:
+        with TemporaryDirectory(prefix="kirby2-release-dev0014-digest-") as temporary:
+            fixture = Path(temporary) / "provider.img"
+            fixture.write_bytes(b"fixed-provider-digest-fixture")
+            fixture.chmod(0o644)
+            fixture_bytes = fixture.stat().st_size
+
+            def require_digest_refusal(fixture_id: str, target: Path, size: int) -> None:
+                try:
+                    executor_module._stable_file_digest(target, expected_bytes=size)
+                except (OSError, ValueError):
+                    digest_refusals.append(fixture_id)
+                else:
+                    surface_failures.append(
+                        f"provider digest accepted hostile fixture: {fixture_id}"
+                    )
+
+            symlink = Path(temporary) / "provider-symlink.img"
+            symlink.symlink_to(fixture)
+            require_digest_refusal("symlink", symlink, fixture_bytes)
+
+            hardlink = Path(temporary) / "provider-hardlink.img"
+            os.link(fixture, hardlink)
+            require_digest_refusal("hardlink", fixture, fixture_bytes)
+            hardlink.unlink()
+
+            require_digest_refusal("wrong-size", fixture, fixture_bytes + 1)
+            fixture.chmod(0o666)
+            require_digest_refusal("writable-mode", fixture, fixture_bytes)
+            fixture.chmod(0o644)
+
+            original_read = executor_module.os.read
+            try:
+                executor_module.os.read = lambda _descriptor, _size: b""
+                require_digest_refusal("short-read", fixture, fixture_bytes)
+            finally:
+                executor_module.os.read = original_read
+
+            original_identity = executor_module._identity
+            identity_calls = 0
+
+            def drifting_identity(metadata: os.stat_result) -> tuple[int, ...]:
+                nonlocal identity_calls
+                identity_calls += 1
+                value = original_identity(metadata)
+                if identity_calls == 2:
+                    return (*value[:-1], value[-1] + 1)
+                return value
+
+            try:
+                executor_module._identity = drifting_identity
+                require_digest_refusal("changed-identity", fixture, fixture_bytes)
+            finally:
+                executor_module._identity = original_identity
+    except (OSError, TypeError, ValueError) as error:
+        surface_failures.append(
+            f"provider digest hostile fixtures failed: {type(error).__name__}"
+        )
+    if sorted(digest_refusals) != [
+        "changed-identity",
+        "hardlink",
+        "short-read",
+        "symlink",
+        "writable-mode",
+        "wrong-size",
+    ]:
+        surface_failures.append("provider digest hostile-refusal inventory differs")
     try:
         diagnostic = executor_module._diagnostic_excerpt(
             b"root privilege required\nRuntimeFailed\tSoftnet\r",
@@ -3741,6 +3826,63 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         )
 
     provider_node = function_node(executor_tree, "_require_tart_provider")
+    digest_node = function_node(executor_tree, "_stable_file_digest")
+    clone_node = function_node(executor_tree, "_create_clone")
+    executor_node = function_node(executor_tree, "execute_release_qualification")
+    digest_names = (
+        set()
+        if digest_node is None
+        else {
+            item.id
+            for item in ast.walk(digest_node)
+            if isinstance(item, ast.Name)
+        }
+    )
+    digest_literals = (
+        set()
+        if digest_node is None
+        else {
+            item.value
+            for item in ast.walk(digest_node)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+    )
+    digest_fstat_calls = (
+        0
+        if digest_node is None
+        else sum(
+            1
+            for item in ast.walk(digest_node)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "fstat"
+        )
+    )
+    digest_attributes = (
+        set()
+        if digest_node is None
+        else {
+            item.attr
+            for item in ast.walk(digest_node)
+            if isinstance(item, ast.Attribute)
+        }
+    )
+    if (
+        digest_node is None
+        or "_PROVIDER_DIGEST_CHUNK_BYTES" not in digest_names
+        or "_identity" not in digest_names
+        or "O_NOFOLLOW" not in digest_literals
+        or digest_fstat_calls != 2
+        or not {
+            "getuid",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_uid",
+        }.issubset(digest_attributes)
+    ):
+        surface_failures.append("streamed provider digest structure is not fail-closed")
+
     provider_names = (
         set()
         if provider_node is None
@@ -3752,6 +3894,46 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
     )
     if "TART_EXECUTABLE_MODE_V1" not in provider_names:
         surface_failures.append("Tart provider omits its executable-mode binding")
+    if "TART_BASE_DISK_SHA256_V1" not in provider_names:
+        surface_failures.append("Tart provider omits its whole-disk content binding")
+    provider_source = "" if provider_node is None else ast.unparse(provider_node)
+    clone_source = "" if clone_node is None else ast.unparse(clone_node)
+    required_provider_bindings = {
+        "disk.sha256 != TART_BASE_DISK_SHA256_V1",
+        "_identity(disk_metadata) != disk.identity",
+        "stat.S_IMODE(disk_metadata.st_mode) != TART_BASE_DISK_MODE_V1",
+        "QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH",
+    }
+    if not all(binding in provider_source for binding in required_provider_bindings):
+        surface_failures.append("fixed provider omits a disk identity or refusal binding")
+    if provider_source.count("except (OSError, ValueError) as error:") < 2:
+        surface_failures.append("fixed provider does not normalize file identity refusals")
+    required_clone_bindings = {
+        "disk.sha256 != TART_BASE_DISK_SHA256_V1",
+        "nvram.sha256 != TART_BASE_NVRAM_SHA256_V1",
+        "projection != base_projection",
+        "stat.S_IMODE(disk_metadata.st_mode) != TART_BASE_DISK_MODE_V1",
+        "QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH",
+    }
+    if not all(binding in clone_source for binding in required_clone_bindings):
+        surface_failures.append("qualification clone omits a preboot provider binding")
+
+    sequential_clone_loops = 0
+    if executor_node is not None:
+        for item in ast.walk(executor_node):
+            if not isinstance(item, ast.For):
+                continue
+            called = {
+                node.func.id
+                for node in ast.walk(item)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            if {"_create_clone", "_run_form"}.issubset(called):
+                sequential_clone_loops += 1
+    if sequential_clone_loops != 1:
+        surface_failures.append(
+            "clone verification and workload are not one sequential lifecycle"
+        )
 
     host_launch = function_node(executor_tree, "_spawn_host_only_vm")
     run_calls: list[ast.Call] = []
@@ -3878,7 +4060,9 @@ def audit_release_qualification_executor_restart() -> ReleaseAuditSuite:
         {
             "executor_invocations": 0,
             "executor_signature": observed_executor_signature,
+            "provider_digest_refusals": digest_refusals,
             "network_tokens": executable_network_tokens,
+            "sequential_clone_loops": sequential_clone_loops,
             "retryable_boot_timeout_calls": retryable_boot_timeout_calls,
             "tart": tart_constants,
             "verifier_signature": observed_verifier_signature,

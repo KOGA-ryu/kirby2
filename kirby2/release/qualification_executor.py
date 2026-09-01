@@ -83,15 +83,21 @@ TART_EXECUTABLE_SHA256_V1: Final[str] = (
     "44137d8dba251d4a4f9a113ecc8619d821ea7ea0f28217a88f57dde894d83d76"
 )
 TART_EXECUTABLE_MODE_V1: Final[int] = 0o555
-TART_BASE_VM_V1: Final[str] = "kirby2-dev0014-macos-offline-base"
+TART_BASE_VM_V1: Final[str] = "kirby2-dev0014-macos-offline-base-hardened"
 TART_BASE_CONFIG_SHA256_V1: Final[str] = (
-    "7049c4f9d0bb1901fc8fa77965f8543e7dc62e513bfa885e16c84a82e653a97b"
+    "1f1175a3731ab4fbb1beff6990775fdbfb00931a10c7d43be87915a766699d8c"
 )
 TART_BASE_NVRAM_SHA256_V1: Final[str] = (
-    "67f21de21c4643f79cb1ee1e0597ea21f0f4d94c54e0b96468db19f8b3517f56"
+    "69078eae7ddf3193411d98f27931674a6abfd75fca229f082591525eddea8387"
 )
 TART_BASE_DISK_BYTES_V1: Final[int] = 80_000_000_000
-TART_PROVIDER_POLICY_ID_V1: Final[str] = "KIRBY2_TART_HOST_ONLY_PROVIDER_V1"
+TART_BASE_DISK_MODE_V1: Final[int] = 0o644
+TART_BASE_DISK_SHA256_V1: Final[str] = (
+    "fa88c6aae58badcf38943ee2c85cf9070d0a79ceff801c2114a9767f82f572a3"
+)
+TART_PROVIDER_POLICY_ID_V1: Final[str] = (
+    "KIRBY2_TART_HOST_ONLY_HARDENED_PROVIDER_V1"
+)
 TART_TARGET_ID_V1: Final[str] = "macos-arm64"
 
 _FORMS: Final[tuple[str, ...]] = ("desktop", "headless")
@@ -139,6 +145,7 @@ _WORKER_TIMEOUT_SECONDS: Final[int] = 3_600
 _COMMAND_OUTPUT_MAX_BYTES: Final[int] = 16 * 1024 * 1024
 _WORKER_OUTPUT_MAX_BYTES: Final[int] = 32 * 1024 * 1024
 _BUILD_EVIDENCE_MAX_BYTES: Final[int] = 16 * 1024 * 1024
+_PROVIDER_DIGEST_CHUNK_BYTES: Final[int] = 8 * 1024 * 1024
 _MINIMUM_GUEST_FREE_BYTES: Final[int] = 20 * 1024 * 1024 * 1024
 _MINIMUM_HOST_FREE_BYTES: Final[int] = 40 * 1024 * 1024 * 1024
 
@@ -182,6 +189,12 @@ class _FileSnapshot:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.raw).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _FileDigest:
+    sha256: str
+    identity: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +349,49 @@ def _stable_read(path: Path, *, maximum_bytes: int, require_read_only: bool) -> 
         if len(raw) != before.st_size or _identity(before) != _identity(after):
             raise ValueError(f"qualification input changed while read: {path.name}")
         return _FileSnapshot(raw=raw, identity=_identity(before))
+    finally:
+        os.close(descriptor)
+
+
+def _stable_file_digest(path: Path, *, expected_bytes: int) -> _FileDigest:
+    """Stream one exact regular file while proving its identity stayed stable."""
+
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError("qualification digest path must be absolute")
+    if type(expected_bytes) is not int or expected_bytes <= 0:
+        raise ValueError("qualification digest size must be one positive integer")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("platform lacks no-follow input support")
+    descriptor = os.open(path, flags | nofollow)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or before.st_size != expected_bytes
+            or before.st_mode & 0o022
+        ):
+            raise ValueError(
+                f"qualification digest input differs from its fixed identity: {path.name}"
+            )
+        digest = hashlib.sha256()
+        observed_bytes = 0
+        while observed_bytes < expected_bytes:
+            chunk = os.read(
+                descriptor,
+                min(_PROVIDER_DIGEST_CHUNK_BYTES, expected_bytes - observed_bytes),
+            )
+            if not chunk:
+                break
+            digest.update(chunk)
+            observed_bytes += len(chunk)
+        after = os.fstat(descriptor)
+        if observed_bytes != expected_bytes or _identity(before) != _identity(after):
+            raise ValueError(f"qualification digest input changed while read: {path.name}")
+        return _FileDigest(sha256=digest.hexdigest(), identity=_identity(before))
     finally:
         os.close(descriptor)
 
@@ -597,6 +653,7 @@ def _redacted_vm_projection(config: Mapping[str, object]) -> dict[str, object]:
         "cpuCountMin",
         "diskFormat",
         "display",
+        "ecid",
         "hardwareModel",
         "memorySize",
         "memorySizeMin",
@@ -636,20 +693,32 @@ def _require_tart_provider() -> dict[str, object]:
         )
     _require_stopped_vm(TART_BASE_VM_V1)
     base = _vm_directory(TART_BASE_VM_V1)
-    config, config_sha256 = _vm_config(TART_BASE_VM_V1)
-    nvram = _stable_read(
-        base / "nvram.bin",
-        maximum_bytes=128 * 1024 * 1024,
-        require_read_only=False,
-    )
-    disk_metadata = os.lstat(base / "disk.img")
+    try:
+        config, config_sha256 = _vm_config(TART_BASE_VM_V1)
+        nvram = _stable_read(
+            base / "nvram.bin",
+            maximum_bytes=128 * 1024 * 1024,
+            require_read_only=False,
+        )
+        disk = _stable_file_digest(
+            base / "disk.img",
+            expected_bytes=TART_BASE_DISK_BYTES_V1,
+        )
+        disk_metadata = os.lstat(base / "disk.img")
+    except (OSError, ValueError) as error:
+        raise _QualificationRefused(
+            QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
+            "offline Tart base files differ from the fixed provider",
+        ) from error
     if (
         config_sha256 != TART_BASE_CONFIG_SHA256_V1
         or nvram.sha256 != TART_BASE_NVRAM_SHA256_V1
+        or disk.sha256 != TART_BASE_DISK_SHA256_V1
+        or _identity(disk_metadata) != disk.identity
         or not stat.S_ISREG(disk_metadata.st_mode)
         or disk_metadata.st_nlink != 1
         or disk_metadata.st_size != TART_BASE_DISK_BYTES_V1
-        or disk_metadata.st_mode & 0o022
+        or stat.S_IMODE(disk_metadata.st_mode) != TART_BASE_DISK_MODE_V1
     ):
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
@@ -678,6 +747,8 @@ def _require_tart_provider() -> dict[str, object]:
         "base_config_projection": projection,
         "base_config_sha256": config_sha256,
         "base_disk_bytes": disk_metadata.st_size,
+        "base_disk_mode": stat.S_IMODE(disk_metadata.st_mode),
+        "base_disk_sha256": disk.sha256,
         "base_nvram_sha256": nvram.sha256,
         "base_vm": TART_BASE_VM_V1,
         "host_free_bytes": free_bytes,
@@ -915,18 +986,43 @@ def _create_clone(state: _CloneState, base_projection: Mapping[str, object]) -> 
         )
     state.created = True
     _require_stopped_vm(state.name)
-    config, config_sha256 = _vm_config(state.name)
-    projection = _redacted_vm_projection(config)
-    if projection != base_projection:
+    clone = _vm_directory(state.name)
+    try:
+        config, config_sha256 = _vm_config(state.name)
+        projection = _redacted_vm_projection(config)
+        nvram = _stable_read(
+            clone / "nvram.bin",
+            maximum_bytes=128 * 1024 * 1024,
+            require_read_only=False,
+        )
+        disk = _stable_file_digest(
+            clone / "disk.img",
+            expected_bytes=TART_BASE_DISK_BYTES_V1,
+        )
+        disk_metadata = os.lstat(clone / "disk.img")
+    except (OSError, ValueError) as error:
         raise _QualificationRefused(
             QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
-            "qualification clone capability differs from the fixed offline base",
+            "qualification clone files differ from the fixed provider",
+        ) from error
+    if (
+        projection != base_projection
+        or nvram.sha256 != TART_BASE_NVRAM_SHA256_V1
+        or disk.sha256 != TART_BASE_DISK_SHA256_V1
+        or _identity(disk_metadata) != disk.identity
+        or stat.S_IMODE(disk_metadata.st_mode) != TART_BASE_DISK_MODE_V1
+    ):
+        raise _QualificationRefused(
+            QualificationExecutorRefusalCodeV1.PROVIDER_IDENTITY_MISMATCH,
+            "qualification clone identity differs from the fixed offline base",
         )
     state.provider_proofs.append(
         {
             "clone_config_projection_sha256": _sha256(canonical_json_bytes(projection)),
             "clone_config_sha256": config_sha256,
+            "clone_disk_sha256": disk.sha256,
             "clone_name": state.name,
+            "clone_nvram_sha256": nvram.sha256,
             "clone_operation": result.observation(),
             "form": state.form,
         }
@@ -2645,10 +2741,12 @@ def execute_release_qualification(
                 )
             )
         for state in states:
-            _create_clone(state, fixed_provider["base_config_projection"])  # type: ignore[arg-type]
-        for state in states:
             form_failure: Exception | None = None
             try:
+                _create_clone(
+                    state,
+                    fixed_provider["base_config_projection"],  # type: ignore[arg-type]
+                )
                 _run_form(state, bundle)
             except Exception as error:
                 form_failure = error
