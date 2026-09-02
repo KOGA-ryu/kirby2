@@ -1,0 +1,1 @@
+{"control_values":{"intensity_scale_ppm":1000000,"liquidity":"NORMAL","relative_volume":"1.00x"},"duration_us":90000000,"profile_ref":{"profile_id":"accepted.balanced.simple","profile_sha256":"f63a5a6cdf0041e2032af11a8ef86758ec1b2fb0b73ff7000f53ccda56e27b53","profile_version":1},"schema_id":"KIRBY2_SIMULATION_PROFILE_SELECTION_V1","schema_version":1,"seed":101}
