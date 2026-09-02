@@ -10,6 +10,7 @@ import json
 import socket
 import ssl
 import stat
+import sys
 import tempfile
 import time
 from collections.abc import Iterable
@@ -61,6 +62,8 @@ from kirby2.orchestration.local import (
     LOCAL_WORKER_MODULE_V1,
     LocalSubprocessBackendV1,
     SingleProcessBackendV1,
+    fixed_local_worker_argv,
+    fixed_local_worker_environment,
 )
 from kirby2.orchestration.lan import (
     FramedTlsChannelV1,
@@ -626,7 +629,7 @@ def _result_attempt_lifecycle_case(
         checks = {
             "corrupted_bytes_are_refused_before_the_first_stage_write": (
                 corruption_refusal is not None
-                and "differs from descriptor digest" in corruption_refusal
+                and "differ from descriptor digest" in corruption_refusal
                 and names_after_corruption == ()
             ),
             "one_attempt_stages_only_its_exact_digest_named_artifact": (
@@ -3074,6 +3077,19 @@ def _worker_authority_boundary_case(
     plan: ExperimentWorkPlanV1,
 ) -> OrchestrationAuditCase:
     unit = plan.logical_units[0]
+    local_worker_argv = fixed_local_worker_argv()
+    local_worker_environment = fixed_local_worker_environment(
+        {
+            "PATH": "audit-path",
+            "PYTHONHOME": "/forbidden",
+            "PYTHONWARNINGS": "error",
+            "PythonHome": "/also-forbidden",
+            "pythonpath": "/also-forbidden",
+        }
+    )
+    expected_repository_root = (
+        Path(inspect.getfile(LocalSubprocessBackendV1)).resolve().parents[2]
+    )
     required_audits = complete_run_runtime_audit_identities()
     unsupported_cell = replace(
         unit.cell,
@@ -3126,6 +3142,26 @@ def _worker_authority_boundary_case(
         ),
         "local_process_argv_target_is_fixed_not_request_controlled": (
             LOCAL_WORKER_MODULE_V1 == "kirby2.orchestration.worker"
+            and local_worker_argv
+            == (
+                sys.executable,
+                "-P",
+                "-s",
+                "-B",
+                "-m",
+                "kirby2",
+                "orchestrate",
+                "worker",
+            )
+            and local_worker_argv == fixed_local_worker_argv()
+            and not inspect.signature(fixed_local_worker_argv).parameters
+            and local_worker_environment
+            == {
+                "PATH": "audit-path",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONHASHSEED": "0",
+                "PYTHONPATH": str(expected_repository_root),
+            }
         ),
     }
     return _case(

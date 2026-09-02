@@ -1513,3 +1513,139 @@ measured `FAIL` and preserves the complete superseded active store by atomic ren
 the repaired source lock and D1 report bind the new candidate; F/G/H/I are
 requalified in order; and no audit or planning call mutates the active store or runs
 the one-time rollover.
+
+## DEV-0019 — Repair inherited closeout qualification gates and restart closeout
+
+- Interrupted canonical card: `WO40-J`.  The first complete closeout aggregate
+  re-exercised the inherited implementation frontier and found eight failing gates:
+  `WO37-C`, `WO37-E`, `WO38-B`, `WO38-C`, `WO38-D`, `WO38-E`, `WO39-D1`, and
+  `WO39-D2`.  Closeout remains interrupted until those production/audit defects are
+  repaired and `WO40-F`, `WO40-G`, `WO40-H`, and `WO40-I` are requalified in that
+  order for a new candidate.
+- Exact first-parent predecessor:
+  `81317d731c0d9d1c38370a4f69b61890e97dac74`
+- Superseded source candidate:
+  `3818dc83c4c031ea99137f04909a595031ab6e52`.  Its active release store contains
+  the complete immutable D1/F/G/H/I publication.  The five public documents record
+  D1/F/G/H as `PASS` and WO40-I as `PASS_WITH_WARNINGS`; the performance warning is
+  retained truthfully and is neither promoted to `PASS` nor reinterpreted as a
+  failure.
+- Observed closeout failures: causal-claim validation selected the stronger design
+  validator before producing the promised domain-specific refusal; exact-class
+  checks rejected platform-native `PosixPath` values; eager worker import polluted
+  `python -m` subprocess stderr; one refusal-text audit expected `differs` instead
+  of the production contract's `differ`; the recovery metrics reader applied the
+  float-forbidden pack-identity JSON grammar to finite operational metrics; and the
+  training-pack command audit treated its owned command set as the entire later CLI
+  surface.  `WO38-D` additionally needs real loopback sockets to exercise its local
+  authenticated-LAN fixture; a socket-restricted sandbox refusal is not a product
+  failure and does not authorize broader network access.
+- Repair — `WO37-C`: preserve the stronger design validator for executable study
+  designs, but validate causal-claim capability first so unsupported causal claims
+  return their stable domain-specific refusal without weakening design validation.
+- Repair — `WO37-E` and `WO39-D2`: accept ordinary platform-native `Path`
+  implementations at the public path boundary while preserving absolute/root,
+  traversal, symlink, ownership, and immutable-evidence checks.
+- Repair — `WO38-B` and `WO38-E`: replace direct runpy worker re-execution with the
+  fixed `-P -s -B -m kirby2 orchestrate worker` declarative action.  Sanitize ambient
+  Python startup controls, pin the measured checkout import root, and preserve the
+  explicit hash seed, no-bytecode policy, and clean startup stream.
+- Repair — `WO38-C`: align the audit with the exact established production refusal
+  text; no production refusal code or transfer behavior changes.
+- Repair — `WO38-D`: apply the same platform-native path correction while retaining
+  loopback-default binding, explicit LAN opt-in, TLS 1.3 mutual authentication,
+  certificate pinning, no plaintext fallback, lease ownership, and sealed-stage
+  controls.  The resumed WO40-J audit is authorized only for host loopback socket
+  creation and connection by the existing WO38-D fixture.  It grants no Internet,
+  non-loopback LAN, provider, credential, brokerage, or persistent-service access.
+- Repair — `WO38-E`: decode operational metrics with the strict finite-number JSON
+  grammar rather than the pack-identity grammar, continuing to reject NaN, infinity,
+  duplicate keys, malformed values, and noncanonical identity-bearing payloads.
+- Repair — `WO39-D1`: require its exact owned training-pack commands as an ordered
+  subset of the declarative registry so the later authorized `pack-portability-demo`
+  command remains valid; reordered or missing owned commands still fail.
+- Repair — complete-candidate history: add the typed
+  `KIRBY2_RELEASE_HISTORY_SNAPSHOT_V5` profile without changing or reinterpreting
+  DEV-0017 V3 or DEV-0018 V4.  V5 binds exact predecessor
+  `81317d731c0d9d1c38370a4f69b61890e97dac74`, exact source candidate
+  `3818dc83c4c031ea99137f04909a595031ab6e52`, all five D1/F/G/H/I documents,
+  the actual `PASS`, `PASS`, `PASS`, `PASS`, `PASS_WITH_WARNINGS` gate projection,
+  and every regular file in the active release store.  Under the existing exclusive
+  global and active-store locks, the one-time executor uses same-filesystem
+  no-replace directory renames to quarantine the complete active store, activate an
+  exact config-only replacement, harden and deeply verify the quarantined snapshot,
+  and publish it at
+  `.kirby2/release-history/81317d731c0d9d1c38370a4f69b61890e97dac74/`.
+  Both rename parents are fsynced.  Interruption states are typed and resumable;
+  ambiguous paths refuse; the active payload has no copy, recursive delete,
+  overwrite, or partial-history path.
+- Repair — release restart: regenerate
+  `release/performance_runner_sources.lock` mechanically only after the gate,
+  history, deviation, and audit repairs are final.  Commit the complete source repair
+  under exact subject `Repair inherited closeout qualification gates`.  Only after
+  that commit exists, run the canonical no-network resource preflight.  The repair
+  changes no release protocol or resource input, so the renderer must reproduce
+  tracked `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md` byte-for-byte with frozen protocol
+  owner `020da2c90c0f0000f822aad7c66538fe68c6c6e6`; any byte change refuses and
+  requires new authority.  Create an intentional empty candidate-boundary commit
+  under exact subject `Reverify release resources for DEV-0019`; it changes no tree
+  path, directly parents the source repair, and becomes the new candidate.  Execute
+  V5, rebuild WO40-F, requalify WO40-G in disposable host-only Tart clones,
+  requalify WO40-H on the pinned Fedora SSH provider, and rerun canonical WO40-I
+  into the empty public root before resuming WO40-J.
+- Owned repair paths: `kirby2/instructor/statistics.py`,
+  `kirby2/instructor/commands.py`, `kirby2/orchestration/local.py`,
+  `kirby2/orchestration/commands.py`, `kirby2/orchestration/security.py`,
+  `kirby2/orchestration/lan.py`, `kirby2/orchestration/aggregation.py`,
+  `kirby2/audit/orchestration.py`, `kirby2/audit/packs.py`,
+  `kirby2/release/history.py`, `kirby2/audit/release.py`,
+  `kirby2/audit/expansion.py`, `release/performance_runner_sources.lock`,
+  `KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md`, and
+  `KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md`.
+- Gate registration: `DEV-0019` appears immediately after `DEV-0018` and before
+  resumed `WO40-J`; the closeout deviation inventory extends monotonically through
+  `DEV-0019`.  The superseded candidate's D1/F/G/H/I evidence remains historical and
+  cannot satisfy the new candidate's prerequisites.
+- Inherited gates: every DEV-0018 production, terminal-presentation, history,
+  qualification, performance, safety, and product-limitation contract remains in
+  force.  Release targets, artifact/member layout, dependency pins, launchers,
+  starter content, qualification rows/check order, four-worker and 256-FIFO
+  resources, 10,000-row corpus, retry/timeout limits, auxiliary repetitions,
+  reductions, numeric thresholds, and designated installed target are unchanged.
+  No brokerage, live-market connection, credential creation, telemetry, updater,
+  background service, network download, GPU workload, provider operation, history
+  rollover, build, qualification, performance workload, or loopback fixture is
+  executed by the DEV-0019 deviation audit.
+- Exact source repair commit subject: `Repair inherited closeout qualification gates`
+- Exact D1 evidence commit subject: `Reverify release resources for DEV-0019`
+
+Required evidence:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0017
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0018
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate DEV-0019
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO37-C
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO37-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO38-B
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO38-C
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO38-D
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO38-E
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO39-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO39-D2
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate WO40-D1
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -I kirby2/__main__.py audit-expansion --gate K2X-02
+PYTHONDONTWRITEBYTECODE=1 ./.venv/bin/python -m compileall -q kirby2
+git diff --check
+```
+
+Acceptance: the ledger prefix through DEV-0018 is byte-preserved and DEV-0019 is
+the only appended authority record; all eight inherited gates pass for their repaired
+production contracts; V5 preserves the five exact predecessor documents plus the
+complete active store and retains WO40-I `PASS_WITH_WARNINGS`; V3 and V4 remain
+byte-semantically unchanged; the rollover is explicit-only, rename-only for the
+active payload, fail-closed, and never invoked by an audit; the repaired source lock
+and byte-identical D1 report bind the new candidate; F/G/H/I are requalified in
+order; WO38-D alone receives narrowly scoped host-loopback authority during resumed
+closeout; and no audit or planning call mutates the active store or executes the
+one-time rollover.

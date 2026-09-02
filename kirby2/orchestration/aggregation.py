@@ -12,7 +12,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -23,7 +25,11 @@ from kirby2.packs.formats import canonical_json_bytes, load_canonical_json_bytes
 
 from .content_store import OrchestrationContentStoreV1
 from .models import ExperimentWorkPlanV1
-from .protocol import InlineArtifactMediaTypeV1, WorkRequestV1
+from .protocol import (
+    MAX_INLINE_ARTIFACT_BYTES,
+    InlineArtifactMediaTypeV1,
+    WorkRequestV1,
+)
 from .worker import complete_run_runtime_audit_identities
 
 
@@ -374,17 +380,7 @@ def aggregate_registered_results(
         if descriptor.media_type is not InlineArtifactMediaTypeV1.CANONICAL_JSON:
             raise ValueError("registered metrics artifact must be canonical JSON")
         raw = content_store.read_result_artifact(manifest_digest, descriptor)
-        ordinary = load_canonical_json_bytes(raw, "registered experiment metrics")
-        if type(ordinary) is not dict or canonical_json_bytes(ordinary) != raw:
-            raise ValueError("registered experiment metrics must be one canonical object")
-        decimal = json.loads(
-            raw,
-            parse_float=Decimal,
-            parse_int=int,
-            parse_constant=_reject_json_constant,
-        )
-        if type(decimal) is not dict or tuple(sorted(decimal)) != tuple(sorted(ordinary)):
-            raise ValueError("decimal metric projection differs from canonical metrics")
+        ordinary, decimal = _load_canonical_metrics_object(raw)
         names = tuple(sorted(ordinary))
         if metric_names is None:
             metric_names = names
@@ -433,7 +429,9 @@ def _reduce_metric_column(
         raise ValueError("metric reduction requires aligned nonempty values")
     null_count = sum(value is None for value in ordinary_values)
     non_null_decimal = tuple(value for value in decimal_values if value is not None)
-    ordered_digest = hashlib.sha256(canonical_json_bytes(list(ordinary_values))).hexdigest()
+    ordered_digest = hashlib.sha256(
+        _canonical_metrics_json_bytes(list(ordinary_values))
+    ).hexdigest()
     if not non_null_decimal:
         kind = MetricValueKindV1.NULL
         exact_sum = None
@@ -491,6 +489,108 @@ def _require_scalar_metric_row(row: dict[str, object]) -> None:
             raise ValueError("metric row values must be scalar numbers, text, or null")
         if type(value) is float and (value != value or value in {float("inf"), float("-inf")}):
             raise ValueError("metric row cannot contain a non-finite float")
+
+
+def _load_canonical_metrics_object(
+    raw: bytes,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Parse one bounded metrics object while retaining exact finite decimals.
+
+    Pack identity JSON deliberately forbids every binary float. Runtime metrics use
+    a different, data-only contract: finite JSON numbers are accepted, their source
+    bytes must still be canonical, and a second Decimal projection drives reduction.
+    """
+
+    if (
+        type(raw) is not bytes
+        or not raw
+        or len(raw) > MAX_INLINE_ARTIFACT_BYTES
+    ):
+        raise ValueError("registered experiment metrics must be bounded exact bytes")
+    try:
+        text = raw.decode("ascii")
+        ordinary = json.loads(
+            text,
+            object_pairs_hook=_metrics_object_from_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError(
+            "registered experiment metrics must be one canonical ASCII JSON object"
+        ) from error
+    if type(ordinary) is not dict:
+        raise TypeError("registered experiment metrics must be one exact object")
+    _require_scalar_metric_row(ordinary)
+    if _canonical_metrics_json_bytes(ordinary) != raw:
+        raise ValueError("registered experiment metrics bytes are not canonical JSON")
+    try:
+        decimal = json.loads(
+            text,
+            object_pairs_hook=_metrics_object_from_pairs,
+            parse_float=Decimal,
+            parse_int=int,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as error:
+        raise ValueError(
+            "registered experiment metrics decimal projection is invalid"
+        ) from error
+    if type(decimal) is not dict or tuple(sorted(decimal)) != tuple(sorted(ordinary)):
+        raise ValueError("decimal metric projection differs from canonical metrics")
+    _require_scalar_metric_row(decimal)
+    return ordinary, decimal
+
+
+def _canonical_metrics_json_bytes(value: object) -> bytes:
+    _validate_metrics_json_value(value)
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise ValueError("runtime metrics are not finite canonical JSON") from error
+
+
+def _validate_metrics_json_value(value: object) -> None:
+    if value is None or type(value) is int:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("runtime metrics contain a non-finite number")
+        return
+    if type(value) is str:
+        if unicodedata.normalize("NFC", value) != value:
+            raise ValueError("runtime metrics text must be NFC-normalized")
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ValueError("runtime metrics text contains a surrogate code point")
+        return
+    if type(value) is list:
+        for item in value:
+            _validate_metrics_json_value(item)
+        return
+    if type(value) is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("runtime metric object keys must be text")
+            _validate_metrics_json_value(key)
+            _validate_metrics_json_value(item)
+        return
+    raise TypeError("runtime metrics contain an unsupported JSON value")
+
+
+def _metrics_object_from_pairs(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"runtime metrics contain duplicate key {key!r}")
+        result[key] = value
+    return result
 
 
 def _reject_json_constant(value: str) -> object:

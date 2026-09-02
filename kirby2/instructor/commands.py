@@ -582,8 +582,9 @@ class PrivacyExportFixtureV1:
 
 
 def load_privacy_export_fixture(path: Path) -> PrivacyExportFixtureV1:
-    if type(path) is not Path:
+    if not isinstance(path, Path):
         raise TypeError("privacy-export fixture path must be pathlib.Path")
+    path = Path(path)
     if path.is_symlink() or not path.is_file():
         raise ValueError("privacy-export fixture must be one regular non-symlink file")
     return PrivacyExportFixtureV1.from_toml_bytes(path.read_bytes())

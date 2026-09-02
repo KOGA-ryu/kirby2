@@ -47,6 +47,7 @@ DEV0014_AUDIT_CASE_COUNT = 3
 DEV0015_AUDIT_CASE_COUNT = 4
 DEV0017_AUDIT_CASE_COUNT = 4
 DEV0018_AUDIT_CASE_COUNT = 4
+DEV0019_AUDIT_CASE_COUNT = 4
 
 _DEV0011_PREDECESSOR_COMMIT_V1 = "da9612349db2f76863ee16fb7726c6d8f85f5329"
 _DEV0011_SOURCE_MANIFEST_SHA256_V1 = (
@@ -75,7 +76,7 @@ RELEASE_FUTURE_EVIDENCE_PATHS_V1: Mapping[str, str] = {
 }
 
 RELEASE_REQUIRED_DEVIATION_GATE_IDS_V1 = tuple(
-    f"DEV-{ordinal:04d}" for ordinal in range(1, 19)
+    f"DEV-{ordinal:04d}" for ordinal in range(1, 20)
 )
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -6882,7 +6883,10 @@ def audit_release_performance_verifier_restart() -> ReleaseAuditSuite:
         "## DEV-0018 — Repair V2 performance publication verification and "
         "restart qualification"
     )
-    section = ledger.split(dev0018_heading, 1)[1] if dev0018_heading in ledger else ""
+    dev0018_tail = (
+        ledger.split(dev0018_heading, 1)[1] if dev0018_heading in ledger else ""
+    )
+    section = dev0018_tail.split("\n## ", 1)[0]
     required_authority_tokens = {
         predecessor,
         candidate,
@@ -7681,6 +7685,665 @@ def audit_release_performance_verifier_restart() -> ReleaseAuditSuite:
             ("executor_invocations", "0"),
             ("history_rollover_invocations", "0"),
             ("interrupted_card", "WO40-J"),
+            ("predecessor_commit", predecessor),
+            ("provider_invocations", "0"),
+            ("workload_invocations", "0"),
+        ),
+    )
+
+
+def audit_release_closeout_gate_restart() -> ReleaseAuditSuite:
+    """Prove DEV-0019 authority and V5 rollover without executing providers."""
+
+    repository = _repository_root()
+    predecessor = "81317d731c0d9d1c38370a4f69b61890e97dac74"
+    candidate = "3818dc83c4c031ea99137f04909a595031ab6e52"
+
+    def git_blob(commit: str, relative: str) -> bytes:
+        completed = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ValueError(f"historical blob is unavailable: {relative}")
+        return completed.stdout
+
+    def parse_source(
+        relative: str,
+        failures: list[str],
+    ) -> tuple[str, ast.Module]:
+        path = repository / relative
+        try:
+            source = path.read_text(encoding="utf-8")
+            return source, ast.parse(source, filename=os.fspath(path))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            failures.append(f"{relative} source failed: {type(error).__name__}")
+            return "", ast.Module(body=[], type_ignores=[])
+
+    def top_level_function(
+        tree: ast.Module,
+        name: str,
+    ) -> ast.FunctionDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            ),
+            None,
+        )
+
+    def top_level_class(tree: ast.Module, name: str) -> ast.ClassDef | None:
+        return next(
+            (
+                item
+                for item in tree.body
+                if isinstance(item, ast.ClassDef) and item.name == name
+            ),
+            None,
+        )
+
+    def called_names(node: ast.AST | None) -> set[str]:
+        if node is None:
+            return set()
+        output: set[str] = set()
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Call):
+                continue
+            if isinstance(item.func, ast.Name):
+                output.add(item.func.id)
+            elif isinstance(item.func, ast.Attribute):
+                output.add(item.func.attr)
+        return output
+
+    authority_failures: list[str] = []
+    ledger_relative = "KIRBY2_WORK_ORDERS_31_40_DEVIATIONS.md"
+    try:
+        predecessor_ledger = git_blob(predecessor, ledger_relative)
+        current_ledger = (repository / ledger_relative).read_bytes()
+    except (OSError, ValueError) as error:
+        predecessor_ledger = b""
+        current_ledger = b""
+        authority_failures.append(
+            f"deviation ledger could not be compared: {type(error).__name__}"
+        )
+    if predecessor_ledger and not current_ledger.startswith(predecessor_ledger):
+        authority_failures.append("DEV-0001 through DEV-0018 bytes were edited")
+    suffix = current_ledger[len(predecessor_ledger) :] if predecessor_ledger else b""
+    try:
+        dev0019_section = suffix.decode("utf-8")
+    except UnicodeDecodeError:
+        dev0019_section = ""
+        authority_failures.append("DEV-0019 suffix is not UTF-8")
+    heading = (
+        "## DEV-0019 — Repair inherited closeout qualification gates and "
+        "restart closeout"
+    )
+    required_authority_tokens = {
+        predecessor,
+        candidate,
+        "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V5",
+        "PASS_WITH_WARNINGS",
+        "WO37-C",
+        "WO37-E",
+        "WO38-B",
+        "WO38-C",
+        "WO38-D",
+        "WO38-E",
+        "WO39-D1",
+        "WO39-D2",
+        "host loopback socket",
+        "creation and connection",
+        "020da2c90c0f0000f822aad7c66538fe68c6c6e6",
+        "Repair inherited closeout qualification gates",
+        "Reverify release resources for DEV-0019",
+    }
+    missing_authority_tokens = sorted(
+        token for token in required_authority_tokens if token not in dev0019_section
+    )
+    expected_owned_paths = (
+        "kirby2/instructor/statistics.py",
+        "kirby2/instructor/commands.py",
+        "kirby2/orchestration/local.py",
+        "kirby2/orchestration/commands.py",
+        "kirby2/orchestration/security.py",
+        "kirby2/orchestration/lan.py",
+        "kirby2/orchestration/aggregation.py",
+        "kirby2/audit/orchestration.py",
+        "kirby2/audit/packs.py",
+        "kirby2/release/history.py",
+        "kirby2/audit/release.py",
+        "kirby2/audit/expansion.py",
+        "release/performance_runner_sources.lock",
+        "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        ledger_relative,
+    )
+    owned_match = re.search(
+        r"(?ms)^- Owned repair paths:(.*?)(?=^- Gate registration:)",
+        dev0019_section,
+    )
+    owned_paths = (
+        ()
+        if owned_match is None
+        else tuple(re.findall(r"`([^`]+)`", owned_match.group(1)))
+    )
+    observed_commit_subjects = tuple(
+        (match.group(1), match.group(2))
+        for match in re.finditer(
+            r"(?m)^- Exact ([^:\n]+) commit subject:\s*`([^`\n]+)`$",
+            dev0019_section,
+        )
+    )
+    expected_commit_subjects = (
+        ("source repair", "Repair inherited closeout qualification gates"),
+        ("D1 evidence", "Reverify release resources for DEV-0019"),
+    )
+    if (
+        dev0019_section.count(heading) != 1
+        or missing_authority_tokens
+        or owned_paths != expected_owned_paths
+        or observed_commit_subjects != expected_commit_subjects
+    ):
+        authority_failures.append("DEV-0019 authority record is missing or differs")
+    authority_case = _case(
+        "dev0019_authority_preserves_the_complete_predecessor",
+        "The append-only deviation binds eight repairs, V5 history, exact commits, and loopback-only audit authority.",
+        {
+            "commit_subjects": [list(item) for item in observed_commit_subjects],
+            "missing_authority_tokens": missing_authority_tokens,
+            "owned_repair_paths": list(owned_paths),
+            "predecessor_commit": predecessor,
+            "source_candidate_commit": candidate,
+        },
+        authority_failures,
+    )
+
+    history_failures: list[str] = []
+    _, history_tree = parse_source(
+        "kirby2/release/history.py",
+        history_failures,
+    )
+    v5_probe_results: dict[str, str] = {}
+    evidence_hashes: dict[str, str] = {}
+    v5_statuses: tuple[tuple[str, str], ...] = ()
+    v5_paths: dict[str, str] = {}
+    v5_protocol_commit: str | None = None
+    history_exports: set[str] = set()
+    try:
+        from kirby2.release import history as release_history
+
+        v5_statuses = release_history.DEV0019_EVIDENCE_STATUS_BY_GATE_V1
+        v5_paths = dict(release_history.DEV0019_EVIDENCE_PATH_BY_GATE_V1)
+        v5_protocol_commit = release_history.DEV0019_PROTOCOL_COMMIT_V1
+        history_exports = set(release_history.__all__)
+        digest = hashlib.sha256(b"").hexdigest()
+        files = tuple(
+            sorted(
+                (
+                    *(
+                        release_history.ReleaseHistoryFileV1(path, 0, digest)
+                        for path in v5_paths.values()
+                    ),
+                    release_history.ReleaseHistoryFileV1(
+                        "artifacts/clean-providers.toml", 0, digest
+                    ),
+                    release_history.ReleaseHistoryFileV1(
+                        "artifacts/gate-evidence/wo40-i/performance-activation.json",
+                        0,
+                        digest,
+                    ),
+                    release_history.ReleaseHistoryFileV1(
+                        "artifacts/gate-evidence/wo40-i/performance-aggregate.json",
+                        0,
+                        digest,
+                    ),
+                    release_history.ReleaseHistoryFileV1(
+                        "artifacts/gate-evidence/wo40-i/performance-attempt.json",
+                        0,
+                        digest,
+                    ),
+                ),
+                key=lambda item: item.path.encode("utf-8"),
+            )
+        )
+        results = tuple(
+            release_history.ReleaseHistoryGateResultV3(gate_id, status)
+            for gate_id, status in v5_statuses
+        )
+        manifest = release_history.ReleaseHistoryManifestV5(
+            release_evidence_commit=predecessor,
+            source_candidate_commit=candidate,
+            gate_results=results,
+            files=files,
+        )
+        if (
+            release_history.ReleaseHistoryManifestV5.from_bytes(
+                manifest.canonical_bytes()
+            )
+            != manifest
+        ):
+            raise ValueError("V5 manifest did not round-trip")
+        v5_probe_results["canonical_round_trip"] = "PASS"
+
+        for probe_id, probe in (
+            (
+                "rejects_wrong_predecessor_binding",
+                lambda: release_history.ReleaseHistoryManifestV5(
+                    release_evidence_commit="0" * 40,
+                    source_candidate_commit=candidate,
+                    gate_results=results,
+                    files=files,
+                ),
+            ),
+            (
+                "rejects_warning_reinterpretation",
+                lambda: release_history.ReleaseHistoryGateResultV3(
+                    "WO40-I", "PASS"
+                ),
+            ),
+            (
+                "rejects_missing_public_document",
+                lambda: release_history.ReleaseHistoryManifestV5(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=results,
+                    files=tuple(
+                        item
+                        for item in files
+                        if item.path != "KIRBY2_RELEASE_PERFORMANCE_EVIDENCE.md"
+                    ),
+                ),
+            ),
+            (
+                "rejects_missing_performance_activation",
+                lambda: release_history.ReleaseHistoryManifestV5(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=results,
+                    files=tuple(
+                        item
+                        for item in files
+                        if item.path
+                        != "artifacts/gate-evidence/wo40-i/performance-activation.json"
+                    ),
+                ),
+            ),
+            (
+                "rejects_missing_performance_aggregate",
+                lambda: release_history.ReleaseHistoryManifestV5(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=results,
+                    files=tuple(
+                        item
+                        for item in files
+                        if item.path
+                        != "artifacts/gate-evidence/wo40-i/performance-aggregate.json"
+                    ),
+                ),
+            ),
+            (
+                "rejects_missing_performance_attempt",
+                lambda: release_history.ReleaseHistoryManifestV5(
+                    release_evidence_commit=predecessor,
+                    source_candidate_commit=candidate,
+                    gate_results=results,
+                    files=tuple(
+                        item
+                        for item in files
+                        if item.path
+                        != "artifacts/gate-evidence/wo40-i/performance-attempt.json"
+                    ),
+                ),
+            ),
+        ):
+            try:
+                probe()
+            except ValueError:
+                v5_probe_results[probe_id] = "ValueError"
+            else:
+                v5_probe_results[probe_id] = "NO_EXCEPTION"
+
+        documents = release_history._load_dev0019_historical_evidence(repository)
+        evidence_hashes = {
+            relative: hashlib.sha256(raw).hexdigest()
+            for relative, raw in documents
+        }
+        if len(documents) != 5:
+            raise ValueError("V5 predecessor document inventory differs")
+        v5_probe_results["exact_predecessor_documents"] = "PASS"
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+        history_failures.append(
+            f"V5 complete-history probes failed: {type(error).__name__}"
+        )
+
+    expected_v5_statuses = (
+        ("WO40-D1", "PASS"),
+        ("WO40-F", "PASS"),
+        ("WO40-G", "PASS"),
+        ("WO40-H", "PASS"),
+        ("WO40-I", "PASS_WITH_WARNINGS"),
+    )
+    expected_v5_paths = {
+        "WO40-D1": "KIRBY2_RELEASE_RESOURCE_PREFLIGHT.md",
+        "WO40-F": "KIRBY2_RELEASE_BUILD_EVIDENCE.md",
+        "WO40-G": "KIRBY2_RELEASE_MACOS_EVIDENCE.md",
+        "WO40-H": "KIRBY2_RELEASE_LINUX_EVIDENCE.md",
+        "WO40-I": "KIRBY2_RELEASE_PERFORMANCE_EVIDENCE.md",
+    }
+    required_v5_classes = (
+        "ReleaseHistoryGateResultV3",
+        "ReleaseHistoryManifestV5",
+    )
+    required_v5_functions = (
+        "inspect_dev0019_release_history_rollover",
+        "plan_dev0019_release_history_rollover",
+        "execute_dev0019_release_history_rollover",
+        "verify_release_history_snapshot_v5",
+    )
+    v5_authority = top_level_function(
+        history_tree, "_verify_dev0019_execution_authority"
+    )
+    v5_authority_source = "" if v5_authority is None else ast.unparse(v5_authority)
+    v5_verifier = top_level_function(
+        history_tree, "verify_release_history_snapshot_v5"
+    )
+    v5_verifier_source = "" if v5_verifier is None else ast.unparse(v5_verifier)
+    required_v5_exports = {
+        "DEV0019_EVIDENCE_PATH_BY_GATE_V1",
+        "DEV0019_EVIDENCE_STATUS_BY_GATE_V1",
+        "DEV0019_PROTOCOL_COMMIT_V1",
+        "DEV0019_RELEASE_EVIDENCE_COMMIT_V1",
+        "DEV0019_RESOURCE_PREFLIGHT_SHA256_V1",
+        "DEV0019_SOURCE_CANDIDATE_COMMIT_V1",
+        "RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V5",
+        *required_v5_classes,
+        *required_v5_functions,
+    }
+    if (
+        v5_statuses != expected_v5_statuses
+        or v5_paths != expected_v5_paths
+        or v5_protocol_commit != "020da2c90c0f0000f822aad7c66538fe68c6c6e6"
+        or any(top_level_class(history_tree, name) is None for name in required_v5_classes)
+        or any(
+            top_level_function(history_tree, name) is None
+            for name in required_v5_functions
+        )
+        or top_level_function(
+            history_tree, "_verify_dev0019_staged_public_documents"
+        )
+        is None
+        or "candidate.protocol_commit != DEV0019_PROTOCOL_COMMIT_V1"
+        not in v5_authority_source
+        or "d1_source.sha256 != DEV0019_RESOURCE_PREFLIGHT_SHA256_V1"
+        not in v5_authority_source
+        or "_verify_manifest_evidence_anchors(manifest, historical_documents)"
+        not in v5_verifier_source
+        or not required_v5_exports.issubset(history_exports)
+        or v5_probe_results
+        != {
+            "canonical_round_trip": "PASS",
+            "exact_predecessor_documents": "PASS",
+            "rejects_missing_performance_activation": "ValueError",
+            "rejects_missing_performance_aggregate": "ValueError",
+            "rejects_missing_performance_attempt": "ValueError",
+            "rejects_missing_public_document": "ValueError",
+            "rejects_wrong_predecessor_binding": "ValueError",
+            "rejects_warning_reinterpretation": "ValueError",
+        }
+    ):
+        history_failures.append("DEV-0019 V5 complete-history contract differs")
+    history_case = _case(
+        "complete_candidate_v5_preserves_all_evidence_and_warning_truth",
+        "V5 binds five exact public documents, the complete active store, and the measured WO40-I warning status.",
+        {
+            "evidence_hashes": evidence_hashes,
+            "evidence_paths": v5_paths,
+            "gate_statuses": [list(item) for item in v5_statuses],
+            "history_schema": "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V5",
+            "probe_results": v5_probe_results,
+            "protocol_commit": v5_protocol_commit,
+            "public_document_count": len(v5_paths),
+        },
+        history_failures,
+    )
+
+    legacy_failures: list[str] = []
+    legacy_names = (
+        "ReleaseHistoryGateResultV1",
+        "ReleaseHistoryManifestV3",
+        "ReleaseHistoryGateResultV2",
+        "ReleaseHistoryManifestV4",
+        "_base_plan_dev0018",
+        "inspect_dev0017_release_history_rollover",
+        "plan_dev0017_release_history_rollover",
+        "inspect_dev0018_release_history_rollover",
+        "plan_dev0018_release_history_rollover",
+        "_verify_execution_authority",
+        "_verify_dev0018_execution_authority",
+        "_load_historical_evidence",
+        "_load_dev0018_historical_evidence",
+        "_verify_dev0018_absent_performance_publication",
+        "_stage_rollover",
+        "_stage_dev0018_rollover",
+        "_load_staged_manifest",
+        "_load_staged_manifest_v4",
+        "_verify_prepared_history_documents",
+        "_verify_complete_snapshot_tree_at",
+        "_verify_complete_snapshot_tree",
+        "_provider_config_record",
+        "_receipt",
+        "verify_release_history_snapshot_v3",
+        "verify_release_history_snapshot_v4",
+        "execute_dev0017_release_history_rollover",
+        "execute_dev0018_release_history_rollover",
+    )
+    legacy_matches: dict[str, bool] = {}
+    try:
+        predecessor_history = ast.parse(
+            git_blob(predecessor, "kirby2/release/history.py").decode("utf-8")
+        )
+        current_by_name = {
+            item.name: item
+            for item in history_tree.body
+            if isinstance(item, (ast.ClassDef, ast.FunctionDef))
+        }
+        predecessor_by_name = {
+            item.name: item
+            for item in predecessor_history.body
+            if isinstance(item, (ast.ClassDef, ast.FunctionDef))
+        }
+        for name in legacy_names:
+            current = current_by_name.get(name)
+            historical = predecessor_by_name.get(name)
+            matched = (
+                current is not None
+                and historical is not None
+                and ast.dump(current, include_attributes=False)
+                == ast.dump(historical, include_attributes=False)
+            )
+            legacy_matches[name] = matched
+        from kirby2.release import history as release_history
+
+        legacy_runtime = {
+            "v3_schema": release_history.RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V3,
+            "v3_statuses": release_history.DEV0017_EVIDENCE_STATUS_BY_GATE_V1,
+            "v4_schema": release_history.RELEASE_HISTORY_SNAPSHOT_SCHEMA_ID_V4,
+            "v4_statuses": release_history.DEV0018_EVIDENCE_STATUS_BY_GATE_V1,
+        }
+    except (ImportError, OSError, SyntaxError, UnicodeDecodeError, ValueError) as error:
+        legacy_runtime = {}
+        legacy_failures.append(
+            f"V3/V4 preservation probe failed: {type(error).__name__}"
+        )
+    if (
+        not legacy_matches
+        or not all(legacy_matches.values())
+        or legacy_runtime
+        != {
+            "v3_schema": "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V3",
+            "v3_statuses": (
+                ("WO40-D1", "PASS"),
+                ("WO40-F", "PASS"),
+                ("WO40-G", "PASS"),
+                ("WO40-H", "PASS"),
+                ("WO40-I", "FAIL"),
+            ),
+            "v4_schema": "KIRBY2_RELEASE_HISTORY_SNAPSHOT_V4",
+            "v4_statuses": (
+                ("WO40-D1", "PASS"),
+                ("WO40-F", "PASS"),
+                ("WO40-G", "PASS"),
+                ("WO40-H", "PASS"),
+                ("WO40-I", "NOT_RUN"),
+            ),
+        }
+    ):
+        legacy_failures.append("DEV-0017 V3 or DEV-0018 V4 semantics changed")
+    legacy_case = _case(
+        "historical_v3_and_v4_surfaces_remain_exact",
+        "Every V3/V4 model, authority, staging, verification, and executor AST remains identical to the predecessor.",
+        {
+            "definition_matches": legacy_matches,
+            "runtime_projection": {
+                key: [list(item) for item in value]
+                if key.endswith("statuses")
+                else value
+                for key, value in legacy_runtime.items()
+            },
+        },
+        legacy_failures,
+    )
+
+    explicit_failures: list[str] = []
+    executor_name = "execute_dev0019_release_history_rollover"
+    executor = top_level_function(history_tree, executor_name)
+    stage = top_level_function(history_tree, "_stage_dev0019_rollover")
+    required_executor_calls = {
+        "inspect_dev0019_release_history_rollover",
+        "plan_dev0019_release_history_rollover",
+        "_verify_dev0019_execution_authority",
+        "_load_dev0019_historical_evidence",
+        "_verify_dev0019_performance_publication",
+        "_verify_dev0019_staged_public_documents",
+        "_verify_manifest_evidence_anchors",
+        "_verify_evidence_anchors",
+        "_stage_dev0019_rollover",
+        "_rename_exclusive_at",
+        "_harden_tree",
+        "verify_release_history_snapshot_v5",
+    }
+    executor_calls = called_names(executor)
+    executor_source = "" if executor is None else ast.unparse(executor)
+    resume_binding_start = executor_source.rfind(
+        "historical_documents = _load_dev0019_historical_evidence"
+    )
+    resume_binding_end = executor_source.find(
+        "_harden_tree", resume_binding_start
+    )
+    final_publish_start = executor_source.rfind("_rename_exclusive_at")
+    resume_binding_source = (
+        ""
+        if resume_binding_start < 0 or resume_binding_end < 0
+        else executor_source[resume_binding_start:resume_binding_end]
+    )
+    required_resume_binding_calls = {
+        "_load_dev0019_historical_evidence",
+        "_verify_dev0019_staged_public_documents",
+        "_verify_manifest_evidence_anchors",
+        "_verify_complete_snapshot_tree",
+    }
+    stage_calls = called_names(stage)
+    forbidden_bulk_calls = {
+        "copy",
+        "copy2",
+        "copyfile",
+        "copytree",
+        "remove",
+        "replace",
+        "rmtree",
+        "unlink",
+    }
+    command_surfaces = (
+        "kirby2/__main__.py",
+        "kirby2/cli/expansion.py",
+        "kirby2/cli/registry.py",
+        "kirby2/release/__init__.py",
+        "kirby2/release/commands.py",
+    )
+    registered_mentions: list[str] = []
+    for relative in command_surfaces:
+        try:
+            if executor_name in (repository / relative).read_text(encoding="utf-8"):
+                registered_mentions.append(relative)
+        except (OSError, UnicodeDecodeError) as error:
+            explicit_failures.append(
+                f"explicit-only command surface failed: {relative}: {type(error).__name__}"
+            )
+    audit_node = top_level_function(
+        ast.parse(
+            (repository / "kirby2/audit/release.py").read_text(encoding="utf-8")
+        ),
+        "audit_release_closeout_gate_restart",
+    )
+    audit_calls = called_names(audit_node)
+    if (
+        executor is None
+        or stage is None
+        or not required_executor_calls.issubset(executor_calls)
+        or not all(
+            name in resume_binding_source for name in required_resume_binding_calls
+        )
+        or not (
+            0 <= resume_binding_start < resume_binding_end < final_publish_start
+        )
+        or forbidden_bulk_calls.intersection(executor_calls | stage_calls)
+        or registered_mentions
+        or executor_name in audit_calls
+        or "argparse" in executor_source
+        or "_DEV0019_NEXT_ACTIVE_BUILD_NAME" not in ast.unparse(stage)
+        or "_DEV0019_HISTORY_BUILD_NAME" not in ast.unparse(stage)
+    ):
+        explicit_failures.append(
+            "DEV-0019 rollover is not explicit-only atomic rename preservation"
+        )
+    explicit_case = _case(
+        "dev0019_rollover_is_explicit_atomic_and_provider_free",
+        "The V5 executor is unregistered and audit-uninvoked, with no active-payload copy/delete path or provider call.",
+        {
+            "audit_executor_calls": int(executor_name in audit_calls),
+            "executor_calls": sorted(executor_calls & required_executor_calls),
+            "executor_invocations": 0,
+            "forbidden_bulk_calls": sorted(
+                forbidden_bulk_calls.intersection(executor_calls | stage_calls)
+            ),
+            "history_rollover_invocations": 0,
+            "loopback_invocations": 0,
+            "prepublication_binding_calls": sorted(
+                name
+                for name in required_resume_binding_calls
+                if name in resume_binding_source
+            ),
+            "provider_invocations": 0,
+            "registered_command_mentions": registered_mentions,
+            "workload_invocations": 0,
+        },
+        explicit_failures,
+    )
+
+    cases = (authority_case, history_case, legacy_case, explicit_case)
+    if len(cases) != DEV0019_AUDIT_CASE_COUNT:
+        raise RuntimeError("DEV-0019 release audit inventory changed")
+    return ReleaseAuditSuite(
+        "DEV-0019",
+        cases,
+        metadata=(
+            ("executor_invocations", "0"),
+            ("history_rollover_invocations", "0"),
+            ("interrupted_card", "WO40-J"),
+            ("loopback_invocations", "0"),
             ("predecessor_commit", predecessor),
             ("provider_invocations", "0"),
             ("workload_invocations", "0"),

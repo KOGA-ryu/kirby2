@@ -8,6 +8,7 @@ import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from kirby2.packs.formats import load_canonical_json_bytes
@@ -113,7 +114,7 @@ class LocalSubprocessBackendV1:
         requests: tuple[WorkRequestV1, ...],
     ) -> tuple[WorkerResultV1, ...]:
         supplied = _canonical_requests(requests)
-        child_environment = _worker_environment(os.environ)
+        child_environment = fixed_local_worker_environment(os.environ)
         results: list[WorkerResultV1] = []
         with ThreadPoolExecutor(max_workers=self.worker_count) as executor:
             futures = {
@@ -142,7 +143,7 @@ def _execute_fixed_subprocess(
     child_environment: Mapping[str, str],
 ) -> WorkerResultV1:
     completed = subprocess.run(
-        (sys.executable, "-m", LOCAL_WORKER_MODULE_V1),
+        fixed_local_worker_argv(),
         input=request.canonical_bytes(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -170,6 +171,21 @@ def _execute_fixed_subprocess(
     if result.request.work_request_id != request.work_request_id:
         raise LocalWorkerProcessError("fixed worker returned a foreign request")
     return result
+
+
+def fixed_local_worker_argv() -> tuple[str, ...]:
+    """Return the static declarative worker invocation."""
+
+    return (
+        sys.executable,
+        "-P",
+        "-s",
+        "-B",
+        "-m",
+        "kirby2",
+        "orchestrate",
+        "worker",
+    )
 
 
 def _canonical_requests(
@@ -216,15 +232,22 @@ def _canonical_results(
     return tuple(by_request[request_id] for request_id in expected)
 
 
-def _worker_environment(source: Mapping[str, str]) -> dict[str, str]:
+def fixed_local_worker_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Pin Python startup controls and the measured checkout import root."""
+
     if not isinstance(source, Mapping) or any(
         type(key) is not str or type(value) is not str
         for key, value in source.items()
     ):
         raise TypeError("worker environment must be a text mapping")
-    result = dict(source)
+    result = {
+        key: value
+        for key, value in source.items()
+        if not key.upper().startswith("PYTHON")
+    }
     result["PYTHONHASHSEED"] = "0"
     result["PYTHONDONTWRITEBYTECODE"] = "1"
+    result["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     return result
 
 
@@ -235,4 +258,6 @@ __all__ = [
     "LocalSubprocessBackendV1",
     "LocalWorkerProcessError",
     "SingleProcessBackendV1",
+    "fixed_local_worker_argv",
+    "fixed_local_worker_environment",
 ]

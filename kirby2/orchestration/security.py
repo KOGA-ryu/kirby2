@@ -121,13 +121,15 @@ class LanTlsConfigurationV1:
         _host(self.host)
         if type(self.port) is not int or not 1 <= self.port <= MAX_LAN_PORT_V1:
             raise ValueError("LAN port must be in [1, 65535]")
-        for value, label in (
-            (self.ca_certificate, "LAN CA certificate"),
-            (self.certificate, "LAN certificate"),
-            (self.private_key, "LAN private key"),
+        for field, label in (
+            ("ca_certificate", "LAN CA certificate"),
+            ("certificate", "LAN certificate"),
+            ("private_key", "LAN private key"),
         ):
-            if type(value) is not Path:
+            value = getattr(self, field)
+            if not isinstance(value, Path):
                 raise TypeError(f"{label} must be pathlib.Path")
+            object.__setattr__(self, field, Path(value))
         _identifier(self.local_identity, "LAN local identity")
         _canonical_identities(
             self.expected_peer_identities,
@@ -796,7 +798,13 @@ def _pin_tls13(context: ssl.SSLContext) -> None:
 
 
 def _regular_file(path: Path, label: str, *, private: bool) -> Path:
-    if type(path) is not Path or not path.is_absolute():
+    if not isinstance(path, Path):
+        raise SecurityRefused(
+            SecurityRefusalCodeV1.CREDENTIAL_PATH_UNSAFE,
+            f"{label} path must be explicit and absolute",
+        )
+    path = Path(path)
+    if not path.is_absolute():
         raise SecurityRefused(
             SecurityRefusalCodeV1.CREDENTIAL_PATH_UNSAFE,
             f"{label} path must be explicit and absolute",

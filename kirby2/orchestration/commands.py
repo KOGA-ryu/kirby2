@@ -7,7 +7,6 @@ import hashlib
 import os
 import secrets
 import subprocess
-import sys
 import tempfile
 import tomllib
 from dataclasses import dataclass, replace
@@ -28,10 +27,11 @@ from .lan import (
 )
 from .leases import LeasePolicyV1
 from .local import (
-    LOCAL_WORKER_MODULE_V1,
     LocalSubprocessBackendV1,
     LocalWorkerProcessError,
     SingleProcessBackendV1,
+    fixed_local_worker_argv,
+    fixed_local_worker_environment,
 )
 from .models import (
     DigestReferenceV1,
@@ -124,8 +124,9 @@ def _seed(value: str) -> int:
 def load_orchestration_experiment(path: Path):
     """Load one strict scientific TOML manifest into an immutable work plan."""
 
-    if type(path) is not Path:
+    if not isinstance(path, Path):
         raise TypeError("orchestration manifest path must be pathlib.Path")
+    path = Path(path)
     raw = path.resolve(strict=True).read_bytes()
     try:
         payload = tomllib.loads(raw.decode("utf-8"))
@@ -685,8 +686,9 @@ def _credential_use(audit_fixture: bool) -> CredentialUseV1:
 
 
 def _required_resolved_file(value: Path | None, label: str) -> Path:
-    if type(value) is not Path:
+    if not isinstance(value, Path):
         raise ValueError(f"{label} is required for LAN startup")
+    value = Path(value)
     try:
         return value.resolve(strict=True)
     except OSError as error:
@@ -771,11 +773,9 @@ class _KilledWorkerBackendV1:
             requests,
             key=lambda item: item.logical_work_unit.logical_work_unit_id,
         )
-        environment = dict(os.environ)
-        environment["PYTHONHASHSEED"] = "0"
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment = fixed_local_worker_environment(os.environ)
         process = subprocess.Popen(
-            (sys.executable, "-m", LOCAL_WORKER_MODULE_V1),
+            fixed_local_worker_argv(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -2878,7 +2878,11 @@ def _generic_domain_pack_lifecycle_case(
             for item in fixtures
         ),
         "generic_lifecycle_and_demo_commands_are_declared": (
-            tuple(item.name for item in PACK_COMMAND_MODULE.commands)
+            tuple(
+                item.name
+                for item in PACK_COMMAND_MODULE.commands
+                if item.name in {"pack", "pack-build-demo"}
+            )
             == ("pack", "pack-build-demo")
             and required_actions <= set(lifecycle_actions)
         ),

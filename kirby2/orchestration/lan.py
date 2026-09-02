@@ -1105,7 +1105,10 @@ def _validate_session_close(raw: bytes) -> None:
 
 
 def _directory_bytes(root: Path) -> int:
-    if type(root) is not Path or not root.is_absolute():
+    if not isinstance(root, Path):
+        raise TypeError("attempt cleanup root must be one absolute Path")
+    root = Path(root)
+    if not root.is_absolute():
         raise TypeError("attempt cleanup root must be one absolute Path")
     total = 0
     for current, directories, files in os.walk(root, followlinks=False):

@@ -1062,11 +1062,6 @@ def require_claim_capability(
     design_value = _design_capability_value(design_capability)
     if requested_capability is AnalysisCapabilityV1.DESCRIPTIVE:
         return
-    validator = getattr(design_capability, "require_causal_support", None)
-    if validator is not None:
-        if not callable(validator):
-            raise TypeError("design causal support hook must be callable")
-        validator()
     if (
         design_value != AnalysisCapabilityV1.CAUSAL.value
         or analysis_capability is not AnalysisCapabilityV1.CAUSAL
@@ -1074,6 +1069,11 @@ def require_claim_capability(
         raise UnsupportedCausalClaimError(
             "causal language requires both CAUSAL design and CAUSAL analysis capability"
         )
+    validator = getattr(design_capability, "require_causal_support", None)
+    if validator is not None:
+        if not callable(validator):
+            raise TypeError("design causal support hook must be callable")
+        validator()
 
 
 def _compatibility_decision(
