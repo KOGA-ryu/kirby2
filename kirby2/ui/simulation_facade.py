@@ -960,6 +960,37 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
     replay_source, replay_verification = resolve_replay_artifact(artifact_reference)
     if replay_source is None:
         raise SimulationContractIntegrityError("golden Replay artifact did not verify")
+    from .simulation_replay_provider import build_replay_provider
+
+    replay_provider = build_replay_provider(replay_source)
+    replay_initial_frame = replay_provider.initial_frame()
+    replay_identity = replay_initial_frame.get("identity")
+    replay_cursor = replay_initial_frame.get("cursor")
+    if type(replay_identity) is not dict or type(replay_cursor) is not dict:
+        raise SimulationContractIntegrityError(
+            "golden Replay provider initial frame is malformed"
+        )
+    replay_step_request = {
+        "request_id": "replay-request-00000001",
+        "source_generation": 1,
+        "origin": {
+            "cursor_id": replay_cursor["cursor_id"],
+            "frame_id": replay_initial_frame["frame_id"],
+            "observation_mode": replay_identity["observation_mode"],
+            "policy_id": replay_identity["policy_id"],
+            "render_cursor_time_us": replay_identity["render_cursor_time_us"],
+            "source_event_sha256": replay_identity["source_event_sha256"],
+            "source_run_id": replay_identity["source_run_id"],
+            "timeline_id": replay_identity["timeline_id"],
+        },
+        "command": {
+            "operation": "EVENT_STEP",
+            "direction": "NEXT",
+            "fixed_step_us": None,
+            "jump_target": None,
+        },
+    }
+    replay_step_response = replay_provider.respond(replay_step_request)
     unknown_store_reference = {
         **artifact_reference,
         "store_id": "kirby2-unknown-replay-store-v1",
@@ -982,6 +1013,9 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "replay_artifact_verification_unknown_store.json": (
             unknown_store_verification
         ),
+        "simulation_replay_provider_initial_frame.json": replay_initial_frame,
+        "simulation_replay_provider_event_step_request.json": replay_step_request,
+        "simulation_replay_provider_event_step_response.json": replay_step_response,
         "simulation_start_available.json": available_start,
         "simulation_start_refused.json": refused_start,
         "simulation_command_request_play.json": play_request,

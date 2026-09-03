@@ -58,6 +58,7 @@ from .simulation_artifact_contract import (
 from .simulation_finalize_facade import finalize_simulation_run
 from .simulation_replay_contract import ReplayArtifactVerificationReceiptV1
 from .simulation_replay_facade import resolve_replay_artifact
+from .simulation_replay_provider import build_replay_provider
 from .terminal import TerminalUiConfig, render_terminal_frame, run_terminal_ui
 
 __all__ = [
@@ -94,6 +95,7 @@ __all__ = [
     "SimulationTimelineEventV1",
     "TerminalUiConfig",
     "advance_simulation_run",
+    "build_replay_provider",
     "close_simulation_run",
     "commit_simulation_reset",
     "discard_simulation_reset",
