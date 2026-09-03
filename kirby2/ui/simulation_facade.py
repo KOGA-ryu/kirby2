@@ -769,7 +769,7 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
     }
     from .simulation_run_facade import _start_simulation_run_with_source_id
 
-    _, available_start = _start_simulation_run_with_source_id(
+    run_handle, available_start = _start_simulation_run_with_source_id(
         available_resolution,
         training_options,
         "simulation-run-00000000000000000000000000000001",
@@ -778,6 +778,62 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         refused_resolution,
         training_options,
         "simulation-run-00000000000000000000000000000002",
+    )
+    if run_handle is None:
+        raise SimulationContractIntegrityError("available golden Start omitted its run handle")
+    initial_frame = available_start["initial_frame"]
+    if type(initial_frame) is not dict or type(initial_frame.get("cursor")) is not dict:
+        raise SimulationContractIntegrityError("available golden Start frame is malformed")
+
+    def command_request(
+        frame: dict[str, object],
+        semantic_action_id: str,
+    ) -> dict[str, object]:
+        cursor = frame.get("cursor")
+        if type(cursor) is not dict:
+            raise SimulationContractIntegrityError("golden command origin cursor is malformed")
+        basis = {
+            "schema_id": "KIRBY2_SIMULATION_COMMAND_REQUEST_V1",
+            "schema_version": 1,
+            "source_run_id": frame["source_run_id"],
+            "origin_frame_id": frame["frame_id"],
+            "origin_cursor_id": cursor["cursor_id"],
+            "semantic_action_id": semantic_action_id,
+            "parameters": {},
+        }
+        return {
+            **basis,
+            "command_id": f"simulation-command-{canonical_digest(basis)[:24]}",
+        }
+
+    from .simulation_run_facade import (
+        advance_simulation_run,
+        dispatch_simulation_command,
+        read_current_simulation_frame,
+    )
+
+    play_request = command_request(initial_frame, "SIMULATION_PLAY")
+    play_result = dispatch_simulation_command(run_handle, play_request)
+    running_frame = play_result["destination_frame"]
+    if type(running_frame) is not dict or type(running_frame.get("cursor")) is not dict:
+        raise SimulationContractIntegrityError("golden Play frame is malformed")
+    running_cursor = running_frame["cursor"]
+    advance_result = advance_simulation_run(
+        run_handle,
+        str(running_frame["source_run_id"]),
+        str(running_frame["frame_id"]),
+        str(running_cursor["cursor_id"]),
+        1_000_000,
+    )
+    advanced_frame = advance_result["destination_frame"]
+    if type(advanced_frame) is not dict:
+        raise SimulationContractIntegrityError("golden advance frame is malformed")
+    buy_bid_request = command_request(advanced_frame, "PLAYER_BUY_BID")
+    buy_bid_result = dispatch_simulation_command(run_handle, buy_bid_request)
+    stale_result = dispatch_simulation_command(run_handle, play_request)
+    current_result = read_current_simulation_frame(
+        run_handle,
+        str(advanced_frame["source_run_id"]),
     )
     return {
         "profile_catalog.json": catalog,
@@ -788,6 +844,13 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "simulation_training_options.json": training_options,
         "simulation_start_available.json": available_start,
         "simulation_start_refused.json": refused_start,
+        "simulation_command_request_play.json": play_request,
+        "simulation_command_result_play.json": play_result,
+        "simulation_advance_result.json": advance_result,
+        "simulation_command_request_buy_bid.json": buy_bid_request,
+        "simulation_command_result_buy_bid.json": buy_bid_result,
+        "simulation_command_result_stale.json": stale_result,
+        "simulation_current_frame_result.json": current_result,
     }
 
 

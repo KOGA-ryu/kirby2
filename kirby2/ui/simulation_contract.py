@@ -716,7 +716,11 @@ class SimulationProfileCatalogV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationProfileCatalogV1:
         root = _object(_snapshot(payload), "simulation profile catalog")
         _exact(root, _CATALOG_FIELDS, "simulation profile catalog")
-        if root["schema_id"] != PROFILE_CATALOG_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != PROFILE_CATALOG_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation profile catalog schema is unsupported")
         profiles = [
             _validate_profile(item, f"simulation profile catalog.profiles[{index}]")
@@ -825,7 +829,11 @@ class SimulationProfileSelectionV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationProfileSelectionV1:
         root = _object(_snapshot(payload), "simulation profile selection")
         _exact(root, _SELECTION_FIELDS, "simulation profile selection")
-        if root["schema_id"] != PROFILE_SELECTION_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != PROFILE_SELECTION_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation profile selection schema is unsupported")
         return cls(
             PROFILE_SELECTION_SCHEMA_ID,
@@ -956,7 +964,11 @@ class SimulationTrainingResourceCatalogV1:
     ) -> SimulationTrainingResourceCatalogV1:
         root = _object(_snapshot(payload), "simulation training resource catalog")
         _exact(root, _TRAINING_CATALOG_FIELDS, "simulation training resource catalog")
-        if root["schema_id"] != TRAINING_RESOURCE_CATALOG_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != TRAINING_RESOURCE_CATALOG_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation training resource catalog schema is unsupported")
         layouts = [
             _validate_layout(item, f"simulation training resource catalog.layouts[{index}]")
@@ -1097,7 +1109,11 @@ class ResolvedSimulationConfigurationV1:
     ) -> ResolvedSimulationConfigurationV1:
         root = _object(_snapshot(payload), "resolved simulation configuration")
         _exact(root, _RESOLVED_CONFIGURATION_FIELDS, "resolved simulation configuration")
-        if root["schema_id"] != RESOLVED_CONFIGURATION_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != RESOLVED_CONFIGURATION_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("resolved simulation configuration schema is unsupported")
         return cls(
             profile_ref=SimulationProfileRefV1.from_dict(_object(root["profile_ref"], "resolved profile ref")),
@@ -1229,7 +1245,11 @@ class SimulationProfileResolutionV1:
     ) -> SimulationProfileResolutionV1:
         root = _object(_snapshot(payload), "simulation profile resolution")
         _exact(root, _PROFILE_RESOLUTION_FIELDS, "simulation profile resolution")
-        if root["schema_id"] != PROFILE_RESOLUTION_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != PROFILE_RESOLUTION_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation profile resolution schema is unsupported")
         status = _enum(root["status"], PROFILE_RESOLUTION_STATUSES, "resolution status")
         selection = SimulationProfileSelectionV1.from_dict(

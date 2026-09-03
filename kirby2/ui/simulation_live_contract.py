@@ -377,7 +377,11 @@ class SimulationTrainingOptionsV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationTrainingOptionsV1:
         root = _object(_snapshot(payload), "simulation training options")
         _exact(root, _TRAINING_FIELDS, "simulation training options")
-        if root["schema_id"] != TRAINING_OPTIONS_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != TRAINING_OPTIONS_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation training options schema is unsupported")
         quantities = tuple(
             _positive_integer(item, f"simulation training options.quantity_options[{index}]")
@@ -1086,7 +1090,11 @@ class SimulationFrameV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationFrameV1:
         root = _object(_snapshot(payload), "simulation frame")
         _exact(root, _FRAME_FIELDS, "simulation frame")
-        if root["schema_id"] != FRAME_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != FRAME_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation frame schema is unsupported")
         source_run_id = _prefixed_id(root["source_run_id"], _RUN_ID, "simulation frame.source_run_id")
         run_request_sha256 = _digest(root["run_request_sha256"], "simulation frame.run_request_sha256")
@@ -1246,7 +1254,11 @@ class SimulationStartResultV1:
     ) -> SimulationStartResultV1:
         root = _object(_snapshot(payload), "simulation start result")
         _exact(root, _START_RESULT_FIELDS, "simulation start result")
-        if root["schema_id"] != START_RESULT_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != START_RESULT_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation start result schema is unsupported")
         status = _enum(root["status"], START_STATUSES, "simulation start result.status")
         if status == "AVAILABLE":

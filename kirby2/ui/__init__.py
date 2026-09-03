@@ -17,6 +17,13 @@ from .simulation_facade import (
     list_simulation_training_resources,
     resolve_simulation_profile,
 )
+from .simulation_interaction_contract import (
+    SimulationAdvanceResultV1,
+    SimulationCommandOutcomeV1,
+    SimulationCommandRequestV1,
+    SimulationCommandResultV1,
+    SimulationCurrentFrameResultV1,
+)
 from .simulation_live_contract import (
     ObjectiveDefinitionV1,
     SimulationFrameV1,
@@ -24,15 +31,25 @@ from .simulation_live_contract import (
     SimulationStartRefusalV1,
     SimulationTrainingOptionsV1,
 )
-from .simulation_run_facade import start_simulation_run
+from .simulation_run_facade import (
+    advance_simulation_run,
+    dispatch_simulation_command,
+    read_current_simulation_frame,
+    start_simulation_run,
+)
 from .terminal import TerminalUiConfig, render_terminal_frame, run_terminal_ui
 
 __all__ = [
     "ResolvedSimulationConfigurationV1",
     "ObjectiveDefinitionV1",
     "SimulationComponentRefV1",
+    "SimulationAdvanceResultV1",
+    "SimulationCommandOutcomeV1",
+    "SimulationCommandRequestV1",
+    "SimulationCommandResultV1",
     "SimulationContractDecodeError",
     "SimulationContractIntegrityError",
+    "SimulationCurrentFrameResultV1",
     "SimulationProfileCatalogV1",
     "SimulationProfileRefV1",
     "SimulationProfileResolutionV1",
@@ -44,9 +61,12 @@ __all__ = [
     "SimulationTrainingOptionsV1",
     "SimulationTrainingResourceCatalogV1",
     "TerminalUiConfig",
+    "advance_simulation_run",
+    "dispatch_simulation_command",
     "list_simulation_profiles",
     "list_simulation_training_resources",
     "render_terminal_frame",
+    "read_current_simulation_frame",
     "resolve_simulation_profile",
     "run_terminal_ui",
     "start_simulation_run",
