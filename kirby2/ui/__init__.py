@@ -46,9 +46,22 @@ from .simulation_run_facade import (
     read_current_simulation_frame,
     start_simulation_run,
 )
+from .simulation_artifact_contract import (
+    EmbeddedComponentV1,
+    EmbeddedSessionRecordingV1,
+    ReplayArtifactRefV1,
+    SimulationFinalizeResultV1,
+    SimulationReplayArtifactV1,
+    SimulationRunResultV1,
+    SimulationTimelineEventV1,
+)
+from .simulation_finalize_facade import finalize_simulation_run
 from .terminal import TerminalUiConfig, render_terminal_frame, run_terminal_ui
 
 __all__ = [
+    "EmbeddedComponentV1",
+    "EmbeddedSessionRecordingV1",
+    "ReplayArtifactRefV1",
     "ResolvedSimulationConfigurationV1",
     "ObjectiveDefinitionV1",
     "SimulationComponentRefV1",
@@ -65,19 +78,24 @@ __all__ = [
     "SimulationProfileResolutionV1",
     "SimulationProfileSelectionV1",
     "SimulationFrameV1",
+    "SimulationFinalizeResultV1",
+    "SimulationReplayArtifactV1",
     "SimulationResolutionRefusalV1",
     "SimulationResetCommitResultV1",
     "SimulationResetResultV1",
+    "SimulationRunResultV1",
     "SimulationStartResultV1",
     "SimulationStartRefusalV1",
     "SimulationTrainingOptionsV1",
     "SimulationTrainingResourceCatalogV1",
+    "SimulationTimelineEventV1",
     "TerminalUiConfig",
     "advance_simulation_run",
     "close_simulation_run",
     "commit_simulation_reset",
     "discard_simulation_reset",
     "dispatch_simulation_command",
+    "finalize_simulation_run",
     "list_simulation_profiles",
     "list_simulation_training_resources",
     "prepare_simulation_reset",

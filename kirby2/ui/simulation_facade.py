@@ -880,6 +880,81 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
     if close_simulation_run(replacement_handle, "USER_ABANDONED") != close_result:
         raise SimulationContractIntegrityError("golden close is not idempotent")
     close_mismatch = close_simulation_run(replacement_handle, "INTEGRITY_LOCKED")
+
+    artifact_handle, artifact_start = _start_simulation_run_with_source_id(
+        available_resolution,
+        training_options,
+        "simulation-run-00000000000000000000000000000004",
+    )
+    if artifact_handle is None:
+        raise SimulationContractIntegrityError(
+            "available golden artifact Start omitted its run handle"
+        )
+    artifact_initial = artifact_start["initial_frame"]
+    if type(artifact_initial) is not dict:
+        raise SimulationContractIntegrityError("golden artifact initial frame is malformed")
+    artifact_play = dispatch_simulation_command(
+        artifact_handle,
+        command_request(artifact_initial, "SIMULATION_PLAY"),
+    )
+    artifact_running = artifact_play["destination_frame"]
+    if type(artifact_running) is not dict or type(artifact_running.get("cursor")) is not dict:
+        raise SimulationContractIntegrityError("golden artifact Play frame is malformed")
+    artifact_advance = advance_simulation_run(
+        artifact_handle,
+        str(artifact_running["source_run_id"]),
+        str(artifact_running["frame_id"]),
+        str(artifact_running["cursor"]["cursor_id"]),
+        1_000_000,
+    )
+    artifact_advanced = artifact_advance["destination_frame"]
+    if type(artifact_advanced) is not dict:
+        raise SimulationContractIntegrityError("golden artifact advance frame is malformed")
+    artifact_buy = dispatch_simulation_command(
+        artifact_handle,
+        command_request(artifact_advanced, "PLAYER_BUY_BID"),
+    )
+    artifact_origin = artifact_buy["destination_frame"]
+    if type(artifact_origin) is not dict or type(artifact_origin.get("cursor")) is not dict:
+        raise SimulationContractIntegrityError("golden artifact origin frame is malformed")
+    from .simulation_finalize_facade import finalize_simulation_run
+
+    finalize_not_complete = finalize_simulation_run(
+        artifact_handle,
+        str(artifact_origin["source_run_id"]),
+        str(artifact_origin["frame_id"]),
+        str(artifact_origin["cursor"]["cursor_id"]),
+        "COMPLETE_ONLY",
+    )
+    finalize_partial = finalize_simulation_run(
+        artifact_handle,
+        str(artifact_origin["source_run_id"]),
+        str(artifact_origin["frame_id"]),
+        str(artifact_origin["cursor"]["cursor_id"]),
+        "ALLOW_PARTIAL",
+    )
+    partial_run_result = finalize_partial["run_result"]
+    if type(partial_run_result) is not dict:
+        raise SimulationContractIntegrityError("golden partial finalization omitted its result")
+    artifact_reference = partial_run_result["replay_artifact"]
+    if type(artifact_reference) is not dict:
+        raise SimulationContractIntegrityError(
+            "golden partial finalization omitted its artifact reference"
+        )
+    from .simulation_artifact_store import _read_simulation_replay_artifact
+
+    artifact_bytes = _read_simulation_replay_artifact(
+        str(artifact_reference["store_id"]),
+        str(artifact_reference["object_key"]),
+    )
+    if artifact_bytes is None:
+        raise SimulationContractIntegrityError("golden Replay artifact is not resolvable")
+    artifact_record = load_canonical_json_bytes(
+        artifact_bytes,
+        "golden simulation Replay artifact",
+    )
+    if type(artifact_record) is not dict:
+        raise SimulationContractIntegrityError("golden Replay artifact root is malformed")
     return {
         "profile_catalog.json": catalog,
         "training_resource_catalog.json": training,
@@ -902,6 +977,11 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "simulation_current_frame_abandoned.json": abandoned_current_result,
         "simulation_close_result_closed.json": close_result,
         "simulation_close_result_mismatch.json": close_mismatch,
+        "simulation_finalize_result_not_complete.json": finalize_not_complete,
+        "simulation_finalize_result_partial.json": finalize_partial,
+        "simulation_run_result_partial.json": partial_run_result,
+        "replay_artifact_reference.json": artifact_reference,
+        "simulation_replay_artifact_partial.json": artifact_record,
     }
 
 

@@ -6,7 +6,7 @@ import hashlib
 import re
 import secrets
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from types import MappingProxyType
 
@@ -35,6 +35,7 @@ from .simulation_contract import (
     canonical_digest,
 )
 from .simulation_facade import (
+    COMPONENT_PAYLOAD_SCHEMA_ID,
     _COMMAND_ACTIONS,
     _catalog_state,
     _regime_payload,
@@ -78,15 +79,19 @@ class _SimulationRunHandle:
     resolved_configuration_sha256: str
     resolution: SimulationProfileResolutionV1
     training_options: SimulationTrainingOptionsV1
+    component_payloads: tuple[dict[str, object], ...]
     observation_policy_disclosure: str
     layout: HotkeyLayout
     semantic_input_keys: Mapping[str, str]
     frame_sequence: int
     run_state: str
     current_frame: SimulationFrameV1
+    event_tape: list[dict[str, object]] = field(default_factory=list)
+    session_timeline_count: int = 0
     lifecycle_disposition: str | None = None
     reset_pending: bool = False
     close_result: SimulationCloseResultV1 | None = None
+    finalization_state: object | None = None
 
 
 @dataclass(slots=True)
@@ -281,6 +286,55 @@ def _materialize_session(
     if disclosure not in {"AVAILABLE", "UNAVAILABLE"}:
         raise SimulationContractIntegrityError("observation policy disclosure is invalid")
     return session, str(disclosure), layout, semantic_input_keys
+
+
+def _capture_component_payloads(
+    resolution: SimulationProfileResolutionV1,
+    training: SimulationTrainingOptionsV1,
+) -> tuple[dict[str, object], ...]:
+    configuration = resolution.resolved_configuration
+    if configuration is None:
+        raise SimulationContractIntegrityError(
+            "available resolution lost its component references"
+        )
+    references = {
+        reference
+        for reference in (
+            configuration.scenario_definition_ref,
+            configuration.regime_profile_ref,
+            configuration.distribution_bundle_ref,
+            configuration.queue_reactive_ref,
+            configuration.hawkes_ref,
+            configuration.intraday_ref,
+            training.layout_ref,
+            training.strategy_ref,
+            training.curriculum_drill_ref,
+            training.observation_policy_ref,
+        )
+        if reference is not None
+    }
+    return tuple(
+        {
+            "component_ref": reference.as_dict(),
+            "payload": {
+                "schema_id": COMPONENT_PAYLOAD_SCHEMA_ID,
+                "schema_version": 1,
+                "component_kind": reference.component_kind,
+                "component_id": reference.component_id,
+                "component_version": reference.component_version,
+                "payload": _component_payload(reference),
+            },
+        }
+        for reference in sorted(
+            references,
+            key=lambda item: (
+                item.component_kind,
+                item.component_id,
+                item.component_version,
+                item.content_sha256,
+            ),
+        )
+    )
 
 
 def _instrument(session: LiveMarketSession) -> dict[str, object]:
@@ -735,6 +789,44 @@ def _frame(
     return SimulationFrameV1.from_dict(record)
 
 
+def _append_event_tape_row(
+    handle: _SimulationRunHandle,
+    *,
+    simulation_time_us: int,
+    kind: str,
+    message: str,
+    data: dict[str, object],
+) -> None:
+    handle.event_tape.append(
+        {
+            "sequence": len(handle.event_tape) + 1,
+            "simulation_time_us": simulation_time_us,
+            "kind": kind,
+            "message": message,
+            "data": data,
+        }
+    )
+
+
+def _capture_session_timeline(handle: _SimulationRunHandle) -> None:
+    records = handle.session.timeline
+    if handle.session_timeline_count > len(records):
+        raise SimulationContractIntegrityError("session timeline regressed")
+    for record in records[handle.session_timeline_count :]:
+        payload = record.as_dict()
+        data = payload["data"]
+        if type(data) is not dict:
+            raise SimulationContractIntegrityError("session timeline data is not detached")
+        _append_event_tape_row(
+            handle,
+            simulation_time_us=record.simulation_time_us,
+            kind=record.kind.value,
+            message=record.message,
+            data=data,
+        )
+    handle.session_timeline_count = len(records)
+
+
 def _start_simulation_run_with_source_id(
     resolution_payload: Mapping[str, object],
     training_options_payload: Mapping[str, object],
@@ -772,6 +864,7 @@ def _start_simulation_run_with_source_id(
             resolution,
             training,
         )
+        component_payloads = _capture_component_payloads(resolution, training)
     except SimulationStartRefusal as refusal:
         return None, _refused_start(refusal.reason_code, refusal.explanation)
     actual_source_run_id = (
@@ -817,6 +910,7 @@ def _start_simulation_run_with_source_id(
         resolved_configuration_sha256=configuration_sha256,
         resolution=resolution,
         training_options=training,
+        component_payloads=component_payloads,
         observation_policy_disclosure=disclosure,
         layout=layout,
         semantic_input_keys=semantic_input_keys,
@@ -824,6 +918,7 @@ def _start_simulation_run_with_source_id(
         run_state=training.initial_run_state,
         current_frame=initial_frame,
     )
+    _capture_session_timeline(handle)
     return handle, result.as_dict()
 
 
@@ -1494,6 +1589,20 @@ def dispatch_simulation_command(
         request=request,
         origin_frame=origin,
     )
+    if outcome["action_kind"] == "LIFECYCLE":
+        _append_event_tape_row(
+            handle,
+            simulation_time_us=int(_current_cursor(handle)["simulation_time_us"]),
+            kind="COMMAND" if outcome["accepted"] else "REJECTED",
+            message=str(outcome["message"]),
+            data={
+                "accepted": bool(outcome["accepted"]),
+                "action_kind": "LIFECYCLE",
+                "semantic_action_id": str(outcome["semantic_action_id"]),
+            },
+        )
+    else:
+        _capture_session_timeline(handle)
     handle.frame_sequence = destination.frame_sequence
     handle.run_state = next_run_state
     handle.current_frame = destination
@@ -1646,6 +1755,7 @@ def advance_simulation_run(
         },
     )
     result = SimulationAdvanceResultV1.from_dict(record, origin_frame=origin)
+    _capture_session_timeline(handle)
     handle.frame_sequence = destination.frame_sequence
     handle.run_state = next_run_state
     handle.current_frame = destination
