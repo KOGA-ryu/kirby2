@@ -807,7 +807,10 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         }
 
     from .simulation_run_facade import (
+        _prepare_simulation_reset_with_ids,
         advance_simulation_run,
+        close_simulation_run,
+        commit_simulation_reset,
         dispatch_simulation_command,
         read_current_simulation_frame,
     )
@@ -835,6 +838,48 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         run_handle,
         str(advanced_frame["source_run_id"]),
     )
+    reset_origin = current_result["current_frame"]
+    if type(reset_origin) is not dict or type(reset_origin.get("cursor")) is not dict:
+        raise SimulationContractIntegrityError("golden reset origin is malformed")
+    pending_reset, reset_result = _prepare_simulation_reset_with_ids(
+        run_handle,
+        str(reset_origin["source_run_id"]),
+        str(reset_origin["frame_id"]),
+        str(reset_origin["cursor"]["cursor_id"]),
+        new_source_run_id="simulation-run-00000000000000000000000000000003",
+        reset_token_id=(
+            "simulation-reset-token-00000000000000000000000000000001"
+        ),
+    )
+    if pending_reset is None:
+        raise SimulationContractIntegrityError("golden reset preparation omitted its handle")
+    reset_initial_frame = reset_result["initial_frame"]
+    if type(reset_initial_frame) is not dict:
+        raise SimulationContractIntegrityError("golden reset initial frame is malformed")
+    _, reset_commit_mismatch = commit_simulation_reset(
+        run_handle,
+        pending_reset,
+        str(reset_result["reset_token_id"]),
+        "simulation-run-ffffffffffffffffffffffffffffffff",
+        str(reset_initial_frame["frame_id"]),
+    )
+    replacement_handle, reset_commit_result = commit_simulation_reset(
+        run_handle,
+        pending_reset,
+        str(reset_result["reset_token_id"]),
+        str(reset_result["new_source_run_id"]),
+        str(reset_initial_frame["frame_id"]),
+    )
+    if replacement_handle is None:
+        raise SimulationContractIntegrityError("golden reset commit omitted its new handle")
+    abandoned_current_result = read_current_simulation_frame(
+        run_handle,
+        str(reset_origin["source_run_id"]),
+    )
+    close_result = close_simulation_run(replacement_handle, "USER_ABANDONED")
+    if close_simulation_run(replacement_handle, "USER_ABANDONED") != close_result:
+        raise SimulationContractIntegrityError("golden close is not idempotent")
+    close_mismatch = close_simulation_run(replacement_handle, "INTEGRITY_LOCKED")
     return {
         "profile_catalog.json": catalog,
         "training_resource_catalog.json": training,
@@ -851,6 +896,12 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "simulation_command_result_buy_bid.json": buy_bid_result,
         "simulation_command_result_stale.json": stale_result,
         "simulation_current_frame_result.json": current_result,
+        "simulation_reset_result_available.json": reset_result,
+        "simulation_reset_commit_mismatch.json": reset_commit_mismatch,
+        "simulation_reset_commit_committed.json": reset_commit_result,
+        "simulation_current_frame_abandoned.json": abandoned_current_result,
+        "simulation_close_result_closed.json": close_result,
+        "simulation_close_result_mismatch.json": close_mismatch,
     }
 
 

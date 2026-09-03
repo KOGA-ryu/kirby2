@@ -59,6 +59,15 @@ from .simulation_live_contract import (
     SimulationStartResultV1,
     SimulationTrainingOptionsV1,
 )
+from .simulation_lifecycle_contract import (
+    CLOSE_DISPOSITIONS,
+    CLOSE_RESULT_SCHEMA_ID,
+    RESET_COMMIT_RESULT_SCHEMA_ID,
+    RESET_RESULT_SCHEMA_ID,
+    SimulationCloseResultV1,
+    SimulationResetCommitResultV1,
+    SimulationResetResultV1,
+)
 
 
 @dataclass(slots=True)
@@ -75,8 +84,19 @@ class _SimulationRunHandle:
     frame_sequence: int
     run_state: str
     current_frame: SimulationFrameV1
-    terminal_disposition: str | None = None
+    lifecycle_disposition: str | None = None
     reset_pending: bool = False
+    close_result: SimulationCloseResultV1 | None = None
+
+
+@dataclass(slots=True)
+class _PendingSimulationReset:
+    previous_handle: _SimulationRunHandle
+    replacement_handle: _SimulationRunHandle | None
+    reset_token_id: str
+    prepared_result: SimulationResetResultV1
+    state: str = "PENDING"
+    commit_result: SimulationResetCommitResultV1 | None = None
 
 
 _PLAYER_ACTION_COMMANDS: Mapping[str, SessionCommand] = MappingProxyType(
@@ -89,6 +109,28 @@ _PLAYER_ACTION_COMMANDS: Mapping[str, SessionCommand] = MappingProxyType(
 _RUN_ID_PATTERN = re.compile(r"simulation-run-[0-9a-f]{32}\Z")
 _FRAME_ID_PATTERN = re.compile(r"simulation-frame-[0-9a-f]{24}\Z")
 _CURSOR_ID_PATTERN = re.compile(r"simulation-cursor-[0-9a-f]{24}\Z")
+_RESET_TOKEN_ID_PATTERN = re.compile(r"simulation-reset-token-[0-9a-f]{32}\Z")
+_ISSUED_SOURCE_RUN_IDS: set[str] = set()
+_ISSUED_RESET_TOKEN_IDS: set[str] = set()
+
+
+def _mint_never_reused_id(prefix: str, issued: set[str]) -> str:
+    while True:
+        candidate = f"{prefix}{secrets.token_hex(16)}"
+        if candidate not in issued:
+            issued.add(candidate)
+            return candidate
+
+
+def _mint_source_run_id() -> str:
+    return _mint_never_reused_id("simulation-run-", _ISSUED_SOURCE_RUN_IDS)
+
+
+def _mint_reset_token_id() -> str:
+    return _mint_never_reused_id(
+        "simulation-reset-token-",
+        _ISSUED_RESET_TOKEN_IDS,
+    )
 
 
 def _start_result_record(
@@ -733,9 +775,9 @@ def _start_simulation_run_with_source_id(
     except SimulationStartRefusal as refusal:
         return None, _refused_start(refusal.reason_code, refusal.explanation)
     actual_source_run_id = (
-        f"simulation-run-{secrets.token_hex(16)}"
+        _mint_source_run_id()
         if source_run_id is None
-        else source_run_id
+        else _operation_id(source_run_id, _RUN_ID_PATTERN, "simulation source run ID")
     )
     configuration_sha256 = resolution.resolved_configuration_sha256
     if configuration_sha256 is None:
@@ -830,6 +872,457 @@ def _identified_result(
     return {**basis, "result_id": f"{prefix}{canonical_digest(basis)[:24]}"}
 
 
+def _reset_result_record(
+    *,
+    status: str,
+    previous_source_run_id: str,
+    origin_frame_id: str,
+    origin_cursor_id: str,
+    reset_token_id: str | None,
+    new_source_run_id: str | None,
+    run_request_sha256: str | None,
+    initial_frame: dict[str, object] | None,
+    unavailable_reason: str | None,
+) -> dict[str, object]:
+    basis = {
+        "schema_id": RESET_RESULT_SCHEMA_ID,
+        "schema_version": 1,
+        "status": status,
+        "previous_source_run_id": previous_source_run_id,
+        "origin_frame_id": origin_frame_id,
+        "origin_cursor_id": origin_cursor_id,
+        "reset_token_id": reset_token_id,
+        "previous_run_disposition_on_commit": (
+            "ABANDONED_BY_RESET" if status == "AVAILABLE" else None
+        ),
+        "new_source_run_id": new_source_run_id,
+        "run_request_sha256": run_request_sha256,
+        "initial_frame": initial_frame,
+        "unavailable_reason": unavailable_reason,
+    }
+    return {
+        **basis,
+        "result_id": f"simulation-reset-result-{canonical_digest(basis)[:24]}",
+    }
+
+
+def _validated_reset_result(
+    record: Mapping[str, object],
+    origin_frame: SimulationFrameV1 | None = None,
+) -> SimulationResetResultV1:
+    try:
+        return SimulationResetResultV1.from_dict(record, origin_frame=origin_frame)
+    except SimulationContractIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise SimulationContractIntegrityError(
+            f"backend constructed an invalid reset result: {error}"
+        ) from error
+
+
+def _unavailable_reset(
+    handle: _SimulationRunHandle,
+    source_run_id: str,
+    origin_frame_id: str,
+    origin_cursor_id: str,
+    reason: str,
+) -> dict[str, object]:
+    return _validated_reset_result(
+        _reset_result_record(
+            status="UNAVAILABLE",
+            previous_source_run_id=source_run_id,
+            origin_frame_id=origin_frame_id,
+            origin_cursor_id=origin_cursor_id,
+            reset_token_id=None,
+            new_source_run_id=None,
+            run_request_sha256=None,
+            initial_frame=None,
+            unavailable_reason=reason,
+        ),
+    ).as_dict()
+
+
+def _prepare_simulation_reset_with_ids(
+    handle_value: object,
+    source_run_id: str,
+    origin_frame_id: str,
+    origin_cursor_id: str,
+    *,
+    new_source_run_id: str | None,
+    reset_token_id: str | None,
+) -> tuple[object | None, dict[str, object]]:
+    handle = _run_handle(handle_value)
+    source_run_id = _operation_id(
+        source_run_id,
+        _RUN_ID_PATTERN,
+        "simulation reset source run ID",
+    )
+    origin_frame_id = _operation_id(
+        origin_frame_id,
+        _FRAME_ID_PATTERN,
+        "simulation reset origin frame ID",
+    )
+    origin_cursor_id = _operation_id(
+        origin_cursor_id,
+        _CURSOR_ID_PATTERN,
+        "simulation reset origin cursor ID",
+    )
+    if source_run_id != handle.source_run_id:
+        return None, _unavailable_reset(
+            handle,
+            source_run_id,
+            origin_frame_id,
+            origin_cursor_id,
+            "SOURCE_RUN_MISMATCH",
+        )
+    if handle.reset_pending:
+        return None, _unavailable_reset(
+            handle,
+            source_run_id,
+            origin_frame_id,
+            origin_cursor_id,
+            "RESET_PENDING",
+        )
+    if handle.lifecycle_disposition == "FINALIZED":
+        return None, _unavailable_reset(
+            handle,
+            source_run_id,
+            origin_frame_id,
+            origin_cursor_id,
+            "RUN_FINALIZED",
+        )
+    if handle.lifecycle_disposition is not None:
+        raise SimulationContractIntegrityError(
+            "cannot reset an abandoned run handle"
+        )
+    cursor = _current_cursor(handle)
+    if (
+        origin_frame_id != handle.current_frame.frame_id
+        or origin_cursor_id != cursor["cursor_id"]
+    ):
+        return None, _unavailable_reset(
+            handle,
+            source_run_id,
+            origin_frame_id,
+            origin_cursor_id,
+            "STALE_ORIGIN",
+        )
+    fixed_source_run_id = (
+        None
+        if new_source_run_id is None
+        else _operation_id(
+            new_source_run_id,
+            _RUN_ID_PATTERN,
+            "simulation reset replacement source run ID",
+        )
+    )
+    replacement_value, start_record = _start_simulation_run_with_source_id(
+        handle.resolution.as_dict(),
+        handle.training_options.as_dict(),
+        fixed_source_run_id,
+    )
+    if replacement_value is None or start_record.get("status") != "AVAILABLE":
+        raise SimulationContractIntegrityError(
+            "an active run could not be reconstructed from its pinned configuration"
+        )
+    replacement = _run_handle(replacement_value)
+    if (
+        replacement.run_request_sha256 != handle.run_request_sha256
+        or replacement.resolved_configuration_sha256
+        != handle.resolved_configuration_sha256
+    ):
+        raise SimulationContractIntegrityError(
+            "reset reconstruction changed the pinned run request"
+        )
+    actual_reset_token_id = (
+        _mint_reset_token_id()
+        if reset_token_id is None
+        else _operation_id(
+            reset_token_id,
+            _RESET_TOKEN_ID_PATTERN,
+            "simulation reset token ID",
+        )
+    )
+    record = _reset_result_record(
+        status="AVAILABLE",
+        previous_source_run_id=handle.source_run_id,
+        origin_frame_id=handle.current_frame.frame_id,
+        origin_cursor_id=str(cursor["cursor_id"]),
+        reset_token_id=actual_reset_token_id,
+        new_source_run_id=replacement.source_run_id,
+        run_request_sha256=replacement.run_request_sha256,
+        initial_frame=replacement.current_frame.as_dict(),
+        unavailable_reason=None,
+    )
+    result = _validated_reset_result(record, handle.current_frame)
+    pending = _PendingSimulationReset(
+        previous_handle=handle,
+        replacement_handle=replacement,
+        reset_token_id=actual_reset_token_id,
+        prepared_result=result,
+    )
+    handle.reset_pending = True
+    return pending, result.as_dict()
+
+
+def prepare_simulation_reset(
+    handle_value: object,
+    source_run_id: str,
+    origin_frame_id: str,
+    origin_cursor_id: str,
+) -> tuple[object | None, dict[str, object]]:
+    """Prepare a fresh replacement while preserving the visible run unchanged."""
+
+    return _prepare_simulation_reset_with_ids(
+        handle_value,
+        source_run_id,
+        origin_frame_id,
+        origin_cursor_id,
+        new_source_run_id=None,
+        reset_token_id=None,
+    )
+
+
+def _reset_commit_result(
+    *,
+    status: str,
+    reset_token_id: str,
+    previous_source_run_id: str,
+    new_source_run_id: str | None,
+    initial_frame_id: str | None,
+    unavailable_reason: str | None,
+) -> SimulationResetCommitResultV1:
+    record = {
+        "schema_id": RESET_COMMIT_RESULT_SCHEMA_ID,
+        "schema_version": 1,
+        "status": status,
+        "reset_token_id": reset_token_id,
+        "previous_source_run_id": previous_source_run_id,
+        "new_source_run_id": new_source_run_id,
+        "initial_frame_id": initial_frame_id,
+        "previous_run_disposition": (
+            "ABANDONED_BY_RESET" if status == "COMMITTED" else None
+        ),
+        "unavailable_reason": unavailable_reason,
+    }
+    try:
+        return SimulationResetCommitResultV1.from_dict(record)
+    except SimulationContractIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise SimulationContractIntegrityError(
+            f"backend constructed an invalid reset commit result: {error}"
+        ) from error
+
+
+def _unavailable_reset_commit(
+    handle: _SimulationRunHandle,
+    reset_token_id: str,
+    reason: str,
+) -> tuple[None, dict[str, object]]:
+    result = _reset_commit_result(
+        status="UNAVAILABLE",
+        reset_token_id=reset_token_id,
+        previous_source_run_id=handle.source_run_id,
+        new_source_run_id=None,
+        initial_frame_id=None,
+        unavailable_reason=reason,
+    )
+    return None, result.as_dict()
+
+
+def commit_simulation_reset(
+    handle_value: object,
+    pending_value: object,
+    reset_token_id: str,
+    expected_new_source_run_id: str,
+    expected_initial_frame_id: str,
+) -> tuple[object | None, dict[str, object]]:
+    """Atomically abandon one run and activate its validated replacement."""
+
+    handle = _run_handle(handle_value)
+    reset_token_id = _operation_id(
+        reset_token_id,
+        _RESET_TOKEN_ID_PATTERN,
+        "simulation reset token ID",
+    )
+    expected_new_source_run_id = _operation_id(
+        expected_new_source_run_id,
+        _RUN_ID_PATTERN,
+        "simulation reset expected source run ID",
+    )
+    expected_initial_frame_id = _operation_id(
+        expected_initial_frame_id,
+        _FRAME_ID_PATTERN,
+        "simulation reset expected initial frame ID",
+    )
+    if (
+        type(pending_value) is not _PendingSimulationReset
+        or pending_value.previous_handle is not handle
+        or pending_value.state == "DISCARDED"
+    ):
+        return _unavailable_reset_commit(
+            handle,
+            reset_token_id,
+            "UNKNOWN_RESET_TOKEN",
+        )
+    pending = pending_value
+    replacement = pending.replacement_handle
+    if replacement is None:
+        return _unavailable_reset_commit(
+            handle,
+            reset_token_id,
+            "UNKNOWN_RESET_TOKEN",
+        )
+    prepared_frame = pending.prepared_result.initial_frame
+    prepared_source_run_id = pending.prepared_result.new_source_run_id
+    if (
+        prepared_frame is None
+        or prepared_source_run_id is None
+        or prepared_source_run_id != replacement.source_run_id
+        or prepared_frame.frame_id != replacement.current_frame.frame_id
+    ):
+        raise SimulationContractIntegrityError(
+            "pending reset handle differs from its validated public result"
+        )
+    exact_match = (
+        reset_token_id == pending.reset_token_id
+        and expected_new_source_run_id == prepared_source_run_id
+        and expected_initial_frame_id == prepared_frame.frame_id
+    )
+    if pending.state == "COMMITTED":
+        if exact_match and pending.commit_result is not None:
+            return replacement, pending.commit_result.as_dict()
+        return _unavailable_reset_commit(
+            handle,
+            reset_token_id,
+            "RESET_TOKEN_MISMATCH",
+        )
+    if pending.state != "PENDING" or not handle.reset_pending:
+        return _unavailable_reset_commit(
+            handle,
+            reset_token_id,
+            "UNKNOWN_RESET_TOKEN",
+        )
+    if not exact_match:
+        return _unavailable_reset_commit(
+            handle,
+            reset_token_id,
+            "RESET_TOKEN_MISMATCH",
+        )
+    result = _reset_commit_result(
+        status="COMMITTED",
+        reset_token_id=pending.reset_token_id,
+        previous_source_run_id=handle.source_run_id,
+        new_source_run_id=replacement.source_run_id,
+        initial_frame_id=replacement.current_frame.frame_id,
+        unavailable_reason=None,
+    )
+    handle.reset_pending = False
+    handle.lifecycle_disposition = "ABANDONED_BY_RESET"
+    pending.state = "COMMITTED"
+    pending.commit_result = result
+    return replacement, result.as_dict()
+
+
+def discard_simulation_reset(
+    handle_value: object,
+    pending_value: object,
+) -> None:
+    """Discard an uncommitted replacement and restore the old run's mutability."""
+
+    handle = _run_handle(handle_value)
+    if type(pending_value) is not _PendingSimulationReset:
+        raise TypeError("simulation reset discard requires an opaque pending handle")
+    pending = pending_value
+    if pending.previous_handle is not handle:
+        raise SimulationContractIntegrityError(
+            "pending reset does not belong to the supplied run handle"
+        )
+    if pending.state != "PENDING":
+        return
+    replacement = pending.replacement_handle
+    if replacement is not None:
+        replacement.lifecycle_disposition = "ABANDONED_BY_RESET"
+    pending.replacement_handle = None
+    pending.state = "DISCARDED"
+    handle.reset_pending = False
+
+
+def _close_result(
+    handle: _SimulationRunHandle,
+    disposition: str,
+    *,
+    status: str,
+    unavailable_reason: str | None,
+) -> SimulationCloseResultV1:
+    record = {
+        "schema_id": CLOSE_RESULT_SCHEMA_ID,
+        "schema_version": 1,
+        "status": status,
+        "source_run_id": handle.source_run_id,
+        "disposition": disposition,
+        "unavailable_reason": unavailable_reason,
+    }
+    try:
+        return SimulationCloseResultV1.from_dict(record)
+    except SimulationContractIntegrityError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise SimulationContractIntegrityError(
+            f"backend constructed an invalid close result: {error}"
+        ) from error
+
+
+def close_simulation_run(
+    handle_value: object,
+    disposition: str,
+) -> dict[str, object]:
+    """Idempotently abandon an unfinalized handle without publishing Replay data."""
+
+    handle = _run_handle(handle_value)
+    if type(disposition) is not str or disposition not in CLOSE_DISPOSITIONS:
+        raise SimulationContractDecodeError(
+            "simulation close disposition is not a supported V1 value"
+        )
+    if handle.reset_pending:
+        raise SimulationContractIntegrityError(
+            "discard or commit the pending reset before closing its previous run"
+        )
+    if handle.lifecycle_disposition == "FINALIZED":
+        return _close_result(
+            handle,
+            disposition,
+            status="UNAVAILABLE",
+            unavailable_reason="RUN_FINALIZED",
+        ).as_dict()
+    if handle.close_result is not None:
+        if handle.close_result.disposition == disposition:
+            return handle.close_result.as_dict()
+        return _close_result(
+            handle,
+            disposition,
+            status="UNAVAILABLE",
+            unavailable_reason="DISPOSITION_MISMATCH",
+        ).as_dict()
+    if handle.lifecycle_disposition is not None:
+        return _close_result(
+            handle,
+            disposition,
+            status="UNAVAILABLE",
+            unavailable_reason="DISPOSITION_MISMATCH",
+        ).as_dict()
+    result = _close_result(
+        handle,
+        disposition,
+        status="CLOSED",
+        unavailable_reason=None,
+    )
+    handle.lifecycle_disposition = disposition
+    handle.close_result = result
+    return result.as_dict()
+
+
 def _command_unavailable(
     request: SimulationCommandRequestV1,
     reason: str,
@@ -859,8 +1352,12 @@ def _command_origin_unavailable_reason(
         return "SOURCE_RUN_MISMATCH"
     if handle.reset_pending:
         return "RESET_PENDING"
-    if handle.terminal_disposition is not None:
+    if handle.lifecycle_disposition == "FINALIZED":
         return "RUN_FINALIZED"
+    if handle.lifecycle_disposition is not None:
+        raise SimulationContractIntegrityError(
+            "cannot dispatch a command against an abandoned run handle"
+        )
     cursor = _current_cursor(handle)
     if (
         request.origin_frame_id != handle.current_frame.frame_id
@@ -1072,13 +1569,17 @@ def advance_simulation_run(
             target_time_us,
             "RESET_PENDING",
         )
-    if handle.terminal_disposition is not None:
+    if handle.lifecycle_disposition == "FINALIZED":
         return _advance_unavailable(
             source_run_id,
             origin_frame_id,
             origin_cursor_id,
             target_time_us,
             "RUN_FINALIZED",
+        )
+    if handle.lifecycle_disposition is not None:
+        raise SimulationContractIntegrityError(
+            "cannot advance an abandoned run handle"
         )
     if (
         origin_frame_id != handle.current_frame.frame_id
@@ -1172,7 +1673,10 @@ def read_current_simulation_frame(
             "current_frame": None,
             "unavailable_reason": "SOURCE_RUN_MISMATCH",
         }
-    elif handle.terminal_disposition == "ABANDONED_BY_RESET":
+    elif (
+        handle.lifecycle_disposition is not None
+        and handle.lifecycle_disposition != "FINALIZED"
+    ):
         record = {
             "schema_id": CURRENT_FRAME_RESULT_SCHEMA_ID,
             "schema_version": 1,
@@ -1201,7 +1705,11 @@ def read_current_simulation_frame(
 __all__ = [
     "RUN_REQUEST_SCHEMA_ID",
     "advance_simulation_run",
+    "close_simulation_run",
+    "commit_simulation_reset",
+    "discard_simulation_reset",
     "dispatch_simulation_command",
+    "prepare_simulation_reset",
     "read_current_simulation_frame",
     "start_simulation_run",
 ]
