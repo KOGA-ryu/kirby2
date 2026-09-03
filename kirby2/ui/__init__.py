@@ -56,12 +56,15 @@ from .simulation_artifact_contract import (
     SimulationTimelineEventV1,
 )
 from .simulation_finalize_facade import finalize_simulation_run
+from .simulation_replay_contract import ReplayArtifactVerificationReceiptV1
+from .simulation_replay_facade import resolve_replay_artifact
 from .terminal import TerminalUiConfig, render_terminal_frame, run_terminal_ui
 
 __all__ = [
     "EmbeddedComponentV1",
     "EmbeddedSessionRecordingV1",
     "ReplayArtifactRefV1",
+    "ReplayArtifactVerificationReceiptV1",
     "ResolvedSimulationConfigurationV1",
     "ObjectiveDefinitionV1",
     "SimulationComponentRefV1",
@@ -102,6 +105,7 @@ __all__ = [
     "render_terminal_frame",
     "read_current_simulation_frame",
     "resolve_simulation_profile",
+    "resolve_replay_artifact",
     "run_terminal_ui",
     "start_simulation_run",
 ]

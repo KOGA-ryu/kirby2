@@ -955,6 +955,22 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
     )
     if type(artifact_record) is not dict:
         raise SimulationContractIntegrityError("golden Replay artifact root is malformed")
+    from .simulation_replay_facade import resolve_replay_artifact
+
+    replay_source, replay_verification = resolve_replay_artifact(artifact_reference)
+    if replay_source is None:
+        raise SimulationContractIntegrityError("golden Replay artifact did not verify")
+    unknown_store_reference = {
+        **artifact_reference,
+        "store_id": "kirby2-unknown-replay-store-v1",
+    }
+    missing_source, unknown_store_verification = resolve_replay_artifact(
+        unknown_store_reference
+    )
+    if missing_source is not None:
+        raise SimulationContractIntegrityError(
+            "unknown golden Replay store yielded a source handle"
+        )
     return {
         "profile_catalog.json": catalog,
         "training_resource_catalog.json": training,
@@ -962,6 +978,10 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "profile_resolution_available.json": available_resolution,
         "profile_resolution_refused.json": refused_resolution,
         "simulation_training_options.json": training_options,
+        "replay_artifact_verification_available.json": replay_verification,
+        "replay_artifact_verification_unknown_store.json": (
+            unknown_store_verification
+        ),
         "simulation_start_available.json": available_start,
         "simulation_start_refused.json": refused_start,
         "simulation_command_request_play.json": play_request,

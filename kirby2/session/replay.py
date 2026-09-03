@@ -154,8 +154,9 @@ class SessionRecording:
         return path
 
     @classmethod
-    def load(cls, path: Path) -> SessionRecording:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+    def from_dict(cls, payload: dict[str, object]) -> SessionRecording:
+        """Decode one already-loaded version-2 recording object."""
+
         if not isinstance(payload, dict):
             raise ValueError("session recording must contain a JSON object")
         if payload.get("record_type") != "kirby2_session_recording":
@@ -222,6 +223,11 @@ class SessionRecording:
                 else CurriculumDrill.from_dict(curriculum_drill)
             ),
         )
+
+    @classmethod
+    def load(cls, path: Path) -> SessionRecording:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(payload)
 
 
 @dataclass(slots=True)
