@@ -1,9 +1,9 @@
 # Simulation UI/backend integration handoff
 
-Status: `IMPLEMENTATION_PENDING`
+Status: `READY_FOR_UI_INTEGRATION`
 Handoff ID: `KIRBY2_SIMULATION_UI_BACKEND_HANDOFF_V1`
 Contract schema target: version 1
-Backend implementation commit: `PENDING`
+Backend implementation commit: `655ccf495b015f2067f11d63adcf3dd63e4e4609`
 UI integration commit: `PENDING`
 Backend setup-contract slice: `IMPLEMENTED`
 Backend setup-contract commit: `19b5fae21e891c798b6bfd6c149761a82597feac`
@@ -15,20 +15,25 @@ Backend reset/close lifecycle slice: `IMPLEMENTED`
 Backend reset/close lifecycle commit: `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f`
 Backend finalization/artifact slice: `IMPLEMENTED`
 Backend finalization/artifact commit: `ccfc9669cc46c29dca226bb5481b13210394d2ca`
+Backend Replay-artifact verification slice: `IMPLEMENTED`
+Backend Replay-artifact verification commit: `49b8854d7739ad59cd3109d319c946e643c3c193`
+Backend verified Replay-provider slice: `IMPLEMENTED`
+Backend verified Replay-provider commit: `655ccf495b015f2067f11d63adcf3dd63e4e4609`
 UI setup-contract projector commit: `66de3b4d9ce2d213e94c68a8f759859566c520cf`
 UI verified Setup integration commits:
 `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`,
 `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320`
+UI verified Start integration commit: `63fed733a77b206d5629dec72ab3325a7d61ce97`
 
 This is the handoff contract for connecting the standalone Kirby2 Qt UI to the
 mathematical simulation backend. It is deliberately separate from release
 qualification and from the WO36 Replay Studio presentation contract.
 
-The UI worker may integrate an individual public surface only when its row below says
-`IMPLEMENTED` and names an exact path and commit. The complete handoff must not be
-treated as finished until this header says `READY_FOR_UI_INTEGRATION`, the backend
-implementation commit is filled in, and the implementation table contains no
-`PENDING` rows.
+The UI worker may integrate an individual public surface only when its backend row
+below says `IMPLEMENTED` and names an exact path and commit. The backend handoff is
+ready because this header says `READY_FOR_UI_INTEGRATION`, the backend implementation
+commit is filled in, and no backend-owned row remains `PENDING`. UI-owned rows remain
+open until the separate UI repository commits the corresponding wiring.
 
 ## 1. Repository locations
 
@@ -132,12 +137,13 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | `SimulationCloseResultV1` and idempotent close facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_lifecycle_contract.py`, `kirby2/ui/simulation_run_facade.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | `SimulationRunResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_artifact_contract.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
 | `SimulationReplayArtifactV1` / `ReplayArtifactRefV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_artifact_contract.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
-| Replay verification receipt/provider bridge | Backend | `PENDING` | To be recorded after implementation |
+| `ReplayArtifactVerificationReceiptV1` and deep resolver | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_replay_contract.py`, `kirby2/ui/simulation_replay_facade.py` at `49b8854d7739ad59cd3109d319c946e643c3c193` |
+| Verified Replay provider bridge | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_replay_provider.py` at `655ccf495b015f2067f11d63adcf3dd63e4e4609` |
 | Profile list/resolve facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_facade.py` |
 | Start facade and fresh run materialization | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Command/advance facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
 | Finalize/artifact facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_finalize_facade.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
-| Backend-produced setup/start/interaction/lifecycle/finalization golden fixtures | Backend | `IMPLEMENTED` | 26 records in `kirby2/ui/fixtures/simulation_contract_v1/` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
+| Backend-produced setup/start/interaction/lifecycle/finalization/Replay golden fixtures | Backend | `IMPLEMENTED` | 31 records in `kirby2/ui/fixtures/simulation_contract_v1/` at `655ccf495b015f2067f11d63adcf3dd63e4e4609` |
 | Strict setup-contract projector | UI | `IMPLEMENTED` | `src/kirby2_ui/simulation_contract.py` at `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | Strict live-frame projector and store | UI | `PENDING` | UI worker selects paths |
 | Setup/profile selector integration | UI | `IMPLEMENTED` | `src/kirby2_ui/` at `77e6d5f28c3e3d254257a37bd8d74a1c786f3958` and `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
@@ -241,11 +247,11 @@ UI `request_id`, source generation, focus, selection, animation, input source,
 originating view, and loading state are operational sidecar state and never enter
 canonical simulation identity.
 
-## 6. Target backend records
+## 6. Implemented backend records
 
-The record names and responsibilities in this section are the version-1 target. The
-backend implementation must publish exact `as_dict()`/`from_dict()` behavior before
-this document becomes ready.
+The record names and responsibilities in this section are the implemented version-1
+contract. Their exact `as_dict()`/`from_dict()` behavior and serializer-produced
+examples are available at the backend implementation commit recorded above.
 
 ### 6.1 `SimulationComponentRefV1`
 
@@ -520,14 +526,13 @@ The resolver is the sole construction point for `SimpleFlowModel`,
 `HawkesFlowModel`, queue-reactive modifiers, distribution profiles, and intraday
 components. A refusal is data, not a partially constructed run.
 
-The implemented setup, run-start, interaction, and lifecycle slices publish their
-backend-authored compatibility records under
-`kirby2/ui/fixtures/simulation_contract_v1/`.
-`manifest.json` pins the exact
-canonical bytes for the profile catalog, training-resource catalog, one selection,
-one `AVAILABLE` resolution, one `REFUSED / INVALID_DURATION` resolution, the exact
-training options, one `AVAILABLE` Start result with its complete initial frame, and
-one `REFUSED` Start result. The records are generated mechanically by
+All implemented setup, run-start, interaction, lifecycle, finalization, artifact-
+verification, and Replay-provider slices publish backend-authored compatibility
+records under `kirby2/ui/fixtures/simulation_contract_v1/`. `manifest.json` pins
+the exact canonical bytes for 31 records. These cover the catalogs and selections,
+available and refused resolution/Start paths, live interaction and lifecycle
+results, finalized artifact/reference/verification records, and the Replay
+provider's initial frame plus one event-step request/response. They are generated by
 `kirby2.ui.simulation_facade.write_simulation_contract_golden_fixtures()`; they are
 not hand-written examples. The current catalog deliberately contains only the 24
 supported combinations formed by the twelve accepted regimes and the existing
@@ -566,8 +571,12 @@ fencing while a replacement is pending; discard recovery; atomic commit; and
 idempotent close. The golden manifest now covers 21 mechanically generated records,
 including successful reset preparation, a commit mismatch, successful commit,
 abandoned-source recovery, exact repeated close behavior, and a conflicting close.
-Finalization, artifact persistence, artifact verification, and the Replay provider
-remain pending and must stay disabled in the UI.
+Finalization and immutable artifact persistence landed at
+`ccfc9669cc46c29dca226bb5481b13210394d2ca`. Deep artifact verification landed at
+`49b8854d7739ad59cd3109d319c946e643c3c193`, and the verified Replay provider landed
+at `655ccf495b015f2067f11d63adcf3dd63e4e4609`. The current golden manifest covers
+31 mechanically generated records, including verification receipts and the Replay
+provider's initial-frame and event-step transport examples.
 
 ### 6.6 `SimulationTrainingOptionsV1`
 
@@ -1362,11 +1371,9 @@ The backend must expose the following semantic operations through a UI-compatibl
 facade. Internal Python objects may remain opaque inside `KirbyBackend`; Qt widgets
 receive only detached standard-library values or UI-owned projections.
 
-At backend commit `ccfc9669cc46c29dca226bb5481b13210394d2ca`, the list,
-training-resource list, resolve, Start, command, advance, current-frame, two-phase
-reset, idempotent close, finalization, and immutable artifact storage operations
-below are implemented. Artifact resolution and Replay-provider operations remain
-target contracts, not callable claims.
+At backend commit `655ccf495b015f2067f11d63adcf3dd63e4e4609`, every operation
+below is implemented and exported. This includes deep artifact resolution and the
+verified Replay provider; neither is merely a target contract.
 
 ```text
 list_simulation_profiles()
@@ -1436,8 +1443,51 @@ resolve_replay_artifact(ReplayArtifactRefV1)
         ReplayArtifactVerificationReceiptV1)
 
 build_replay_provider(opaque verified replay-source handle)
-    -> opaque provider implementing the existing WO36 public Replay calls
+    -> opaque provider with initial_frame() and respond(request)
 ```
+
+The provider's detached adapter envelope exactly matches the UI-owned
+`ReplayTransportRequest.as_dict()` shape:
+
+```text
+provider.initial_frame()
+    -> ReplayPresentationFrameV1 dictionary
+
+provider.respond({
+    "request_id": "replay-request-00000001",
+    "source_generation": nonnegative integer,
+    "origin": {
+        "cursor_id": string,
+        "frame_id": string,
+        "observation_mode": "AS_OBSERVED",
+        "policy_id": "MICROSCOPE_AS_OBSERVED_V1",
+        "render_cursor_time_us": nonnegative integer,
+        "source_event_sha256": SHA-256,
+        "source_run_id": replay run ID,
+        "timeline_id": string,
+    },
+    "command": {
+        "operation": "PLAY" | "PAUSE" | "EVENT_STEP" |
+                     "FIXED_TIME_STEP" | "JUMP",
+        "direction": null | "PREVIOUS" | "NEXT",
+        "fixed_step_us": null | positive integer,
+        "jump_target": null | existing WO36 jump-target token,
+    },
+}) -> {
+    "request_id": exact request ID,
+    "source_generation": exact source generation,
+    "kind": "PLAYBACK" | "NAVIGATION",
+    "navigation_payload": null | TimelineNavigationResult dictionary,
+    "frame_payload": null | ReplayPresentationFrameV1 dictionary,
+}
+```
+
+`PLAY` and `PAUSE` return `PLAYBACK`, no navigation payload, and one complete
+frame. The three navigation operations return `NAVIGATION`; `frame_payload` is
+present exactly when the navigation result is `AVAILABLE`. The provider accepts an
+origin only when all eight fields identify a frame previously issued by that same
+provider. Mutated, foreign, or stale origin records fail before navigation. The
+provider returns fresh detached dictionaries on every call.
 
 The exact in-process handle types are backend-private, held only by the UI adapter,
 and absent from canonical JSON. Start re-resolves the embedded selection and verifies
@@ -1457,13 +1507,12 @@ digest or cross-identity failures fail as `SimulationContractIntegrityError`.
 passing simulator objects or arbitrary exceptions to widgets.
 
 Version 1 is strictly synchronous and single-call-at-a-time per adapter. A call
-returns before another start, command, advance, reset, finalize, or artifact resolve
-begins; callbacks and out-of-order backend delivery are not part of this contract.
-The UI still keeps its monotonic `source_generation` and optional request ID around
-each call so source replacement is safe, but those values wrap the call locally and
-do not enter a canonical request or result. An asynchronous backend is a future
-contract version and must add a separate adapter-owned correlation envelope rather
-than altering these DTOs.
+returns before another start, command, advance, reset, finalize, artifact resolve,
+or Replay-provider operation begins. The live-simulation DTOs remain free of local
+request correlation. Replay navigation uses the adapter-owned envelope shown above:
+`source_generation` and `request_id` are echoed for the UI delivery gate but do not
+enter canonical evidence, timeline, or presentation identity. An asynchronous
+backend remains a future contract version and must preserve this separation.
 
 ## 8. UI connection procedure
 
@@ -1740,7 +1789,7 @@ Before changing this document to `READY_FOR_UI_INTEGRATION`, the backend worker 
 - implement idempotent unfinalized-run cleanup for unpublished and locked handles;
 - prove completion-edge behavior and finalize idempotence in focused contract tests;
 - record exact source paths and the backend implementation commit here;
-- replace the illustrative examples below with serializer-produced examples;
+- publish serializer-produced examples in the governed golden-fixture directory;
 - leave Replay and release-performance contracts separate;
 - send this absolute document path to the UI task.
 
@@ -1748,8 +1797,9 @@ No broad release or performance run is required to complete this handoff.
 
 ## 13. Illustrative lifecycle
 
-The following is explanatory only while the status is `IMPLEMENTATION_PENDING`. It
-must be replaced with exact serializer output before UI production wiring begins.
+The following remains a compact lifecycle outline. Exact serializer output is in
+`kirby2/ui/fixtures/simulation_contract_v1/`; its 31 files and manifest are the
+machine-consumable integration examples.
 
 ```text
 catalog = backend.list_simulation_profiles()
@@ -1837,7 +1887,7 @@ if finalize_result.status == "AVAILABLE":
 | Field | Value |
 | --- | --- |
 | Contract authoring status | `COMPLETE` |
-| Backend implementation status | `IN_PROGRESS_RESET_CLOSE_IMPLEMENTED` |
+| Backend implementation status | `COMPLETE_READY_FOR_UI_INTEGRATION` |
 | UI integration status | `IN_PROGRESS_SETUP_INTEGRATED` |
 | Backend setup-contract slice | `IMPLEMENTED` |
 | Backend setup-contract commit | `19b5fae21e891c798b6bfd6c149761a82597feac` |
@@ -1847,9 +1897,16 @@ if finalize_result.status == "AVAILABLE":
 | Backend interaction commit | `78c82f01af640d20616347fd021f86b92db5cfd2` |
 | Backend reset/close lifecycle slice | `IMPLEMENTED` |
 | Backend reset/close lifecycle commit | `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
+| Backend finalization/artifact slice | `IMPLEMENTED` |
+| Backend finalization/artifact commit | `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
+| Backend Replay-artifact verification slice | `IMPLEMENTED` |
+| Backend Replay-artifact verification commit | `49b8854d7739ad59cd3109d319c946e643c3c193` |
+| Backend verified Replay-provider slice | `IMPLEMENTED` |
+| Backend verified Replay-provider commit | `655ccf495b015f2067f11d63adcf3dd63e4e4609` |
 | UI setup-contract projector commit | `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | UI verified Setup integration commits | `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`, `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
-| Backend implementation commit | `PENDING` |
+| UI verified Start integration commit | `63fed733a77b206d5629dec72ab3325a7d61ce97` |
+| Backend implementation commit | `655ccf495b015f2067f11d63adcf3dd63e4e4609` |
 | UI integration commit | `PENDING` |
 | Expensive qualification authorization | `NOT_GRANTED` |
 | Live brokerage/network authority | `NOT_GRANTED` |
