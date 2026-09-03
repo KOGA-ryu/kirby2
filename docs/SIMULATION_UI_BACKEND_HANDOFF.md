@@ -7,16 +7,22 @@ Backend implementation commit: `PENDING`
 UI integration commit: `PENDING`
 Backend setup-contract slice: `IMPLEMENTED`
 Backend setup-contract commit: `19b5fae21e891c798b6bfd6c149761a82597feac`
+Backend run-start slice: `IMPLEMENTED`
+Backend run-start commit: `80372cbb12d4a2262e189f9ae63e20f0fadb9a11`
 UI setup-contract projector commit: `66de3b4d9ce2d213e94c68a8f759859566c520cf`
+UI verified Setup integration commits:
+`77e6d5f28c3e3d254257a37bd8d74a1c786f3958`,
+`d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320`
 
 This is the handoff contract for connecting the standalone Kirby2 Qt UI to the
 mathematical simulation backend. It is deliberately separate from release
 qualification and from the WO36 Replay Studio presentation contract.
 
-The UI worker may use this document to prepare its adapter boundary now. It must not
-treat a target symbol as implemented until this header says
-`READY_FOR_UI_INTEGRATION`, the backend implementation commit is filled in, and the
-implementation table below contains no `PENDING` rows.
+The UI worker may integrate an individual public surface only when its row below says
+`IMPLEMENTED` and names an exact path and commit. The complete handoff must not be
+treated as finished until this header says `READY_FOR_UI_INTEGRATION`, the backend
+implementation commit is filled in, and the implementation table contains no
+`PENDING` rows.
 
 ## 1. Repository locations
 
@@ -109,9 +115,9 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | `SimulationProfileSelectionV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_contract.py` |
 | `SimulationProfileResolutionV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_contract.py` |
 | `ResolvedSimulationConfigurationV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_contract.py` |
-| `SimulationTrainingOptionsV1` | Backend | `PENDING` | To be recorded after implementation |
-| `SimulationStartResultV1` | Backend | `PENDING` | To be recorded after implementation |
-| `SimulationFrameV1` | Backend | `PENDING` | To be recorded after implementation |
+| `SimulationTrainingOptionsV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_live_contract.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
+| `SimulationStartResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_live_contract.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
+| `SimulationFrameV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_live_contract.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | `SimulationCommandRequestV1` / `SimulationCommandResultV1` | Backend | `PENDING` | To be recorded after implementation |
 | `SimulationAdvanceResultV1` | Backend | `PENDING` | To be recorded after implementation |
 | `SimulationResetResultV1` | Backend | `PENDING` | To be recorded after implementation |
@@ -121,11 +127,12 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | `SimulationReplayArtifactV1` / `ReplayArtifactRefV1` | Backend | `PENDING` | To be recorded after implementation |
 | Replay verification receipt/provider bridge | Backend | `PENDING` | To be recorded after implementation |
 | Profile list/resolve facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_facade.py` |
-| Start/command/advance/reset/finalize/artifact facade | Backend | `PENDING` | To be recorded after implementation |
-| Backend-produced setup golden fixtures | Backend | `IMPLEMENTED` | `kirby2/ui/fixtures/simulation_contract_v1/` |
+| Start facade and fresh run materialization | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
+| Command/advance/reset/finalize/artifact facade | Backend | `PENDING` | To be recorded after implementation |
+| Backend-produced setup/start golden fixtures | Backend | `IMPLEMENTED` | `kirby2/ui/fixtures/simulation_contract_v1/` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Strict setup-contract projector | UI | `IMPLEMENTED` | `src/kirby2_ui/simulation_contract.py` at `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | Strict live-frame projector and store | UI | `PENDING` | UI worker selects paths |
-| Setup/profile selector integration | UI | `PENDING` | UI worker selects paths |
+| Setup/profile selector integration | UI | `IMPLEMENTED` | `src/kirby2_ui/` at `77e6d5f28c3e3d254257a37bd8d74a1c786f3958` and `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
 | Live workstation integration | UI | `PENDING` | UI worker selects paths |
 | Completed-run handoff to Replay | Backend + UI | `PENDING` | To be recorded after both sides land |
 
@@ -500,11 +507,13 @@ The resolver is the sole construction point for `SimpleFlowModel`,
 `HawkesFlowModel`, queue-reactive modifiers, distribution profiles, and intraday
 components. A refusal is data, not a partially constructed run.
 
-The implemented setup slice publishes its backend-authored compatibility records
-under `kirby2/ui/fixtures/simulation_contract_v1/`. `manifest.json` pins the exact
+The implemented setup and run-start slices publish their backend-authored
+compatibility records under `kirby2/ui/fixtures/simulation_contract_v1/`.
+`manifest.json` pins the exact
 canonical bytes for the profile catalog, training-resource catalog, one selection,
-one `AVAILABLE` resolution, and one `REFUSED / INVALID_DURATION` resolution. The
-records are generated mechanically by
+one `AVAILABLE` resolution, one `REFUSED / INVALID_DURATION` resolution, the exact
+training options, one `AVAILABLE` Start result with its complete initial frame, and
+one `REFUSED` Start result. The records are generated mechanically by
 `kirby2.ui.simulation_facade.write_simulation_contract_golden_fixtures()`; they are
 not hand-written examples. The current catalog deliberately contains only the 24
 supported combinations formed by the twelve accepted regimes and the existing
@@ -515,6 +524,16 @@ embedded selection again against the current digest-pinned catalog and component
 store, and compares the new canonical configuration bytes and digest to those in
 the request. Any difference refuses Start before a session is created. No hidden
 cache or object identity participates.
+
+The implemented Start boundary is
+`kirby2.ui.simulation_run_facade.start_simulation_run()`. It validates the complete
+resolution and training records, rechecks every referenced component against the
+current accepted sources, creates fresh simple or Hawkes runtime state, and emits a
+detached initial `SimulationFrameV1`. A public execution identity is allocated only
+after all typed refusal checks pass. The returned handle is intentionally opaque and
+backend-private. Command, advance, current-frame recovery, reset, close, finalize,
+artifact, and Replay-provider operations remain pending and must stay disabled in
+the UI.
 
 ### 6.6 `SimulationTrainingOptionsV1`
 
@@ -1300,6 +1319,10 @@ The backend must expose the following semantic operations through a UI-compatibl
 facade. Internal Python objects may remain opaque inside `KirbyBackend`; Qt widgets
 receive only detached standard-library values or UI-owned projections.
 
+At backend commit `80372cbb12d4a2262e189f9ae63e20f0fadb9a11`, the list,
+training-resource list, resolve, and Start operations below are implemented. Every
+later operation in this section remains a target contract, not a callable claim.
+
 ```text
 list_simulation_profiles()
     -> SimulationProfileCatalogV1
@@ -1769,11 +1792,14 @@ if finalize_result.status == "AVAILABLE":
 | Field | Value |
 | --- | --- |
 | Contract authoring status | `COMPLETE` |
-| Backend implementation status | `IN_PROGRESS_SETUP_CONTRACTS_IMPLEMENTED` |
-| UI integration status | `IN_PROGRESS_SETUP_PROJECTOR_IMPLEMENTED` |
+| Backend implementation status | `IN_PROGRESS_RUN_START_IMPLEMENTED` |
+| UI integration status | `IN_PROGRESS_SETUP_INTEGRATED` |
 | Backend setup-contract slice | `IMPLEMENTED` |
 | Backend setup-contract commit | `19b5fae21e891c798b6bfd6c149761a82597feac` |
+| Backend run-start slice | `IMPLEMENTED` |
+| Backend run-start commit | `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | UI setup-contract projector commit | `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
+| UI verified Setup integration commits | `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`, `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
 | Backend implementation commit | `PENDING` |
 | UI integration commit | `PENDING` |
 | Expensive qualification authorization | `NOT_GRANTED` |
