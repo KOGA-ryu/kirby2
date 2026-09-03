@@ -13,6 +13,8 @@ Backend interaction slice: `IMPLEMENTED`
 Backend interaction commit: `78c82f01af640d20616347fd021f86b92db5cfd2`
 Backend reset/close lifecycle slice: `IMPLEMENTED`
 Backend reset/close lifecycle commit: `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f`
+Backend finalization/artifact slice: `IMPLEMENTED`
+Backend finalization/artifact commit: `ccfc9669cc46c29dca226bb5481b13210394d2ca`
 UI setup-contract projector commit: `66de3b4d9ce2d213e94c68a8f759859566c520cf`
 UI verified Setup integration commits:
 `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`,
@@ -128,14 +130,14 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | Current-frame recovery facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
 | Two-phase reset facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | `SimulationCloseResultV1` and idempotent close facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_lifecycle_contract.py`, `kirby2/ui/simulation_run_facade.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
-| `SimulationRunResultV1` | Backend | `PENDING` | To be recorded after implementation |
-| `SimulationReplayArtifactV1` / `ReplayArtifactRefV1` | Backend | `PENDING` | To be recorded after implementation |
+| `SimulationRunResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_artifact_contract.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
+| `SimulationReplayArtifactV1` / `ReplayArtifactRefV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_artifact_contract.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
 | Replay verification receipt/provider bridge | Backend | `PENDING` | To be recorded after implementation |
 | Profile list/resolve facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_facade.py` |
 | Start facade and fresh run materialization | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Command/advance facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
-| Finalize/artifact facade | Backend | `PENDING` | To be recorded after implementation |
-| Backend-produced setup/start/interaction/lifecycle golden fixtures | Backend | `IMPLEMENTED` | `kirby2/ui/fixtures/simulation_contract_v1/` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
+| Finalize/artifact facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_finalize_facade.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
+| Backend-produced setup/start/interaction/lifecycle/finalization golden fixtures | Backend | `IMPLEMENTED` | 26 records in `kirby2/ui/fixtures/simulation_contract_v1/` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
 | Strict setup-contract projector | UI | `IMPLEMENTED` | `src/kirby2_ui/simulation_contract.py` at `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | Strict live-frame projector and store | UI | `PENDING` | UI worker selects paths |
 | Setup/profile selector integration | UI | `IMPLEMENTED` | `src/kirby2_ui/` at `77e6d5f28c3e3d254257a37bd8d74a1c786f3958` and `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
@@ -1257,6 +1259,13 @@ The artifact digest hashes the exact immutable bytes defined above, and
 `object_key` are governed operational locators. Host paths, URLs, credentials, and
 open file handles are forbidden in this record and do not enter artifact identity.
 
+The current version-1 implementation uses the governed process-local immutable store
+`kirby2-in-process-replay-store-v1`. It provides exact same-process finalization and
+Replay handoff without writing user data or temporary artifacts to the host
+filesystem. It is intentionally not restart-durable. Cross-process persistence is a
+future storage contract and must preserve these exact artifact bytes and reference
+semantics rather than silently re-encoding them.
+
 `SimulationRunResultV1`:
 
 ```text
@@ -1353,11 +1362,11 @@ The backend must expose the following semantic operations through a UI-compatibl
 facade. Internal Python objects may remain opaque inside `KirbyBackend`; Qt widgets
 receive only detached standard-library values or UI-owned projections.
 
-At backend commit `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f`, the list,
+At backend commit `ccfc9669cc46c29dca226bb5481b13210394d2ca`, the list,
 training-resource list, resolve, Start, command, advance, current-frame, two-phase
-reset, and idempotent close operations below are implemented. Finalize, artifact
-resolution, and Replay-provider operations remain target contracts, not callable
-claims.
+reset, idempotent close, finalization, and immutable artifact storage operations
+below are implemented. Artifact resolution and Replay-provider operations remain
+target contracts, not callable claims.
 
 ```text
 list_simulation_profiles()
