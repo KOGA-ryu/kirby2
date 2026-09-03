@@ -252,7 +252,14 @@ class ScenarioRun:
 
 def load_scenario_definitions(path: Path = DEFINITIONS_PATH) -> dict[str, ScenarioDefinition]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    definitions = [ScenarioDefinition.from_dict(item) for item in payload["scenarios"]]
+    if type(payload) is not dict or set(payload) != {"schema_version", "scenarios"}:
+        raise ValueError("accepted scenario root fields are not exact")
+    if payload["schema_version"] != 1 or type(payload["schema_version"]) is not int:
+        raise ValueError("unsupported accepted scenario schema version")
+    raw_scenarios = payload["scenarios"]
+    if type(raw_scenarios) is not list or any(type(item) is not dict for item in raw_scenarios):
+        raise ValueError("accepted scenarios must be an array of objects")
+    definitions = [ScenarioDefinition.from_dict(item) for item in raw_scenarios]
     by_name = {definition.name: definition for definition in definitions}
     if len(by_name) != len(definitions):
         raise ValueError("scenario names must be unique")

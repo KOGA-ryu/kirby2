@@ -12,9 +12,13 @@ from kirby2.exchange import Order, OrderOwner, OrderStatus, OrderView, Side
 from kirby2.scenarios import ScenarioDefinition, create_market_engine
 from kirby2.session.events import EventType, SimulationEvent
 from kirby2.simulation import (
+    FlowModel,
+    HawkesConfig,
+    HawkesFlowModel,
     LiquidityPreset,
     RegimeOrderFlow,
     ScenarioDimensions,
+    SimpleFlowModel,
     VolumePreset,
 )
 from kirby2.simulation.clock import MICROSECONDS_PER_SECOND
@@ -44,6 +48,42 @@ if TYPE_CHECKING:
 
 
 DEFAULT_QUANTITIES = (25, 50, 100, 200, 500, 1_000, 2_000)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionFlowConfiguration:
+    """Immutable recipe for creating fresh arrival-model state.
+
+    Public setup records retain integer-scaled values and content references. The
+    UI facade resolves those values into this backend-only recipe before a session
+    exists. Keeping a recipe instead of a model instance ensures every reset gets
+    fresh mutable Poisson/Hawkes state.
+    """
+
+    arrival_model_family: str
+    intensity_scale_ppm: int
+    hawkes_config: HawkesConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.arrival_model_family not in {"simple", "hawkes"}:
+            raise ValueError("session arrival model must be simple or hawkes")
+        if type(self.intensity_scale_ppm) is not int or self.intensity_scale_ppm < 0:
+            raise ValueError("session intensity scale must be a nonnegative integer")
+        if self.arrival_model_family == "simple" and self.hawkes_config is not None:
+            raise ValueError("simple session flow must not carry a Hawkes config")
+        if self.arrival_model_family == "hawkes" and type(self.hawkes_config) is not HawkesConfig:
+            raise ValueError("Hawkes session flow requires an exact Hawkes config")
+
+    def create_flow_model(self) -> FlowModel:
+        if self.arrival_model_family == "simple":
+            return SimpleFlowModel()
+        if self.hawkes_config is None:
+            raise RuntimeError("validated Hawkes flow configuration lost its config")
+        return HawkesFlowModel(self.hawkes_config)
+
+    @property
+    def event_intensity(self) -> float:
+        return self.intensity_scale_ppm / 1_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +184,7 @@ class LiveMarketSession:
         strategy_definition: StrategyDefinition | StateMachineDefinition | None = None,
         objective: SessionObjective | None = None,
         curriculum_drill: CurriculumDrill | None = None,
+        flow_configuration: SessionFlowConfiguration | None = None,
     ) -> None:
         if type(duration_seconds) is not int or duration_seconds <= 0:
             raise ValueError("session duration must be a positive integer")
@@ -155,6 +196,8 @@ class LiveMarketSession:
             raise ValueError("quantity options must be unique and ascending")
         if initial_quantity not in quantity_options:
             raise ValueError("initial quantity must be one of the quantity options")
+        if flow_configuration is not None and type(flow_configuration) is not SessionFlowConfiguration:
+            raise TypeError("session flow configuration has the wrong type")
 
         self.definition = definition
         self.seed = definition.seed if seed is None else seed
@@ -165,6 +208,7 @@ class LiveMarketSession:
         self.strategy_definition = strategy_definition
         self.objective = objective
         self.curriculum_drill = curriculum_drill
+        self.flow_configuration = flow_configuration
         self._initial_quantity = initial_quantity
         self._quantity_index = quantity_options.index(initial_quantity)
         self._order_sequence = 0
@@ -254,6 +298,7 @@ class LiveMarketSession:
             or recovered.duration_us != self.duration_us
             or recovered.quantity_options != self.quantity_options
             or recovered.initial_quantity != self.initial_quantity
+            or recovered.flow_configuration != self.flow_configuration
         ):
             raise ValueError("recovered session configuration differs from startup")
         journal = self._recovery_journal
@@ -287,11 +332,23 @@ class LiveMarketSession:
             )
 
     def reset(self, start: bool = False) -> None:
+        flow_model = (
+            None
+            if self.flow_configuration is None
+            else self.flow_configuration.create_flow_model()
+        )
+        parameter_overrides = (
+            None
+            if self.flow_configuration is None
+            else {"event_intensity": self.flow_configuration.event_intensity}
+        )
         self.engine, self.dimensions = create_market_engine(
             self.definition,
             seed=self.seed,
             relative_volume=self.relative_volume,
             liquidity=self.liquidity,
+            flow_model=flow_model,
+            parameter_overrides=parameter_overrides,
         )
         self.engine.start()
         self._quantity_index = self.quantity_options.index(self._initial_quantity)

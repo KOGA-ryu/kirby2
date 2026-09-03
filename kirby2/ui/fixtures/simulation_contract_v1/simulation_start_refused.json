@@ -1,0 +1,1 @@
+{"initial_frame":null,"refusal":{"explanation":"A refused profile resolution cannot start a run.","reason_code":"RESOLUTION_NOT_AVAILABLE"},"result_id":"simulation-start-result-4fe5980d0aed687251c0f6a1","run_request_sha256":null,"schema_id":"KIRBY2_SIMULATION_START_RESULT_V1","schema_version":1,"source_run_id":null,"status":"REFUSED"}

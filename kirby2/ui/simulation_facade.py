@@ -750,12 +750,44 @@ def simulation_contract_golden_records() -> dict[str, dict[str, object]]:
         "control_values": dict(selection["control_values"]),
         "duration_us": int(selection["duration_us"]) + 500_000,
     }
+    available_resolution = resolve_simulation_profile(selection)
+    refused_resolution = resolve_simulation_profile(refused_selection)
+    training_defaults = training["defaults"]
+    if type(training_defaults) is not dict:
+        raise SimulationContractIntegrityError("training catalog golden defaults are malformed")
+    training_options: dict[str, object] = {
+        "schema_id": "KIRBY2_SIMULATION_TRAINING_OPTIONS_V1",
+        "schema_version": 1,
+        "quantity_options": list(training_defaults["quantity_options"]),
+        "initial_quantity": training_defaults["initial_quantity"],
+        "layout_ref": dict(training_defaults["layout_ref"]),
+        "strategy_ref": None,
+        "objective": None,
+        "curriculum_drill_ref": None,
+        "initial_run_state": "READY",
+        "observation_policy_ref": dict(training_defaults["observation_policy_ref"]),
+    }
+    from .simulation_run_facade import _start_simulation_run_with_source_id
+
+    _, available_start = _start_simulation_run_with_source_id(
+        available_resolution,
+        training_options,
+        "simulation-run-00000000000000000000000000000001",
+    )
+    _, refused_start = _start_simulation_run_with_source_id(
+        refused_resolution,
+        training_options,
+        "simulation-run-00000000000000000000000000000002",
+    )
     return {
         "profile_catalog.json": catalog,
         "training_resource_catalog.json": training,
         "profile_selection.json": selection,
-        "profile_resolution_available.json": resolve_simulation_profile(selection),
-        "profile_resolution_refused.json": resolve_simulation_profile(refused_selection),
+        "profile_resolution_available.json": available_resolution,
+        "profile_resolution_refused.json": refused_resolution,
+        "simulation_training_options.json": training_options,
+        "simulation_start_available.json": available_start,
+        "simulation_start_refused.json": refused_start,
     }
 
 
