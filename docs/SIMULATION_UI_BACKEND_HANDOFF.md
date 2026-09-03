@@ -11,6 +11,8 @@ Backend run-start slice: `IMPLEMENTED`
 Backend run-start commit: `80372cbb12d4a2262e189f9ae63e20f0fadb9a11`
 Backend interaction slice: `IMPLEMENTED`
 Backend interaction commit: `78c82f01af640d20616347fd021f86b92db5cfd2`
+Backend reset/close lifecycle slice: `IMPLEMENTED`
+Backend reset/close lifecycle commit: `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f`
 UI setup-contract projector commit: `66de3b4d9ce2d213e94c68a8f759859566c520cf`
 UI verified Setup integration commits:
 `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`,
@@ -122,18 +124,18 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | `SimulationFrameV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_live_contract.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | `SimulationCommandRequestV1` / `SimulationCommandResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_interaction_contract.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
 | `SimulationAdvanceResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_interaction_contract.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
-| `SimulationResetResultV1` | Backend | `PENDING` | To be recorded after implementation |
+| `SimulationResetResultV1` | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_lifecycle_contract.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | Current-frame recovery facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
-| Two-phase reset facade | Backend | `PENDING` | To be recorded after implementation |
-| `SimulationCloseResultV1` and idempotent close facade | Backend | `PENDING` | To be recorded after implementation |
+| Two-phase reset facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
+| `SimulationCloseResultV1` and idempotent close facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_lifecycle_contract.py`, `kirby2/ui/simulation_run_facade.py` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | `SimulationRunResultV1` | Backend | `PENDING` | To be recorded after implementation |
 | `SimulationReplayArtifactV1` / `ReplayArtifactRefV1` | Backend | `PENDING` | To be recorded after implementation |
 | Replay verification receipt/provider bridge | Backend | `PENDING` | To be recorded after implementation |
 | Profile list/resolve facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_facade.py` |
 | Start facade and fresh run materialization | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Command/advance facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
-| Reset/finalize/artifact facade | Backend | `PENDING` | To be recorded after implementation |
-| Backend-produced setup/start/interaction golden fixtures | Backend | `IMPLEMENTED` | `kirby2/ui/fixtures/simulation_contract_v1/` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
+| Finalize/artifact facade | Backend | `PENDING` | To be recorded after implementation |
+| Backend-produced setup/start/interaction/lifecycle golden fixtures | Backend | `IMPLEMENTED` | `kirby2/ui/fixtures/simulation_contract_v1/` at `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | Strict setup-contract projector | UI | `IMPLEMENTED` | `src/kirby2_ui/simulation_contract.py` at `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | Strict live-frame projector and store | UI | `PENDING` | UI worker selects paths |
 | Setup/profile selector integration | UI | `IMPLEMENTED` | `src/kirby2_ui/` at `77e6d5f28c3e3d254257a37bd8d74a1c786f3958` and `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
@@ -222,6 +224,11 @@ configuration bytes can produce separate practice attempts. Mathematical identit
 and determinism are proven by the profile, selection, resolved-configuration,
 run-request, book, event-tape, and artifact digests. The UI validates the run-ID
 format and equality across records but never manufactures it.
+
+`reset_token_id` is a separate backend-issued one-time correlation identity with
+the exact form `simulation-reset-token-` followed by 32 lowercase hexadecimal
+characters. It is never reused, is not a content digest, and never becomes the
+identity of the replacement run.
 
 The complete event tape digest is `H(the ordered array of canonical recorded event
 rows)`, with `H([])` as the empty-tape value. A frame ID binds the complete render
@@ -511,8 +518,9 @@ The resolver is the sole construction point for `SimpleFlowModel`,
 `HawkesFlowModel`, queue-reactive modifiers, distribution profiles, and intraday
 components. A refusal is data, not a partially constructed run.
 
-The implemented setup and run-start slices publish their backend-authored
-compatibility records under `kirby2/ui/fixtures/simulation_contract_v1/`.
+The implemented setup, run-start, interaction, and lifecycle slices publish their
+backend-authored compatibility records under
+`kirby2/ui/fixtures/simulation_contract_v1/`.
 `manifest.json` pins the exact
 canonical bytes for the profile catalog, training-resource catalog, one selection,
 one `AVAILABLE` resolution, one `REFUSED / INVALID_DURATION` resolution, the exact
@@ -535,9 +543,9 @@ resolution and training records, rechecks every referenced component against the
 current accepted sources, creates fresh simple or Hawkes runtime state, and emits a
 detached initial `SimulationFrameV1`. A public execution identity is allocated only
 after all typed refusal checks pass. The returned handle is intentionally opaque and
-backend-private. Command, advance, current-frame recovery, reset, close, finalize,
-artifact, and Replay-provider operations remain pending and must stay disabled in
-the UI.
+backend-private. The separately versioned interaction and lifecycle slices below
+state which operations are callable; no UI surface may infer callable status from
+Start alone.
 
 The interaction slice at `78c82f01af640d20616347fd021f86b92db5cfd2`
 implements exact command, command-outcome, advance, and current-frame records plus
@@ -547,8 +555,17 @@ complete next frame even when the domain action is rejected; stale or otherwise
 unavailable calls do not mutate the handle. Absolute-time advance publishes the
 first complete frame at the duration boundary, and current-frame recovery returns
 the exact already-published frame without changing any sequence. The golden
-manifest now covers 15 mechanically generated records, including lifecycle and
-player commands, one engine advance, a stale refusal, and current-frame recovery.
+manifest now covers those interaction records alongside the setup and Start records.
+
+The reset/close lifecycle slice at
+`9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` implements strict reset-preparation,
+reset-commit, and close records; a private two-phase replacement handle; mutation
+fencing while a replacement is pending; discard recovery; atomic commit; and
+idempotent close. The golden manifest now covers 21 mechanically generated records,
+including successful reset preparation, a commit mismatch, successful commit,
+abandoned-source recovery, exact repeated close behavior, and a conflicting close.
+Finalization, artifact persistence, artifact verification, and the Replay provider
+remain pending and must stay disabled in the UI.
 
 ### 6.6 `SimulationTrainingOptionsV1`
 
@@ -1064,9 +1081,11 @@ unavailable_reason: string | null
 
 An available preparation reconstructs from the exact same available resolution and
 training options, mints a never-reused source run ID and reset token, and returns a
-private pending-reset handle plus this public result. The initial frame has time and
-all input/flow/exchange/trade sequences zero, frame sequence 1, deterministic
-initial book content, and the original configured `READY` or `RUNNING` state. The
+private pending-reset handle plus this public result. The initial frame has time,
+input, flow, and trade sequences zero; frame sequence 1; deterministic initial book
+content; and the original configured `READY` or `RUNNING` state. Its exchange-event
+sequence retains the deterministic events used to seed that authoritative initial
+book, so it is nonzero when the matching engine starts with resting liquidity. The
 old handle remains intact but temporarily refuses mutations with `RESET_PENDING`.
 
 For an unavailable preparation, the token, the three new-source fields, and the
@@ -1334,10 +1353,11 @@ The backend must expose the following semantic operations through a UI-compatibl
 facade. Internal Python objects may remain opaque inside `KirbyBackend`; Qt widgets
 receive only detached standard-library values or UI-owned projections.
 
-At backend commit `78c82f01af640d20616347fd021f86b92db5cfd2`, the list,
-training-resource list, resolve, Start, command, advance, and current-frame
-operations below are implemented. Reset, close, finalize, artifact resolution, and
-Replay-provider operations remain target contracts, not callable claims.
+At backend commit `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f`, the list,
+training-resource list, resolve, Start, command, advance, current-frame, two-phase
+reset, and idempotent close operations below are implemented. Finalize, artifact
+resolution, and Replay-provider operations remain target contracts, not callable
+claims.
 
 ```text
 list_simulation_profiles()
@@ -1808,7 +1828,7 @@ if finalize_result.status == "AVAILABLE":
 | Field | Value |
 | --- | --- |
 | Contract authoring status | `COMPLETE` |
-| Backend implementation status | `IN_PROGRESS_INTERACTION_IMPLEMENTED` |
+| Backend implementation status | `IN_PROGRESS_RESET_CLOSE_IMPLEMENTED` |
 | UI integration status | `IN_PROGRESS_SETUP_INTEGRATED` |
 | Backend setup-contract slice | `IMPLEMENTED` |
 | Backend setup-contract commit | `19b5fae21e891c798b6bfd6c149761a82597feac` |
@@ -1816,6 +1836,8 @@ if finalize_result.status == "AVAILABLE":
 | Backend run-start commit | `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Backend interaction slice | `IMPLEMENTED` |
 | Backend interaction commit | `78c82f01af640d20616347fd021f86b92db5cfd2` |
+| Backend reset/close lifecycle slice | `IMPLEMENTED` |
+| Backend reset/close lifecycle commit | `9fa910fa475716cd2e6e1ce4bfd0f87a4ddd730f` |
 | UI setup-contract projector commit | `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | UI verified Setup integration commits | `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`, `d0a3d2d2bed4901f45dc1c0ce322c8d3c1459320` |
 | Backend implementation commit | `PENDING` |
