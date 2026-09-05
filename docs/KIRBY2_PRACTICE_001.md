@@ -145,6 +145,13 @@ command dispatch fails after Continue releases a hold, the facade returns an exp
 destination, rebinds) a guided hold; it does not silently leave an unlocked staged
 step. Preparation publication failures close the acquired source, or return the
 opaque cleanup owner with `CLEANUP_UNCONFIRMED` if close cannot be confirmed.
+When the original owner has settled, the byte-identical request becomes a
+process-local `DUPLICATE_REQUEST_SETTLED` tombstone: it returns no handle, attempt,
+or current-frame claim and cannot allocate a replacement source. A fresh source then
+requires a new explicitly correlated Begin, exact-repeat, or variation operation.
+Attempt construction mints a `practice-operation-*` correlation ID unless the caller
+supplies one; retry resends that exact payload, while a later genuine Start receives
+a distinct correlation and is not mistaken for a delayed retry.
 
 Wall-time evidence is optional and explicitly typed: `MONOTONIC_CALLER` carries a
 positive declared resolution and nonnegative elapsed value; unavailable timing is
@@ -169,6 +176,15 @@ action-index bounds to the recipe, and assessment/debrief outcome and causal pub
 evidence to each other. The F3 cancellation debrief retains the pre-dispatch public
 partial-order ID even though that order is absent from the post-cancel frame.
 
+The authored recipe definitions themselves recursively freeze profile references,
+controls, rules, and action sequences; getters, the constant catalog, and list
+results cannot mutate a shared recipe, and every `as_dict()` call is detached. A
+recomputed digest is not authorization: catalog decode only permits the V1 semantic
+actions and the authored F1/F2/F3 preparation and learner-action shapes. Guided
+`CONTINUE` hold presence is bound to real completion; a completed continuation cannot
+claim a live hold. A duplicate can retain a guided hold only when its public phase is
+not otherwise inferable (for example, an F2 answer staged at step count zero).
+
 Exact repeats require the same recipe and create a fresh source; a variation must
 name the original recipe as its declared parent and uses its own pinned recipe. This
 V1 boundary is process-local only: it does not implement persistence, learner
@@ -188,4 +204,7 @@ answers, guided hold blocking and exactly-once release, unassisted dispatch, and
 fresh exact-repeat/variation lineage. It also proves idempotent retry does not open a
 second source, nested mutation/unknown-field/bool-versus-int rejection, causal F3
 debrief retention, and the failure-path rehold transaction. The second is the
-required Packet A regression.
+required Packet A regression. The hardening rerun additionally covers settled
+duplicate tombstones with an unchanged source-allocation count, direct curriculum
+recipe/constructor alias mutation, unauthorized recomputed semantic actions, F2
+staged duplicate holds, and a recomputed completed-guided-hold rejection.

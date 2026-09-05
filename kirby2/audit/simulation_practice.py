@@ -8,7 +8,12 @@ import unittest
 from unittest.mock import patch
 
 from kirby2.curriculum.practice_assessment import assess_response, classify_public_reading
-from kirby2.curriculum.practice_episodes import get_practice_episode_v1
+from kirby2.curriculum.practice_episodes import (
+    PRACTICE_EPISODES_V1,
+    PracticeEpisodeDefinitionV1,
+    get_practice_episode_v1,
+    list_practice_episodes_v1,
+)
 from kirby2.ui import (
     PracticeCatalogV1,
     PracticeActionRequestV1,
@@ -61,6 +66,20 @@ def _reidentify_practice_result(record: dict[str, object]) -> None:
     record["result_id"] = f"practice-result-{canonical_digest(basis)[:24]}"
 
 
+def _reidentify_recipe(record: dict[str, object]) -> None:
+    from kirby2.ui.simulation_contract import canonical_digest
+
+    basis = {key: value for key, value in record.items() if key != "recipe_sha256"}
+    record["recipe_sha256"] = canonical_digest(basis)
+
+
+def _reidentify_catalog(record: dict[str, object]) -> None:
+    from kirby2.ui.simulation_contract import canonical_digest
+
+    basis = {"schema_id": record["schema_id"], "schema_version": record["schema_version"], "episodes": record["episodes"]}
+    record["catalog_id"] = f"practice-catalog-{canonical_digest(basis)[:24]}"
+
+
 def _temporary_public_cut(profile_id: str) -> tuple[object, dict[str, object]]:
     profile = next(row for row in list_simulation_profiles()["profiles"] if row["profile_ref"]["profile_id"] == profile_id)
     defaults = profile["defaults"]
@@ -106,6 +125,44 @@ class SimulationPracticeAudit(unittest.TestCase):
             PracticeCatalogV1.from_dict(hostile)
         catalog["episodes"][0]["title"] = "caller mutation"
         self.assertNotEqual(list_simulation_practice_episodes()["episodes"][0]["title"], "caller mutation")
+        episode = get_practice_episode_v1("practice.f1.place-and-cancel.v1")
+        self.assertIs(episode, PRACTICE_EPISODES_V1[0])
+        self.assertIs(episode, list_practice_episodes_v1()[0])
+        with self.assertRaises(TypeError):
+            episode.profile_ref["profile_id"] = "hostile"
+        with self.assertRaises(TypeError):
+            PRACTICE_EPISODES_V1[0].control_values["relative_volume"] = "hostile"
+        detached_recipe = episode.as_dict()
+        detached_recipe["control_values"]["relative_volume"] = "caller-mutated"
+        detached_recipe["observation_rule"]["quantity"] = 999
+        self.assertEqual(episode.control_values["relative_volume"], "1.00x")
+        self.assertEqual(episode.observation_rule["quantity"], 200)
+        profile_ref = dict(episode.profile_ref)
+        controls = dict(episode.control_values)
+        preparation_actions = ["SIMULATION_PLAY"]
+        expected_actions = ["PLAYER_INCREASE_QUANTITY", "PLAYER_BUY_BID", "PLAYER_CANCEL_NEAREST"]
+        rule = dict(episode.observation_rule)
+        constructed = PracticeEpisodeDefinitionV1(
+            "practice.audit-immutable.v1", "F1_CONTROL", "Audit immutable recipe", None,
+            profile_ref, 101, controls, 90_000_000, preparation_actions, 1,
+            "CANCEL_TIMING", "EXACT_MECHANICAL", expected_actions, rule,
+        )
+        profile_ref["profile_id"] = "caller-mutated"
+        controls["relative_volume"] = "caller-mutated"
+        preparation_actions[0] = "PLAYER_BUY_BID"
+        expected_actions[0] = "PLAYER_NOT_A_REAL_ACTION"
+        rule["quantity"] = 999
+        self.assertEqual(constructed.profile_ref["profile_id"], "accepted.balanced.simple")
+        self.assertEqual(constructed.control_values["relative_volume"], "1.00x")
+        self.assertEqual(constructed.preparation_actions, ("SIMULATION_PLAY",))
+        self.assertEqual(constructed.expected_actions[0], "PLAYER_INCREASE_QUANTITY")
+        self.assertEqual(constructed.observation_rule["quantity"], 200)
+        hostile = copy.deepcopy(list_simulation_practice_episodes())
+        hostile["episodes"][0]["expected_actions"] = ["PLAYER_NOT_A_REAL_ACTION"]
+        _reidentify_recipe(hostile["episodes"][0])
+        _reidentify_catalog(hostile)
+        with self.assertRaises(ValueError):
+            PracticeCatalogV1.from_dict(hostile)
         _CASES.append({"case_id": "B01_STRICT_DETACHED_SIX_RECIPE_CATALOG", "catalog_id": list_simulation_practice_episodes()["catalog_id"]})
 
     def test_measured_public_cuts_and_f2_declared_rule_branches(self) -> None:
@@ -114,7 +171,9 @@ class SimulationPracticeAudit(unittest.TestCase):
         try:
             results: dict[str, dict[str, object]] = {}
             for episode_id in catalog:
-                handle, result = begin_simulation_practice_attempt(build_practice_attempt_request(episode_id=episode_id))
+                handle, result = begin_simulation_practice_attempt(build_practice_attempt_request(
+                    episode_id=episode_id, mode="UNASSISTED", pace_multiplier_ppm=500_000,
+                ))
                 self.assertIsNotNone(handle)
                 self.assertEqual(result["status"], "AVAILABLE")
                 handles.append(handle)
@@ -230,6 +289,11 @@ class SimulationPracticeAudit(unittest.TestCase):
             hostile["schema_version"] = True
             with self.assertRaises(ValueError):
                 PracticeResultV1.from_dict(hostile)
+            hostile = copy.deepcopy(released)
+            hostile["hold_id"] = "practice-guided-hold-000000000000000000000000"
+            _reidentify_practice_result(hostile)
+            with self.assertRaises(ValueError):
+                PracticeResultV1.from_dict(hostile)
             invalid_wall = _action(stage, "CONTINUE", "SEMANTIC_ACTION", "PLAYER_CANCEL_NEAREST")
             invalid_wall["wall_time"] = {"source": "MONOTONIC_CALLER", "resolution_us": True, "elapsed_wall_time_us": 0}
             action_basis = {key: value for key, value in invalid_wall.items() if key != "request_id"}
@@ -239,6 +303,74 @@ class SimulationPracticeAudit(unittest.TestCase):
         finally:
             self.assertEqual(release_simulation_episode(handle)["status"], "CLOSED")
         _CASES.append({"case_id": "B04_RETRY_FENCE_CAUSAL_DEBRIEF_AND_NESTED_HOSTILES", "attempt_id": begun["attempt"]["attempt_id"]})
+
+    def test_settled_duplicate_is_tombstoned_without_new_source(self) -> None:
+        from kirby2.ui.simulation_run_facade import _ISSUED_SOURCE_RUN_IDS
+
+        request = build_practice_attempt_request(
+            episode_id="practice.f1.place-and-replace.v1", pace_multiplier_ppm=500_000,
+        )
+        handle, begun = begin_simulation_practice_attempt(request)
+        self.assertIsNotNone(handle)
+        source_run_id = begun["source_run_id"]
+        try:
+            staged = submit_simulation_practice_action(handle, _action(
+                begun, "STAGE", "SEMANTIC_ACTION", "PLAYER_DECREASE_QUANTITY",
+            ))
+            self.assertEqual(staged["assessment"]["outcome"], "PASS")
+        finally:
+            self.assertEqual(release_simulation_episode(handle)["status"], "CLOSED")
+        count_before = len(_ISSUED_SOURCE_RUN_IDS)
+        duplicate_handle, duplicate = begin_simulation_practice_attempt(request)
+        self.assertIsNone(duplicate_handle)
+        self.assertEqual(duplicate["status"], "REFUSED")
+        self.assertEqual(duplicate["unavailable_reason"], "DUPLICATE_REQUEST_SETTLED")
+        self.assertIsNone(duplicate["attempt"])
+        self.assertIsNone(duplicate["current_frame"])
+        self.assertEqual(len(_ISSUED_SOURCE_RUN_IDS), count_before)
+        fresh_begin_request = build_practice_attempt_request(
+            episode_id="practice.f1.place-and-replace.v1", pace_multiplier_ppm=500_000,
+        )
+        self.assertNotEqual(fresh_begin_request["request_id"], request["request_id"])
+        self.assertNotEqual(fresh_begin_request["operation_id"], request["operation_id"])
+        fresh_handle, fresh = begin_simulation_practice_attempt(fresh_begin_request)
+        try:
+            self.assertIsNotNone(fresh_handle)
+            self.assertEqual(fresh["status"], "AVAILABLE")
+            self.assertNotEqual(fresh["source_run_id"], source_run_id)
+        finally:
+            self.assertEqual(release_simulation_episode(fresh_handle)["status"], "CLOSED")
+        repeat_handle, repeat = begin_simulation_practice_attempt(build_practice_attempt_request(
+            episode_id="practice.f1.place-and-replace.v1", operation="EXACT_REPEAT",
+            prior_attempt_id=begun["attempt"]["attempt_id"], pace_multiplier_ppm=500_000,
+        ))
+        try:
+            self.assertIsNotNone(repeat_handle)
+            self.assertEqual(repeat["status"], "AVAILABLE")
+            self.assertNotEqual(repeat["source_run_id"], source_run_id)
+        finally:
+            self.assertEqual(release_simulation_episode(repeat_handle)["status"], "CLOSED")
+        _CASES.append({"case_id": "B07_SETTLED_DUPLICATE_TOMBSTONE", "settled_source": source_run_id})
+
+    def test_f2_staged_duplicate_retains_its_active_hold(self) -> None:
+        request = build_practice_attempt_request(
+            episode_id="practice.f2.public-pressure.v1", pace_multiplier_ppm=500_000,
+        )
+        handle, begun = begin_simulation_practice_attempt(request)
+        self.assertIsNotNone(handle)
+        try:
+            staged = submit_simulation_practice_action(handle, _action(
+                begun, "STAGE", "PRESSURE_PRESENT",
+            ))
+            self.assertEqual(staged["assessment"]["outcome"], "PASS")
+            duplicate_handle, duplicate = begin_simulation_practice_attempt(request)
+            self.assertIs(duplicate_handle, handle)
+            self.assertEqual(duplicate["status"], "DUPLICATE")
+            self.assertEqual(duplicate["hold_id"], staged["hold_id"])
+            self.assertEqual(duplicate["current_frame"]["frame_id"], staged["current_frame"]["frame_id"])
+        finally:
+            self.assertEqual(release_simulation_episode(handle)["status"], "CLOSED")
+        _CASES.append({"case_id": "B08_F2_STAGED_DUPLICATE_ACTIVE_HOLD", "attempt_id": begun["attempt"]["attempt_id"]})
 
     def test_guided_dispatch_failure_reholds_without_consuming_stage(self) -> None:
         handle, begun = begin_simulation_practice_attempt(build_practice_attempt_request(

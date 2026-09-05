@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from .skills import require_stable_skill_v1
 
@@ -25,22 +27,56 @@ def _digest(value: object) -> str:
     ).hexdigest()
 
 
+def _freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _plain(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    return value
+
+
+_F1_ACTION_SEQUENCES = frozenset(
+    {
+        ("PLAYER_INCREASE_QUANTITY", "PLAYER_BUY_BID", "PLAYER_CANCEL_NEAREST"),
+        ("PLAYER_DECREASE_QUANTITY", "PLAYER_BUY_BID", "PLAYER_REPLACE_NEAREST"),
+    }
+)
+PRACTICE_SEMANTIC_ACTIONS_V1 = frozenset(
+    {
+        "SIMULATION_PLAY",
+        "PLAYER_INCREASE_QUANTITY",
+        "PLAYER_DECREASE_QUANTITY",
+        "PLAYER_BUY_BID",
+        "PLAYER_CANCEL_NEAREST",
+        "PLAYER_REPLACE_NEAREST",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class PracticeEpisodeDefinitionV1:
     episode_id: str
     family: str
     title: str
     variation_of: str | None
-    profile_ref: dict[str, object]
+    profile_ref: Mapping[str, object]
     seed: int
-    control_values: dict[str, object]
+    control_values: Mapping[str, object]
     duration_us: int
     preparation_actions: tuple[str, ...]
     anchor_time_us: int
     primary_skill_id: str
     objective_class: str
     expected_actions: tuple[str, ...]
-    observation_rule: dict[str, object]
+    observation_rule: Mapping[str, object]
 
     def __post_init__(self) -> None:
         if self.family not in {"F1_CONTROL", "F2_READING", "F3_RESIDUAL"}:
@@ -56,11 +92,11 @@ class PracticeEpisodeDefinitionV1:
         if type(self.anchor_time_us) is not int or self.anchor_time_us <= 0:
             raise ValueError("practice episode anchor is invalid")
         if not self.preparation_actions or any(
-            type(action) is not str or not action.startswith(("SIMULATION_", "PLAYER_"))
+            type(action) is not str or action not in PRACTICE_SEMANTIC_ACTIONS_V1
             for action in self.preparation_actions
         ):
             raise ValueError("practice preparation actions are invalid")
-        if any(type(action) is not str or not action.startswith("PLAYER_") for action in self.expected_actions):
+        if any(type(action) is not str or action not in PRACTICE_SEMANTIC_ACTIONS_V1 for action in self.expected_actions):
             raise ValueError("practice expected actions are invalid")
         if self.objective_class not in {
             "EXACT_MECHANICAL",
@@ -69,6 +105,21 @@ class PracticeEpisodeDefinitionV1:
         }:
             raise ValueError("practice objective class is invalid")
         require_stable_skill_v1(self.primary_skill_id)
+        prep = tuple(self.preparation_actions)
+        expected = tuple(self.expected_actions)
+        if self.family == "F1_CONTROL":
+            if prep != ("SIMULATION_PLAY",) or expected not in _F1_ACTION_SEQUENCES:
+                raise ValueError("practice F1 action shape is invalid")
+        elif self.family == "F2_READING":
+            if prep != ("SIMULATION_PLAY",) or expected:
+                raise ValueError("practice F2 action shape is invalid")
+        elif prep != ("SIMULATION_PLAY", "PLAYER_BUY_BID") or expected != ("PLAYER_CANCEL_NEAREST",):
+            raise ValueError("practice F3 action shape is invalid")
+        object.__setattr__(self, "preparation_actions", prep)
+        object.__setattr__(self, "expected_actions", expected)
+        object.__setattr__(self, "profile_ref", _freeze(self.profile_ref))
+        object.__setattr__(self, "control_values", _freeze(self.control_values))
+        object.__setattr__(self, "observation_rule", _freeze(self.observation_rule))
 
     def recipe_basis(self) -> dict[str, object]:
         return {
@@ -78,16 +129,16 @@ class PracticeEpisodeDefinitionV1:
             "family": self.family,
             "title": self.title,
             "variation_of": self.variation_of,
-            "profile_ref": self.profile_ref,
+            "profile_ref": _plain(self.profile_ref),
             "seed": self.seed,
-            "control_values": self.control_values,
+            "control_values": _plain(self.control_values),
             "duration_us": self.duration_us,
             "preparation_actions": list(self.preparation_actions),
             "anchor_time_us": self.anchor_time_us,
             "primary_skill_id": self.primary_skill_id,
             "objective_class": self.objective_class,
             "expected_actions": list(self.expected_actions),
-            "observation_rule": self.observation_rule,
+            "observation_rule": _plain(self.observation_rule),
         }
 
     @property

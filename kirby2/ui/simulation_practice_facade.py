@@ -66,6 +66,7 @@ class _RequestOutcome:
 
 _ATTEMPTS: dict[str, _AttemptState] = {}
 _REQUEST_OUTCOMES: dict[str, _RequestOutcome] = {}
+_SETTLED_REQUESTS: dict[str, str] = {}
 
 
 def _cursor(frame: Mapping[str, object]) -> dict[str, object]:
@@ -214,8 +215,11 @@ def _duplicate_request(request: PracticeAttemptRequestV1) -> tuple[object | None
     current = _current(existing.handle, str(attempt["source_run_id"]))
     if current is None:
         _REQUEST_OUTCOMES.pop(request.request_id, None)
-        _ATTEMPTS.pop(str(attempt["attempt_id"]), None)
-        return None
+        _SETTLED_REQUESTS[request.request_id] = str(attempt["attempt_id"])
+        return None, _result(
+            status="REFUSED", operation="BEGIN",
+            unavailable_reason="DUPLICATE_REQUEST_SETTLED",
+        )
     state = _ATTEMPTS.get(str(attempt["attempt_id"]))
     original_frame = existing.result.get("current_frame")
     if (
@@ -244,6 +248,11 @@ def begin_simulation_practice_attempt(
     """Prepare one fresh ordinary source run and optionally place its guided hold."""
 
     request = PracticeAttemptRequestV1.from_dict(request_payload)
+    if request.request_id in _SETTLED_REQUESTS:
+        return None, _result(
+            status="REFUSED", operation="BEGIN",
+            unavailable_reason="DUPLICATE_REQUEST_SETTLED",
+        )
     duplicate = _duplicate_request(request)
     if duplicate is not None:
         return duplicate
@@ -273,7 +282,10 @@ def begin_simulation_practice_attempt(
         "source_run_id": source_run_id,
     }
     attempt_id = f"practice-attempt-{canonical_digest(attempt_basis)[:24]}"
-    binding = {"attempt_id": attempt_id, **attempt_basis, "episode_id": recipe.episode_id}
+    binding = {
+        "attempt_id": attempt_id, **attempt_basis, "episode_id": recipe.episode_id,
+        "operation_id": request.operation_id,
+    }
     state: _AttemptState | None = None
     try:
         _bind_practice_attempt(handle, binding)
@@ -283,6 +295,7 @@ def begin_simulation_practice_attempt(
             "episode_id": recipe.episode_id,
             "episode_recipe_sha256": recipe.recipe_sha256,
             "operation": request.operation,
+            "operation_id": request.operation_id,
             "mode": request.mode,
             "pace_multiplier_ppm": request.pace_multiplier_ppm,
             "prior_attempt_id": request.prior_attempt_id,

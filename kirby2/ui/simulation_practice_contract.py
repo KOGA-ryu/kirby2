@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -33,12 +34,29 @@ _FRAME = re.compile(r"simulation-frame-[0-9a-f]{24}\Z")
 _CURSOR = re.compile(r"simulation-cursor-[0-9a-f]{24}\Z")
 _ACTION = re.compile(r"PLAYER_[A-Z0-9_]+\Z")
 _CATALOG = re.compile(r"practice-catalog-[0-9a-f]{24}\Z")
+_OPERATION = re.compile(r"practice-operation-[0-9a-f]{24}\Z")
+_PRACTICE_SEMANTIC_ACTIONS = frozenset(
+    {
+        "SIMULATION_PLAY",
+        "PLAYER_INCREASE_QUANTITY",
+        "PLAYER_DECREASE_QUANTITY",
+        "PLAYER_BUY_BID",
+        "PLAYER_CANCEL_NEAREST",
+        "PLAYER_REPLACE_NEAREST",
+    }
+)
+_F1_ACTION_SEQUENCES = frozenset(
+    {
+        ("PLAYER_INCREASE_QUANTITY", "PLAYER_BUY_BID", "PLAYER_CANCEL_NEAREST"),
+        ("PLAYER_DECREASE_QUANTITY", "PLAYER_BUY_BID", "PLAYER_REPLACE_NEAREST"),
+    }
+)
 
 _CATALOG_FIELDS = frozenset({"schema_id", "schema_version", "catalog_id", "episodes"})
 _ATTEMPT_FIELDS = frozenset(
     {
         "schema_id", "schema_version", "request_id", "episode_id", "operation",
-        "mode", "pace_multiplier_ppm", "prior_attempt_id",
+        "operation_id", "mode", "pace_multiplier_ppm", "prior_attempt_id",
     }
 )
 _ACTION_FIELDS = frozenset(
@@ -164,21 +182,25 @@ def _episode(value: object) -> dict[str, object]:
     for field in ("preparation_actions", "expected_actions"):
         if not isinstance(root[field], Sequence) or isinstance(root[field], (str, bytes)):
             raise ValueError(f"practice episode.{field} must be an array")
-        if any(type(item) is not str for item in root[field]):
+        if any(type(item) is not str or item not in _PRACTICE_SEMANTIC_ACTIONS for item in root[field]):
             raise ValueError(f"practice episode.{field} has an invalid action")
     prep = tuple(root["preparation_actions"])
     expected = tuple(root["expected_actions"])
     if not prep or prep[0] != "SIMULATION_PLAY":
         raise ValueError("practice episode must begin preparation by playing")
     if root["family"] == "F1_CONTROL":
-        if root["objective_class"] != "EXACT_MECHANICAL" or len(expected) != 3:
+        if (
+            root["objective_class"] != "EXACT_MECHANICAL"
+            or prep != ("SIMULATION_PLAY",)
+            or expected not in _F1_ACTION_SEQUENCES
+        ):
             raise ValueError("F1 recipe actions are invalid")
         rule = _object(root["observation_rule"], "practice F1 rule")
         _exact(rule, frozenset({"instruction", "quantity", "requires_learner_placement"}), "practice F1 rule")
         if type(rule["instruction"]) is not str or type(rule["quantity"]) is not int or rule["quantity"] <= 0 or rule["requires_learner_placement"] is not True:
             raise ValueError("practice F1 rule is invalid")
     elif root["family"] == "F2_READING":
-        if root["objective_class"] != "DECLARED_RULE" or expected:
+        if root["objective_class"] != "DECLARED_RULE" or prep != ("SIMULATION_PLAY",) or expected:
             raise ValueError("F2 recipe actions are invalid")
         rule = _object(root["observation_rule"], "practice F2 rule")
         _exact(rule, frozenset({
@@ -199,7 +221,11 @@ def _episode(value: object) -> dict[str, object]:
         ):
             raise ValueError("practice F2 rule is invalid")
     else:
-        if root["objective_class"] != "EXACT_MECHANICAL" or expected != ("PLAYER_CANCEL_NEAREST",):
+        if (
+            root["objective_class"] != "EXACT_MECHANICAL"
+            or prep != ("SIMULATION_PLAY", "PLAYER_BUY_BID")
+            or expected != ("PLAYER_CANCEL_NEAREST",)
+        ):
             raise ValueError("F3 recipe actions are invalid")
         rule = _object(root["observation_rule"], "practice F3 rule")
         _exact(rule, frozenset({
@@ -263,6 +289,7 @@ class PracticeAttemptRequestV1:
     request_id: str
     episode_id: str
     operation: str
+    operation_id: str
     mode: str
     pace_multiplier_ppm: int
     prior_attempt_id: str | None
@@ -276,6 +303,7 @@ class PracticeAttemptRequestV1:
         operation = _text(root["operation"], "practice attempt operation")
         if operation not in {"BEGIN", "EXACT_REPEAT", "VARIATION"}:
             raise ValueError("practice attempt operation is unsupported")
+        operation_id = _id(root["operation_id"], _OPERATION, "practice attempt operation ID")
         mode = _text(root["mode"], "practice attempt mode")
         if mode not in {"GUIDED", "UNASSISTED"}:
             raise ValueError("practice attempt mode is unsupported")
@@ -292,6 +320,7 @@ class PracticeAttemptRequestV1:
             "schema_version": 1,
             "episode_id": episode_id,
             "operation": operation,
+            "operation_id": operation_id,
             "mode": mode,
             "pace_multiplier_ppm": pace,
             "prior_attempt_id": prior,
@@ -299,7 +328,7 @@ class PracticeAttemptRequestV1:
         request_id = _id(root["request_id"], _REQUEST, "practice attempt request ID")
         if request_id != f"practice-attempt-request-{canonical_digest(basis)[:24]}":
             raise SimulationContractIntegrityError("practice attempt request ID does not match")
-        return cls(request_id, episode_id, operation, mode, pace, prior)
+        return cls(request_id, episode_id, operation, operation_id, mode, pace, prior)
 
     def as_dict(self) -> dict[str, object]:
         basis = {
@@ -307,6 +336,7 @@ class PracticeAttemptRequestV1:
             "schema_version": 1,
             "episode_id": self.episode_id,
             "operation": self.operation,
+            "operation_id": self.operation_id,
             "mode": self.mode,
             "pace_multiplier_ppm": self.pace_multiplier_ppm,
             "prior_attempt_id": self.prior_attempt_id,
@@ -393,12 +423,16 @@ class PracticeActionRequestV1:
 def build_practice_attempt_request(
     *, episode_id: str, operation: str = "BEGIN", mode: str = "GUIDED",
     pace_multiplier_ppm: int = 1_000_000, prior_attempt_id: str | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, object]:
+    if operation_id is None:
+        operation_id = f"practice-operation-{secrets.token_hex(12)}"
     basis = {
         "schema_id": PRACTICE_ATTEMPT_REQUEST_SCHEMA_ID,
         "schema_version": 1,
         "episode_id": episode_id,
         "operation": operation,
+        "operation_id": operation_id,
         "mode": mode,
         "pace_multiplier_ppm": pace_multiplier_ppm,
         "prior_attempt_id": prior_attempt_id,
@@ -435,7 +469,7 @@ def build_practice_action_request(
 
 _ATTEMPT_RESULT_FIELDS = frozenset({
     "attempt_id", "attempt_request_id", "episode_id", "episode_recipe_sha256", "operation",
-    "mode", "pace_multiplier_ppm", "prior_attempt_id", "prepared_result_id", "source_run_id",
+    "operation_id", "mode", "pace_multiplier_ppm", "prior_attempt_id", "prepared_result_id", "source_run_id",
     "prepared_identity", "anchor_time_us", "step_index", "step_count",
 })
 _ASSISTANCE_FIELDS = frozenset({"kind", "simulation_time_us", "wall_time", "message"})
@@ -459,6 +493,7 @@ def _attempt_record(value: object) -> dict[str, object]:
     _digest(root["episode_recipe_sha256"], "practice result attempt recipe digest")
     if root["operation"] not in {"BEGIN", "EXACT_REPEAT", "VARIATION"}:
         raise ValueError("practice result attempt operation is unsupported")
+    _id(root["operation_id"], _OPERATION, "practice result attempt operation ID")
     if root["mode"] not in {"GUIDED", "UNASSISTED"}:
         raise ValueError("practice result attempt mode is unsupported")
     if type(root["pace_multiplier_ppm"]) is not int or root["pace_multiplier_ppm"] not in {500_000, 1_000_000}:
@@ -633,6 +668,17 @@ class PracticeResultV1:
                     raise ValueError("practice stage requires an active guided hold")
                 elif operation == "UNASSISTED" and (attempt["mode"] != "UNASSISTED" or root["hold_id"] is not None):
                     raise ValueError("unassisted result hold does not match attempt mode")
+                elif operation == "CONTINUE":
+                    completed = attempt["step_index"] >= attempt["step_count"]
+                    if attempt["mode"] == "UNASSISTED" and root["hold_id"] is not None:
+                        raise ValueError("unassisted continuation cannot carry a hold")
+                    if attempt["mode"] == "GUIDED" and (
+                        (completed and root["hold_id"] is not None)
+                        or (not completed and root["hold_id"] is None)
+                    ):
+                        raise ValueError("guided continuation hold does not match completion")
+                elif operation == "DUPLICATE" and attempt["mode"] == "UNASSISTED" and root["hold_id"] is not None:
+                    raise ValueError("unassisted duplicate cannot carry a hold")
                 if assessment is not None:
                     if debrief is None or debrief["source_run_id"] != root["source_run_id"] or debrief["outcome"] != assessment["outcome"] or debrief["evidence"] != assessment["evidence"] or debrief["action_request_id"] is None:
                         raise SimulationContractIntegrityError("practice debrief does not bind its assessment")
