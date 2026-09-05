@@ -208,3 +208,70 @@ required Packet A regression. The hardening rerun additionally covers settled
 duplicate tombstones with an unchanged source-allocation count, direct curriculum
 recipe/constructor alias mutation, unauthorized recomputed semantic actions, F2
 staged duplicate holds, and a recomputed completed-guided-hold rejection.
+
+## Repair R2 — immutable public observation passages
+
+Status: `IMPLEMENTED_PUBLIC_PROOF_PASS_F1_EXCEPTION_UNAPPROVED`
+
+Repair R2 adds a strict, additive public passage boundary. It reconstructs the
+pre-answer history for one exact active attempt in a disposable backend-owned run,
+publishes detached public frames at stable quarter points, verifies the terminal
+projection and opaque full-model commitment against the held learner cut, and closes
+the reconstruction before returning. It never advances, finalizes, closes, or
+otherwise mutates the learner's live handle.
+
+The public entry points are:
+
+- `list_simulation_practice_passage_capabilities()`;
+- `build_simulation_practice_observation_passage_request(practice_result_payload)`;
+- `acquire_simulation_practice_observation_passage(handle, request_payload)`.
+
+Acquisition normally returns `(None, result)`. If transient cleanup cannot be
+confirmed, it returns the exact transient owner alongside an `UNAVAILABLE` result
+whose resource state is `CALLER_OWNS_CLEANUP_HANDLE`. The caller must retain and
+settle that handle through the existing `release_simulation_episode` cleanup seam.
+No observations are published in that state.
+
+Available passages use sampling policy `VERIFIED_UNIFORM_QUARTERS_V1` and order by
+`SIMULATION_TIME_THEN_TIE_BREAKER_V1`. Each current F2/F3 recipe has a real
+1,000,000-microsecond passage at 0, 250,000, 500,000, 750,000, and 1,000,000
+microseconds. The record binds the attempt, source/frame/cursor authority, recipe
+digest, prepared identity, observation policy, prefix actions, terminal public
+projection, and three equal opaque full-model commitments. The strict decoder
+rejects mismatched request bindings, reversed or duplicate ordering, incomplete or
+post-cut observations, terminal-digest changes, substituted live cut identifiers,
+unknown fields, and malformed scalar types.
+
+| Recipe | Passage support | Duration | Reason |
+| --- | --- | ---: | --- |
+| `practice.f1.place-and-cancel.v1` | `UNSUPPORTED` | n/a | `ANCHOR_TOO_SHORT_FOR_MEANINGFUL_PACE` |
+| `practice.f1.place-and-replace.v1` | `UNSUPPORTED` | n/a | `ANCHOR_TOO_SHORT_FOR_MEANINGFUL_PACE` |
+| `practice.f2.public-pressure.v1` | `AVAILABLE` | 1,000,000 us | — |
+| `practice.f2.replenishment.v1` | `AVAILABLE` | 1,000,000 us | — |
+| `practice.f3.cancel-partial-residual.v1` | `AVAILABLE` | 1,000,000 us | — |
+| `practice.f3.cancel-volume-variation.v1` | `AVAILABLE` | 1,000,000 us | — |
+
+The two F1 recipes still anchor at one microsecond. This repair does not relabel that
+as meaningful pace and does not approve a Chapter 1 exception. Completing Chapter 1
+therefore requires either user approval of the exact exception “F1 control drills
+are untimed; pace is hidden or disabled and no pacing claim is made for F1,” or a
+new versioned F1 recipe with an authentic useful market lead-in. Extending the
+current recipe by fabricated waiting or interpolation is not permitted.
+
+The boundary is additive. A backend predating it retains the existing ordinary
+practice API; a consumer must treat absent passage capability as paced lead-in
+unavailable and must not fabricate a fallback passage.
+
+### Repair R2 audit
+
+```text
+python3 -B -m kirby2.audit.simulation_practice_passage
+```
+
+The proof exercises all four supported real passages, changing public observations,
+strict order/cut/request validation, acquisition/construction/projection/publication
+failures, confirmed and unconfirmed cleanup, live-frame and full-model conservation,
+and one frozen F3 cut whose 1x and 0.5x metadata variants execute the same ordinary
+action and independently resolve verified Replay artifacts. It does not prove UI
+scheduling, visible 2:1 wall-clock timing, Qt integration, F1 pace, human acceptance,
+or release qualification.

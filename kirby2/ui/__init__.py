@@ -64,6 +64,17 @@ from .simulation_practice_facade import (
     list_simulation_practice_episodes,
     submit_simulation_practice_action,
 )
+from .simulation_practice_passage_contract import (
+    PracticeObservationPassageRequestV1,
+    PracticeObservationPassageResultV1,
+    PracticePassageCapabilityCatalogV1,
+    PracticePassageObservationV1,
+    build_simulation_practice_observation_passage_request,
+)
+from .simulation_practice_passage_facade import (
+    acquire_simulation_practice_observation_passage,
+    list_simulation_practice_passage_capabilities,
+)
 from .simulation_run_facade import (
     advance_simulation_run,
     close_simulation_run,
@@ -119,6 +130,10 @@ __all__ = [
     "PracticeAttemptRequestV1",
     "PracticeCatalogV1",
     "PracticeResultV1",
+    "PracticeObservationPassageRequestV1",
+    "PracticeObservationPassageResultV1",
+    "PracticePassageCapabilityCatalogV1",
+    "PracticePassageObservationV1",
     "SimulationFinalizeResultV1",
     "SimulationReplayArtifactV1",
     "SimulationResolutionRefusalV1",
@@ -132,9 +147,11 @@ __all__ = [
     "SimulationTimelineEventV1",
     "TerminalUiConfig",
     "advance_simulation_run",
+    "acquire_simulation_practice_observation_passage",
     "build_simulation_episode_preparation_request",
     "build_practice_action_request",
     "build_practice_attempt_request",
+    "build_simulation_practice_observation_passage_request",
     "begin_simulation_practice_attempt",
     "build_replay_provider",
     "close_simulation_run",
@@ -144,6 +161,7 @@ __all__ = [
     "finalize_simulation_run",
     "list_simulation_profiles",
     "list_simulation_practice_episodes",
+    "list_simulation_practice_passage_capabilities",
     "list_simulation_training_resources",
     "prepare_simulation_reset",
     "prepare_simulation_episode",
