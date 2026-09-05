@@ -147,7 +147,8 @@ def _assistance(kind: str, frame: Mapping[str, object], wall_time: Mapping[str, 
 
 
 def _result(
-    *, status: str, operation: str, attempt: Mapping[str, object] | None = None,
+    *, status: str, operation: str, request_id: str,
+    attempt: Mapping[str, object] | None = None,
     episode: Mapping[str, object] | None = None, source_run_id: str | None = None,
     current_frame: Mapping[str, object] | None = None, hold_id: str | None = None,
     assistance: list[dict[str, object]] | None = None, assessment: Mapping[str, object] | None = None,
@@ -156,6 +157,7 @@ def _result(
     return build_practice_result(
         status=status,
         operation=operation,
+        request_id=request_id,
         attempt=None if attempt is None else dict(attempt),
         episode=None if episode is None else dict(episode),
         source_run_id=source_run_id,
@@ -188,18 +190,31 @@ def _repeat_is_valid(request: PracticeAttemptRequestV1, recipe: PracticeEpisodeD
     return recipe.variation_of == prior.episode.episode_id
 
 
-def _begin_refusal(handle: object | None, reason: str) -> tuple[object | None, dict[str, object]]:
+def _begin_refusal(
+    handle: object | None,
+    request_id: str,
+    reason: str,
+) -> tuple[object | None, dict[str, object]]:
     """Close an acquired source or explicitly return its opaque cleanup owner."""
 
     if handle is None:
-        return None, _result(status="REFUSED", operation="BEGIN", unavailable_reason=reason)
+        return None, _result(
+            status="REFUSED", operation="BEGIN", request_id=request_id,
+            unavailable_reason=reason,
+        )
     try:
         closed = release_simulation_episode(handle)
     except Exception:
         closed = {"status": "UNAVAILABLE"}
     if closed.get("status") == "CLOSED":
-        return None, _result(status="REFUSED", operation="BEGIN", unavailable_reason=reason)
-    return handle, _result(status="REFUSED", operation="BEGIN", unavailable_reason="CLEANUP_UNCONFIRMED")
+        return None, _result(
+            status="REFUSED", operation="BEGIN", request_id=request_id,
+            unavailable_reason=reason,
+        )
+    return handle, _result(
+        status="REFUSED", operation="BEGIN", request_id=request_id,
+        unavailable_reason="CLEANUP_UNCONFIRMED",
+    )
 
 
 def _duplicate_request(request: PracticeAttemptRequestV1) -> tuple[object | None, dict[str, object]] | None:
@@ -217,7 +232,7 @@ def _duplicate_request(request: PracticeAttemptRequestV1) -> tuple[object | None
         _REQUEST_OUTCOMES.pop(request.request_id, None)
         _SETTLED_REQUESTS[request.request_id] = str(attempt["attempt_id"])
         return None, _result(
-            status="REFUSED", operation="BEGIN",
+            status="REFUSED", operation="BEGIN", request_id=request.request_id,
             unavailable_reason="DUPLICATE_REQUEST_SETTLED",
         )
     state = _ATTEMPTS.get(str(attempt["attempt_id"]))
@@ -234,7 +249,8 @@ def _duplicate_request(request: PracticeAttemptRequestV1) -> tuple[object | None
         _REQUEST_OUTCOMES.pop(request.request_id, None)
         return None
     return existing.handle, _result(
-        status="DUPLICATE", operation="DUPLICATE", attempt=_attempt_public(state),
+        status="DUPLICATE", operation="DUPLICATE", request_id=request.request_id,
+        attempt=_attempt_public(state),
         episode=state.episode.as_dict(), source_run_id=str(attempt["source_run_id"]),
         current_frame=current, hold_id=state.hold_id,
         assistance=[_assistance("DUPLICATE_REQUEST_FENCED", current, _UNAVAILABLE_WALL_TIME, "The request already owns this progressed process-local attempt; no second source was allocated.")],
@@ -250,7 +266,7 @@ def begin_simulation_practice_attempt(
     request = PracticeAttemptRequestV1.from_dict(request_payload)
     if request.request_id in _SETTLED_REQUESTS:
         return None, _result(
-            status="REFUSED", operation="BEGIN",
+            status="REFUSED", operation="BEGIN", request_id=request.request_id,
             unavailable_reason="DUPLICATE_REQUEST_SETTLED",
         )
     duplicate = _duplicate_request(request)
@@ -258,10 +274,16 @@ def begin_simulation_practice_attempt(
         return duplicate
     recipe = get_practice_episode_v1(request.episode_id)
     if not _repeat_is_valid(request, recipe):
-        return None, _result(status="REFUSED", operation="BEGIN", unavailable_reason="INVALID_REPEAT_LINEAGE")
+        return None, _result(
+            status="REFUSED", operation="BEGIN", request_id=request.request_id,
+            unavailable_reason="INVALID_REPEAT_LINEAGE",
+        )
     resolution = _resolution(recipe)
     if resolution.get("status") != "AVAILABLE":
-        return None, _result(status="REFUSED", operation="BEGIN", unavailable_reason="PROFILE_RESOLUTION_REFUSED")
+        return None, _result(
+            status="REFUSED", operation="BEGIN", request_id=request.request_id,
+            unavailable_reason="PROFILE_RESOLUTION_REFUSED",
+        )
     preparation = build_simulation_episode_preparation_request(
         episode_id=recipe.episode_id,
         episode_version=1,
@@ -272,7 +294,7 @@ def begin_simulation_practice_attempt(
     )
     handle, prepared = prepare_simulation_episode(preparation)
     if handle is None or prepared.get("status") != "AVAILABLE" or not isinstance(prepared.get("current_frame"), Mapping):
-        return _begin_refusal(handle, "EPISODE_PREPARATION_REFUSED")
+        return _begin_refusal(handle, request.request_id, "EPISODE_PREPARATION_REFUSED")
     frame = dict(prepared["current_frame"])
     source_run_id = str(frame["source_run_id"])
     attempt_basis = {
@@ -322,13 +344,16 @@ def begin_simulation_practice_attempt(
             )
             state.hold_id = hold_id
         result = _result(
-            status="AVAILABLE", operation="BEGIN", attempt=_attempt_public(state), episode=recipe.as_dict(),
+            status="AVAILABLE", operation="BEGIN", request_id=request.request_id,
+            attempt=_attempt_public(state), episode=recipe.as_dict(),
             source_run_id=source_run_id, current_frame=frame, hold_id=hold_id,
             assistance=[_assistance("PREPARATION_ATTRIBUTED", frame, _UNAVAILABLE_WALL_TIME, "Preparation actions are attributed to the recipe, not the learner.")],
         )
     except Exception:
         _ATTEMPTS.pop(attempt_id, None)
-        return _begin_refusal(handle, "PRACTICE_RESULT_PUBLICATION_FAILED")
+        return _begin_refusal(
+            handle, request.request_id, "PRACTICE_RESULT_PUBLICATION_FAILED"
+        )
     _REQUEST_OUTCOMES[request.request_id] = _RequestOutcome(handle, copy.deepcopy(result))
     return handle, result
 
@@ -357,6 +382,7 @@ def _unavailable_action(request: PracticeActionRequestV1, reason: str) -> dict[s
     state = _ATTEMPTS.get(request.attempt_id)
     return _result(
         status="UNAVAILABLE", operation=request.operation,
+        request_id=request.request_id,
         attempt=None if state is None else _attempt_public(state),
         episode=None if state is None else state.episode.as_dict(),
         source_run_id=request.source_run_id, unavailable_reason=reason,
@@ -439,7 +465,8 @@ def submit_simulation_practice_action(
         debrief = debrief_from_assessment(assessment, source_run_id=request.source_run_id, action_request_id=request.request_id)
         if not _valid_to_stage(state, assessment):
             return _result(
-                status="AVAILABLE", operation="STAGE", attempt=_attempt_public(state), episode=episode.as_dict(),
+                status="AVAILABLE", operation="STAGE", request_id=request.request_id,
+                attempt=_attempt_public(state), episode=episode.as_dict(),
                 source_run_id=request.source_run_id, current_frame=frame, hold_id=request.hold_id,
                 assistance=[_assistance("GUIDED_FEEDBACK_NO_LIVE_COMMAND", frame, request.wall_time, "The staged response is not valid; no simulation command was sent.")],
                 assessment=assessment, debrief=debrief,
@@ -458,7 +485,8 @@ def submit_simulation_practice_action(
             return _unavailable_action(request, "GUIDED_HOLD_MISMATCH")
         state.initial_begin_active = False
         return _result(
-            status="AVAILABLE", operation="STAGE", attempt=_attempt_public(state), episode=episode.as_dict(),
+            status="AVAILABLE", operation="STAGE", request_id=request.request_id,
+            attempt=_attempt_public(state), episode=episode.as_dict(),
             source_run_id=request.source_run_id, current_frame=frame, hold_id=request.hold_id,
             assistance=[_assistance("GUIDED_STAGED", frame, request.wall_time, "The response is staged; explicit Continue is required before release.")],
             assessment=assessment, debrief=debrief,
@@ -486,7 +514,8 @@ def submit_simulation_practice_action(
             state.hold_id = None
             debrief = debrief_from_assessment(assessment, source_run_id=request.source_run_id, action_request_id=request.request_id)
             return _result(
-                status="AVAILABLE", operation="CONTINUE", attempt=_attempt_public(state), episode=episode.as_dict(),
+                status="AVAILABLE", operation="CONTINUE", request_id=request.request_id,
+                attempt=_attempt_public(state), episode=episode.as_dict(),
                 source_run_id=request.source_run_id, current_frame=frame, hold_id=None,
                 assistance=[_assistance("GUIDED_RELEASED", frame, request.wall_time, "The staged non-command response was released without a simulation command.")],
                 assessment=assessment, debrief=debrief,
@@ -509,7 +538,8 @@ def submit_simulation_practice_action(
             )
             debrief = debrief_from_assessment(failure, source_run_id=request.source_run_id, action_request_id=request.request_id)
             return _result(
-                status="AVAILABLE", operation="CONTINUE", attempt=_attempt_public(state), episode=episode.as_dict(),
+                status="AVAILABLE", operation="CONTINUE", request_id=request.request_id,
+                attempt=_attempt_public(state), episode=episode.as_dict(),
                 source_run_id=request.source_run_id, current_frame=frame, hold_id=request.hold_id,
                 assistance=[_assistance("GUIDED_FEEDBACK_NO_LIVE_COMMAND", frame, request.wall_time, "Command dispatch failed before confirmation; the original guided hold was restored.")],
                 assessment=failure, debrief=debrief,
@@ -526,7 +556,8 @@ def submit_simulation_practice_action(
             )
             debrief = debrief_from_assessment(failure, source_run_id=request.source_run_id, action_request_id=request.request_id)
             return _result(
-                status="AVAILABLE", operation="CONTINUE", attempt=_attempt_public(state), episode=episode.as_dict(),
+                status="AVAILABLE", operation="CONTINUE", request_id=request.request_id,
+                attempt=_attempt_public(state), episode=episode.as_dict(),
                 source_run_id=request.source_run_id, current_frame=destination, hold_id=next_hold,
                 assistance=[_assistance("GUIDED_FEEDBACK_NO_LIVE_COMMAND", destination, request.wall_time, "The command did not confirm; a fresh guided hold was retained for recovery.")],
                 assessment=failure, debrief=debrief,
@@ -545,7 +576,8 @@ def submit_simulation_practice_action(
         state.hold_id = next_hold
         debrief = debrief_from_assessment(assessment, source_run_id=request.source_run_id, action_request_id=request.request_id)
         return _result(
-            status="AVAILABLE", operation="CONTINUE", attempt=_attempt_public(state), episode=episode.as_dict(),
+            status="AVAILABLE", operation="CONTINUE", request_id=request.request_id,
+            attempt=_attempt_public(state), episode=episode.as_dict(),
             source_run_id=request.source_run_id, current_frame=destination, hold_id=next_hold,
             assistance=[_assistance("GUIDED_RELEASED", destination, request.wall_time, "The matching staged semantic action was released exactly once.")],
             assessment=assessment, debrief=debrief,
@@ -573,7 +605,8 @@ def submit_simulation_practice_action(
             state.step_index += 1
     debrief = debrief_from_assessment(assessment, source_run_id=request.source_run_id, action_request_id=request.request_id)
     return _result(
-        status="AVAILABLE", operation="UNASSISTED", attempt=_attempt_public(state), episode=episode.as_dict(),
+        status="AVAILABLE", operation="UNASSISTED", request_id=request.request_id,
+        attempt=_attempt_public(state), episode=episode.as_dict(),
         source_run_id=request.source_run_id, current_frame=frame, hold_id=None,
         assistance=[_assistance("UNASSISTED_DISPATCH", frame, request.wall_time, "Unassisted semantic actions are sent through the ordinary command boundary.")],
         assessment=assessment, debrief=debrief,

@@ -323,6 +323,7 @@ class SimulationPracticeAudit(unittest.TestCase):
         count_before = len(_ISSUED_SOURCE_RUN_IDS)
         duplicate_handle, duplicate = begin_simulation_practice_attempt(request)
         self.assertIsNone(duplicate_handle)
+        self.assertEqual(duplicate["request_id"], request["request_id"])
         self.assertEqual(duplicate["status"], "REFUSED")
         self.assertEqual(duplicate["unavailable_reason"], "DUPLICATE_REQUEST_SETTLED")
         self.assertIsNone(duplicate["attempt"])
@@ -351,6 +352,75 @@ class SimulationPracticeAudit(unittest.TestCase):
         finally:
             self.assertEqual(release_simulation_episode(repeat_handle)["status"], "CLOSED")
         _CASES.append({"case_id": "B07_SETTLED_DUPLICATE_TOMBSTONE", "settled_source": source_run_id})
+
+    def test_result_request_correlations_are_explicit_and_integral(self) -> None:
+        refused_request = build_practice_attempt_request(
+            episode_id="practice.f1.place-and-cancel.v1",
+            operation="EXACT_REPEAT",
+            prior_attempt_id="practice-attempt-000000000000000000000000",
+        )
+        refused_handle, refused = begin_simulation_practice_attempt(refused_request)
+        self.assertIsNone(refused_handle)
+        self.assertEqual(refused["status"], "REFUSED")
+        self.assertEqual(refused["request_id"], refused_request["request_id"])
+        self.assertEqual(PracticeResultV1.from_dict(refused).as_dict(), refused)
+
+        begin_request = build_practice_attempt_request(
+            episode_id="practice.f1.place-and-cancel.v1",
+        )
+        handle, begun = begin_simulation_practice_attempt(begin_request)
+        self.assertIsNotNone(handle)
+        try:
+            self.assertEqual(begun["request_id"], begin_request["request_id"])
+            hostile_begin = copy.deepcopy(begun)
+            hostile_begin["request_id"] = refused_request["request_id"]
+            _reidentify_practice_result(hostile_begin)
+            with self.assertRaises(Exception):
+                PracticeResultV1.from_dict(hostile_begin)
+
+            stage_request = _action(
+                begun, "STAGE", "SEMANTIC_ACTION", "PLAYER_INCREASE_QUANTITY"
+            )
+            staged = submit_simulation_practice_action(handle, stage_request)
+            self.assertEqual(staged["request_id"], stage_request["request_id"])
+            hostile_action = copy.deepcopy(staged)
+            hostile_action["request_id"] = (
+                "practice-action-request-000000000000000000000000"
+            )
+            _reidentify_practice_result(hostile_action)
+            with self.assertRaises(Exception):
+                PracticeResultV1.from_dict(hostile_action)
+
+            unavailable_request = copy.deepcopy(stage_request)
+            unavailable_request["attempt_id"] = (
+                "practice-attempt-000000000000000000000000"
+            )
+            from kirby2.ui.simulation_contract import canonical_digest
+
+            unavailable_basis = {
+                key: value
+                for key, value in unavailable_request.items()
+                if key != "request_id"
+            }
+            unavailable_request["request_id"] = (
+                f"practice-action-request-{canonical_digest(unavailable_basis)[:24]}"
+            )
+            unavailable = submit_simulation_practice_action(
+                handle, unavailable_request
+            )
+            self.assertEqual(unavailable["status"], "UNAVAILABLE")
+            self.assertEqual(
+                unavailable["request_id"], unavailable_request["request_id"]
+            )
+        finally:
+            self.assertEqual(release_simulation_episode(handle)["status"], "CLOSED")
+        _CASES.append(
+            {
+                "case_id": "B09_RESULT_REQUEST_CORRELATION",
+                "refused_request_id": refused_request["request_id"],
+                "begin_request_id": begin_request["request_id"],
+            }
+        )
 
     def test_f2_staged_duplicate_retains_its_active_hold(self) -> None:
         request = build_practice_attempt_request(

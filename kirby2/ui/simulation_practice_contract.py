@@ -69,6 +69,7 @@ _ACTION_FIELDS = frozenset(
 _RESULT_FIELDS = frozenset(
     {
         "schema_id", "schema_version", "result_id", "status", "operation",
+        "request_id",
         "attempt", "episode", "source_run_id", "current_frame", "hold_id",
         "assistance", "assessment", "debrief", "unavailable_reason",
     }
@@ -586,6 +587,21 @@ class PracticeResultV1:
         operation = _text(root["operation"], "practice result operation")
         if operation not in {"CATALOG", "BEGIN", "STAGE", "CONTINUE", "UNASSISTED", "DUPLICATE"}:
             raise ValueError("practice result operation is unsupported")
+        request_id = (
+            None
+            if root["request_id"] is None
+            else _id(root["request_id"], _REQUEST, "practice result request ID")
+        )
+        if operation == "CATALOG":
+            if request_id is not None:
+                raise ValueError("catalog practice result cannot bind a request")
+        elif request_id is None:
+            raise ValueError("practice result requires its submitted request ID")
+        elif operation in {"BEGIN", "DUPLICATE"}:
+            if not request_id.startswith("practice-attempt-request-"):
+                raise ValueError("practice begin result requires an attempt request ID")
+        elif not request_id.startswith("practice-action-request-"):
+            raise ValueError("practice action result requires an action request ID")
         attempt = None if root["attempt"] is None else _attempt_record(root["attempt"])
         if root["episode"] is not None:
             _episode(root["episode"])
@@ -643,6 +659,8 @@ class PracticeResultV1:
                     or root["current_frame"]["source_run_id"] != root["source_run_id"]
                 ):
                     raise SimulationContractIntegrityError("practice result attempt identity does not bind its episode or frame")
+                if operation in {"BEGIN", "DUPLICATE"} and request_id != attempt["attempt_request_id"]:
+                    raise SimulationContractIntegrityError("practice result does not bind its attempt request")
                 prepared_identity = SimulationEpisodeIdentityV1.from_dict(
                     _object(attempt["prepared_identity"], "practice result prepared identity")
                 )
@@ -682,6 +700,8 @@ class PracticeResultV1:
                 if assessment is not None:
                     if debrief is None or debrief["source_run_id"] != root["source_run_id"] or debrief["outcome"] != assessment["outcome"] or debrief["evidence"] != assessment["evidence"] or debrief["action_request_id"] is None:
                         raise SimulationContractIntegrityError("practice debrief does not bind its assessment")
+                    if request_id != debrief["action_request_id"]:
+                        raise SimulationContractIntegrityError("practice result does not bind its action request")
                     if attempt["step_count"] == 0:
                         if assessment["action_index"] != 0:
                             raise ValueError("declared-rule assessment action index is invalid")
