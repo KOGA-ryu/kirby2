@@ -51,6 +51,14 @@ from .simulation_episode_facade import (
     release_simulation_episode,
     verify_prepared_simulation_episode,
 )
+from .simulation_practice_contract import (
+    PracticeActionRequestV1,
+    PracticeAttemptRequestV1,
+    PracticeCatalogV1,
+    PracticeResultV1,
+    build_practice_action_request,
+    build_practice_attempt_request,
+)
 from .simulation_run_facade import (
     advance_simulation_run,
     close_simulation_run,
@@ -102,6 +110,10 @@ __all__ = [
     "SimulationEpisodePreparedResultV1",
     "SimulationEpisodeRefusalV1",
     "SimulationEpisodeVerificationV1",
+    "PracticeActionRequestV1",
+    "PracticeAttemptRequestV1",
+    "PracticeCatalogV1",
+    "PracticeResultV1",
     "SimulationFinalizeResultV1",
     "SimulationReplayArtifactV1",
     "SimulationResolutionRefusalV1",
@@ -116,6 +128,8 @@ __all__ = [
     "TerminalUiConfig",
     "advance_simulation_run",
     "build_simulation_episode_preparation_request",
+    "build_practice_action_request",
+    "build_practice_attempt_request",
     "build_replay_provider",
     "close_simulation_run",
     "commit_simulation_reset",

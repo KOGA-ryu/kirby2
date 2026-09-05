@@ -1,6 +1,13 @@
 """Controlled execution lessons over deterministic synthetic scenarios."""
 
 from .catalog import LESSONS, get_lesson, load_curriculum, prepare_lesson
+from .practice_episodes import (
+    PRACTICE_EPISODE_CATALOG_ID_V1,
+    PRACTICE_EPISODES_V1,
+    PracticeEpisodeDefinitionV1,
+    get_practice_episode_v1,
+    list_practice_episodes_v1,
+)
 from .errors import (
     AMBIGUITY_ERROR_TYPES_V1,
     CRITICAL_ERROR_CAP_PPM_V1,
