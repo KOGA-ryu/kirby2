@@ -55,7 +55,7 @@ Read `/Users/kogaryu/Documents/ChatGPT/kirby2-ui/AGENTS.md` before editing.
 /Users/kogaryu/Documents/ChatGPT/kirby2
 ```
 
-- Current HEAD and handoff-document commit:
+- Canonical backend/UI handoff-document commit:
   `b812514bfad858e1385c5e7e60e9dea2ad64a2b9`
 - Production integration pin:
   `655ccf495b015f2067f11d63adcf3dd63e4e4609`
