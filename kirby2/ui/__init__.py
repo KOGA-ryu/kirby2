@@ -59,7 +59,6 @@ from .simulation_run_facade import (
     dispatch_simulation_command,
     prepare_simulation_reset,
     read_current_simulation_frame,
-    simulation_run_model_prefix_sha256,
     start_simulation_run,
 )
 from .simulation_artifact_contract import (
@@ -132,7 +131,6 @@ __all__ = [
     "read_current_simulation_frame",
     "resolve_simulation_profile",
     "resolve_replay_artifact",
-    "simulation_run_model_prefix_sha256",
     "verify_prepared_simulation_episode",
     "episode_prefix_projection",
     "episode_prefix_projection_sha256",

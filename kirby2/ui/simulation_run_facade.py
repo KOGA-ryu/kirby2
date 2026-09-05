@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from types import MappingProxyType
@@ -92,6 +92,7 @@ class _SimulationRunHandle:
     reset_pending: bool = False
     close_result: SimulationCloseResultV1 | None = None
     finalization_state: object | None = None
+    prepared_episode_binding_sha256: str | None = None
 
 
 @dataclass(slots=True)
@@ -941,21 +942,47 @@ def _run_handle(value: object) -> _SimulationRunHandle:
     return value
 
 
-def simulation_run_model_prefix_sha256(
+def _bind_prepared_episode_identity(
     handle_value: object,
-    prefix_actions: Sequence[str],
-) -> str:
-    """Commit the complete source-independent live model without exposing it."""
+    binding: Mapping[str, object],
+) -> None:
+    """Bind one opaque handle to its immutable prepared-episode identity."""
 
     handle = _run_handle(handle_value)
-    if any(type(action) is not str for action in prefix_actions):
-        raise TypeError("simulation model prefix actions must be strings")
+    binding_sha256 = canonical_digest(dict(binding))
+    if handle.prepared_episode_binding_sha256 is not None:
+        raise SimulationContractIntegrityError(
+            "simulation run handle is already bound to a prepared episode"
+        )
+    handle.prepared_episode_binding_sha256 = binding_sha256
+
+
+def _prepared_episode_identity_matches(
+    handle_value: object,
+    binding: Mapping[str, object],
+) -> bool:
+    handle = _run_handle(handle_value)
+    return (
+        handle.prepared_episode_binding_sha256 is not None
+        and handle.prepared_episode_binding_sha256 == canonical_digest(dict(binding))
+    )
+
+
+def _prepared_episode_model_sha256(handle_value: object) -> str:
+    """Commit a bound episode's full live model without exposing runtime bytes."""
+
+    handle = _run_handle(handle_value)
+    binding_sha256 = handle.prepared_episode_binding_sha256
+    if binding_sha256 is None:
+        raise SimulationContractIntegrityError(
+            "simulation run handle is not bound to a prepared episode"
+        )
     return canonical_digest(
         {
             "projection_id": "KIRBY2_SIMULATION_FULL_MODEL_PREFIX_PROJECTION_V1",
             "projection_version": 1,
             "run_request_sha256": handle.run_request_sha256,
-            "prefix_actions": list(prefix_actions),
+            "prepared_episode_binding_sha256": binding_sha256,
             "branch_runtime_state": handle.session.branch_runtime_state(),
         }
     )
@@ -1842,5 +1869,4 @@ __all__ = [
     "prepare_simulation_reset",
     "read_current_simulation_frame",
     "start_simulation_run",
-    "simulation_run_model_prefix_sha256",
 ]

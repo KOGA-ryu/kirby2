@@ -1546,12 +1546,16 @@ The original `SimulationStartResultV1` remains an ordinary, immutable `READY` fr
 at time zero. The prepared result separately publishes the current `PAUSED` anchor
 frame, an opaque `full_model_prefix_sha256`, and the fixed projection identity
 `KIRBY2_SIMULATION_FULL_MODEL_PREFIX_PROJECTION_V1`. That digest commits, without
-returning private bytes, to the source-independent run request, ordered prefix, and
-the backend's canonical `LiveMarketSession.branch_runtime_state()`: engine and
-arrival history, market-state/queue state, player and working-order state, input
-history, strategy state, objective state, and supporting deterministic counters.
-The detached `prefix_projection_sha256` remains a useful public-model comparison but
-is not evidence of complete reconstructible state by itself.
+returning private bytes, to the source-independent run request, the opaque handle's
+immutable prepared-episode binding (exact request ID, full recipe identity, timing
+policy, and prefix identity), and the backend's canonical
+`LiveMarketSession.branch_runtime_state()`: engine and arrival history,
+market-state/queue state, player and working-order state, input history, strategy
+state, objective state, and supporting deterministic counters. The detached
+`prefix_projection_sha256` remains a useful public-model comparison but is not
+evidence of complete reconstructible state by itself. There is no public generic
+full-model-digest operation: only episode preparation and verification can create or
+compare this commitment.
 
 An available prepared result gives the caller one opaque active handle. The caller
 must either finalize it or call `release_simulation_episode`; preparation failures

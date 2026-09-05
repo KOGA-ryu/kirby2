@@ -31,10 +31,13 @@ versioned schedule schema and acceptance review.
   `KIRBY2_SIMULATION_FULL_MODEL_PREFIX_PROJECTION_V1`.
 
 The latter is an opaque commitment to a canonical, source-independent backend model
-projection: pinned run request and prefix plus `LiveMarketSession.branch_runtime_state`.
-It covers engine/arrival history, market and queue state, player and working orders,
-input history, strategy/objective state, and deterministic counters. No branch-state
-bytes, replay inventory, or private handle fields enter the UI wire record.
+projection: the pinned run request, the opaque handle's exact prepared request and
+recipe identity (request ID, episode ID/version, timing policy, and prefix), plus
+`LiveMarketSession.branch_runtime_state`. It covers engine/arrival history, market
+and queue state, player and working orders, input history, strategy/objective state,
+and deterministic counters. No branch-state bytes, replay inventory, or private
+handle fields enter the UI wire record. The backend intentionally exports no general
+full-model-digest oracle to UI consumers.
 
 `verify_prepared_simulation_episode()` compares an active opaque handle with that
 commitment and returns only a strict `MATCH` or `MISMATCH` result. A prepared handle is
@@ -46,7 +49,7 @@ settled only by finalization or `release_simulation_episode()`.
 python3 -B -m kirby2.audit.simulation_episode
 ```
 
-The audit reports three passing cases:
+The audit reports four passing cases:
 
 - `A01_CONTROL_RESIDUAL_PREPARE`: two independently allocated source runs reach the
   same T=1 `PAUSED` control-residual cut (100 filled shares and one working order),
@@ -62,9 +65,18 @@ The audit reports three passing cases:
   to the old full-model commitment produces `FULL_MODEL_PREFIX_MISMATCH`. The existing
   V1 Start fixture still validates `READY` at T=0; hostile frame and Start records
   with recomputed canonical IDs reject `READY` at T=1 by the lifecycle invariant.
+- `A04_IDENTITY_REBIND_SCHEMA_AND_START_CLEANUP`: recomputed prepared-result outer
+  IDs cannot rebind episode ID/version, request ID, timing policy, or prefix identity
+  to the original opaque handle; all five Packet A decoders reject
+  `schema_version=true`; and an invalid or nonavailable Start record paired with a
+  non-null allocated handle is closed as `USER_ABANDONED` rather than losing cleanup
+  ownership. A
+  malformed close projection instead returns the exact retained opaque cleanup handle
+  with `CLEANUP_UNCONFIRMED`.
 
-The audit is intentionally backend-public-boundary only: it imports `kirby2.ui`, not
-private live-session, replay-store, or handle internals.
+The audit uses public episode operations and one backend-private opaque commitment
+helper solely to compare final-model identities. It does not read private
+live-session, replay-store, or handle state.
 
 ## What this proves
 

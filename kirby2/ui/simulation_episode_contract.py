@@ -184,7 +184,11 @@ class SimulationEpisodeIdentityV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationEpisodeIdentityV1:
         root = _object(payload, "simulation episode identity")
         _exact(root, _IDENTITY_FIELDS, "simulation episode identity")
-        if root["schema_id"] != EPISODE_IDENTITY_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != EPISODE_IDENTITY_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation episode identity schema is unsupported")
         profile_ref = SimulationProfileRefV1.from_dict(
             _object(root["profile_ref"], "simulation episode identity.profile_ref")
@@ -270,7 +274,11 @@ class SimulationEpisodePreparationRequestV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationEpisodePreparationRequestV1:
         root = _object(payload, "simulation episode preparation request")
         _exact(root, _REQUEST_FIELDS, "simulation episode preparation request")
-        if root["schema_id"] != EPISODE_REQUEST_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != EPISODE_REQUEST_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation episode preparation request schema is unsupported")
         identity = SimulationEpisodeIdentityV1.from_dict(
             _object(root["identity"], "simulation episode preparation request.identity")
@@ -343,7 +351,11 @@ class SimulationEpisodeRefusalV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationEpisodeRefusalV1:
         root = _object(payload, "simulation episode refusal")
         _exact(root, _REFUSAL_FIELDS, "simulation episode refusal")
-        if root["schema_id"] != EPISODE_REFUSAL_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != EPISODE_REFUSAL_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation episode refusal schema is unsupported")
         reason = _text(root["reason_code"], "simulation episode refusal.reason_code")
         if reason not in _REFUSAL_REASONS:
@@ -421,7 +433,11 @@ class SimulationEpisodePreparedResultV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationEpisodePreparedResultV1:
         root = _object(payload, "simulation episode prepared result")
         _exact(root, _RESULT_FIELDS, "simulation episode prepared result")
-        if root["schema_id"] != EPISODE_RESULT_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != EPISODE_RESULT_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation episode prepared result schema is unsupported")
         status = _text(root["status"], "simulation episode prepared result.status")
         if status not in {"AVAILABLE", "REFUSED"}:
@@ -571,7 +587,11 @@ class SimulationEpisodeVerificationV1:
     def from_dict(cls, payload: Mapping[str, object]) -> SimulationEpisodeVerificationV1:
         root = _object(payload, "simulation episode verification")
         _exact(root, _VERIFICATION_FIELDS, "simulation episode verification")
-        if root["schema_id"] != EPISODE_VERIFICATION_SCHEMA_ID or root["schema_version"] != 1:
+        if (
+            root["schema_id"] != EPISODE_VERIFICATION_SCHEMA_ID
+            or type(root["schema_version"]) is not int
+            or root["schema_version"] != 1
+        ):
             raise ValueError("simulation episode verification schema is unsupported")
         status = _text(root["status"], "simulation episode verification.status")
         if status not in {"MATCH", "MISMATCH"}:
@@ -586,6 +606,8 @@ class SimulationEpisodeVerificationV1:
         elif type(reason) is not str or reason not in {
             "CURRENT_FRAME_CHANGED",
             "FULL_MODEL_PREFIX_MISMATCH",
+            "INVALID_PREPARED_RESULT",
+            "PREPARED_IDENTITY_MISMATCH",
         }:
             raise ValueError("mismatching episode verification reason is unsupported")
         basis = {key: value for key, value in root.items() if key != "verification_id"}

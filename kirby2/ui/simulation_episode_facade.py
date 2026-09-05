@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 
 from .simulation_contract import canonical_digest
@@ -17,14 +18,20 @@ from .simulation_episode_contract import (
 )
 from .simulation_interaction_contract import COMMAND_REQUEST_SCHEMA_ID, SimulationCommandResultV1
 from .simulation_live_contract import SimulationFrameV1, SimulationStartResultV1
+from .simulation_lifecycle_contract import SimulationCloseResultV1
 from .simulation_run_facade import (
     advance_simulation_run,
+    _bind_prepared_episode_identity,
+    _prepared_episode_identity_matches,
+    _prepared_episode_model_sha256,
     close_simulation_run,
     dispatch_simulation_command,
     read_current_simulation_frame,
-    simulation_run_model_prefix_sha256,
     start_simulation_run,
 )
+
+
+_PREPARED_RESULT_ID = re.compile(r"simulation-episode-prepared-result-[0-9a-f]{24}\Z")
 
 
 def _cursor(frame: SimulationFrameV1) -> Mapping[str, object]:
@@ -48,6 +55,25 @@ def _command_request(frame: SimulationFrameV1, semantic_action_id: str) -> dict[
     return {
         **basis,
         "command_id": f"simulation-command-{canonical_digest(basis)[:24]}",
+    }
+
+
+def _episode_binding(
+    *,
+    request_id: str,
+    identity: SimulationEpisodeIdentityV1,
+    prefix_actions: tuple[str, ...],
+    prefix_timing_policy: str,
+) -> dict[str, object]:
+    """Return the complete public identity permanently associated with one handle."""
+
+    return {
+        "schema_id": "KIRBY2_SIMULATION_PREPARED_EPISODE_BINDING_V1",
+        "schema_version": 1,
+        "request_id": request_id,
+        "identity": identity.as_dict(),
+        "prefix_actions": list(prefix_actions),
+        "prefix_timing_policy": prefix_timing_policy,
     }
 
 
@@ -124,7 +150,11 @@ def _close_after_failure(
     """Close a post-allocation failure or return its handle for explicit caller cleanup."""
 
     try:
-        close_record = close_simulation_run(handle, "USER_ABANDONED")
+        close_result = SimulationCloseResultV1.from_dict(
+            close_simulation_run(handle, "USER_ABANDONED")
+        )
+        if close_result.status != "CLOSED":
+            raise RuntimeError("automatic close was not confirmed CLOSED")
     except Exception as error:  # The opaque handle remains the caller's cleanup responsibility.
         return handle, _refused(
             reason_code="CLEANUP_UNCONFIRMED",
@@ -133,18 +163,10 @@ def _close_after_failure(
             ownership="CALLER_OWNS_CLEANUP_HANDLE",
             cleanup_disposition="USER_ABANDONED",
         )
-    if close_record.get("status") == "CLOSED":
-        return None, _refused(
-            reason_code=reason_code,
-            explanation=explanation,
-            request=request,
-            cleanup_disposition="USER_ABANDONED",
-        )
-    return handle, _refused(
-        reason_code="CLEANUP_UNCONFIRMED",
-        explanation=f"{explanation}; automatic cleanup was not confirmed",
+    return None, _refused(
+        reason_code=reason_code,
+        explanation=explanation,
         request=request,
-        ownership="CALLER_OWNS_CLEANUP_HANDLE",
         cleanup_disposition="USER_ABANDONED",
     )
 
@@ -185,10 +207,23 @@ def prepare_simulation_episode(
             "START_REFUSED",
             f"start result was invalid: {error}",
         )
-    if handle is None or start.status != "AVAILABLE" or start.initial_frame is None:
+    if start.status != "AVAILABLE" or start.initial_frame is None:
+        if handle is not None:
+            return _close_after_failure(
+                handle,
+                request,
+                "START_REFUSED",
+                "the start result was not an available ordinary READY run",
+            )
         return None, _refused(
             reason_code="START_REFUSED",
             explanation="the pinned profile could not start an ordinary READY run",
+            request=request,
+        )
+    if handle is None:
+        return None, _refused(
+            reason_code="START_REFUSED",
+            explanation="an available start result did not supply an opaque run handle",
             request=request,
         )
 
@@ -243,6 +278,15 @@ def prepare_simulation_episode(
                 "the prepared cut could not be paused at its declared anchor",
             )
         current = pause.destination_frame
+        _bind_prepared_episode_identity(
+            handle,
+            _episode_binding(
+                request_id=request.request_id,
+                identity=request.identity,
+                prefix_actions=request.prefix_actions,
+                prefix_timing_policy=request.prefix_timing_policy,
+            ),
+        )
         result = SimulationEpisodePreparedResultV1.from_dict(
             _result_record(
                 status="AVAILABLE",
@@ -255,9 +299,7 @@ def prepare_simulation_episode(
                     current, request.prefix_actions
                 ),
                 full_model_projection_id=FULL_MODEL_PREFIX_PROJECTION_ID,
-                full_model_prefix_sha256=simulation_run_model_prefix_sha256(
-                    handle, request.prefix_actions
-                ),
+                full_model_prefix_sha256=_prepared_episode_model_sha256(handle),
                 ownership="CALLER_OWNS_ACTIVE_HANDLE",
                 cleanup_disposition=None,
                 refusal=None,
@@ -285,7 +327,22 @@ def verify_prepared_simulation_episode(
 ) -> dict[str, object]:
     """Compare an opaque active run with its prepared full-model commitment."""
 
-    prepared = SimulationEpisodePreparedResultV1.from_dict(prepared_result_payload)
+    try:
+        prepared = SimulationEpisodePreparedResultV1.from_dict(prepared_result_payload)
+    except (TypeError, ValueError) as error:
+        result_id = (
+            prepared_result_payload.get("result_id")
+            if isinstance(prepared_result_payload, Mapping)
+            else None
+        )
+        if type(result_id) is not str or _PREPARED_RESULT_ID.fullmatch(result_id) is None:
+            raise error
+        return SimulationEpisodeVerificationV1(
+            verification_id="",
+            status="MISMATCH",
+            prepared_result_id=result_id,
+            reason="INVALID_PREPARED_RESULT",
+        ).as_dict()
     if (
         prepared.status != "AVAILABLE"
         or prepared.current_frame is None
@@ -293,19 +350,27 @@ def verify_prepared_simulation_episode(
         or prepared.full_model_prefix_sha256 is None
     ):
         raise ValueError("episode verification requires an available prepared result")
-    current = read_current_simulation_frame(handle_value, prepared.current_frame.source_run_id)
-    if (
-        current.get("status") != "AVAILABLE"
-        or current.get("current_frame", {}).get("frame_id") != prepared.current_frame.frame_id
+    if not _prepared_episode_identity_matches(
+        handle_value,
+        _episode_binding(
+            request_id=prepared.request_id,
+            identity=prepared.identity,
+            prefix_actions=prepared.prefix_actions,
+            prefix_timing_policy=prepared.identity.prefix_timing_policy,
+        ),
     ):
-        status, reason = "MISMATCH", "CURRENT_FRAME_CHANGED"
-    elif (
-        simulation_run_model_prefix_sha256(handle_value, prepared.prefix_actions)
-        != prepared.full_model_prefix_sha256
-    ):
-        status, reason = "MISMATCH", "FULL_MODEL_PREFIX_MISMATCH"
+        status, reason = "MISMATCH", "PREPARED_IDENTITY_MISMATCH"
     else:
-        status, reason = "MATCH", None
+        current = read_current_simulation_frame(handle_value, prepared.current_frame.source_run_id)
+        if (
+            current.get("status") != "AVAILABLE"
+            or current.get("current_frame", {}).get("frame_id") != prepared.current_frame.frame_id
+        ):
+            status, reason = "MISMATCH", "CURRENT_FRAME_CHANGED"
+        elif _prepared_episode_model_sha256(handle_value) != prepared.full_model_prefix_sha256:
+            status, reason = "MISMATCH", "FULL_MODEL_PREFIX_MISMATCH"
+        else:
+            status, reason = "MATCH", None
     return SimulationEpisodeVerificationV1(
         verification_id="", status=status, prepared_result_id=prepared.result_id, reason=reason
     ).as_dict()

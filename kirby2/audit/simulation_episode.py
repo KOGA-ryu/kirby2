@@ -1,8 +1,9 @@
 """Public-boundary audit for Packet A prepared simulation episodes.
 
-Run with ``python3 -m kirby2.audit.simulation_episode``.  The audit deliberately
-imports only ``kirby2.ui`` public surfaces: it never reads an opaque run handle's
-session, event tape, or Replay-store internals.
+Run with ``python3 -m kirby2.audit.simulation_episode``. The audit uses public
+episode operations and one backend-private opaque commitment helper for final-state
+comparison; it never reads an opaque run handle's session, event tape, or
+Replay-store internals.
 """
 
 from __future__ import annotations
@@ -12,7 +13,14 @@ import hashlib
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
 from kirby2.ui import (
+    SimulationEpisodeIdentityV1,
+    SimulationEpisodePreparationRequestV1,
+    SimulationEpisodePreparedResultV1,
+    SimulationEpisodeRefusalV1,
+    SimulationEpisodeVerificationV1,
     SimulationFrameV1,
     SimulationStartResultV1,
     build_simulation_episode_preparation_request,
@@ -23,9 +31,10 @@ from kirby2.ui import (
     release_simulation_episode,
     resolve_replay_artifact,
     resolve_simulation_profile,
-    simulation_run_model_prefix_sha256,
+    start_simulation_run,
     verify_prepared_simulation_episode,
 )
+from kirby2.ui.simulation_run_facade import _prepared_episode_model_sha256
 
 
 _FIXTURE_ROOT = Path(__file__).parents[1] / "ui" / "fixtures" / "simulation_contract_v1"
@@ -97,6 +106,54 @@ def _nonzero_ready_frame(frame: dict[str, object]) -> dict[str, object]:
     frame_basis = {key: value for key, value in hostile.items() if key != "frame_id"}
     hostile["frame_id"] = f"simulation-frame-{_canonical_digest(frame_basis)[:24]}"
     return hostile
+
+
+def _recalculate_identity(identity: dict[str, object]) -> None:
+    basis = {key: value for key, value in identity.items() if key != "recipe_sha256"}
+    identity["recipe_sha256"] = _canonical_digest(basis)
+
+
+def _recalculate_prepared_result(prepared: dict[str, object]) -> None:
+    basis = {key: value for key, value in prepared.items() if key != "result_id"}
+    prepared["result_id"] = (
+        f"simulation-episode-prepared-result-{_canonical_digest(basis)[:24]}"
+    )
+
+
+def _rebound_prepared_result(
+    prepared: dict[str, object],
+    kind: str,
+) -> dict[str, object]:
+    forged = copy.deepcopy(prepared)
+    identity = forged["identity"]
+    if not isinstance(identity, dict):
+        raise AssertionError("available prepared result has no identity")
+    if kind == "episode_id":
+        identity["episode_id"] = "forged.other.episode"
+        _recalculate_identity(identity)
+    elif kind == "episode_version":
+        identity["episode_version"] = 2
+        _recalculate_identity(identity)
+    elif kind == "request_id":
+        forged["request_id"] = f"simulation-episode-request-{_canonical_digest({'forged': kind})[:24]}"
+    elif kind == "timing_policy":
+        identity["prefix_timing_policy"] = "FORGED_TIMING_POLICY_V1"
+        _recalculate_identity(identity)
+    elif kind == "prefix_identity":
+        actions = ["SIMULATION_PLAY", "PLAYER_BUY_BID", "PLAYER_BUY_MARKET"]
+        forged["prefix_actions"] = actions
+        identity["prefix_sha256"] = _canonical_digest(actions)
+        _recalculate_identity(identity)
+        current = forged["current_frame"]
+        if not isinstance(current, dict):
+            raise AssertionError("available prepared result has no current frame")
+        forged["prefix_projection_sha256"] = episode_prefix_projection_sha256(
+            SimulationFrameV1.from_dict(current), actions
+        )
+    else:
+        raise AssertionError(f"unknown forged binding kind: {kind}")
+    _recalculate_prepared_result(forged)
+    return forged
 
 
 def _destination(command_result: dict[str, object]) -> dict[str, object]:
@@ -186,9 +243,7 @@ class SimulationEpisodeAudit(unittest.TestCase):
             frame = _destination(command_result)
             outcome = command_result["outcome"]
             self.assertIsInstance(outcome, dict)
-            final_full_model_sha256 = simulation_run_model_prefix_sha256(
-                handle, (*_BASE_ACTIONS, "PLAYER_CANCEL_NEAREST")
-            )
+            final_full_model_sha256 = _prepared_episode_model_sha256(handle)
             proof = _finalize_and_verify(handle, frame)
             proofs.append(
                 {
@@ -208,6 +263,124 @@ class SimulationEpisodeAudit(unittest.TestCase):
                 "case_id": "A02_CONTINUATION_REPLAY_VERIFICATION",
                 "continuations": proofs,
                 "cleanup": "FINALIZED_TO_REPLAY",
+            }
+        )
+
+    def test_prepared_identity_rebinding_and_boolean_schema_versions_are_refused(self) -> None:
+        handle, prepared = self._prepare()
+        try:
+            hostile_results: list[dict[str, object]] = []
+            for kind in (
+                "episode_id",
+                "episode_version",
+                "request_id",
+                "timing_policy",
+                "prefix_identity",
+            ):
+                verification = verify_prepared_simulation_episode(
+                    handle, _rebound_prepared_result(prepared, kind)
+                )
+                self.assertEqual(verification["status"], "MISMATCH")
+                expected = (
+                    "INVALID_PREPARED_RESULT"
+                    if kind == "timing_policy"
+                    else "PREPARED_IDENTITY_MISMATCH"
+                )
+                self.assertEqual(verification["reason"], expected)
+                hostile_results.append(
+                    {
+                        "kind": kind,
+                        "verification_id": verification["verification_id"],
+                        "reason": verification["reason"],
+                    }
+                )
+
+            request = _request()
+            refusal = SimulationEpisodeRefusalV1(
+                "INVALID_REQUEST", "hostile schema-version coverage"
+            ).as_dict()
+            verification = verify_prepared_simulation_episode(handle, prepared)
+            records_and_decoders = (
+                (prepared["identity"], SimulationEpisodeIdentityV1),
+                (request, SimulationEpisodePreparationRequestV1),
+                (refusal, SimulationEpisodeRefusalV1),
+                (prepared, SimulationEpisodePreparedResultV1),
+                (verification, SimulationEpisodeVerificationV1),
+            )
+            for record, decoder in records_and_decoders:
+                hostile = copy.deepcopy(record)
+                hostile["schema_version"] = True
+                with self.assertRaisesRegex(ValueError, "schema is unsupported"):
+                    decoder.from_dict(hostile)
+        finally:
+            self.assertEqual(release_simulation_episode(handle)["status"], "CLOSED")
+
+        request = _request()
+        invalid_start_handle, _ = start_simulation_run(
+            request["resolution"], request["training_options"]
+        )
+        self.assertIsNotNone(invalid_start_handle)
+        with patch(
+            "kirby2.ui.simulation_episode_facade.start_simulation_run",
+            return_value=(invalid_start_handle, {}),
+        ):
+            invalid_cleanup_handle, invalid_cleanup_refusal = prepare_simulation_episode(request)
+        self.assertIsNone(invalid_cleanup_handle)
+        self.assertEqual(invalid_cleanup_refusal["status"], "REFUSED")
+        self.assertEqual(invalid_cleanup_refusal["refusal"]["reason_code"], "START_REFUSED")
+        self.assertEqual(invalid_cleanup_refusal["resource_ownership"], "NO_RESOURCE")
+        self.assertEqual(invalid_cleanup_refusal["cleanup_disposition"], "USER_ABANDONED")
+
+        refused_start_handle, _ = start_simulation_run(
+            request["resolution"], request["training_options"]
+        )
+        self.assertIsNotNone(refused_start_handle)
+        with patch(
+            "kirby2.ui.simulation_episode_facade.start_simulation_run",
+            return_value=(refused_start_handle, _fixture("simulation_start_refused.json")),
+        ):
+            refused_cleanup_handle, refused_cleanup = prepare_simulation_episode(request)
+        self.assertIsNone(refused_cleanup_handle)
+        self.assertEqual(refused_cleanup["status"], "REFUSED")
+        self.assertEqual(refused_cleanup["refusal"]["reason_code"], "START_REFUSED")
+        self.assertEqual(refused_cleanup["resource_ownership"], "NO_RESOURCE")
+        self.assertEqual(refused_cleanup["cleanup_disposition"], "USER_ABANDONED")
+
+        malformed_close_handle, _ = start_simulation_run(
+            request["resolution"], request["training_options"]
+        )
+        self.assertIsNotNone(malformed_close_handle)
+        with (
+            patch(
+                "kirby2.ui.simulation_episode_facade.start_simulation_run",
+                return_value=(malformed_close_handle, {}),
+            ),
+            patch(
+                "kirby2.ui.simulation_episode_facade.close_simulation_run",
+                return_value={"status": "CLOSED"},
+            ),
+        ):
+            retained_handle, cleanup_unconfirmed = prepare_simulation_episode(request)
+        self.assertIs(retained_handle, malformed_close_handle)
+        self.assertEqual(cleanup_unconfirmed["status"], "REFUSED")
+        self.assertEqual(
+            cleanup_unconfirmed["refusal"]["reason_code"], "CLEANUP_UNCONFIRMED"
+        )
+        self.assertEqual(
+            cleanup_unconfirmed["resource_ownership"], "CALLER_OWNS_CLEANUP_HANDLE"
+        )
+        self.assertEqual(
+            release_simulation_episode(retained_handle)["status"], "CLOSED"
+        )
+        _CASE_RECORDS.append(
+            {
+                "case_id": "A04_IDENTITY_REBIND_SCHEMA_AND_START_CLEANUP",
+                "identity_rebinds": hostile_results,
+                "boolean_schema_version_rejections": 5,
+                "invalid_start_cleanup_result_id": invalid_cleanup_refusal["result_id"],
+                "nonavailable_start_cleanup_result_id": refused_cleanup["result_id"],
+                "malformed_close_retained_handle_result_id": cleanup_unconfirmed["result_id"],
+                "cleanup": "USER_ABANDONED",
             }
         )
 
