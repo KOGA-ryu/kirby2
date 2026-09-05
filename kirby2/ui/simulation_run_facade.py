@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from types import MappingProxyType
@@ -941,6 +941,26 @@ def _run_handle(value: object) -> _SimulationRunHandle:
     return value
 
 
+def simulation_run_model_prefix_sha256(
+    handle_value: object,
+    prefix_actions: Sequence[str],
+) -> str:
+    """Commit the complete source-independent live model without exposing it."""
+
+    handle = _run_handle(handle_value)
+    if any(type(action) is not str for action in prefix_actions):
+        raise TypeError("simulation model prefix actions must be strings")
+    return canonical_digest(
+        {
+            "projection_id": "KIRBY2_SIMULATION_FULL_MODEL_PREFIX_PROJECTION_V1",
+            "projection_version": 1,
+            "run_request_sha256": handle.run_request_sha256,
+            "prefix_actions": list(prefix_actions),
+            "branch_runtime_state": handle.session.branch_runtime_state(),
+        }
+    )
+
+
 def _operation_id(value: object, pattern: re.Pattern[str], label: str) -> str:
     if type(value) is not str or pattern.fullmatch(value) is None:
         raise SimulationContractDecodeError(f"{label} has an invalid V1 form")
@@ -1822,4 +1842,5 @@ __all__ = [
     "prepare_simulation_reset",
     "read_current_simulation_frame",
     "start_simulation_run",
+    "simulation_run_model_prefix_sha256",
 ]

@@ -19,6 +19,7 @@ Backend Replay-artifact verification slice: `IMPLEMENTED`
 Backend Replay-artifact verification commit: `49b8854d7739ad59cd3109d319c946e643c3c193`
 Backend verified Replay-provider slice: `IMPLEMENTED`
 Backend verified Replay-provider commit: `655ccf495b015f2067f11d63adcf3dd63e4e4609`
+Backend Packet A prepared-episode slice: `IMPLEMENTED_PENDING_SOL_REVIEW`
 UI setup-contract projector commit: `66de3b4d9ce2d213e94c68a8f759859566c520cf`
 UI verified Setup integration commits:
 `77e6d5f28c3e3d254257a37bd8d74a1c786f3958`,
@@ -143,6 +144,7 @@ sibling live-simulation projector, controller, and atomic frame store in the UI.
 | Start facade and fresh run materialization | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `80372cbb12d4a2262e189f9ae63e20f0fadb9a11` |
 | Command/advance facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_run_facade.py` at `78c82f01af640d20616347fd021f86b92db5cfd2` |
 | Finalize/artifact facade | Backend | `IMPLEMENTED` | `kirby2/ui/simulation_finalize_facade.py` at `ccfc9669cc46c29dca226bb5481b13210394d2ca` |
+| Packet A prepared-episode facade | Backend | `IMPLEMENTED_PENDING_SOL_REVIEW` | `kirby2/ui/simulation_episode_contract.py`, `kirby2/ui/simulation_episode_facade.py`, `kirby2/ui/simulation_run_facade.py` |
 | Backend-produced setup/start/interaction/lifecycle/finalization/Replay golden fixtures | Backend | `IMPLEMENTED` | 31 records in `kirby2/ui/fixtures/simulation_contract_v1/` at `655ccf495b015f2067f11d63adcf3dd63e4e4609` |
 | Strict setup-contract projector | UI | `IMPLEMENTED` | `src/kirby2_ui/simulation_contract.py` at `66de3b4d9ce2d213e94c68a8f759859566c520cf` |
 | Strict live-frame projector and store | UI | `PENDING` | UI worker selects paths |
@@ -1438,6 +1440,28 @@ finalize_simulation_run(
 )
     -> SimulationFinalizeResultV1
 
+build_simulation_episode_preparation_request(
+    episode_id,
+    episode_version,
+    resolution,
+    training_options,
+    prefix_actions,
+    anchor_time_us,
+)
+    -> SimulationEpisodePreparationRequestV1
+
+prepare_simulation_episode(SimulationEpisodePreparationRequestV1)
+    -> (opaque active handle | null, SimulationEpisodePreparedResultV1)
+
+verify_prepared_simulation_episode(
+    opaque active handle,
+    SimulationEpisodePreparedResultV1,
+)
+    -> SimulationEpisodeVerificationV1
+
+release_simulation_episode(opaque active handle)
+    -> SimulationCloseResultV1
+
 resolve_replay_artifact(ReplayArtifactRefV1)
     -> (opaque verified replay-source handle | null,
         ReplayArtifactVerificationReceiptV1)
@@ -1505,6 +1529,36 @@ Decode/schema/type errors fail before mutation as `SimulationContractDecodeError
 digest or cross-identity failures fail as `SimulationContractIntegrityError`.
 `KirbyBackend` maps both to its compatibility/integrity error surface rather than
 passing simulator objects or arbitrary exceptions to widgets.
+
+### Packet A prepared-episode boundary
+
+Packet A is an intentionally narrow catalogue-to-practice boundary, not a general
+episode timeline language. A request and its recipe identity both seal
+`prefix_timing_policy = ACTIONS_AT_T0_THEN_ADVANCE_TO_ANCHOR_V1`, alongside the
+episode ID/version, profile/configuration/seed/training identity, ordered
+semantic-action prefix, and one positive in-duration anchor timestamp. Version 1
+therefore supports the declared prefix only at simulation time zero, followed by
+exactly one normal public advance to the anchor and a normal public
+`SIMULATION_PAUSE`. It does not encode arbitrary timestamped prefix commands; that
+requires a future versioned schedule record.
+
+The original `SimulationStartResultV1` remains an ordinary, immutable `READY` frame
+at time zero. The prepared result separately publishes the current `PAUSED` anchor
+frame, an opaque `full_model_prefix_sha256`, and the fixed projection identity
+`KIRBY2_SIMULATION_FULL_MODEL_PREFIX_PROJECTION_V1`. That digest commits, without
+returning private bytes, to the source-independent run request, ordered prefix, and
+the backend's canonical `LiveMarketSession.branch_runtime_state()`: engine and
+arrival history, market-state/queue state, player and working-order state, input
+history, strategy state, objective state, and supporting deterministic counters.
+The detached `prefix_projection_sha256` remains a useful public-model comparison but
+is not evidence of complete reconstructible state by itself.
+
+An available prepared result gives the caller one opaque active handle. The caller
+must either finalize it or call `release_simulation_episode`; preparation failures
+after allocation attempt `close_simulation_run(handle, "USER_ABANDONED")` and return
+either confirmed no-resource cleanup or the exact opaque handle whose cleanup remains
+the caller's responsibility. Packet A must not be wired into Qt, marked production
+ready, or generalized into a catalog/drill system until Sol reviews this slice.
 
 Version 1 is strictly synchronous and single-call-at-a-time per adapter. A call
 returns before another start, command, advance, reset, finalize, artifact resolve,

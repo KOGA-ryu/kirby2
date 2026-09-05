@@ -36,6 +36,21 @@ from .simulation_lifecycle_contract import (
     SimulationResetCommitResultV1,
     SimulationResetResultV1,
 )
+from .simulation_episode_contract import (
+    SimulationEpisodeIdentityV1,
+    SimulationEpisodePreparationRequestV1,
+    SimulationEpisodePreparedResultV1,
+    SimulationEpisodeRefusalV1,
+    SimulationEpisodeVerificationV1,
+    build_simulation_episode_preparation_request,
+    episode_prefix_projection,
+    episode_prefix_projection_sha256,
+)
+from .simulation_episode_facade import (
+    prepare_simulation_episode,
+    release_simulation_episode,
+    verify_prepared_simulation_episode,
+)
 from .simulation_run_facade import (
     advance_simulation_run,
     close_simulation_run,
@@ -44,6 +59,7 @@ from .simulation_run_facade import (
     dispatch_simulation_command,
     prepare_simulation_reset,
     read_current_simulation_frame,
+    simulation_run_model_prefix_sha256,
     start_simulation_run,
 )
 from .simulation_artifact_contract import (
@@ -82,6 +98,11 @@ __all__ = [
     "SimulationProfileResolutionV1",
     "SimulationProfileSelectionV1",
     "SimulationFrameV1",
+    "SimulationEpisodeIdentityV1",
+    "SimulationEpisodePreparationRequestV1",
+    "SimulationEpisodePreparedResultV1",
+    "SimulationEpisodeRefusalV1",
+    "SimulationEpisodeVerificationV1",
     "SimulationFinalizeResultV1",
     "SimulationReplayArtifactV1",
     "SimulationResolutionRefusalV1",
@@ -95,6 +116,7 @@ __all__ = [
     "SimulationTimelineEventV1",
     "TerminalUiConfig",
     "advance_simulation_run",
+    "build_simulation_episode_preparation_request",
     "build_replay_provider",
     "close_simulation_run",
     "commit_simulation_reset",
@@ -104,10 +126,16 @@ __all__ = [
     "list_simulation_profiles",
     "list_simulation_training_resources",
     "prepare_simulation_reset",
+    "prepare_simulation_episode",
+    "release_simulation_episode",
     "render_terminal_frame",
     "read_current_simulation_frame",
     "resolve_simulation_profile",
     "resolve_replay_artifact",
+    "simulation_run_model_prefix_sha256",
+    "verify_prepared_simulation_episode",
+    "episode_prefix_projection",
+    "episode_prefix_projection_sha256",
     "run_terminal_ui",
     "start_simulation_run",
 ]
