@@ -13,6 +13,7 @@ from .simulation_contract import (
     _plain,
     canonical_digest,
 )
+from .simulation_episode_contract import SimulationEpisodeIdentityV1
 from .simulation_live_contract import SimulationFrameV1
 
 
@@ -105,10 +106,11 @@ def _wall_time(value: object) -> dict[str, object]:
         child = root[field]
         if child is not None and (type(child) is not int or child < 0):
             raise ValueError(f"practice wall time {field} is invalid")
-    if root["source"] == "UNAVAILABLE" and (
-        root["resolution_us"] is not None or root["elapsed_wall_time_us"] is not None
-    ):
-        raise ValueError("unavailable wall time cannot claim a measurement")
+    if root["source"] == "UNAVAILABLE":
+        if root["resolution_us"] is not None or root["elapsed_wall_time_us"] is not None:
+            raise ValueError("unavailable wall time cannot claim a measurement")
+    elif root["resolution_us"] is None or root["resolution_us"] <= 0 or root["elapsed_wall_time_us"] is None:
+        raise ValueError("caller wall time requires resolution and elapsed measurement")
     return root
 
 
@@ -434,7 +436,7 @@ def build_practice_action_request(
 _ATTEMPT_RESULT_FIELDS = frozenset({
     "attempt_id", "attempt_request_id", "episode_id", "episode_recipe_sha256", "operation",
     "mode", "pace_multiplier_ppm", "prior_attempt_id", "prepared_result_id", "source_run_id",
-    "anchor_time_us", "step_index", "step_count",
+    "prepared_identity", "anchor_time_us", "step_index", "step_count",
 })
 _ASSISTANCE_FIELDS = frozenset({"kind", "simulation_time_us", "wall_time", "message"})
 _ASSESSMENT_FIELDS = frozenset({
@@ -466,6 +468,9 @@ def _attempt_record(value: object) -> dict[str, object]:
     if (root["operation"] == "BEGIN") != (root["prior_attempt_id"] is None):
         raise ValueError("practice result attempt prior identity is inconsistent")
     _id(root["prepared_result_id"], re.compile(r"simulation-episode-prepared-result-[0-9a-f]{24}\Z"), "practice prepared result ID")
+    SimulationEpisodeIdentityV1.from_dict(
+        _object(root["prepared_identity"], "practice prepared episode identity")
+    )
     _id(root["source_run_id"], _RUN, "practice result attempt source run ID")
     for field in ("anchor_time_us", "step_index", "step_count"):
         if type(root[field]) is not int or root[field] < 0:
@@ -541,10 +546,10 @@ class PracticeResultV1:
         _exact(root, _RESULT_FIELDS, "practice result")
         _schema(root, PRACTICE_RESULT_SCHEMA_ID, "practice result")
         status = _text(root["status"], "practice result status")
-        if status not in {"AVAILABLE", "UNAVAILABLE", "REFUSED"}:
+        if status not in {"AVAILABLE", "UNAVAILABLE", "REFUSED", "DUPLICATE"}:
             raise ValueError("practice result status is unsupported")
         operation = _text(root["operation"], "practice result operation")
-        if operation not in {"CATALOG", "BEGIN", "STAGE", "CONTINUE", "UNASSISTED"}:
+        if operation not in {"CATALOG", "BEGIN", "STAGE", "CONTINUE", "UNASSISTED", "DUPLICATE"}:
             raise ValueError("practice result operation is unsupported")
         attempt = None if root["attempt"] is None else _attempt_record(root["attempt"])
         if root["episode"] is not None:
@@ -562,7 +567,7 @@ class PracticeResultV1:
             _exact(assistance, _ASSISTANCE_FIELDS, "practice assistance")
             if assistance["kind"] not in {
                 "PREPARATION_ATTRIBUTED", "GUIDED_STAGED", "GUIDED_FEEDBACK_NO_LIVE_COMMAND",
-                "GUIDED_RELEASED", "UNASSISTED_DISPATCH",
+                "GUIDED_RELEASED", "UNASSISTED_DISPATCH", "DUPLICATE_REQUEST_FENCED",
             }:
                 raise ValueError("practice assistance kind is unsupported")
             if type(assistance["simulation_time_us"]) is not int or assistance["simulation_time_us"] < 0:
@@ -578,19 +583,64 @@ class PracticeResultV1:
             raise ValueError("unavailable practice result requires a reason")
         if status == "REFUSED" and type(unavailable) is not str:
             raise ValueError("refused practice result requires a reason")
-        if status != "AVAILABLE":
+        if status == "DUPLICATE" and unavailable != "DUPLICATE_REQUEST_ALREADY_PROGRESSED":
+            raise ValueError("duplicate practice result requires its typed reason")
+        if status not in {"AVAILABLE", "DUPLICATE"}:
             if root["current_frame"] is not None or root["hold_id"] is not None:
                 raise ValueError("unavailable or refused practice result cannot carry a destination")
         if operation == "CATALOG":
             if any(value is not None for value in (attempt, root["episode"], root["source_run_id"], root["current_frame"], root["hold_id"], assessment, debrief)) or root["assistance"]:
                 raise ValueError("catalog result must not carry attempt state")
-        elif status == "AVAILABLE":
+        elif status in {"AVAILABLE", "DUPLICATE"}:
             if attempt is None or root["episode"] is None or root["source_run_id"] is None or root["current_frame"] is None:
                 raise ValueError("available practice operation requires public attempt state")
             if operation == "BEGIN" and (assessment is not None or debrief is not None):
                 raise ValueError("begin result cannot carry an action assessment")
+            if operation == "DUPLICATE" and (status != "DUPLICATE" or assessment is not None or debrief is not None):
+                raise ValueError("duplicate result has an invalid status or action payload")
             if operation in {"STAGE", "CONTINUE", "UNASSISTED"} and (assessment is None or debrief is None):
                 raise ValueError("practice action result requires assessment and debrief")
+            if attempt is not None:
+                if (
+                    attempt["episode_id"] != root["episode"]["episode_id"]
+                    or attempt["episode_recipe_sha256"] != root["episode"]["recipe_sha256"]
+                    or attempt["source_run_id"] != root["source_run_id"]
+                    or root["current_frame"]["source_run_id"] != root["source_run_id"]
+                ):
+                    raise SimulationContractIntegrityError("practice result attempt identity does not bind its episode or frame")
+                prepared_identity = SimulationEpisodeIdentityV1.from_dict(
+                    _object(attempt["prepared_identity"], "practice result prepared identity")
+                )
+                episode_profile = SimulationProfileRefV1.from_dict(
+                    _object(root["episode"]["profile_ref"], "practice result episode profile"),
+                    label="practice result episode profile",
+                )
+                if (
+                    prepared_identity.episode_id != attempt["episode_id"]
+                    or prepared_identity.anchor_time_us != attempt["anchor_time_us"]
+                    or prepared_identity.profile_ref != episode_profile
+                    or prepared_identity.profile_ref.as_dict() != root["current_frame"]["profile_ref"]
+                    or prepared_identity.resolved_configuration_sha256 != root["current_frame"]["resolved_configuration_sha256"]
+                ):
+                    raise SimulationContractIntegrityError("practice prepared identity does not bind its episode or current frame")
+                cursor = root["current_frame"]["cursor"]
+                if operation == "BEGIN":
+                    if cursor["simulation_time_us"] != attempt["anchor_time_us"] or cursor["run_state"] != "PAUSED":
+                        raise ValueError("practice begin result does not preserve its paused anchor")
+                    if (attempt["mode"] == "GUIDED") != (root["hold_id"] is not None):
+                        raise ValueError("practice begin hold does not match attempt mode")
+                elif operation == "STAGE" and (attempt["mode"] != "GUIDED" or root["hold_id"] is None):
+                    raise ValueError("practice stage requires an active guided hold")
+                elif operation == "UNASSISTED" and (attempt["mode"] != "UNASSISTED" or root["hold_id"] is not None):
+                    raise ValueError("unassisted result hold does not match attempt mode")
+                if assessment is not None:
+                    if debrief is None or debrief["source_run_id"] != root["source_run_id"] or debrief["outcome"] != assessment["outcome"] or debrief["evidence"] != assessment["evidence"] or debrief["action_request_id"] is None:
+                        raise SimulationContractIntegrityError("practice debrief does not bind its assessment")
+                    if attempt["step_count"] == 0:
+                        if assessment["action_index"] != 0:
+                            raise ValueError("declared-rule assessment action index is invalid")
+                    elif assessment["action_index"] >= attempt["step_count"]:
+                        raise ValueError("mechanical assessment action index exceeds the attempt")
         basis = {key: root[key] for key in root if key != "result_id"}
         result_id = _id(root["result_id"], _RESULT, "practice result ID")
         if result_id != f"practice-result-{canonical_digest(basis)[:24]}":

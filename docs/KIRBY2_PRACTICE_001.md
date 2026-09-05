@@ -96,3 +96,96 @@ live-session, replay-store, or handle state.
   acceptance.
 - Approval of this packet as a donor or release-ready surface. Sol review remains the
   gate for that decision.
+
+## Packet B — curated decision repeater
+
+Status: `IMPLEMENTED_INTERNAL_AUDIT_PASS_PENDING_SOL_REVIEW`
+
+Packet B adds a process-local, no-Qt practice boundary over Packet A. It publishes
+exactly six immutable public recipes and creates a fresh ordinary prepared source
+for every attempt. The catalog records the complete pinned profile reference, seed,
+all selected control values, T=0 preparation actions, anchor, recipe digest, and
+variation parent. No checkpoint injection, hidden regime label, replay inventory, or
+simulation-private handle field is exposed through the new public records.
+
+| Recipe | Recipe SHA-256 | Measured anchor |
+| --- | --- | --- |
+| `practice.f1.place-and-cancel.v1` | `e5245133976ab5e0766f3cc164a5279ee4787c218ee3d7353c4b2bbd10500586` | balanced/simple seed 101; T=1; learner increases 100→200, places, recognizes, then cancels |
+| `practice.f1.place-and-replace.v1` | `656a2515109fb42e23297a1801dc1199725f9f2bcac7aa5923c019296e29fee4` | balanced/simple seed 102; T=1; learner decreases 100→50, places, recognizes, then replaces |
+| `practice.f2.public-pressure.v1` | `62ef9ec704b92bd45b9aaf09a61a7d21703da09b7c960c465b86e6693e228122` | buy-pressure/simple seed 202; NORMAL/1.00x/1,000,000 ppm; T=1,000,000; 13 public trades and 3,050 bid vs 0 ask displayed quantity |
+| `practice.f2.replenishment.v1` | `8b8b748e2156ef187dc5e490ccb09e8823e5e8aaac668ab0c26e3085cc7a3d21` | balanced/simple seed 101; NORMAL/1.00x/1,000,000 ppm; T=1,000,000; 2 public trades and 1,300 bid vs 2,500 ask displayed quantity |
+| `practice.f3.cancel-partial-residual.v1` | `a29b223fb7ad3342a1142a70132d41a46e4bc3dc80ffa6824995f4424fdb7474` | buy-pressure/simple seed 202; prefix Play + Buy Bid; T=1,000,000; one `PLAYER-O-000001`, 50 filled and 50 remaining, position 50 |
+| `practice.f3.cancel-volume-variation.v1` | `bbea819721cd659794c94672b6649e941d46629b972c42e2fbabbdc31827b9e6` | buy-pressure/simple seed 190; NORMAL/0.50x/1,000,000 ppm; prefix Play + Buy Bid; T=1,000,000; the same one-order shape, 28 filled and 72 remaining |
+
+F1’s learner actions are deliberately absent from preparation. Quantity choice,
+placement, public resting-order recognition, and cancel/replace are individual
+ordinary semantic commands. F3’s residual is not a market fill paired with a second
+order: ordinary matching partially fills the exact player bid that remains public
+and cancellable at the cut.
+
+### Guided holds and assessment
+
+Guided attempts bind an opaque handle, source run, frame, and cursor to one hold.
+Generic command dispatch and advance return typed `GUIDED_HOLD_ACTIVE` unavailability
+without changing the readable current frame. A wrong staged response records guided
+feedback and sends no command. A correct staged response, `WAIT`, or a valid
+`DECLINE` remains staged until a matching `CONTINUE` request revalidates every public
+identity; it releases the hold once and issues at most its one staged semantic
+command. Later mechanical steps receive a newly bound hold. Unassisted semantic
+actions go through the ordinary dispatch boundary immediately.
+
+The attempt request ID is also a process-local idempotency fence: a duplicate active
+request returns the original Begin result only while its exact published anchor/hold
+is still active. Once the attempt has progressed, retry returns a typed
+`DUPLICATE_REQUEST_ALREADY_PROGRESSED` record with the current frame, step, hold, and
+original opaque owner rather than allocating a second live source or republishing a
+stale Begin state. It is not relabeled as a fresh attempt. If ordinary
+command dispatch fails after Continue releases a hold, the facade returns an explicit
+`SYSTEM_FAILURE` assessment and restores (or, after an already-published rejected
+destination, rebinds) a guided hold; it does not silently leave an unlocked staged
+step. Preparation publication failures close the acquired source, or return the
+opaque cleanup owner with `CLEANUP_UNCONFIRMED` if close cannot be confirmed.
+
+Wall-time evidence is optional and explicitly typed: `MONOTONIC_CALLER` carries a
+positive declared resolution and nonnegative elapsed value; unavailable timing is
+recorded as `UNAVAILABLE` with null measurement fields. No learner reaction time is
+inferred from simulation time.
+
+Assessment classes are `EXACT_MECHANICAL`, `DECLARED_RULE`, and `OPEN_JUDGMENT`.
+Outcomes keep `PASS` and `FAIL` distinct from `NO_OPPORTUNITY`,
+`INSUFFICIENT_EVIDENCE`, `LEARNER_ABORT`, and `SYSTEM_FAILURE`. F2 reads only the
+published book and recent-trade fields using its recipe rule; it has no profile or
+regime input. Public-rule branch audits also measure a thin-liquidity no-trade cut
+(`0` trades, `850` bid / `825` ask) for `WAIT`/valid `DECLINE`, and a sell-pressure
+cut (`8` trades, `2,250` bid / `1,800` ask) for the explicit
+`INSUFFICIENT_EVIDENCE` answer. These are separately exercised public frames, not
+extra catalog recipes or fabricated missing observations. Debriefs retain only public source/frame/cursor,
+action request, semantic action, and order identifiers.
+
+Practice catalog, request, and result decoders use exact nested record shapes and
+recursively detached snapshots. Result decoding also binds attempt recipe/source and
+prepared identity to its published episode/current frame, mode to hold nullability,
+action-index bounds to the recipe, and assessment/debrief outcome and causal public
+evidence to each other. The F3 cancellation debrief retains the pre-dispatch public
+partial-order ID even though that order is absent from the post-cancel frame.
+
+Exact repeats require the same recipe and create a fresh source; a variation must
+name the original recipe as its declared parent and uses its own pinned recipe. This
+V1 boundary is process-local only: it does not implement persistence, learner
+progression, eligibility, UI/Qt wiring, release qualification, or a broader episode
+catalog.
+
+### Packet B audit
+
+```text
+python3 -B -m kirby2.audit.simulation_practice
+python3 -B -m kirby2.audit.simulation_episode
+```
+
+The first audit covers the immutable six-recipe catalog and hostile decoder input,
+measured F2/F3 cuts, represented pressure/replenishment/no-opportunity/insufficient
+answers, guided hold blocking and exactly-once release, unassisted dispatch, and
+fresh exact-repeat/variation lineage. It also proves idempotent retry does not open a
+second source, nested mutation/unknown-field/bool-versus-int rejection, causal F3
+debrief retention, and the failure-path rehold transaction. The second is the
+required Packet A regression.

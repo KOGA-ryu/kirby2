@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import secrets
 from collections.abc import Mapping
@@ -71,6 +72,15 @@ from .simulation_lifecycle_contract import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _GuidedHoldState:
+    attempt_id: str
+    hold_id: str
+    source_run_id: str
+    frame_id: str
+    cursor_id: str
+
+
 @dataclass(slots=True)
 class _SimulationRunHandle:
     session: LiveMarketSession
@@ -93,6 +103,9 @@ class _SimulationRunHandle:
     close_result: SimulationCloseResultV1 | None = None
     finalization_state: object | None = None
     prepared_episode_binding_sha256: str | None = None
+    practice_attempt_binding_sha256: str | None = None
+    guided_hold: _GuidedHoldState | None = None
+    practice_staged_response: Mapping[str, object] | None = None
 
 
 @dataclass(slots=True)
@@ -983,8 +996,158 @@ def _prepared_episode_model_sha256(handle_value: object) -> str:
             "projection_version": 1,
             "run_request_sha256": handle.run_request_sha256,
             "prepared_episode_binding_sha256": binding_sha256,
-            "branch_runtime_state": handle.session.branch_runtime_state(),
+            "branch_runtime_state": _full_model_identity_value(
+                handle.session.branch_runtime_state()
+            ),
         }
+    )
+
+
+def _bind_practice_attempt(handle_value: object, binding: Mapping[str, object]) -> None:
+    """Associate one opaque simulation resource with one practice attempt."""
+
+    handle = _run_handle(handle_value)
+    binding_sha256 = canonical_digest(dict(binding))
+    if handle.practice_attempt_binding_sha256 is not None:
+        raise SimulationContractIntegrityError(
+            "simulation run handle is already bound to a practice attempt"
+        )
+    handle.practice_attempt_binding_sha256 = binding_sha256
+
+
+def _practice_attempt_matches(handle_value: object, binding: Mapping[str, object]) -> bool:
+    handle = _run_handle(handle_value)
+    return (
+        handle.practice_attempt_binding_sha256 is not None
+        and handle.practice_attempt_binding_sha256 == canonical_digest(dict(binding))
+    )
+
+
+def _activate_guided_hold(
+    handle_value: object,
+    *,
+    attempt_id: str,
+    hold_id: str,
+    source_run_id: str,
+    frame_id: str,
+    cursor_id: str,
+) -> None:
+    """Freeze backend mutation at one exact public frame for guided practice."""
+
+    handle = _run_handle(handle_value)
+    cursor = _current_cursor(handle)
+    if (
+        handle.guided_hold is not None
+        or handle.practice_attempt_binding_sha256 is None
+        or source_run_id != handle.source_run_id
+        or frame_id != handle.current_frame.frame_id
+        or cursor_id != cursor["cursor_id"]
+        or cursor["run_state"] != "PAUSED"
+    ):
+        raise SimulationContractIntegrityError("guided hold cannot bind this simulation state")
+    handle.guided_hold = _GuidedHoldState(
+        attempt_id, hold_id, source_run_id, frame_id, cursor_id
+    )
+
+
+def _release_guided_hold(
+    handle_value: object,
+    *,
+    attempt_id: str,
+    hold_id: str,
+    source_run_id: str,
+    frame_id: str,
+    cursor_id: str,
+) -> bool:
+    """Release one hold exactly once after every public identity is revalidated."""
+
+    handle = _run_handle(handle_value)
+    hold = handle.guided_hold
+    cursor = _current_cursor(handle)
+    if (
+        hold is None
+        or hold != _GuidedHoldState(attempt_id, hold_id, source_run_id, frame_id, cursor_id)
+        or source_run_id != handle.source_run_id
+        or frame_id != handle.current_frame.frame_id
+        or cursor_id != cursor["cursor_id"]
+    ):
+        return False
+    handle.guided_hold = None
+    return True
+
+
+def _stage_practice_response(
+    handle_value: object,
+    binding: Mapping[str, object],
+    *,
+    attempt_id: str,
+    hold_id: str,
+    source_run_id: str,
+    frame_id: str,
+    cursor_id: str,
+    response: Mapping[str, object],
+) -> bool:
+    """Retain one guided answer without dispatching a simulation command."""
+
+    handle = _run_handle(handle_value)
+    hold = handle.guided_hold
+    cursor = _current_cursor(handle)
+    if (
+        not _practice_attempt_matches(handle, binding)
+        or hold != _GuidedHoldState(attempt_id, hold_id, source_run_id, frame_id, cursor_id)
+        or source_run_id != handle.source_run_id
+        or frame_id != handle.current_frame.frame_id
+        or cursor_id != cursor["cursor_id"]
+        or handle.practice_staged_response is not None
+    ):
+        return False
+    handle.practice_staged_response = MappingProxyType(dict(response))
+    return True
+
+
+def _take_staged_practice_response(
+    handle_value: object,
+    binding: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Consume the sole staged answer after an exact hold release."""
+
+    handle = _run_handle(handle_value)
+    if not _practice_attempt_matches(handle, binding):
+        return None
+    response = handle.practice_staged_response
+    handle.practice_staged_response = None
+    return response
+
+
+def _peek_staged_practice_response(
+    handle_value: object,
+    binding: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Read a staged response for Continue validation without consuming it."""
+
+    handle = _run_handle(handle_value)
+    if not _practice_attempt_matches(handle, binding):
+        return None
+    return handle.practice_staged_response
+
+
+def _full_model_identity_value(value: object) -> object:
+    """Encode private runtime floats losslessly before canonical identity hashing."""
+
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise SimulationContractIntegrityError(
+                "prepared episode runtime state contains a non-finite float"
+            )
+        return {"encoding": "IEEE754_BINARY64_HEX_V1", "value": value.hex()}
+    if isinstance(value, Mapping):
+        return {str(key): _full_model_identity_value(item) for key, item in value.items()}
+    if type(value) in {list, tuple}:
+        return [_full_model_identity_value(item) for item in value]
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    raise SimulationContractIntegrityError(
+        f"prepared episode runtime state has unsupported identity type {type(value).__name__}"
     )
 
 
@@ -1492,6 +1655,8 @@ def _command_origin_unavailable_reason(
 ) -> str | None:
     if request.source_run_id != handle.source_run_id:
         return "SOURCE_RUN_MISMATCH"
+    if handle.guided_hold is not None:
+        return "GUIDED_HOLD_ACTIVE"
     if handle.reset_pending:
         return "RESET_PENDING"
     if handle.lifecycle_disposition == "FINALIZED":
@@ -1716,6 +1881,14 @@ def advance_simulation_run(
             origin_cursor_id,
             target_time_us,
             "SOURCE_RUN_MISMATCH",
+        )
+    if handle.guided_hold is not None:
+        return _advance_unavailable(
+            source_run_id,
+            origin_frame_id,
+            origin_cursor_id,
+            target_time_us,
+            "GUIDED_HOLD_ACTIVE",
         )
     if handle.reset_pending:
         return _advance_unavailable(

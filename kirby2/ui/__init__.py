@@ -59,6 +59,11 @@ from .simulation_practice_contract import (
     build_practice_action_request,
     build_practice_attempt_request,
 )
+from .simulation_practice_facade import (
+    begin_simulation_practice_attempt,
+    list_simulation_practice_episodes,
+    submit_simulation_practice_action,
+)
 from .simulation_run_facade import (
     advance_simulation_run,
     close_simulation_run,
@@ -130,6 +135,7 @@ __all__ = [
     "build_simulation_episode_preparation_request",
     "build_practice_action_request",
     "build_practice_attempt_request",
+    "begin_simulation_practice_attempt",
     "build_replay_provider",
     "close_simulation_run",
     "commit_simulation_reset",
@@ -137,6 +143,7 @@ __all__ = [
     "dispatch_simulation_command",
     "finalize_simulation_run",
     "list_simulation_profiles",
+    "list_simulation_practice_episodes",
     "list_simulation_training_resources",
     "prepare_simulation_reset",
     "prepare_simulation_episode",
@@ -150,4 +157,5 @@ __all__ = [
     "episode_prefix_projection_sha256",
     "run_terminal_ui",
     "start_simulation_run",
+    "submit_simulation_practice_action",
 ]
