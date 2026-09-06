@@ -251,12 +251,14 @@ unknown fields, and malformed scalar types.
 | `practice.f3.cancel-partial-residual.v1` | `AVAILABLE` | 1,000,000 us | — |
 | `practice.f3.cancel-volume-variation.v1` | `AVAILABLE` | 1,000,000 us | — |
 
-The two F1 recipes still anchor at one microsecond. This repair does not relabel that
-as meaningful pace and does not approve a Chapter 1 exception. Completing Chapter 1
-therefore requires either user approval of the exact exception “F1 control drills
-are untimed; pace is hidden or disabled and no pacing claim is made for F1,” or a
-new versioned F1 recipe with an authentic useful market lead-in. Extending the
-current recipe by fabricated waiting or interpolation is not permitted.
+The two F1 recipes still anchor at one microsecond. On 2026-09-05 the user approved
+the explicit Chapter 1 scope exception: **F1 control drills are untimed; pace is
+hidden or disabled and no A12 pacing claim is made for F1.** Meaningful 1x and 0.5x
+passage pacing applies only to F2 and F3. The F1 recipes, identities, guided staging,
+Unassisted command consequences, Repeat, Variation, and lifecycle fencing remain
+unchanged requirements. A retained compatibility pace value is request metadata,
+not evidence of F1 playback speed. Extending the current F1 recipes by fabricated
+waiting or interpolation remains prohibited.
 
 The boundary is additive. A backend predating it retains the existing ordinary
 practice API; a consumer must treat absent passage capability as paced lead-in

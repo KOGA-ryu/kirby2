@@ -247,7 +247,7 @@ class SimulationPracticePassageAudit(unittest.TestCase):
                 "case_id": "P01_REAL_PUBLIC_PASSAGE",
                 "capability_catalog_id": capabilities["catalog_id"],
                 "passages": summaries,
-                "f1_resolution": "USER_APPROVAL_REQUIRED_FOR_UNTIMED_CONTROL_EXCEPTION",
+                "f1_resolution": "APPROVED_UNTIMED_CONTROL_EXCEPTION",
             }
         )
 
