@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from kirby2.curriculum.practice_assessment import (
     assess_dispatched_action,
@@ -56,6 +56,9 @@ class _AttemptState:
     step_index: int = 0
     hold_id: str | None = None
     initial_begin_active: bool = True
+    history: list[dict[str, object]] = field(default_factory=list)
+    passage: dict[str, object] | None = None
+    requests: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -67,6 +70,9 @@ class _RequestOutcome:
 _ATTEMPTS: dict[str, _AttemptState] = {}
 _REQUEST_OUTCOMES: dict[str, _RequestOutcome] = {}
 _SETTLED_REQUESTS: dict[str, str] = {}
+# Verified saved parent identities, never live handles or mutable run state.
+_PERSISTED_PARENTS: dict[str, str] = {}
+_PERSISTED_HISTORY: dict[str, list[dict]] = {}
 
 
 def _cursor(frame: Mapping[str, object]) -> dict[str, object]:
@@ -154,7 +160,7 @@ def _result(
     assistance: list[dict[str, object]] | None = None, assessment: Mapping[str, object] | None = None,
     debrief: Mapping[str, object] | None = None, unavailable_reason: str | None = None,
 ) -> dict[str, object]:
-    return build_practice_result(
+    result = build_practice_result(
         status=status,
         operation=operation,
         request_id=request_id,
@@ -168,6 +174,13 @@ def _result(
         debrief=None if debrief is None else dict(debrief),
         unavailable_reason=unavailable_reason,
     )
+    if status == "AVAILABLE" and attempt is not None:
+        state = _ATTEMPTS.get(str(attempt["attempt_id"]))
+        if state is not None and not any(
+            prior["result_id"] == result["result_id"] for prior in state.history
+        ):
+            state.history.append(copy.deepcopy(result))
+    return result
 
 
 def list_simulation_practice_episodes() -> dict[str, object]:
@@ -184,7 +197,11 @@ def _repeat_is_valid(request: PracticeAttemptRequestV1, recipe: PracticeEpisodeD
         return True
     prior = _ATTEMPTS.get(str(request.prior_attempt_id))
     if prior is None:
-        return False
+        parent = _PERSISTED_PARENTS.get(str(request.prior_attempt_id))
+        return parent is not None and (
+            recipe.episode_id == parent if request.operation == "EXACT_REPEAT"
+            else recipe.variation_of == parent
+        )
     if request.operation == "EXACT_REPEAT":
         return recipe.episode_id == prior.episode.episode_id
     return recipe.variation_of == prior.episode.episode_id
@@ -454,6 +471,7 @@ def submit_simulation_practice_action(
         return _unavailable_action(request, "CURRENT_FRAME_UNAVAILABLE")
     if not _origin_matches(frame, request):
         return _unavailable_action(request, "STALE_ORIGIN")
+    state.requests[request.request_id] = request.as_dict()
     episode = state.episode
     if request.operation == "STAGE":
         if state.record["mode"] != "GUIDED" or request.hold_id is None:

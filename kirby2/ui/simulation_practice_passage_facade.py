@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 
 from kirby2.curriculum.practice_episodes import (
@@ -411,9 +412,13 @@ def acquire_simulation_practice_observation_passage(
             cleanup_disposition="TRANSIENT_RECONSTRUCTION_CLOSED",
             unavailable_reason=None,
         )
-        return None, PracticeObservationPassageResultV1.from_dict(
+        published = PracticeObservationPassageResultV1.from_dict(
             record, request=request
         ).as_dict()
+        state = _ATTEMPTS.get(request.attempt_id)
+        if state is not None:
+            state.passage = copy.deepcopy(published)
+        return None, published
     except Exception:
         return None, _unavailable(
             request,

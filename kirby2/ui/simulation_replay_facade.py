@@ -370,6 +370,18 @@ def resolve_replay_artifact(
     )
     if artifact_bytes is None:
         return _unavailable(reference, "OBJECT_NOT_FOUND")
+    return _verify_replay_artifact_bytes(reference, artifact_bytes)
+
+
+def _verify_replay_artifact_bytes(
+    reference: ReplayArtifactRefV1, artifact_bytes: bytes,
+) -> tuple[object | None, dict[str, object]]:
+    """Shared deep verification for in-process and durable backend stores.
+
+    Location resolution is the caller's responsibility. No store is populated
+    here, and an original reference remains original artifact provenance.
+    """
+
     if hashlib.sha256(artifact_bytes).hexdigest() != reference.artifact_sha256:
         return _unavailable(reference, "ARTIFACT_DIGEST_MISMATCH")
     try:
