@@ -39,6 +39,8 @@ from .simulation_facade import (
     COMPONENT_PAYLOAD_SCHEMA_ID,
     _COMMAND_ACTIONS,
     _catalog_state,
+    _state_for_profile,
+    _state_for_selection,
     _regime_payload,
     _scenario_payload,
     resolve_simulation_profile,
@@ -188,7 +190,7 @@ def _refused_start(reason_code: str, explanation: str) -> dict[str, object]:
 
 def _component_payload(reference: SimulationComponentRefV1) -> dict[str, object]:
     try:
-        return _catalog_state().components.verify(reference)
+        return _state_for_profile(reference.component_id).components.verify(reference)
     except SimulationResolutionRefusal as refusal:
         if refusal.reason_code not in {"COMPONENT_NOT_FOUND", "COMPONENT_DIGEST_MISMATCH"}:
             raise SimulationContractIntegrityError(refusal.explanation) from refusal
@@ -252,11 +254,10 @@ def _materialize_session(
         "ownership": "REGIME_PROFILE_FIELDS",
     }:
         raise SimulationContractIntegrityError("distribution component is not runtime-native V1")
+    queue_config = intraday_profile = intraday_window = None
     if configuration.queue_reactive_ref is not None or configuration.intraday_ref is not None:
-        raise SimulationStartRefusal(
-            "RESOLUTION_CHANGED",
-            "The V1 runtime received an unadvertised queue-reactive or intraday component.",
-        )
+        from .market_profiles import materialize_market_components
+        queue_config, intraday_profile, intraday_window = materialize_market_components(configuration)
     hawkes_config = None
     if configuration.hawkes_ref is not None:
         hawkes_payload = _component_payload(configuration.hawkes_ref)
@@ -279,6 +280,9 @@ def _materialize_session(
         configuration.arrival_model_family,
         configuration.intensity_scale_ppm,
         hawkes_config,
+        queue_config,
+        intraday_profile,
+        intraday_window,
     )
     objective = None if training.objective is None else training.objective.to_session_objective()
     session = LiveMarketSession(
@@ -765,8 +769,8 @@ def _frame(
             "display_precision_us": 1,
             "cursor_label": _cursor_label(snapshot.simulation_time_us),
             "intraday_phase": (
-                resolution.resolved_configuration.intraday_phase
-                if resolution.resolved_configuration is not None
+                session.engine.intraday_clock.phase.value
+                if session.engine.intraday_clock is not None
                 else "NOT_APPLICABLE"
             ),
         },
@@ -846,8 +850,8 @@ def _start_simulation_run_with_source_id(
     training_options_payload: Mapping[str, object],
     source_run_id: str | None,
 ) -> tuple[object | None, dict[str, object]]:
-    state = _catalog_state()
     try:
+        state = _state_for_selection(resolution_payload["selection"])
         resolution = SimulationProfileResolutionV1.from_dict(
             resolution_payload,
             catalog=state.profiles,
@@ -858,7 +862,7 @@ def _start_simulation_run_with_source_id(
         )
     except SimulationContractIntegrityError:
         raise
-    except (TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise SimulationContractDecodeError(str(error)) from error
     if not resolution.available:
         return None, _refused_start(

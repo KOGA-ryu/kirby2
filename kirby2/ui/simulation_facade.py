@@ -595,6 +595,19 @@ def _catalog_state() -> _CatalogState:
     return _CatalogState(profile_catalog, training_catalog, registry)
 
 
+def _state_for_profile(profile_id: str) -> _CatalogState:
+    # Optional capability, deliberately absent from the original V1 catalog.
+    if profile_id.startswith("market."):
+        from .market_profiles import _market_state
+        return _market_state()
+    return _catalog_state()
+
+
+def _state_for_selection(payload: Mapping[str, object]) -> _CatalogState:
+    selection = SimulationProfileSelectionV1.from_dict(payload)
+    return _state_for_profile(selection.profile_ref.profile_id)
+
+
 def list_simulation_profiles() -> dict[str, object]:
     """Return a detached, digest-pinned catalog of runnable synthetic profiles."""
 
@@ -631,13 +644,15 @@ def resolve_simulation_profile(
 ) -> dict[str, object]:
     """Resolve one selection into a complete safe recipe or typed refusal."""
 
-    state = _catalog_state()
     try:
         selection = SimulationProfileSelectionV1.from_dict(payload)
     except (TypeError, ValueError) as error:
         raise SimulationContractDecodeError(str(error)) from error
+    state = _state_for_profile(selection.profile_ref.profile_id)
     try:
         profile = state.profiles.validate_selection(selection)
+        if selection.profile_ref.profile_id.startswith("market.") and selection.duration_us != profile["defaults"]["duration_us"]:
+            raise SimulationResolutionRefusal("INVALID_DURATION", "Market workbench recipes require their complete 30-second synthetic window.")
         if selection.duration_us % 1_000_000:
             raise SimulationResolutionRefusal(
                 "INVALID_DURATION",

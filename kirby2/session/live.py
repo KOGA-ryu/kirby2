@@ -22,6 +22,8 @@ from kirby2.simulation import (
     VolumePreset,
 )
 from kirby2.simulation.clock import MICROSECONDS_PER_SECOND
+from kirby2.simulation.intraday import IntradayProfile, IntradayWindow
+from kirby2.simulation.queue_reactive import QueueReactiveConfig, QueueReactiveFlowModifier
 from kirby2.simulation.flow import FlowEvent
 from kirby2.strategy import (
     StateMachineDefinition,
@@ -63,6 +65,9 @@ class SessionFlowConfiguration:
     arrival_model_family: str
     intensity_scale_ppm: int
     hawkes_config: HawkesConfig | None = None
+    queue_reactive_config: QueueReactiveConfig | None = None
+    intraday_profile: IntradayProfile | None = None
+    intraday_window: IntradayWindow | None = None
 
     def __post_init__(self) -> None:
         if self.arrival_model_family not in {"simple", "hawkes"}:
@@ -73,6 +78,17 @@ class SessionFlowConfiguration:
             raise ValueError("simple session flow must not carry a Hawkes config")
         if self.arrival_model_family == "hawkes" and type(self.hawkes_config) is not HawkesConfig:
             raise ValueError("Hawkes session flow requires an exact Hawkes config")
+
+        if self.queue_reactive_config is not None and type(self.queue_reactive_config) is not QueueReactiveConfig:
+            raise TypeError("queue response requires an exact immutable recipe")
+        if (self.intraday_profile is None) != (self.intraday_window is None):
+            raise ValueError("intraday recipe and window must be supplied together")
+        if self.intraday_profile is not None:
+            if type(self.intraday_profile) is not IntradayProfile or type(self.intraday_window) is not IntradayWindow:
+                raise TypeError("intraday composition requires exact recipe types")
+            if (self.intraday_window.start_second < self.intraday_profile.start_second
+                    or self.intraday_window.end_second > self.intraday_profile.end_second):
+                raise ValueError("intraday window is outside its recipe")
 
     def create_flow_model(self) -> FlowModel:
         if self.arrival_model_family == "simple":
@@ -349,6 +365,10 @@ class LiveMarketSession:
             liquidity=self.liquidity,
             flow_model=flow_model,
             parameter_overrides=parameter_overrides,
+            intensity_modifier=(None if self.flow_configuration is None or self.flow_configuration.queue_reactive_config is None
+                                else QueueReactiveFlowModifier(self.flow_configuration.queue_reactive_config)),
+            intraday_profile=None if self.flow_configuration is None else self.flow_configuration.intraday_profile,
+            intraday_window=None if self.flow_configuration is None else self.flow_configuration.intraday_window,
         )
         self.engine.start()
         self._quantity_index = self.quantity_options.index(self._initial_quantity)

@@ -40,7 +40,7 @@ from .simulation_replay_contract import (
     REPLAY_VERIFICATION_RECEIPT_SCHEMA_ID,
     ReplayArtifactVerificationReceiptV1,
 )
-from .simulation_facade import _catalog_state
+from .simulation_facade import _catalog_state, _state_for_selection
 from .simulation_run_facade import _frame, _materialize_session
 
 
@@ -92,7 +92,7 @@ def _resolution_from_artifact(
     try:
         resolution = SimulationProfileResolutionV1.from_dict(
             resolution_record,
-            catalog=_catalog_state().profiles,
+            catalog=_state_for_selection(selection).profiles,
         )
         options = SimulationTrainingOptionsV1.from_dict(training)
     except (KeyError, TypeError, ValueError, SimulationResolutionRefusal) as error:
