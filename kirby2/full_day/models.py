@@ -105,6 +105,10 @@ def _validate_strict_json(value: object, active: set[int]) -> None:
     if value is None or type(value) in {bool, int}:
         return
     if type(value) is str:
+        # ASCII is already NFC and contains no surrogate code points. Most
+        # checkpoint identifiers use it; avoid walking each character in Python.
+        if value.isascii():
+            return
         if unicodedata.normalize("NFC", value) != value:
             raise ValueError("semantic JSON strings must be NFC-normalized")
         if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
@@ -115,14 +119,15 @@ def _validate_strict_json(value: object, active: set[int]) -> None:
     if isinstance(value, Mapping):
         if any(type(key) is not str for key in value):
             raise TypeError("semantic JSON object keys must be strings")
-        if any(unicodedata.normalize("NFC", key) != key for key in value):
-            raise ValueError("semantic JSON object keys must be NFC-normalized")
-        if any(
-            0xD800 <= ord(character) <= 0xDFFF
-            for key in value
-            for character in key
-        ):
-            raise ValueError("semantic JSON object keys must contain Unicode scalar values")
+        if not all(key.isascii() for key in value):
+            if any(unicodedata.normalize("NFC", key) != key for key in value):
+                raise ValueError("semantic JSON object keys must be NFC-normalized")
+            if any(
+                0xD800 <= ord(character) <= 0xDFFF
+                for key in value
+                for character in key
+            ):
+                raise ValueError("semantic JSON object keys must contain Unicode scalar values")
         identity = id(value)
         if identity in active:
             raise ValueError("semantic JSON must not contain reference cycles")
