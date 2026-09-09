@@ -12,6 +12,43 @@ from kirby2.ui.simulation_contract import canonical_digest
 WINDOW_US = 5_000_000
 
 
+def observe_delivered_book(market, *, observed_at_us, available_at_us):
+    """Quote-only C6 capability, separate from V1's complete event window.
+
+    The delivery owner supplies an already-delivered public book. Executed flow,
+    cancellation, replenishment and relative activity remain unavailable: a
+    changing quote is not evidence of which economic event caused the change.
+    """
+    _integer(observed_at_us, 'observation time')
+    if market is None:
+        return dict(schema_id='KIRBY2_DELIVERED_BOOK_OBSERVATION_V1', status='MISSING_BOOK',
+                    source_cut_us=None, available_at_us=None, observed_at_us=observed_at_us,
+                    age_us=None, values=None, event_window_status='UNAVAILABLE_NO_PUBLIC_TAPE',
+                    relative_activity=None)
+    source=_integer(market['simulation_time_us'], 'source time')
+    _integer(available_at_us, 'availability time')
+    if not source<=available_at_us<=observed_at_us:raise ValueError('delivered book violates observation chronology')
+    sides={}
+    for side in ('bid','ask'):
+        levels=market[side+'_levels']
+        if type(levels) is not list or len(levels)>256:raise ValueError('invalid delivered book depth')
+        prices=[]
+        for level in levels:
+            prices.append(_integer(level['price_ticks'],'price',1));_integer(level['quantity'],'shares',1)
+        if prices!=sorted(set(prices),reverse=side=='bid'):raise ValueError('delivered depth is not strictly ordered')
+        if market['best_'+side+'_ticks']!=(prices[0] if prices else None):raise ValueError('delivered top differs from depth')
+        sides[side]=sum(level['quantity'] for level in levels)
+    bid,ask=market['best_bid_ticks'],market['best_ask_ticks']
+    spread=None if bid is None or ask is None else ask-bid
+    if spread is not None and spread<0:raise ValueError('crossed delivered book')
+    age=observed_at_us-source
+    status='STALE_BOOK' if age>500000 else 'INCOMPLETE_BOOK' if spread is None else 'AVAILABLE'
+    return dict(schema_id='KIRBY2_DELIVERED_BOOK_OBSERVATION_V1',status=status,
+                source_cut_us=source,available_at_us=available_at_us,observed_at_us=observed_at_us,age_us=age,
+                values=dict(spread_ticks=spread,bid_depth_shares=sides['bid'],ask_depth_shares=sides['ask']),
+                event_window_status='UNAVAILABLE_NO_PUBLIC_TAPE',relative_activity=None)
+
+
 def _integer(value, label, minimum=0):
     if type(value) is not int or value < minimum:
         raise ValueError(label + " must be a bounded integer")

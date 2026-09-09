@@ -97,11 +97,26 @@ def observation(frame):
 
 
 def evaluate_playbook(source, cut, eligible_since_us=None):
+    return _evaluate_observation(source, cut, eligible_since_us, STOP_US)
+
+
+def evaluate_session_playbook(source, cut):
+    """C6 eligibility only; manual orders do not run the C5 trial actor.
+
+    Same V1 rule parser and feature evaluator. The separately versioned world
+    supplies its bounded clock; C4's public observation horizon is unchanged.
+    Candidate lifetime belongs to Radar, not the C5 automated order lifetime.
+    """
+    return _evaluate_observation(source, cut, None, 9_000_000,
+                                 schema_id='KIRBY2_SESSION_RULE_OBSERVATION_V1')
+
+
+def _evaluate_observation(source, cut, eligible_since_us, maximum_time_us, *, schema_id='KIRBY2_RULE_OBSERVATION_V1'):
     document, definition, identifier = _parse(source)
     exact(cut, ('schema_id','simulation_time_us','market','observation_id'), 'observation')
-    if cut['schema_id'] != 'KIRBY2_RULE_OBSERVATION_V1' or cut['observation_id'] != 'observation-'+canonical_sha256({k:v for k,v in cut.items() if k!='observation_id'}):
+    if cut['schema_id'] != schema_id or cut['observation_id'] != 'observation-'+canonical_sha256({k:v for k,v in cut.items() if k!='observation_id'}):
         raise ValueError('observation identity differs')
-    now = integer(cut['simulation_time_us'], 'observation time', 0, STOP_US)
+    now = integer(cut['simulation_time_us'], 'observation time', 0, maximum_time_us)
     values = {feature: None for feature in FeatureName}
     market = cut['market']; unavailable = None
     if market is None: unavailable = 'MISSING_MARKET'
